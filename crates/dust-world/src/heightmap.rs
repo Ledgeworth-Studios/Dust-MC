@@ -331,3 +331,166 @@ impl HeightmapSet {
             .expect("ALL lists every kind")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_plus_one_in_the_width_is_a_whole_bit_at_a_power_of_two() {
+        // 384 blocks of world is 385 distinct stored values, which is nine
+        // bits. Eight would be enough for every position and one short of the
+        // "full to the ceiling" value, and the column that reached the top
+        // would wrap to the floor.
+        //
+        // The nether is the case that makes the point: it is exactly 256 tall,
+        // which is eight bits of position, and it still needs nine -- because
+        // the value that says "full" is 256 and does not fit. A width worked
+        // out from the height alone is wrong for every world whose height is a
+        // power of two, and both of Minecraft's other dimensions are.
+        assert_eq!(WorldHeight::OVERWORLD.heightmap_bits(), 9);
+        assert_eq!(WorldHeight::NETHER.heightmap_bits(), 9);
+        assert_eq!(WorldHeight::new(0, 255).heightmap_bits(), 8);
+        assert_eq!(WorldHeight::new(0, 256).heightmap_bits(), 9);
+    }
+
+    #[test]
+    fn a_heightmap_is_two_hundred_and_fifty_six_values_and_thirty_seven_longs() {
+        let map = Heightmap::new(HeightmapKind::MotionBlocking, WorldHeight::OVERWORLD);
+        assert_eq!(map.storage().len(), COLUMNS);
+        assert_eq!(map.storage().bits(), 9);
+        assert_eq!(
+            map.as_longs().len(),
+            37,
+            "36 would be the pre-1.16 packing of the same values"
+        );
+    }
+
+    #[test]
+    fn an_empty_column_reads_as_the_floor_and_holds_no_block() {
+        let map = Heightmap::new(HeightmapKind::WorldSurface, WorldHeight::OVERWORLD);
+        assert_eq!(map.first_available(0, 0), -64);
+        assert_eq!(map.highest_taken(0, 0), None);
+    }
+
+    #[test]
+    fn the_highest_block_is_one_below_the_first_available_position() {
+        // The off-by-one that puts a mob inside the floor.
+        let mut map = Heightmap::new(HeightmapKind::MotionBlocking, WorldHeight::OVERWORLD);
+        map.set_first_available(4, 9, 64);
+        assert_eq!(map.first_available(4, 9), 64);
+        assert_eq!(map.highest_taken(4, 9), Some(63));
+    }
+
+    #[test]
+    fn a_column_full_to_the_ceiling_stores_the_value_past_the_top() {
+        let mut map = Heightmap::new(HeightmapKind::WorldSurface, WorldHeight::OVERWORLD);
+        let top = WorldHeight::OVERWORLD.max_y_exclusive();
+        assert_eq!(top, 320);
+        map.set_first_available(0, 0, top);
+        assert_eq!(map.first_available(0, 0), 320);
+        assert_eq!(map.highest_taken(0, 0), Some(319));
+    }
+
+    #[test]
+    fn every_column_is_its_own_and_survives_the_round_trip_through_longs() {
+        let mut map = Heightmap::new(HeightmapKind::OceanFloor, WorldHeight::OVERWORLD);
+        for z in 0..16 {
+            for x in 0..16 {
+                map.set_first_available(x, z, -64 + (x * 16 + z) as i32);
+            }
+        }
+        let longs = map.as_longs().to_vec();
+        assert!(map.storage().padding_is_zero());
+        let read = Heightmap::from_longs(HeightmapKind::OceanFloor, WorldHeight::OVERWORLD, longs)
+            .expect("its own output");
+        for z in 0..16 {
+            for x in 0..16 {
+                assert_eq!(
+                    read.first_available(x, z),
+                    -64 + (x * 16 + z) as i32,
+                    "({x}, {z})"
+                );
+            }
+        }
+        assert_eq!(read, map);
+    }
+
+    #[test]
+    fn recomputing_a_column_stops_at_the_first_state_the_predicate_accepts() {
+        // The seam. The predicate here counts odd state ids, which is not what
+        // any real heightmap does and is exactly the point: this module must
+        // work for a predicate it knows nothing about.
+        let mut map = Heightmap::new(HeightmapKind::MotionBlocking, WorldHeight::OVERWORLD);
+        let column: Vec<(i32, u32)> = (-64..320)
+            .rev()
+            .map(|y| (y, if y == 70 { 3 } else { 0 }))
+            .collect();
+        let mut asked = 0;
+        map.recompute_column(2, 3, column, |state| {
+            asked += 1;
+            state % 2 == 1
+        });
+        assert_eq!(map.first_available(2, 3), 71);
+        assert_eq!(map.highest_taken(2, 3), Some(70));
+        assert_eq!(asked, 320 - 70, "it kept asking after it had an answer");
+    }
+
+    #[test]
+    fn a_column_the_predicate_never_accepts_is_empty() {
+        let mut map = Heightmap::new(HeightmapKind::MotionBlocking, WorldHeight::OVERWORLD);
+        map.recompute_column(0, 0, (-64..320).rev().map(|y| (y, 0u32)), |_| false);
+        assert_eq!(map.first_available(0, 0), -64);
+        assert_eq!(map.highest_taken(0, 0), None);
+    }
+
+    #[test]
+    fn four_of_the_six_are_written_to_disk() {
+        // A reader that expected six keys in a chunk's Heightmaps compound and
+        // found four would call an intact file damaged.
+        let persisted: Vec<&str> = HeightmapKind::ALL
+            .into_iter()
+            .filter(|k| k.persisted())
+            .map(HeightmapKind::nbt_key)
+            .collect();
+        assert_eq!(
+            persisted,
+            vec![
+                "WORLD_SURFACE",
+                "OCEAN_FLOOR",
+                "MOTION_BLOCKING",
+                "MOTION_BLOCKING_NO_LEAVES"
+            ]
+        );
+        assert!(!HeightmapKind::WorldSurfaceWg.persisted());
+        assert!(!HeightmapKind::OceanFloorWg.persisted());
+    }
+
+    #[test]
+    fn keys_round_trip_and_nothing_else_parses() {
+        for kind in HeightmapKind::ALL {
+            assert_eq!(HeightmapKind::from_nbt_key(kind.nbt_key()), Some(kind));
+        }
+        assert_eq!(HeightmapKind::from_nbt_key("MOTION_BLOCKING_LEAVES"), None);
+        assert_eq!(HeightmapKind::from_nbt_key("world_surface"), None);
+    }
+
+    #[test]
+    fn a_set_holds_one_of_each_and_hands_back_the_one_asked_for() {
+        let mut set = HeightmapSet::new(WorldHeight::OVERWORLD);
+        assert_eq!(set.iter().count(), 6);
+        assert_eq!(set.persisted().count(), 4);
+        for kind in HeightmapKind::ALL {
+            assert_eq!(set.get(kind).kind(), kind);
+            set.get_mut(kind).set_first_available(1, 1, kind as i32);
+        }
+        for kind in HeightmapKind::ALL {
+            assert_eq!(
+                set.get(kind).first_available(1, 1),
+                kind as i32,
+                "{}",
+                kind.nbt_key()
+            );
+        }
+    }
+}

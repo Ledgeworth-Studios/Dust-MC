@@ -286,3 +286,92 @@ const fn capacity_at(bits: u32) -> usize {
         1usize << bits
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ceil_log2_is_the_width_a_palette_of_that_many_entries_needs() {
+        // The boundaries are the promotion schedule, so they are spelled out
+        // rather than checked against a formula that could be the same mistake
+        // written twice.
+        assert_eq!(ceil_log2(0), 0);
+        assert_eq!(ceil_log2(1), 0);
+        assert_eq!(ceil_log2(2), 1);
+        assert_eq!(ceil_log2(3), 2);
+        assert_eq!(ceil_log2(4), 2);
+        assert_eq!(ceil_log2(5), 3);
+        assert_eq!(ceil_log2(8), 3);
+        assert_eq!(ceil_log2(9), 4);
+        assert_eq!(ceil_log2(16), 4);
+        assert_eq!(ceil_log2(17), 5);
+        assert_eq!(ceil_log2(256), 8);
+        assert_eq!(ceil_log2(257), 9);
+        assert_eq!(ceil_log2(26_684), 15);
+
+        // And the property, over a range that crosses every power of two that
+        // a palette reaches.
+        for n in 1..=4096u32 {
+            let bits = ceil_log2(n);
+            assert!(1u64 << bits >= u64::from(n), "{n} does not fit in {bits}");
+            if bits > 0 {
+                assert!(
+                    1u64 << (bits - 1) < u64::from(n),
+                    "{n} fits in {} bits",
+                    bits - 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_single_palette_holds_one_value_and_refuses_a_second() {
+        let mut palette = Palette::single(7);
+        assert_eq!(palette.kind(), PaletteKind::Single);
+        assert_eq!(palette.bits(), 0);
+        assert_eq!(palette.len(), 1);
+        assert_eq!(palette.value(0), Some(7));
+        assert_eq!(palette.value(1), None);
+        assert_eq!(palette.index_of(7), Some(0));
+        assert_eq!(palette.try_insert(7), Some(0));
+        assert_eq!(palette.try_insert(8), None, "the container must promote");
+    }
+
+    #[test]
+    fn linear_and_hashed_fill_to_capacity_then_signal() {
+        for mut palette in [Palette::linear(4), Palette::hashed(4)] {
+            let kind = palette.kind();
+            assert_eq!(palette.capacity(), 16, "{kind}");
+            for n in 0..16u32 {
+                assert_eq!(palette.try_insert(n * 3), Some(n), "{kind} entry {n}");
+            }
+            assert_eq!(palette.len(), 16);
+            // A value already present is found, full or not.
+            assert_eq!(palette.try_insert(0), Some(0), "{kind}");
+            assert_eq!(palette.try_insert(1), None, "{kind} is full");
+            for n in 0..16u32 {
+                assert_eq!(palette.value(n), Some(n * 3), "{kind}");
+                assert_eq!(palette.index_of(n * 3), Some(n), "{kind}");
+            }
+            assert_eq!(palette.entries().map(<[u32]>::len), Some(16), "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_global_palette_is_the_registry_and_has_no_entry_list() {
+        let mut palette = Palette::global(26_684);
+        assert_eq!(palette.kind(), PaletteKind::Global);
+        assert_eq!(palette.bits(), 15);
+        assert_eq!(palette.value(9), Some(9), "the index is the id");
+        assert_eq!(palette.index_of(9), Some(9));
+        assert_eq!(palette.try_insert(26_683), Some(26_683));
+        assert_eq!(palette.value(26_684), None, "past the registry");
+        assert_eq!(palette.try_insert(26_684), None);
+        assert_eq!(
+            palette.entries(),
+            None,
+            "a global palette has no list, which is the point of it"
+        );
+    }
+}

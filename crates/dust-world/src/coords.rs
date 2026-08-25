@@ -148,3 +148,105 @@ impl std::fmt::Display for RegionPos {
         write!(f, "region ({}, {})", self.x, self.z)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negative_chunks_land_in_negative_regions() {
+        // The whole reason this module exists. Written out rather than derived,
+        // because a shared formula would be the same mistake twice.
+        for (chunk, region) in [
+            ((0, 0), (0, 0)),
+            ((31, 31), (0, 0)),
+            ((32, 32), (1, 1)),
+            ((-1, -1), (-1, -1)),
+            ((-32, -32), (-1, -1)),
+            ((-33, -33), (-2, -2)),
+            ((-1, 40), (-1, 1)),
+        ] {
+            assert_eq!(
+                ChunkPos::new(chunk.0, chunk.1).region(),
+                RegionPos::new(region.0, region.1),
+                "chunk {chunk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_coordinates_are_always_in_range_and_come_back() {
+        for x in -70i32..70 {
+            for z in -70i32..70 {
+                let chunk = ChunkPos::new(x, z);
+                assert!(chunk.local_x() < 32 && chunk.local_z() < 32, "{chunk}");
+                assert!(chunk.header_slot() < 1024, "{chunk}");
+                assert_eq!(
+                    chunk.region().chunk_at(chunk.local_x(), chunk.local_z()),
+                    chunk
+                );
+                assert_eq!(chunk.region().chunk_at_slot(chunk.header_slot()), chunk);
+            }
+        }
+    }
+
+    #[test]
+    fn a_region_lists_its_thousand_and_twenty_four_chunks_once_each() {
+        for region in [RegionPos::new(0, 0), RegionPos::new(-2, 3)] {
+            let chunks: Vec<ChunkPos> = region.chunks().collect();
+            assert_eq!(chunks.len(), 1024);
+            let mut sorted = chunks.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), 1024, "{region} lists a chunk twice");
+            for chunk in chunks {
+                assert!(region.contains(chunk), "{chunk} is not in {region}");
+            }
+        }
+    }
+
+    #[test]
+    fn file_names_round_trip_and_near_misses_do_not_parse() {
+        for region in [
+            RegionPos::new(0, 0),
+            RegionPos::new(-1, 2),
+            RegionPos::new(1234, -5678),
+        ] {
+            let name = region.file_name();
+            assert_eq!(RegionPos::from_file_name(&name), Some(region), "{name}");
+        }
+        assert_eq!(RegionPos::new(-1, 2).file_name(), "r.-1.2.mca");
+        for name in [
+            "r.0.0.mca.bak",
+            "r.0.mca",
+            "r..0.mca",
+            "region.0.0.mca",
+            "r.0.0.mcr",
+            "r.0.0.0.mca",
+            "",
+        ] {
+            assert_eq!(
+                RegionPos::from_file_name(name),
+                None,
+                "{name} should not parse as a region"
+            );
+        }
+    }
+
+    #[test]
+    fn external_files_are_named_by_absolute_chunk_coordinates() {
+        // Not by the local ones. A `.mcc` sits in the same directory as every
+        // other region's, so a name built from local coordinates would collide
+        // with the same slot in the region next door.
+        assert_eq!(ChunkPos::new(-33, 40).external_file_name(), "c.-33.40.mcc");
+        assert_eq!(ChunkPos::new(0, 0).external_file_name(), "c.0.0.mcc");
+    }
+
+    #[test]
+    fn the_header_slot_varies_x_fastest() {
+        assert_eq!(ChunkPos::new(0, 0).header_slot(), 0);
+        assert_eq!(ChunkPos::new(1, 0).header_slot(), 1);
+        assert_eq!(ChunkPos::new(0, 1).header_slot(), 32);
+        assert_eq!(ChunkPos::new(31, 31).header_slot(), 1023);
+    }
+}

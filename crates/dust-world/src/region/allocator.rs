@@ -157,3 +157,100 @@ impl SectorAllocator {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_header_sectors_are_never_handed_out() {
+        let mut allocator = SectorAllocator::new(0);
+        assert_eq!(allocator.sectors(), 2);
+        assert_eq!(allocator.used_sectors(), 2);
+        assert_eq!(allocator.allocate(1), 2, "sectors 0 and 1 are the header");
+    }
+
+    #[test]
+    fn a_freed_run_is_reused_before_the_file_grows() {
+        let mut allocator = SectorAllocator::new(2);
+        let a = allocator.allocate(3);
+        let b = allocator.allocate(2);
+        let c = allocator.allocate(1);
+        assert_eq!((a, b, c), (2, 5, 7));
+        assert_eq!(allocator.sectors(), 8);
+
+        allocator.free(b, 2);
+        assert!(allocator.is_free(5, 2));
+        // A two-sector chunk fits the hole exactly.
+        assert_eq!(allocator.allocate(2), 5);
+        assert_eq!(allocator.sectors(), 8, "the file did not have to grow");
+    }
+
+    #[test]
+    fn a_run_too_long_for_the_hole_goes_past_the_end() {
+        let mut allocator = SectorAllocator::new(2);
+        let a = allocator.allocate(2);
+        let b = allocator.allocate(2);
+        allocator.free(a, 2);
+        // Three does not fit in the two-sector hole at 2.
+        let c = allocator.allocate(3);
+        assert_eq!(c, 6, "after the run at {b}");
+        assert!(allocator.is_free(2, 2), "and the hole is still there");
+    }
+
+    #[test]
+    fn adjacent_freed_runs_merge_without_anything_merging_them() {
+        // The reason this is a bitmap. Three separate one-sector runs given
+        // back become one three-sector run, and a free list of runs would have
+        // to notice that.
+        let mut allocator = SectorAllocator::new(2);
+        let runs: Vec<u32> = (0..3).map(|_| allocator.allocate(1)).collect();
+        for first in &runs {
+            allocator.free(*first, 1);
+        }
+        assert_eq!(allocator.allocate(3), 2);
+    }
+
+    #[test]
+    fn trailing_free_sectors_are_the_front_of_a_run_that_extends_the_file() {
+        // A file ending in one free sector, asked for three, must use that one
+        // and add two -- not abandon it and add three. Getting this wrong makes
+        // a file grow by a sector on every rewrite of a chunk that grew.
+        let mut allocator = SectorAllocator::new(2);
+        let a = allocator.allocate(1);
+        let b = allocator.allocate(1);
+        assert_eq!((a, b), (2, 3));
+        allocator.free(b, 1);
+        assert_eq!(allocator.allocate(3), 3);
+        assert_eq!(allocator.sectors(), 6);
+    }
+
+    #[test]
+    fn claiming_a_sector_twice_names_it() {
+        let mut allocator = SectorAllocator::new(10);
+        allocator.claim(4, 3).expect("nothing held 4..7 yet");
+        let taken = allocator.claim(6, 2).expect_err("6 is inside 4..7");
+        assert_eq!(taken, SectorTaken { sector: 6 });
+    }
+
+    #[test]
+    fn the_free_list_is_the_complement_of_what_is_used() {
+        let mut allocator = SectorAllocator::new(10);
+        allocator.claim(3, 2).expect("free");
+        allocator.claim(7, 1).expect("free");
+        assert_eq!(allocator.free_runs(), vec![(2, 1), (5, 2), (8, 2)]);
+        assert_eq!(allocator.used_sectors(), 5);
+    }
+
+    #[test]
+    fn freeing_something_already_free_changes_nothing() {
+        // The lenient-open path frees runs from header entries it dropped, and
+        // two of those entries may have pointed at the same sectors.
+        let mut allocator = SectorAllocator::new(6);
+        allocator.free(2, 2);
+        allocator.free(2, 2);
+        allocator.free(100, 4);
+        assert_eq!(allocator.used_sectors(), 2);
+        assert_eq!(allocator.sectors(), 6, "freeing past the end does not grow");
+    }
+}

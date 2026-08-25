@@ -562,3 +562,380 @@ impl PalettedContainer {
         id
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::palette::PaletteKind::{Global, Hashed, Linear, Single};
+
+    /// The number of block states on 1.21.1, from the extracted registry.
+    ///
+    /// Written down rather than imported. The container takes the registry size
+    /// as a parameter precisely so that it does not depend on the block table,
+    /// and a test that reached for the table would quietly remove the seam it
+    /// is supposed to be checking.
+    const BLOCK_STATES_1_21_1: u32 = 26_684;
+
+    /// Biomes on 1.21.1. The exact number does not matter to the container; it
+    /// matters that it is small enough that the global biome palette is narrow.
+    const BIOMES_1_21_1: u32 = 64;
+
+    #[test]
+    fn a_fresh_container_is_one_value_and_no_longs() {
+        let container = PalettedContainer::filled(Strategy::BLOCK_STATES, BLOCK_STATES_1_21_1, 0);
+        assert_eq!(container.len(), 4096);
+        assert_eq!(container.palette_kind(), Single);
+        assert_eq!(container.storage().bits(), 0);
+        assert!(container.storage().as_longs().is_empty());
+        assert!((0..4096).all(|i| container.get(i) == 0));
+
+        let biomes = PalettedContainer::filled(Strategy::BIOMES, BIOMES_1_21_1, 3);
+        assert_eq!(biomes.len(), 64);
+        assert_eq!(biomes.palette_kind(), Single);
+        assert!((0..64).all(|i| biomes.get(i) == 3));
+    }
+
+    #[test]
+    fn block_states_promote_at_the_boundaries_vanilla_documents() {
+        // Distinct values are added one at a time and the tier is checked after
+        // each. These are the numbers from `Strategy.SECTION_STATES`: linear
+        // through 4 bits and stored at 4 regardless, hashed from 5 to 8,
+        // global above.
+        let mut container =
+            PalettedContainer::filled(Strategy::BLOCK_STATES, BLOCK_STATES_1_21_1, 0);
+        let expected = |distinct: u32| -> (crate::palette::PaletteKind, u32) {
+            match distinct {
+                1 => (Single, 0),
+                2..=16 => (Linear, 4),
+                17..=32 => (Hashed, 5),
+                33..=64 => (Hashed, 6),
+                65..=128 => (Hashed, 7),
+                129..=256 => (Hashed, 8),
+                _ => (Global, 15),
+            }
+        };
+
+        for distinct in 1..=300u32 {
+            // Value 0 is already in the palette from the fill, so the nth
+            // distinct value is n - 1.
+            container.set(distinct as usize - 1, distinct - 1);
+            let (kind, bits) = expected(distinct);
+            assert_eq!(
+                container.palette_kind(),
+                kind,
+                "{distinct} distinct block states"
+            );
+            assert_eq!(
+                container.storage().bits(),
+                bits,
+                "{distinct} distinct block states"
+            );
+        }
+    }
+
+    #[test]
+    fn biomes_promote_at_their_own_boundaries_and_never_hash() {
+        // Not the same numbers, and this is the test that fails if the
+        // container was written once for block states and reused.
+        let mut container = PalettedContainer::filled(Strategy::BIOMES, BIOMES_1_21_1, 0);
+        let expected = |distinct: u32| match distinct {
+            1 => (Single, 0),
+            2 => (Linear, 1),
+            3..=4 => (Linear, 2),
+            5..=8 => (Linear, 3),
+            _ => (Global, 6),
+        };
+        for distinct in 1..=16u32 {
+            container.set(distinct as usize - 1, distinct - 1);
+            let (kind, bits) = expected(distinct);
+            assert_eq!(container.palette_kind(), kind, "{distinct} distinct biomes");
+            assert_eq!(
+                container.storage().bits(),
+                bits,
+                "{distinct} distinct biomes"
+            );
+            assert_ne!(
+                container.palette_kind(),
+                Hashed,
+                "biomes have no hashed tier"
+            );
+        }
+    }
+
+    #[test]
+    fn every_value_written_survives_every_promotion() {
+        // The point of the whole exercise. A promotion rebuilds the palette and
+        // repacks the storage at a new width, and the new palette does not
+        // continue the old one's numbering -- so the check is not "the storage
+        // is the right length" but "every cell still reads back the block that
+        // was put in it", verified in full each time the tier changes.
+        let mut container =
+            PalettedContainer::filled(Strategy::BLOCK_STATES, BLOCK_STATES_1_21_1, 0);
+        let mut written = vec![0u32; 4096];
+        let mut tier = (container.palette_kind(), container.storage().bits());
+        let mut promotions = 0;
+
+        for cell in 0..4096usize {
+            // Every cell gets a distinct value, so the container is driven all
+            // the way from single-valued to global.
+            let value = cell as u32 * 6 + 1;
+            assert_eq!(container.set(cell, value), written[cell]);
+            written[cell] = value;
+            assert_eq!(container.get(cell), value);
+
+            let now = (container.palette_kind(), container.storage().bits());
+            if now != tier {
+                promotions += 1;
+                tier = now;
+                for (index, expected) in written.iter().enumerate() {
+                    assert_eq!(
+                        container.get(index),
+                        *expected,
+                        "cell {index} changed when the palette became {} at {} bits",
+                        now.0,
+                        now.1
+                    );
+                }
+                assert!(
+                    container.storage().padding_is_zero(),
+                    "a repacked storage is still written for a vanilla client"
+                );
+            }
+        }
+
+        // Single -> linear(4) -> hashed(5,6,7,8) -> global: six changes of tier.
+        assert_eq!(
+            promotions, 6,
+            "the container did not pass through every tier"
+        );
+        assert_eq!(container.palette_kind(), Global);
+        for (index, expected) in written.iter().enumerate() {
+            assert_eq!(container.get(index), *expected, "cell {index} at the end");
+        }
+    }
+
+    #[test]
+    fn a_value_outside_the_registry_is_named_and_not_stored() {
+        let mut container = PalettedContainer::filled(Strategy::BIOMES, 64, 0);
+        let err = container.try_set(0, 64).expect_err("64 ids are 0..64");
+        assert_eq!(
+            err,
+            NotInRegistry {
+                value: 64,
+                registry_size: 64
+            }
+        );
+        assert!(err.to_string().contains("64 entries"), "{err}");
+        assert_eq!(container.get(0), 0, "nothing was stored");
+    }
+
+    #[test]
+    fn the_index_order_is_y_then_z_then_x_and_covers_every_cell() {
+        for strategy in [Strategy::BLOCK_STATES, Strategy::BIOMES] {
+            let edge = strategy.edge();
+            let mut seen = vec![false; strategy.len()];
+            for y in 0..edge {
+                for z in 0..edge {
+                    for x in 0..edge {
+                        let index = strategy.index(x, y, z);
+                        // Written out rather than derived, so a shift in the
+                        // implementation does not move the expectation with it.
+                        let expected = match edge {
+                            16 => (y * 256 + z * 16 + x) as usize,
+                            4 => (y * 16 + z * 4 + x) as usize,
+                            _ => unreachable!("only two shapes exist"),
+                        };
+                        assert_eq!(index, expected, "({x}, {y}, {z}) in a {edge}-cube");
+                        assert!(!seen[index], "two coordinates share index {index}");
+                        seen[index] = true;
+                    }
+                }
+            }
+            assert!(seen.into_iter().all(|s| s), "some cell has no coordinate");
+        }
+    }
+
+    #[test]
+    fn coordinates_and_indices_reach_the_same_cell() {
+        let mut container =
+            PalettedContainer::filled(Strategy::BLOCK_STATES, BLOCK_STATES_1_21_1, 0);
+        container.set_at(3, 7, 11, 42);
+        assert_eq!(container.get_at(3, 7, 11), 42);
+        assert_eq!(container.get(Strategy::BLOCK_STATES.index(3, 7, 11)), 42);
+        assert_eq!(container.get_at(11, 7, 3), 0, "not the transposed cell");
+    }
+
+    #[test]
+    fn the_disk_width_is_the_palette_width_until_the_container_goes_global() {
+        let s = Strategy::BLOCK_STATES;
+        // Below the global tier the two agree, and the four-bit floor applies.
+        assert_eq!(s.disk_bits(2, BLOCK_STATES_1_21_1), 4);
+        assert_eq!(s.disk_bits(16, BLOCK_STATES_1_21_1), 4);
+        assert_eq!(s.disk_bits(17, BLOCK_STATES_1_21_1), 5);
+        assert_eq!(s.disk_bits(256, BLOCK_STATES_1_21_1), 8);
+        // Above it they must not: on disk the indices point into the palette
+        // written beside them, so 257 entries are packed at 9 bits and not at
+        // the global palette's 15.
+        assert_eq!(s.disk_bits(257, BLOCK_STATES_1_21_1), 9);
+        assert_eq!(s.disk_bits(4096, BLOCK_STATES_1_21_1), 12);
+        assert_eq!(Strategy::BIOMES.disk_bits(9, BIOMES_1_21_1), 4);
+    }
+
+    #[test]
+    fn parts_round_trip_through_every_tier() {
+        for distinct in [1usize, 2, 16, 17, 256, 257, 1000, 4096] {
+            let mut container =
+                PalettedContainer::filled(Strategy::BLOCK_STATES, BLOCK_STATES_1_21_1, 0);
+            let values: Vec<u32> = (0..4096)
+                .map(|cell| (cell % distinct) as u32 * 5 + 1)
+                .collect();
+            for (cell, value) in values.iter().enumerate() {
+                container.set(cell, *value);
+            }
+
+            let (entries, data) = container.to_parts();
+            assert_eq!(entries.len(), distinct, "{distinct} distinct values");
+            assert_eq!(data.is_none(), distinct == 1);
+            if let Some(longs) = &data {
+                assert_eq!(
+                    longs.len(),
+                    crate::bits::long_count(
+                        4096,
+                        Strategy::BLOCK_STATES.disk_bits(distinct, BLOCK_STATES_1_21_1)
+                    ),
+                    "{distinct} distinct values"
+                );
+            }
+
+            let rebuilt = PalettedContainer::from_parts(
+                Strategy::BLOCK_STATES,
+                BLOCK_STATES_1_21_1,
+                &entries,
+                data,
+            )
+            .expect("its own output");
+            for (cell, value) in values.iter().enumerate() {
+                assert_eq!(
+                    rebuilt.get(cell),
+                    *value,
+                    "{distinct} distinct, cell {cell}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_global_tier_file_has_its_indices_translated_and_not_taken_literally() {
+        // A 300-entry palette on disk holds 9-bit indices into that list. Read
+        // as registry ids they would be a section of the first 300 block states
+        // in the game, which is a perfectly plausible section of stone and
+        // grass -- and wrong. This is the check that the translation happens.
+        let entries: Vec<u32> = (0..300u32).map(|n| n * 77 + 5).collect();
+        let bits = Strategy::BLOCK_STATES.disk_bits(entries.len(), BLOCK_STATES_1_21_1);
+        assert_eq!(bits, 9);
+        let mut packed = BitStorage::new(bits, 4096);
+        for cell in 0..4096 {
+            packed.set(cell, (cell % 300) as u32);
+        }
+
+        let container = PalettedContainer::from_parts(
+            Strategy::BLOCK_STATES,
+            BLOCK_STATES_1_21_1,
+            &entries,
+            Some(packed.into_longs()),
+        )
+        .expect("a well-formed global-tier section");
+
+        assert_eq!(container.palette_kind(), Global);
+        assert_eq!(container.storage().bits(), 15);
+        for cell in 0..4096 {
+            assert_eq!(container.get(cell), entries[cell % 300], "cell {cell}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_section_is_named_rather_than_decoded() {
+        let s = Strategy::BLOCK_STATES;
+        let registry = BLOCK_STATES_1_21_1;
+
+        assert_eq!(
+            PalettedContainer::from_parts(s, registry, &[], None),
+            Err(ContainerError::EmptyPalette)
+        );
+
+        assert_eq!(
+            PalettedContainer::from_parts(s, registry, &[1, 2], None),
+            Err(ContainerError::MissingData { entries: 2 })
+        );
+
+        // 4-bit data for a 2-entry palette is 256 longs, not 128.
+        let err = PalettedContainer::from_parts(s, registry, &[1, 2], Some(vec![0; 128]))
+            .expect_err("128 longs is the pre-1.16 length");
+        assert!(matches!(err, ContainerError::Storage(_)), "{err}");
+        assert!(err.to_string().contains("256 longs"), "{err}");
+
+        // A 5-entry palette is packed at 4 bits, and 4 bits can say 15.
+        let mut packed = BitStorage::new(4, 4096);
+        packed.set(9, 7);
+        let err =
+            PalettedContainer::from_parts(s, registry, &[1, 2, 3, 4, 5], Some(packed.into_longs()))
+                .expect_err("index 7 names nothing");
+        assert_eq!(
+            err,
+            ContainerError::IndexNotInPalette {
+                cell: 9,
+                index: 7,
+                entries: 5
+            }
+        );
+        assert!(err.to_string().contains("cell 9"), "{err}");
+
+        let err = PalettedContainer::from_parts(s, registry, &[1, 2, 1], Some(vec![0; 256]))
+            .expect_err("1 appears twice");
+        assert_eq!(
+            err,
+            ContainerError::DuplicateEntry {
+                value: 1,
+                first: 0,
+                again: 2
+            }
+        );
+
+        let err = PalettedContainer::from_parts(s, 10, &[1, 2, 99], Some(vec![0; 256]))
+            .expect_err("99 is not an id of a 10-entry registry");
+        assert_eq!(
+            err,
+            ContainerError::NotInRegistry {
+                position: 2,
+                value: 99,
+                registry_size: 10
+            }
+        );
+    }
+
+    #[test]
+    fn a_rewritten_section_names_only_the_values_still_in_it() {
+        // A container that reached the hashed tier and was then filled with one
+        // block writes a single-valued section, exactly as vanilla does. A
+        // writer that dumped its own palette would write 200 dead entries and
+        // an 8-bit array, which is a different file for the same section.
+        let mut container =
+            PalettedContainer::filled(Strategy::BLOCK_STATES, BLOCK_STATES_1_21_1, 0);
+        for cell in 0..4096 {
+            container.set(cell, (cell % 200) as u32);
+        }
+        assert_eq!(container.palette_kind(), Hashed);
+        for cell in 0..4096 {
+            container.set(cell, 12);
+        }
+        assert_eq!(
+            container.palette_kind(),
+            Hashed,
+            "the container does not demote on its own"
+        );
+
+        let (entries, data) = container.to_parts();
+        assert_eq!(entries, vec![12]);
+        assert_eq!(data, None);
+    }
+}

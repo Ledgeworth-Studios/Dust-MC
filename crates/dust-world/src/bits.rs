@@ -363,3 +363,275 @@ impl BitStorage {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A deterministic value that fits in `bits`, varied enough that a value
+    /// landing in the wrong slot changes it.
+    ///
+    /// Not random: a test that fails on one seed in fifty is a test nobody
+    /// trusts. The multiplier is Knuth's and spreads consecutive indices across
+    /// the whole range, which is what makes a neighbouring-slot mistake show up
+    /// rather than being masked by two adjacent values happening to agree.
+    fn sample(index: usize, bits: u32) -> u32 {
+        if bits == 0 {
+            return 0;
+        }
+        let span = 1u64 << bits;
+        ((index as u64).wrapping_mul(2_654_435_761) % span) as u32
+    }
+
+    /// The long count worked out by placing the values one at a time, which
+    /// shares no arithmetic with the closed form it is checking.
+    fn long_count_by_placement(values: usize, bits: u32) -> usize {
+        if bits == 0 || values == 0 {
+            return 0;
+        }
+        let per_long = (64 / bits) as usize;
+        let mut highest = 0;
+        for index in 0..values {
+            highest = highest.max(index / per_long);
+        }
+        highest + 1
+    }
+
+    #[test]
+    fn every_width_from_one_to_thirty_two_round_trips() {
+        // Every width, not a sample of them. The interesting ones are the
+        // widths that do not divide 64 -- everything else agrees with the
+        // pre-1.16 packing and proves nothing -- and there is no reason to
+        // guess which of those matter when all thirty-two take milliseconds.
+        for bits in 1..=MAX_BITS {
+            for len in [1usize, 2, 63, 64, 65, 256, 4095, 4096, 4097] {
+                let mut storage = BitStorage::new(bits, len);
+                assert_eq!(storage.bits(), bits);
+                assert_eq!(storage.len(), len);
+                for index in 0..len {
+                    storage.set(index, sample(index, bits));
+                }
+                for index in 0..len {
+                    assert_eq!(
+                        storage.get(index),
+                        sample(index, bits),
+                        "{bits} bits, {len} values, index {index}"
+                    );
+                }
+                assert!(
+                    storage.padding_is_zero(),
+                    "{bits} bits, {len} values: a vanilla client reads these longs"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_long_count_matches_the_arithmetic_vanilla_uses() {
+        // This is the off-by-one's home. `long_count` divides by the number of
+        // values that fit in a long; the check divides nothing and places every
+        // value by hand.
+        for bits in 1..=MAX_BITS {
+            for len in [
+                0usize, 1, 2, 3, 7, 63, 64, 65, 127, 255, 256, 257, 4095, 4096, 4097,
+            ] {
+                assert_eq!(
+                    long_count(len, bits),
+                    long_count_by_placement(len, bits),
+                    "{len} values at {bits} bits"
+                );
+                assert_eq!(
+                    BitStorage::new(bits, len).as_longs().len(),
+                    long_count(len, bits),
+                    "{len} values at {bits} bits: the array is not the length it claims"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_pre_1_16_packing_is_a_different_length_exactly_where_it_matters() {
+        // The two conventions agree for every width that divides 64 and differ
+        // for every width that does not. That is why a corpus of 4-bit and
+        // 8-bit arrays cannot tell them apart, and why the nine-bit heightmap
+        // in a real chunk is the best evidence there is.
+        for bits in 1..=MAX_BITS {
+            let values = 4096usize;
+            let modern = long_count(values, bits);
+            let pre_1_16 = (values * bits as usize).div_ceil(64);
+            if 64 % bits == 0 {
+                assert_eq!(modern, pre_1_16, "{bits} bits divides 64");
+            } else {
+                assert!(
+                    modern > pre_1_16,
+                    "{bits} bits: modern {modern}, pre-1.16 {pre_1_16}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn from_longs_refuses_an_array_packed_the_old_way() {
+        // 256 nine-bit values: 37 longs now, 36 before 1.16. Handing the old
+        // array to the modern reader has to be an error, because every value it
+        // would return is plausible.
+        let modern = long_count(256, 9);
+        assert_eq!(modern, 37);
+        let old = (256 * 9usize).div_ceil(64);
+        assert_eq!(old, 36);
+
+        let err = BitStorage::from_longs(9, 256, vec![0; old]).expect_err("36 longs is not 37");
+        assert_eq!(
+            err,
+            BitStorageError::WrongLongCount {
+                bits: 9,
+                values: 256,
+                expected: 37,
+                found: 36,
+            }
+        );
+        assert!(err.to_string().contains("37 longs"), "{err}");
+        assert!(BitStorage::from_longs(9, 256, vec![0; modern]).is_ok());
+    }
+
+    #[test]
+    fn a_width_past_the_ceiling_is_named_rather_than_wrapped() {
+        let err = BitStorage::try_new(33, 16).expect_err("33 bits is too wide");
+        assert_eq!(err, BitStorageError::UnsupportedWidth { bits: 33 });
+        assert!(err.to_string().contains("33"), "{err}");
+    }
+
+    #[test]
+    fn setting_one_value_leaves_its_neighbours_alone() {
+        // The bug this catches is a mask built from the wrong width, which
+        // clears bits belonging to the value in the next slot -- and only ever
+        // shows up when the neighbour is not already zero.
+        for bits in 1..=MAX_BITS {
+            let mut storage = BitStorage::new(bits, 200);
+            let max = storage.max_value();
+            for index in 0..200 {
+                storage.set(index, max);
+            }
+            for index in 0..200 {
+                storage.set(index, 0);
+                for other in 0..200 {
+                    let expected = if other <= index { 0 } else { max };
+                    assert_eq!(
+                        storage.get(other),
+                        expected,
+                        "{bits} bits: writing {index} disturbed {other}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn padding_is_zero_notices_a_dirty_long() {
+        // The positive control. Without it this guard could be a function that
+        // returns true, and every test that asserts it would still pass.
+        let mut storage = BitStorage::new(9, 256);
+        for index in 0..256 {
+            storage.set(index, sample(index, 9));
+        }
+        assert!(storage.padding_is_zero());
+
+        // 9 bits x 7 values per long = 63 used bits, so bit 63 is padding.
+        let mut longs = storage.as_longs().to_vec();
+        longs[0] |= 1i64 << 63;
+        let dirty = BitStorage::from_longs(9, 256, longs).expect("still 37 longs");
+        assert!(
+            !dirty.padding_is_zero(),
+            "bit 63 of a 9-bit long is padding"
+        );
+        for index in 0..256 {
+            assert_eq!(dirty.get(index), sample(index, 9), "and it changes nothing");
+        }
+
+        // The unused slots of the final long count too. 256 values at 7 per
+        // long fill 36 longs and put 4 in the 37th, leaving 3 slots spare.
+        let mut longs = storage.as_longs().to_vec();
+        longs[36] |= 1i64 << (4 * 9);
+        let dirty = BitStorage::from_longs(9, 256, longs).expect("still 37 longs");
+        assert!(
+            !dirty.padding_is_zero(),
+            "slot 4 of the last long is unused"
+        );
+    }
+
+    #[test]
+    fn resizing_preserves_every_value_at_every_width() {
+        for bits in 1..MAX_BITS {
+            let mut storage = BitStorage::new(bits, 4096);
+            for index in 0..4096 {
+                storage.set(index, sample(index, bits));
+            }
+            for wider in bits + 1..=MAX_BITS {
+                let grown = storage.resized(wider);
+                assert_eq!(grown.bits(), wider);
+                assert_eq!(grown.len(), 4096);
+                assert_eq!(grown.as_longs().len(), long_count(4096, wider));
+                assert!(grown.padding_is_zero());
+                for index in 0..4096 {
+                    assert_eq!(
+                        grown.get(index),
+                        sample(index, bits),
+                        "{bits} -> {wider} bits at index {index}"
+                    );
+                }
+                // And back again, since nothing grew past the old ceiling.
+                let shrunk = grown.checked_resized(bits).expect("nothing was widened");
+                assert_eq!(shrunk, storage);
+            }
+        }
+    }
+
+    #[test]
+    fn narrowing_refuses_rather_than_truncating() {
+        let mut storage = BitStorage::new(8, 64);
+        storage.set(0, 255);
+        assert_eq!(storage.checked_resized(7), None);
+        storage.set(0, 127);
+        assert!(storage.checked_resized(7).is_some());
+    }
+
+    #[test]
+    fn zero_bits_is_a_run_of_zeroes_with_no_longs() {
+        // The single-valued palette's storage. It has a length and no array,
+        // and a container asks it for values 4096 times.
+        let storage = BitStorage::new(0, 4096);
+        assert_eq!(storage.len(), 4096);
+        assert_eq!(storage.bits(), 0);
+        assert!(storage.as_longs().is_empty());
+        assert_eq!(storage.max_value(), 0);
+        assert!(storage.iter().all(|v| v == 0));
+        assert!(storage.padding_is_zero());
+    }
+
+    #[test]
+    fn iterating_agrees_with_indexing() {
+        for bits in [1u32, 3, 5, 9, 17, 32] {
+            let mut storage = BitStorage::new(bits, 1000);
+            for index in 0..1000 {
+                storage.set(index, sample(index, bits));
+            }
+            let collected: Vec<u32> = storage.iter().collect();
+            assert_eq!(collected.len(), 1000);
+            for (index, value) in collected.into_iter().enumerate() {
+                assert_eq!(value, storage.get(index), "{bits} bits");
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "does not fit in 4 bits")]
+    fn a_value_too_wide_panics_rather_than_being_masked() {
+        BitStorage::new(4, 16).set(0, 16);
+    }
+
+    #[test]
+    #[should_panic(expected = "past the end")]
+    fn an_index_past_the_end_panics() {
+        let _ = BitStorage::new(4, 16).get(16);
+    }
+}
