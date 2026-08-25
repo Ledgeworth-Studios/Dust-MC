@@ -25,9 +25,11 @@
 //! Terralith changed the baseline underneath it. A multiplier composes with the
 //! datapack; a count fights it.
 //!
-//! **Keyed by ore, not by placement.** Vanilla generates diamond through three
-//! separate placements — an ordinary one, a large-vein one and a buried one.
-//! An operator who wants more diamond means all three. The multiplier applies to
+//! **Keyed by ore, not by placement.** Vanilla generates diamond through four
+//! separate placements — an ordinary one, a medium one, a large-vein one and a
+//! buried one. An operator who wants more diamond means all four, and which
+//! four is read out of the world's data rather than written down here; see
+//! `dust-gen::vanilla_ores`. The multiplier applies to
 //! every placement of the group, which preserves the *character* of the ore's
 //! distribution while changing its quantity.
 

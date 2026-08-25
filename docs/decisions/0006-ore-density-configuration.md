@@ -35,12 +35,12 @@ and it is why the resolver reports what it computed.
 
 **2. What the number is attached to — an ore, or a placement.**
 
-Vanilla generates diamond through three separate placed features: an ordinary
-one, one that makes large veins, and one that only generates fully enclosed in
-stone. Iron has three, coal has two, gold has three.
+Vanilla generates diamond through four separate placed features: an ordinary
+one, a medium one, one that makes large veins, and one that only generates
+fully enclosed in stone. Iron has three, coal has two, gold has three.
 
 The knob is keyed by **ore group** — one entry named `diamond` covering all
-three — because an operator who says "more diamond" means all three, and
+four — because an operator who says "more diamond" means all four, and
 because scaling all of an ore's placements by the same factor preserves the
 *character* of its distribution while changing its quantity. Exposing the raw
 placements would let someone triple only the buried variant, which is a real
@@ -133,3 +133,20 @@ from, which is what makes the identity property hold for both forms.
   answer to x-ray is obfuscating ore positions in the chunk packet, which is
   about what the client is told, not about what generates. The two are
   independent.
+
+## Correction, 2026-08-25
+
+This record originally said diamond had **three** placed features and named an
+ordinary one, a large-vein one and a buried one. It has four: `ore_diamond`,
+`ore_diamond_medium`, `ore_diamond_large` and `ore_diamond_buried`. The counts
+given for iron, coal and gold were right.
+
+The decision is unaffected — if anything the miscount argues for it, since a
+number written from memory went wrong in exactly the way keying by placement
+would have gone wrong in a datapack. What corrected it was the extractor
+built in Phase 0.5, which derives the grouping from the block states each
+feature places rather than from anything written down here; the four are one
+group because all four place `minecraft:diamond_ore` and
+`minecraft:deepslate_diamond_ore`.
+
+The same miscount was in `dust-config/src/ore.rs` and is corrected there too.
