@@ -3,3 +3,7 @@
 # changes. They are reviewed and moved into tests/ui/, never committed as-is.
 wip/
 .dust-extract/
+# A vanilla server the conformance test speaks to, stood up by hand. It holds
+# Mojang's world data and Mojang's logs, and none of that is this repository's
+# to carry. See crates/dust-protocol/tests/vanilla_conformance.rs.
+.dust-vanilla/
