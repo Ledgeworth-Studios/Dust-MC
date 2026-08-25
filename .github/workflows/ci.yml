@@ -24,7 +24,7 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install the pinned toolchain
         run: rustup show
@@ -50,3 +50,12 @@ jobs:
 
       - name: Build
         run: just build
+
+      # trybuild compiles the compile-fail cases in a workspace of its own under
+      # target/tests/, with a nested target directory the cache action's cleanup
+      # walk cannot open. It is only a warning, and a warning that is always
+      # there teaches people to stop reading warnings. Post steps run in reverse
+      # order, so removing it here is removing it before the cache runs.
+      - name: Remove trybuild's nested workspace before the cache step
+        if: always()
+        run: rm -rf target/tests
