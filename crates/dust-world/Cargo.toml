@@ -8,6 +8,11 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+# gzip and zlib, which region files use and Dust does not get to choose. The
+# pure-Rust backend is selected explicitly: the C `zlib-sys` backends would put
+# a build-time C toolchain between a contributor and a working checkout, and
+# nothing here is hot enough to need them.
+flate2 = { workspace = true }
 
 [lints]
 workspace = true
