@@ -4,4 +4,5 @@
 //! Crate docs are completed in the final pass; see the module docs.
 
 pub mod frame;
+pub mod state;
 pub mod varint;
