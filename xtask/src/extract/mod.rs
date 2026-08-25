@@ -50,7 +50,12 @@ pub fn run(options: &Options, workspace_root: &Path) -> Result<(), String> {
         None => download::server_jar(version, &cache)?,
     };
 
-    let reports = generate_reports(&jar, &cache.join(format!("reports-{version}")))?;
+    let reports = generate_reports(
+        &jar,
+        &cache.join(format!("reports-{version}")),
+        &cache,
+        workspace_root,
+    )?;
 
     let block_json = std::fs::read(reports.join("reports/blocks.json"))
         .map_err(|e| format!("could not read the generated block report: {e}"))?;
@@ -221,21 +226,63 @@ fn version_modules(directory: &Path) -> Result<Vec<String>, String> {
     Ok(modules)
 }
 
+/// An absolute form of `path`, for handing to a process running somewhere else.
+///
+/// `std::path::absolute` rather than `canonicalize`, because the output
+/// directory does not exist yet and canonicalising a path that is not there
+/// fails.
+fn absolute(path: &Path) -> Result<PathBuf, String> {
+    std::path::absolute(path).map_err(|e| {
+        format!(
+            "could not resolve {} to an absolute path: {e}",
+            path.display()
+        )
+    })
+}
+
 /// Run the server jar's own data generators.
-fn generate_reports(jar: &Path, output: &Path) -> Result<PathBuf, String> {
+///
+/// `scratch` is the directory java is run *in*, and it has to be the cache
+/// rather than wherever the operator happened to be standing. The 1.21.1 server
+/// jar is a bundler: before it runs anything it unpacks its libraries and a
+/// second copy of the server jar into the process's working directory, which
+/// with no `current_dir` is the workspace root. That left 55 MB of Mojang jars
+/// in `libraries/` and `versions/` beside `Cargo.toml`, matched by no
+/// `.gitignore` pattern, one `git add -A` away from committing exactly what
+/// this project's licensing line exists to keep out. The paths are made
+/// absolute first because they are about to be read from somewhere else.
+fn generate_reports(
+    jar: &Path,
+    output: &Path,
+    scratch: &Path,
+    workspace_root: &Path,
+) -> Result<PathBuf, String> {
     if output.join("reports/blocks.json").exists() {
         println!("using the cached reports in {}", output.display());
         return Ok(output.to_path_buf());
     }
 
+    std::fs::create_dir_all(scratch)
+        .map_err(|e| format!("could not create {}: {e}", scratch.display()))?;
+    let jar = absolute(jar)?;
+    let output = absolute(output)?;
+
+    // Taken before the run so that anything the generators leave behind can be
+    // named afterwards. Deliberately a snapshot of the whole directory rather
+    // than a check for `libraries/`, `versions/` and `logs/` by name: those are
+    // the three 1.21.1 happens to unpack, and a guard that lists them can only
+    // fail on the cases whoever wrote it already knew about.
+    let before = top_level_entries(workspace_root)?;
+
     println!("running Minecraft's data generators (this takes a minute)");
     let status = std::process::Command::new("java")
+        .current_dir(scratch)
         .arg("-DbundlerMainClass=net.minecraft.data.Main")
         .arg("-jar")
-        .arg(jar)
+        .arg(&jar)
         .arg("--reports")
         .arg("--output")
-        .arg(output)
+        .arg(&output)
         .status()
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => {
@@ -252,5 +299,32 @@ fn generate_reports(jar: &Path, output: &Path) -> Result<PathBuf, String> {
              a class version, the JDK on PATH is older than 21."
         ));
     }
+    let escaped: Vec<String> = top_level_entries(workspace_root)?
+        .difference(&before)
+        .cloned()
+        .collect();
+    if !escaped.is_empty() {
+        return Err(format!(
+            "Minecraft's data generators wrote {} into the workspace root. Nothing Mojang \
+             ships may land outside {CACHE_DIR}, which is the one directory .gitignore \
+             covers; anywhere else it is one `git add -A` from being committed. Delete \
+             those and check that java is still being run with its working directory set \
+             to the cache.",
+            escaped.join(", ")
+        ));
+    }
+
     Ok(output.to_path_buf())
+}
+
+/// The names directly inside `directory`, for comparing before and after.
+fn top_level_entries(directory: &Path) -> Result<std::collections::BTreeSet<String>, String> {
+    std::fs::read_dir(directory)
+        .map_err(|e| format!("could not read {}: {e}", directory.display()))?
+        .map(|entry| {
+            entry
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .map_err(|e| format!("could not read {}: {e}", directory.display()))
+        })
+        .collect()
 }
