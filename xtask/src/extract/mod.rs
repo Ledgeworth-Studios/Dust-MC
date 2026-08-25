@@ -14,6 +14,12 @@
 //! every packet id in `dust-protocol` — and, beside them, the golden samples,
 //! which are the only part that can tell the tables apart from a
 //! self-consistent wrong answer.
+//!
+//! Two of the jar's generators are needed and they write different trees.
+//! `--reports` produces the block state table, the registries and the packet
+//! report; `--server` produces the worldgen data, which is where the vanilla
+//! ore baseline in `dust-gen` comes from. Each is cached on a path only that
+//! generator writes, so having one does not look like having both.
 
 mod blocks;
 mod codegen;
@@ -21,6 +27,7 @@ mod download;
 mod packets;
 mod registries;
 mod sha1;
+mod worldgen;
 
 use std::path::{Path, PathBuf};
 
@@ -50,9 +57,19 @@ pub fn run(options: &Options, workspace_root: &Path) -> Result<(), String> {
         None => download::server_jar(version, &cache)?,
     };
 
-    let reports = generate_reports(
+    let reports = generate(
         &jar,
         &cache.join(format!("reports-{version}")),
+        "--reports",
+        "reports/blocks.json",
+        &cache,
+        workspace_root,
+    )?;
+    let server_data = generate(
+        &jar,
+        &cache.join(format!("data-{version}")),
+        "--server",
+        "data/minecraft/worldgen/placed_feature",
         &cache,
         workspace_root,
     )?;
@@ -86,6 +103,7 @@ pub fn run(options: &Options, workspace_root: &Path) -> Result<(), String> {
     println!("wrote {}", path.display());
 
     extract_packets(&reports, version, workspace_root)?;
+    ores(&server_data.join("data"), workspace_root, version)?;
 
     // Emitted unformatted on purpose: rustfmt is the one authority on how the
     // committed file looks, and a generator that lays code out itself will
@@ -93,8 +111,8 @@ pub fn run(options: &Options, workspace_root: &Path) -> Result<(), String> {
     println!("\nRun `just fmt` — these are committed as rustfmt leaves them.");
     println!(
         "Then `cargo test --workspace` — the round-trip over all {} states, {} registry \
-         entries and every packet id, and the golden samples beside them, are what say \
-         this worked.",
+         entries and every packet id, the golden samples beside them, and the ore \
+         baseline's source-row check are what say this worked.",
         parsed.state_count, flat.entry_count
     );
     Ok(())
@@ -199,6 +217,55 @@ fn extract_packets(reports: &Path, version: &str, workspace_root: &Path) -> Resu
     Ok(())
 }
 
+/// Read the vanilla ore baseline out of the `--server` tree and write it into
+/// `dust-gen`.
+fn ores(data_root: &Path, workspace_root: &Path, version: &str) -> Result<(), String> {
+    let ores = worldgen::parse(data_root)?;
+    println!(
+        "\nread {} ore placements in {} group(s) across {} dimension(s)",
+        ores.placements.len(),
+        ores.groups.len(),
+        ores.dimensions.len()
+    );
+
+    // Which groups the configuration's hand-written vanilla list knows about,
+    // said out loud rather than left for someone to work out from the table.
+    // The half it does not know about are the stone variants and terrain blobs,
+    // and they are knobs too — see xtask/src/extract/worldgen.rs.
+    let known: Vec<&str> = ores
+        .groups
+        .iter()
+        .map(|g| g.name.as_str())
+        .filter(|n| dust_config::ore::VANILLA_ORE_GROUPS.contains(n))
+        .collect();
+    let rest: Vec<&str> = ores
+        .groups
+        .iter()
+        .map(|g| g.name.as_str())
+        .filter(|n| !dust_config::ore::VANILLA_ORE_GROUPS.contains(n))
+        .collect();
+    println!("  ores the configuration documents: {}", known.join(", "));
+    println!("  other groups the ore feature places: {}", rest.join(", "));
+    if ores.ungrouped.is_empty() {
+        println!("  every placement was grouped");
+    } else {
+        println!(
+            "  NOT GROUPED, and therefore not in the table — no setting will reach \
+             these: {}",
+            ores.ungrouped.join(", ")
+        );
+    }
+
+    let generated = workspace_root.join("crates/dust-gen/src/generated");
+    std::fs::create_dir_all(&generated)
+        .map_err(|e| format!("could not create {}: {e}", generated.display()))?;
+    let path = generated.join("ores.rs");
+    std::fs::write(&path, codegen::ores(&ores, version))
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    println!("wrote {}", path.display());
+    Ok(())
+}
+
 /// The version modules on disk, in file-name order.
 ///
 /// Read from the directory rather than kept in a list, so that the index and
@@ -240,7 +307,12 @@ fn absolute(path: &Path) -> Result<PathBuf, String> {
     })
 }
 
-/// Run the server jar's own data generators.
+/// Run one of the server jar's own data generators.
+///
+/// `marker` is a path inside the output that only exists once that generator
+/// has run, so the two trees cache independently: `--reports` and `--server`
+/// write different things, and having one already does not mean having the
+/// other.
 ///
 /// `scratch` is the directory java is run *in*, and it has to be the cache
 /// rather than wherever the operator happened to be standing. The 1.21.1 server
@@ -251,14 +323,19 @@ fn absolute(path: &Path) -> Result<PathBuf, String> {
 /// `.gitignore` pattern, one `git add -A` away from committing exactly what
 /// this project's licensing line exists to keep out. The paths are made
 /// absolute first because they are about to be read from somewhere else.
-fn generate_reports(
+fn generate(
     jar: &Path,
     output: &Path,
+    generator: &str,
+    marker: &str,
     scratch: &Path,
     workspace_root: &Path,
 ) -> Result<PathBuf, String> {
-    if output.join("reports/blocks.json").exists() {
-        println!("using the cached reports in {}", output.display());
+    if output.join(marker).exists() {
+        println!(
+            "using the cached {generator} output in {}",
+            output.display()
+        );
         return Ok(output.to_path_buf());
     }
 
@@ -274,13 +351,13 @@ fn generate_reports(
     // fail on the cases whoever wrote it already knew about.
     let before = top_level_entries(workspace_root)?;
 
-    println!("running Minecraft's data generators (this takes a minute)");
+    println!("running Minecraft's {generator} data generator (this takes a minute)");
     let status = std::process::Command::new("java")
         .current_dir(scratch)
         .arg("-DbundlerMainClass=net.minecraft.data.Main")
         .arg("-jar")
         .arg(&jar)
-        .arg("--reports")
+        .arg(generator)
         .arg("--output")
         .arg(&output)
         .status()
