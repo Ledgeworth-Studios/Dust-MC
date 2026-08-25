@@ -19,8 +19,8 @@ cargo xtask <command>
 
   extract --version <v> [--server-jar <path>]
                    Download the Minecraft server jar for <v>, run its own data
-                   generators, and regenerate the tables in dust-registry from
-                   the reports. Needs a network and a JDK 21 or newer. Not part
+                   generators, and regenerate the tables in dust-registry and
+                   dust-protocol from the reports. Needs a network and a JDK 21 or newer. Not part
                    of `just verify`, and not something CI runs.
 ";
 

@@ -10,13 +10,15 @@
 //! part of `just verify` — it needs a network, a JVM and a fifty-megabyte
 //! download, and CI has no business doing any of that. What CI checks is the
 //! generated code, which is committed, compiles, and has the round-trip tests
-//! over every block state and every registry entry in `dust-registry` — and,
-//! beside them, the golden samples, which are the only part that can tell the
-//! tables apart from a self-consistent wrong answer.
+//! over every block state and every registry entry in `dust-registry` and
+//! every packet id in `dust-protocol` — and, beside them, the golden samples,
+//! which are the only part that can tell the tables apart from a
+//! self-consistent wrong answer.
 
 mod blocks;
 mod codegen;
 mod download;
+mod packets;
 mod registries;
 mod sha1;
 
@@ -78,13 +80,16 @@ pub fn run(options: &Options, workspace_root: &Path) -> Result<(), String> {
         .map_err(|e| format!("could not write {}: {e}", path.display()))?;
     println!("wrote {}", path.display());
 
+    extract_packets(&reports, version, workspace_root)?;
+
     // Emitted unformatted on purpose: rustfmt is the one authority on how the
     // committed file looks, and a generator that lays code out itself will
     // disagree with it eventually.
     println!("\nRun `just fmt` — these are committed as rustfmt leaves them.");
     println!(
-        "Then `cargo test -p dust-registry` — the round-trip over all {} states and \
-         {} registry entries, and the golden samples beside it, are what say this worked.",
+        "Then `cargo test --workspace` — the round-trip over all {} states, {} registry \
+         entries and every packet id, and the golden samples beside them, are what say \
+         this worked.",
         parsed.state_count, flat.entry_count
     );
     Ok(())
@@ -130,6 +135,90 @@ fn report_what_the_registries_said(flat: &registries::Registries) {
         registries::BLOCK_REGISTRY,
         flat.block.entries.len()
     );
+}
+
+/// Read the packet report and regenerate `dust-protocol`'s tables for this
+/// version.
+///
+/// One version at a time, and the others stay where they are: each version's
+/// table is its own module, and the index that lists them is rebuilt from the
+/// modules on disk. Running this for 1.21.4 later adds a file and a row rather
+/// than replacing 1.21.1.
+fn extract_packets(reports: &Path, version: &str, workspace_root: &Path) -> Result<(), String> {
+    let json = std::fs::read(reports.join("reports/packets.json"))
+        .map_err(|e| format!("could not read the generated packet report: {e}"))?;
+    let parsed = packets::parse(&json)?;
+
+    println!("\nread {} packets from the packet report:", parsed.total);
+    for group in &parsed.groups {
+        let state = format!("{}/{}", group.state, group.direction);
+        if !group.present {
+            // Not a failure: on 1.21.1 the server says nothing during the
+            // handshake. Printed anyway, because a pair that vanishes in a
+            // later version has to be something somebody sees.
+            println!("  {state:<26} absent from the report");
+            continue;
+        }
+        println!(
+            "  {state:<26} {:>3} packets, ids 0..{}",
+            group.count(),
+            group.by_id.len()
+        );
+        if !group.holes.is_empty() {
+            // Loud, and deliberately not fatal: the table encodes the gap as an
+            // id that decodes to nothing, which is what the report says. Closing
+            // it up would renumber every packet after it.
+            println!(
+                "  !! {state} leaves protocol id(s) {:?} unclaimed. The ids in this pair are \
+                 NOT contiguous, and the generated table has holes where the report does.",
+                group.holes
+            );
+        }
+    }
+
+    let module = codegen::module_name(version)?;
+    let generated = workspace_root.join("crates/dust-protocol/src/generated");
+    let versions = generated.join("packets");
+    std::fs::create_dir_all(&versions)
+        .map_err(|e| format!("could not create {}: {e}", versions.display()))?;
+
+    let path = versions.join(format!("{module}.rs"));
+    std::fs::write(&path, codegen::packets(&parsed, version))
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    println!("wrote {}", path.display());
+
+    let path = generated.join("packets.rs");
+    std::fs::write(&path, codegen::packet_index(&version_modules(&versions)?))
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    println!("wrote {}", path.display());
+    Ok(())
+}
+
+/// The version modules on disk, in file-name order.
+///
+/// Read from the directory rather than kept in a list, so that the index and
+/// the modules cannot disagree: there is one place a version exists, and it is
+/// the file.
+fn version_modules(directory: &Path) -> Result<Vec<String>, String> {
+    let mut modules = Vec::new();
+    let entries = std::fs::read_dir(directory)
+        .map_err(|e| format!("could not read {}: {e}", directory.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("could not read {}: {e}", directory.display()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        match name.strip_suffix(".rs") {
+            Some(stem) => modules.push(stem.to_owned()),
+            None => {
+                return Err(format!(
+                    "{} holds {name}, which is not a generated version module. The index is \
+                     built from whatever is in that directory, so it may hold nothing else.",
+                    directory.display()
+                ))
+            }
+        }
+    }
+    modules.sort();
+    Ok(modules)
 }
 
 /// Run the server jar's own data generators.
