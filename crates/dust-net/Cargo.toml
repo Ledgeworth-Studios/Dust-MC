@@ -62,7 +62,17 @@ rsa = { version = "0.10.0-rc.18", default-features = false, features = [
 # The OS CSPRNG, for the server keypair and the verify token. Not `rand`: the
 # only randomness this crate needs is "give me n unpredictable bytes", and
 # taking the whole distribution library to get it widens the audit for nothing.
-rand_core = { version = "0.9", features = ["os_rng"] }
+# The OS CSPRNG, for the server key pair and the verify token. Only `os_rng`:
+# the distributions, the thread-local generator and the seedable PRNGs are all
+# off, because the only randomness this crate wants is "give me n
+# unpredictable bytes from the operating system".
+#
+# The 0.10 line, because that is the one built on the `rand_core` 0.10 that
+# `rsa` 0.10 speaks. Two `rand_core` versions in one graph compile happily and
+# then fail to satisfy `rsa`'s `CryptoRng` bound, because they are two
+# different traits with the same name — an error that reads as if the OS
+# CSPRNG were not a CSPRNG.
+rand = { version = "0.10", default-features = false, features = ["sys_rng"] }
 
 # The SHA-1 the login handshake hashes the server id with. Not a security
 # choice — the protocol specifies SHA-1 and Mojang's session server checks it,
