@@ -8,6 +8,10 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+# Already in the tree — `xtask` uses it — so this adds no new licence surface.
+# Checked against `Cargo.lock` before reaching for anything else, per the rule
+# in `just licenses`.
+serde_json.workspace = true
 
 [lints]
 workspace = true
