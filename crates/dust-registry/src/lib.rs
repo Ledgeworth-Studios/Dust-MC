@@ -30,11 +30,14 @@
 
 pub mod flat;
 pub mod generated;
+pub mod items;
 pub mod registry;
 
 pub use flat::{EntityType, Fluid, Item};
 pub use generated::blocks::{DATA_VERSION, STATE_COUNT, STATE_SAMPLES};
+pub use generated::items::COMPONENT_SAMPLES;
 pub use generated::registries::{ENTRY_COUNT, ENTRY_SAMPLES};
+pub use items::{ComponentValue, Components, Rarity};
 pub use registry::{Registry, RegistryDef};
 
 /// One property of a block, and the values it may take, in id order.

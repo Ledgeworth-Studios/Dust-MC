@@ -17,6 +17,7 @@
 mod blocks;
 mod codegen;
 mod download;
+mod items;
 mod registries;
 mod sha1;
 
@@ -65,6 +66,11 @@ pub fn run(options: &Options, workspace_root: &Path) -> Result<(), String> {
     registries::check_block_ids_match_state_order(&flat, &parsed)?;
     report_what_the_registries_said(&flat);
 
+    let item_json = std::fs::read(reports.join("reports/items.json"))
+        .map_err(|e| format!("could not read the generated item report: {e}"))?;
+    let item_components = items::parse(&item_json, &flat, &parsed)?;
+    report_what_the_items_said(&item_components);
+
     let generated = workspace_root.join("crates/dust-registry/src/generated");
     std::fs::create_dir_all(&generated)
         .map_err(|e| format!("could not create {}: {e}", generated.display()))?;
@@ -75,6 +81,11 @@ pub fn run(options: &Options, workspace_root: &Path) -> Result<(), String> {
 
     let path = generated.join("registries.rs");
     std::fs::write(&path, codegen::registries(&flat, version)?)
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    println!("wrote {}", path.display());
+
+    let path = generated.join("items.rs");
+    std::fs::write(&path, codegen::items(&item_components, version)?)
         .map_err(|e| format!("could not write {}: {e}", path.display()))?;
     println!("wrote {}", path.display());
 
@@ -129,6 +140,38 @@ fn report_what_the_registries_said(flat: &registries::Registries) {
          state ids, checked",
         registries::BLOCK_REGISTRY,
         flat.block.entries.len()
+    );
+}
+
+/// Print what the item report turned out to say.
+fn report_what_the_items_said(items: &items::Items) {
+    println!(
+        "read {} items and {} distinct component maps from the item report",
+        items.items.len(),
+        items.maps.len()
+    );
+    println!(
+        "  every one of the {} numbers in the file re-prints to its own text, so nothing is \
+         being stored at the wrong width",
+        items.number_count
+    );
+    println!(
+        "  {} distinct components appear as defaults, all of them entries of the \
+         data_component_type registry",
+        items.components.len()
+    );
+    let mut by_count: Vec<(&String, &usize)> = items.components.iter().collect();
+    by_count.sort_by_key(|(name, count)| (std::cmp::Reverse(**count), (*name).clone()));
+    let head: Vec<String> = by_count
+        .iter()
+        .take(6)
+        .map(|(name, count)| format!("{name} ({count})"))
+        .collect();
+    println!("  the most common are {}", head.join(", "));
+    println!(
+        "  string values that are not namespaced ids or #tags: {:?} — there is no free text \
+         in this report",
+        items.non_id_strings
     );
 }
 
