@@ -70,6 +70,11 @@ rand_core = { version = "0.9", features = ["os_rng"] }
 sha1 = "0.11"
 
 [dev-dependencies]
+# The tests build decompression bombs and hand-rolled malformed frames, which
+# means constructing zlib streams the encoder in this crate would never emit.
+# A test that can only produce what the code under test produces cannot test
+# what an attacker produces.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tokio = { version = "1", default-features = false, features = [
     "io-util",
     "macros",
