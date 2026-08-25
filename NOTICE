@@ -1,0 +1,36 @@
+Dust
+Copyright (C) 2026 Ledgeworth Studios
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See LICENSE for the full text.
+
+---
+
+Dust is licensed GPL-3.0 in order to be able to incorporate the work of others
+under compatible terms. Permission arrives with an attribution obligation
+attached, and this file is where that obligation is met.
+
+Every project whose code is incorporated into Dust — in whole, in part, or as a
+transcribed implementation of a non-obvious algorithm — is listed below with
+what was taken and under which licence. A project that was only read for
+understanding is not incorporation and is not listed here; a project whose
+structure or constants were carried across is.
+
+The list is empty. No third-party code has been incorporated yet.
+
+  Project | Licence | What was taken | Where it lives in this tree
+  ------- | ------- | -------------- | ---------------------------
+  (none)
+
+---
+
+Dust ships no Mojang data and no Mojang assets. The registries, recipes, loot
+tables and world-generation data the server needs are extracted from an
+official server jar obtained by the person running the extractor, on their own
+machine. What this repository contains is the extractor. See the project's
+Code Provenance document.
+
+Minecraft is a trademark of Mojang Synergies AB. Dust is not affiliated with,
+endorsed by, or connected to Mojang Synergies AB or Microsoft.

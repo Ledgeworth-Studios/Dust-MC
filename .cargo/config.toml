@@ -1,0 +1,4 @@
+# `cargo xtask` rather than `cargo run -p xtask --`, so the tooling reads the
+# same way in the justfile, in CI and in a shell.
+[alias]
+xtask = "run --quiet --package xtask --"

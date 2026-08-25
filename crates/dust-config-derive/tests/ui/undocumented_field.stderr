@@ -1,0 +1,6 @@
+error: configuration field `Section::undocumented` has no doc comment.
+       Every setting is documented in docs/configuration.md, and that reference is generated from these comments — so an undocumented setting fails the build rather than shipping undocumented. Add a `///` comment saying what it does and what the value means.
+  --> tests/ui/undocumented_field.rs:10:9
+   |
+10 |     pub undocumented: bool,
+   |         ^^^^^^^^^^^^

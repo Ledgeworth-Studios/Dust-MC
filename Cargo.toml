@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-only"
+repository = "https://github.com/Ledgeworth-Studios/Dust-MC"
+authors = ["Ledgeworth Studios"]
+
+[workspace.dependencies]
+dust-arena = { path = "crates/dust-arena" }
+dust-atlas = { path = "crates/dust-atlas" }
+dust-config = { path = "crates/dust-config" }
+dust-config-derive = { path = "crates/dust-config-derive" }
+dust-data = { path = "crates/dust-data" }
+dust-gateway = { path = "crates/dust-gateway" }
+dust-gen = { path = "crates/dust-gen" }
+dust-guard = { path = "crates/dust-guard" }
+dust-jvm = { path = "crates/dust-jvm" }
+dust-nbt = { path = "crates/dust-nbt" }
+dust-net = { path = "crates/dust-net" }
+dust-plugin = { path = "crates/dust-plugin" }
+dust-protocol = { path = "crates/dust-protocol" }
+dust-registry = { path = "crates/dust-registry" }
+dust-sim = { path = "crates/dust-sim" }
+dust-world = { path = "crates/dust-world" }
+
+proc-macro2 = "1"
+quote = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+syn = { version = "2", features = ["full", "extra-traits"] }
+toml = "1"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+todo = "warn"
+dbg_macro = "warn"

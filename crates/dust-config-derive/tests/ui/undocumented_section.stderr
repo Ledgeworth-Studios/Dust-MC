@@ -1,0 +1,6 @@
+error: configuration section `Section` has no doc comment.
+       Every section appears in docs/configuration.md, and a section with nothing to say about itself is a section nobody can configure. Add a `///` comment describing what it controls.
+ --> tests/ui/undocumented_section.rs:5:8
+  |
+5 | struct Section {
+  |        ^^^^^^^

@@ -1,0 +1,5 @@
+# Pinned so every developer and every runner build with the same compiler.
+# Raising this is a deliberate commit, not a side effect of `rustup update`.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

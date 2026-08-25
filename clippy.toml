@@ -1,0 +1,4 @@
+# Anything above this many arguments is a struct waiting to be written.
+too-many-arguments-threshold = 8
+# Worldgen and protocol code is full of legitimate magic constants that come
+# from the game, not from us. They belong in named consts, not in allow attrs.

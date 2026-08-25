@@ -1,0 +1,23 @@
+[package]
+name = "dust-jvm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[lints.rust]
+# On the unsafe allow-list; see docs/decisions/0005-implementation-language.md.
+# The workspace denies unsafe, and this crate cannot do its job without it, so
+# it opts out here rather than sprinkling `#[allow]` at each use site — the
+# exception is then visible in one place per crate instead of many.
+unsafe_code = "warn"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+todo = "warn"
+dbg_macro = "warn"
