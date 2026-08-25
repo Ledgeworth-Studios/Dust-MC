@@ -9,12 +9,15 @@
 //! This runs by hand, a few times per Minecraft release. It is deliberately not
 //! part of `just verify` — it needs a network, a JVM and a fifty-megabyte
 //! download, and CI has no business doing any of that. What CI checks is the
-//! generated code, which is committed, compiles, and has the round-trip test
-//! over every state in `dust-registry`.
+//! generated code, which is committed, compiles, and has the round-trip tests
+//! over every block state and every registry entry in `dust-registry` — and,
+//! beside them, the golden samples, which are the only part that can tell the
+//! tables apart from a self-consistent wrong answer.
 
 mod blocks;
 mod codegen;
 mod download;
+mod registries;
 mod sha1;
 
 use std::path::{Path, PathBuf};
@@ -56,6 +59,12 @@ pub fn run(options: &Options, workspace_root: &Path) -> Result<(), String> {
         parsed.state_count
     );
 
+    let registry_json = std::fs::read(reports.join("reports/registries.json"))
+        .map_err(|e| format!("could not read the generated registry report: {e}"))?;
+    let flat = registries::parse(&registry_json)?;
+    registries::check_block_ids_match_state_order(&flat, &parsed)?;
+    report_what_the_registries_said(&flat);
+
     let generated = workspace_root.join("crates/dust-registry/src/generated");
     std::fs::create_dir_all(&generated)
         .map_err(|e| format!("could not create {}: {e}", generated.display()))?;
@@ -64,12 +73,63 @@ pub fn run(options: &Options, workspace_root: &Path) -> Result<(), String> {
         .map_err(|e| format!("could not write {}: {e}", path.display()))?;
     println!("wrote {}", path.display());
 
+    let path = generated.join("registries.rs");
+    std::fs::write(&path, codegen::registries(&flat, version)?)
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    println!("wrote {}", path.display());
+
+    // Emitted unformatted on purpose: rustfmt is the one authority on how the
+    // committed file looks, and a generator that lays code out itself will
+    // disagree with it eventually.
+    println!("\nRun `just fmt` — these are committed as rustfmt leaves them.");
     println!(
-        "\nRun `cargo test -p dust-registry` — the round-trip over all {} states is what \
-         says this worked.",
-        parsed.state_count
+        "Then `cargo test -p dust-registry` — the round-trip over all {} states and \
+         {} registry entries, and the golden samples beside it, are what say this worked.",
+        parsed.state_count, flat.entry_count
     );
     Ok(())
+}
+
+/// Print what the registry report turned out to say, rather than only that it
+/// was accepted.
+///
+/// The checks in `registries` are all of the shape "refuse if not", which makes
+/// a silent success indistinguishable from a check that stopped looking. These
+/// are the numbers that would move if it had.
+fn report_what_the_registries_said(flat: &registries::Registries) {
+    let disagree = flat
+        .registries
+        .iter()
+        .filter(|r| r.name_order_disagrees)
+        .count();
+    let defaults = flat
+        .registries
+        .iter()
+        .filter(|r| r.default.is_some())
+        .count();
+    let namespaces: Vec<&str> = flat.namespaces.iter().map(String::as_str).collect();
+    println!(
+        "read {} flat registries and {} entries from the registry report",
+        flat.registries.len(),
+        flat.entry_count
+    );
+    println!(
+        "  every registry's protocol ids run 0..n with no gap and no repeat, so the \
+         generated tables index by id"
+    );
+    println!(
+        "  {disagree} of {} have a name order that is not their protocol-id order, which is \
+         why both index arrays are emitted",
+        flat.registries.len()
+    );
+    println!("  {defaults} carry a default, and each names an entry that exists");
+    println!("  entry namespaces: {}", namespaces.join(", "));
+    println!(
+        "  {} is not emitted here; its {} protocol ids are the order of blocks.rs's base \
+         state ids, checked",
+        registries::BLOCK_REGISTRY,
+        flat.block.entries.len()
+    );
 }
 
 /// Run the server jar's own data generators.

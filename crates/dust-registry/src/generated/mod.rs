@@ -5,3 +5,4 @@
 //! resulted from reading one. See the project's Code Provenance document.
 
 pub mod blocks;
+pub mod registries;
