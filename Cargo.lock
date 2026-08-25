@@ -41,6 +41,9 @@ version = "0.0.0"
 [[package]]
 name = "dust-gen"
 version = "0.0.0"
+dependencies = [
+ "dust-config",
+]
 
 [[package]]
 name = "dust-guard"

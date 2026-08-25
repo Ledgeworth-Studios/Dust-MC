@@ -21,6 +21,7 @@ extern crate self as dust_config;
 pub mod docs;
 pub mod env;
 pub mod model;
+pub mod ore;
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -317,12 +318,9 @@ impl DustConfig {
     /// value, restarts, and is told about the next one learns to distrust the
     /// server rather than the file.
     pub fn check(&self) -> Vec<Finding> {
-        // Sections add their own checks here as they arrive. Nothing in the
-        // groundwork configuration can be individually wrong yet — the types
-        // already reject everything that is — so this is empty rather than
-        // absent, because a section that has nowhere to report to is a section
-        // that reports nothing.
-        Vec::new()
+        let mut findings = Vec::new();
+        self.worldgen.ores.check("worldgen.ores", &mut findings);
+        findings
     }
 }
 
@@ -333,6 +331,23 @@ mod tests {
     #[test]
     fn defaults_are_a_valid_configuration() {
         assert_eq!(DustConfig::defaults().check(), Vec::new());
+    }
+
+    #[test]
+    fn a_warning_does_not_stop_the_server_starting() {
+        // The master switch off with overrides written under it is the classic
+        // "I configured it and nothing happened" case. It is worth saying so,
+        // and it is not worth refusing to boot over.
+        let loaded = DustConfig::from_toml_and_env(
+            "[worldgen.ores]\nenabled = false\n\n\
+             [worldgen.ores.overrides.diamond]\nfrequency = 4.0\n",
+            "test",
+            [],
+        )
+        .expect("a warning must not fail the load");
+        let findings = loaded.check();
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].severity, Severity::Warning);
     }
 
     #[test]

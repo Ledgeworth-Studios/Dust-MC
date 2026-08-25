@@ -37,3 +37,31 @@ The embedded JVM that runs plugin bytecode.
 | --- | --- | --- | --- | --- |
 | `enabled` | `bool` | `true` | restart | Start the embedded JVM and load plugins. With this off, Dust runs with no JVM in the process at all and everything except plugins still works. |
 | `max_heap_mib` | `u32` | `1024` | restart | Heap ceiling for the embedded JVM, in mebibytes. |
+
+## `[worldgen]`
+
+World generation: the engine, and Dust's knobs over it.
+
+
+## `[worldgen.ores]`
+
+How common each ore is, and where it generates.
+
+| Setting | Type | Default | When | Meaning |
+| --- | --- | --- | --- | --- |
+| `enabled` | `bool` | `true` | hot, new chunks only | Apply Dust's ore settings at all. With this off, every ore generates exactly where and as often as the world's own data says, and the settings below are ignored — which is the switch the vanilla parity test uses. |
+| `default_frequency` | `f64` | `1.0` | hot, new chunks only | Frequency multiplier for every ore group with no entry of its own. `1.0` is untouched, `2.0` is twice as much ore, `0.5` is half. |
+
+## `[worldgen.ores.overrides.<ore-group>]`
+
+Per-ore settings, keyed by ore group — `coal`, `iron`, `diamond` and so
+on. An ore with no entry here uses `default_frequency` and is otherwise
+left alone.
+
+| Setting | Type | Default | When | Meaning |
+| --- | --- | --- | --- | --- |
+| `enabled` | `bool` | `true` | hot, new chunks only | Generate this ore at all. `false` removes it from new chunks entirely, which is not the same as `frequency = 0.0` only in that it reads as a decision rather than as an extreme value. |
+| `frequency` | `Option<f64>` | `unset` | hot, new chunks only | Frequency multiplier for this ore. `1.0` is untouched, `3.0` is three times as much. Omit to use `default_frequency`. |
+| `vein_size` | `Option<f64>` | `unset` | hot, new chunks only | Vein-size multiplier for this ore: how many blocks a single vein tries to place. Independent of `frequency` — doubling the size at half the frequency leaves roughly the same amount of ore in bigger, rarer clumps. |
+| `min_y` | `Option<i32>` | `unset` | hot, new chunks only | Lowest Y this ore may generate at, replacing the world's own lower bound. Omit to leave the ore's natural depth range alone. |
+| `max_y` | `Option<i32>` | `unset` | hot, new chunks only | Highest Y this ore may generate at, replacing the world's own upper bound. Omit to leave the ore's natural depth range alone. |

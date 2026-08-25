@@ -1,0 +1,64 @@
+# Dust — example configuration.
+#
+# Every setting has a default, so this whole file is optional: a Dust with no
+# dust.toml at all runs on the defaults. Copy this to `dust.toml` and change
+# what you want changed.
+#
+# The complete reference, generated from the server's own types, is in
+# docs/configuration.md. Anything not listed there is not a setting.
+
+[server]
+bind = "0.0.0.0:25565"
+motd = "A Dust server"
+max_players = 20
+online_mode = true
+
+[jvm]
+# Turning this off runs the server with no JVM in the process. Everything
+# except plugins keeps working — that is a guarantee with a test behind it,
+# not a hope.
+enabled = true
+max_heap_mib = 1024
+
+# ---------------------------------------------------------------------------
+# How common each ore is.
+#
+# Every number here is a multiplier on what this world would have generated
+# anyway, so it keeps meaning the same thing if you add a datapack such as
+# Terralith later. 1.0 is untouched, 2.0 is twice as much, 0.5 is half.
+#
+# These settings apply to terrain generated from here on. Chunks you have
+# already explored are on disk and do not change.
+# ---------------------------------------------------------------------------
+[worldgen.ores]
+enabled = true
+
+# Applies to any ore with no entry of its own below.
+default_frequency = 1.0
+
+# Diamond, three times as common, in veins half again as large, and reaching
+# further up than it normally would.
+[worldgen.ores.overrides.diamond]
+frequency = 3.0
+vein_size = 1.5
+max_y = 48
+
+# Iron a little scarcer, without touching anything else about how it generates.
+[worldgen.ores.overrides.iron]
+frequency = 0.75
+
+# Coal in bigger, rarer seams. Roughly the same amount of coal in the world,
+# found less often and worth more when it is.
+[worldgen.ores.overrides.coal]
+frequency = 0.4
+vein_size = 2.5
+
+# Emerald everywhere rather than only in mountains is not something these
+# settings can do — they change how much of an ore there is and where in the
+# world's vertical range it sits, not which biomes it chooses. Biome placement
+# is a datapack's job.
+#
+# Ore names are: coal, copper, iron, gold, redstone, lapis, diamond, emerald,
+# nether_quartz, nether_gold, ancient_debris — plus anything a datapack adds,
+# written as `namespace:name`. A name this world does not have is an error at
+# startup naming the closest match, not a line that silently does nothing.

@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::ore::OresConfig;
 use crate::ConfigSection;
 
 /// The whole of `dust.toml`.
@@ -17,6 +18,10 @@ pub struct DustConfig {
     /// The embedded JVM that runs plugin bytecode.
     #[config(section)]
     pub jvm: JvmConfig,
+
+    /// World generation: the engine, and Dust's knobs over it.
+    #[config(section)]
+    pub worldgen: WorldgenConfig,
 }
 
 /// Listener, identity and the basics a server needs to answer a ping.
@@ -77,4 +82,13 @@ impl Default for JvmConfig {
             max_heap_mib: 1024,
         }
     }
+}
+
+/// World generation: the engine, and Dust's knobs over it.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, ConfigSection)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorldgenConfig {
+    /// How common each ore is, and where it generates.
+    #[config(section)]
+    pub ores: OresConfig,
 }

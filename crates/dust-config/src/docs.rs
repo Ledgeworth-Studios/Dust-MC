@@ -104,6 +104,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_ore_settings_are_documented_as_new_chunks_only() {
+        // Worth its own assertion: an operator who believes turning up diamond
+        // rewrites the world they already explored will file a bug, and the
+        // only place that expectation can be corrected is here.
+        let rendered = render();
+        assert!(rendered.contains("worldgen.ores"), "ore section missing");
+        assert!(
+            rendered.contains("hot, new chunks only"),
+            "the ore settings must say that already-generated chunks do not change"
+        );
+    }
+
     fn walk(section: &SectionDoc, f: &mut impl FnMut(&SectionDoc, &str)) {
         fn inner(section: &SectionDoc, prefix: &str, f: &mut impl FnMut(&SectionDoc, &str)) {
             let path = if prefix.is_empty() {
