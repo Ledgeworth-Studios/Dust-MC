@@ -36,6 +36,7 @@ pub mod items;
 pub mod loot;
 pub mod recipes;
 pub mod registry;
+pub mod synced;
 pub mod tags;
 
 pub use commands::{ArgumentProperties, CommandDef, CommandGraph, NodeKind};

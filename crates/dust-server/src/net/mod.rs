@@ -32,10 +32,73 @@
 //! invented here on speculation. When there is a player to move, there will be
 //! a [`TickParticipant`](crate::participant::TickParticipant) to move them.
 
+use std::time::Duration;
+
+pub(crate) use dust_net::frame::Frame;
+use dust_net::io::{Conn, ConnError};
+pub(crate) use dust_protocol::wire::Writer;
+use tokio::io::{AsyncRead, AsyncWrite};
+
+pub mod configure;
 pub mod favicon;
 pub mod listen;
 pub mod session;
 pub mod status;
+
+/// Turn a packet into a frame without writing its id into its own body.
+///
+/// The two crates keep the id in different places on purpose — `dust-net`'s
+/// `Frame` holds it as a number because the framer has to read it to find the
+/// body, and `dust-protocol` holds it as a lookup because the number depends on
+/// the version. Writing it twice would give the framer two ids and no rule
+/// about which one wins.
+#[macro_export]
+macro_rules! to_frame {
+    ($packet:expr, $version:expr) => {{
+        let packet = $packet;
+        let mut body = $crate::net::Writer::default();
+        packet.encode_body(&mut body, $version)?;
+        $crate::net::Frame::new(packet.protocol_id($version)? as i32, body.into_bytes())
+    }};
+}
+
+/// How long a graceful close may spend flushing before it is abandoned.
+///
+/// `Conn::close` is *willing to wait*, which is the right default and the wrong
+/// one here: a peer that stops reading can hold a flush open for as long as it
+/// likes, and every one of these connections belongs to a stranger. Five
+/// seconds is far beyond any real client's need for a few hundred bytes on a
+/// socket it is actively reading, and short enough that a peer cannot pin a
+/// task by going quiet.
+pub(crate) const CLOSE_LINGER: Duration = Duration::from_secs(5);
+
+/// End a connection, flushing what is queued if the peer will take it.
+///
+/// Dropping a `Conn` **aborts** it — that is `dust-net`'s documented contract,
+/// and it is the right default, because a caller that wanted the flush
+/// guarantee had `close` for it. It also means that returning from this module
+/// with a reply still in the outbound queue sends the peer nothing at all,
+/// which is exactly the bug this function exists to make unrepresentable: every
+/// path that sent something goes through here.
+///
+/// On timeout the close future is dropped, which drops the `Conn`, which sets
+/// the abort flag. The fallback needs no code of its own.
+pub(crate) async fn finish<W>(
+    conn: Conn<W>,
+    outcome: session::Served,
+) -> Result<session::Served, session::SessionError>
+where
+    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    match tokio::time::timeout(CLOSE_LINGER, conn.close()).await {
+        // A peer that hung up mid-flush is the ordinary end of a status ping,
+        // not a failure worth reporting: the client got what it asked for and
+        // stopped listening. The outcome stands.
+        Ok(Ok(())) | Err(_) => Ok(outcome),
+        Ok(Err(ConnError::Closed)) => Ok(outcome),
+        Ok(Err(e)) => Err(session::SessionError::Conn(e)),
+    }
+}
 
 pub use favicon::{Favicon, FaviconError};
 pub use listen::{Listener, ListenerHandle};

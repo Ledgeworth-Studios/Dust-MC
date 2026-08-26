@@ -43,6 +43,7 @@ mod numbers;
 mod packets;
 mod recipes;
 mod registries;
+mod synced;
 mod tags;
 mod worldgen;
 
@@ -87,6 +88,8 @@ pub enum Domain {
     Loot,
     /// The five tag directories as overlayable baseline data.
     Tags,
+    /// The datapack registries a server sends during configuration.
+    Synced,
     /// Packet id tables for `dust-protocol`.
     Packets,
     /// Worldgen: the ore baseline in `dust-gen`.
@@ -103,6 +106,7 @@ pub const ALL_DOMAINS: &[Domain] = &[
     Domain::Recipes,
     Domain::Loot,
     Domain::Tags,
+    Domain::Synced,
     Domain::Packets,
     Domain::Worldgen,
 ];
@@ -119,6 +123,7 @@ impl Domain {
             Self::Recipes => "recipes",
             Self::Loot => "loot",
             Self::Tags => "tags",
+            Self::Synced => "synced",
             Self::Packets => "packets",
             Self::Worldgen => "worldgen",
         }
@@ -156,7 +161,7 @@ impl Domain {
     fn needs_data(self) -> bool {
         matches!(
             self,
-            Self::Recipes | Self::Loot | Self::Tags | Self::Worldgen
+            Self::Recipes | Self::Loot | Self::Tags | Self::Synced | Self::Worldgen
         )
     }
 }
@@ -363,6 +368,7 @@ pub fn run(options: &Options, workspace_root: &Path) -> Result<(), String> {
                 registries.as_ref().expect("parsed above"),
                 &context,
             )?,
+            Domain::Synced => synced_domain(&context)?,
             Domain::Packets => packets_domain(&context)?,
             Domain::Worldgen => {
                 worldgen_domain(registries.as_ref().expect("parsed above"), &context)?
@@ -731,6 +737,36 @@ fn loot_domain(flat: &registries::Registries, context: &Context) -> Result<Outco
         "{} tables, {} vocabulary items",
         parsed.tables.len(),
         parsed.vocabulary.len()
+    ))
+}
+
+fn synced_domain(context: &Context) -> Result<Outcome, String> {
+    let registries = synced::parse(context.data()?)?;
+    let total: usize = registries.iter().map(|r| r.entries.len()).sum();
+    for registry in &registries {
+        println!(
+            "  {:<32} {:>3} entries",
+            registry.name,
+            registry.entries.len()
+        );
+    }
+
+    let generated = context
+        .workspace_root
+        .join("crates/dust-registry/src/generated");
+    std::fs::create_dir_all(&generated)
+        .map_err(|e| format!("could not create {}: {e}", generated.display()))?;
+    let path = generated.join("synced.rs");
+    std::fs::write(
+        &path,
+        codegen::synced_registries(&registries, context.version),
+    )
+    .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    println!("wrote {}", path.display());
+
+    Ok(format!(
+        "{} datapack registries, {total} entries, names only",
+        registries.len()
     ))
 }
 

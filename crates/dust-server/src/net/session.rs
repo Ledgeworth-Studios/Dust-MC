@@ -27,9 +27,7 @@
 //! actually in.
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use dust_net::frame::Frame;
 use dust_net::io::{Conn, ConnConfig, ConnError};
 use dust_net::login::ServerKey;
 use dust_net::login_flow::{LoginConfig, LoginHandler};
@@ -38,14 +36,17 @@ use dust_net::session::{
     TlsTransport,
 };
 use dust_net::state::{Intent, State};
-use dust_protocol::packets::{configuration, handshake, status};
+use dust_protocol::packets::{configuration, handshake, play, status};
 use dust_protocol::text::{Color, Component, NamedColor};
 use dust_protocol::types::ProtocolString;
-use dust_protocol::wire::{Reader, Writer};
+use dust_protocol::wire::Reader;
 use dust_protocol::ProtocolVersion;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use super::configure::{configure, Configured};
+use super::finish;
 use super::status::StatusPolicy;
+use crate::to_frame;
 
 /// What one connection turned out to be, once it ended.
 ///
@@ -153,6 +154,17 @@ impl std::fmt::Display for SessionError {
 
 impl std::error::Error for SessionError {}
 
+impl From<dust_net::state::IllegalTransition> for SessionError {
+    /// A transition this connection was not allowed to make. Reachable only
+    /// from a bug here rather than from anything a peer sent — `dust-net` owns
+    /// the legality of transitions precisely so this code cannot invent one —
+    /// which is why it is an error and not an assertion: the loop that catches
+    /// it logs and drops one connection instead of ending the process.
+    fn from(e: dust_net::state::IllegalTransition) -> Self {
+        Self::Conn(ConnError::from(e))
+    }
+}
+
 impl From<dust_net::state::HandshakeError> for SessionError {
     /// A handshake naming a state that does not exist is `dust-net`'s to
     /// refuse, and it arrives here as a connection-level failure because that
@@ -178,57 +190,6 @@ impl From<dust_protocol::wire::DecodeError> for SessionError {
 impl From<dust_protocol::wire::EncodeError> for SessionError {
     fn from(e: dust_protocol::wire::EncodeError) -> Self {
         Self::Encode(e)
-    }
-}
-
-/// Turn a packet into a frame without writing its id into its own body.
-///
-/// The two crates keep the id in different places on purpose — `dust-net`'s
-/// `Frame` holds it as a number because the framer has to read it to find the
-/// body, and `dust-protocol` holds it as a lookup because the number depends on
-/// the version. Writing it twice would give the framer two ids and no rule
-/// about which one wins.
-macro_rules! to_frame {
-    ($packet:expr, $version:expr) => {{
-        let packet = $packet;
-        let mut body = Writer::default();
-        packet.encode_body(&mut body, $version)?;
-        Frame::new(packet.protocol_id($version)? as i32, body.into_bytes())
-    }};
-}
-
-/// How long a graceful close may spend flushing before it is abandoned.
-///
-/// `Conn::close` is *willing to wait*, which is the right default and the wrong
-/// one here: a peer that stops reading can hold a flush open for as long as it
-/// likes, and every one of these connections belongs to a stranger. Five
-/// seconds is far beyond any real client's need for a few hundred bytes on a
-/// socket it is actively reading, and short enough that a peer cannot pin a
-/// task by going quiet.
-const CLOSE_LINGER: Duration = Duration::from_secs(5);
-
-/// End a connection, flushing what is queued if the peer will take it.
-///
-/// Dropping a `Conn` **aborts** it — that is `dust-net`'s documented contract,
-/// and it is the right default, because a caller that wanted the flush
-/// guarantee had `close` for it. It also means that returning from this module
-/// with a reply still in the outbound queue sends the peer nothing at all,
-/// which is exactly the bug this function exists to make unrepresentable: every
-/// path that sent something goes through here.
-///
-/// On timeout the close future is dropped, which drops the `Conn`, which sets
-/// the abort flag. The fallback needs no code of its own.
-async fn finish<W>(conn: Conn<W>, outcome: Served) -> Result<Served, SessionError>
-where
-    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    match tokio::time::timeout(CLOSE_LINGER, conn.close()).await {
-        // A peer that hung up mid-flush is the ordinary end of a status ping,
-        // not a failure worth reporting: the client got what it asked for and
-        // stopped listening. The outcome stands.
-        Ok(Ok(())) | Err(_) => Ok(outcome),
-        Ok(Err(ConnError::Closed)) => Ok(outcome),
-        Ok(Err(e)) => Err(SessionError::Conn(e)),
     }
 }
 
@@ -349,11 +310,56 @@ where
     };
 
     // Login Acknowledged has been received, so the connection is in
-    // configuration. The disconnect below is therefore a *configuration*
-    // disconnect and carries an NBT component — not the JSON one login uses.
-    // The two states spell the same idea differently, which is exactly the
-    // sort of thing that is invisible until a client renders nothing.
-    let reason = Component::text("Dust cannot serve a world yet.")
+    // configuration. Every disconnect from here carries an NBT component, not
+    // login's JSON: the two states spell one idea differently, and the wrong
+    // one is a packet that travels and renders nothing.
+    let outcome = match configure(&mut conn, ctx).await? {
+        Configured::Ready => Served::LoggedIn {
+            username: authenticated.username,
+            profile_id: authenticated.profile_id,
+        },
+        Configured::UnknownContent => {
+            // The client did not acknowledge the vanilla pack, so its
+            // registries would have to carry their own contents, and Dust has
+            // none to send. Saying so beats sending three hundred entries with
+            // no definitions and leaving it in a world with no dimension types.
+            refuse_in_configuration(
+                &mut conn,
+                ctx,
+                "This server can only serve clients that already have \
+                 Minecraft 1.21.1's own data.",
+            )
+            .await?;
+            return finish(
+                conn,
+                Served::LoginFailed {
+                    reason: "the client did not acknowledge minecraft:core 1.21.1".to_owned(),
+                },
+            )
+            .await;
+        }
+    };
+
+    // Configuration finished, so both ends are in Play. There is no world to
+    // send, so the connection ends here — but it ends *in Play*, which is the
+    // state the next wave of work starts from rather than one it stopped short
+    // of.
+    conn.transition(State::Play)?;
+    refuse_in_play(&mut conn, ctx, "Dust cannot serve a world yet.").await?;
+    conn.disconnect();
+    finish(conn, outcome).await
+}
+
+/// Send a configuration-state disconnect carrying `message`.
+async fn refuse_in_configuration<W>(
+    conn: &mut Conn<W>,
+    ctx: &SessionContext,
+    message: &str,
+) -> Result<(), SessionError>
+where
+    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let reason = Component::text(message)
         .colored(Color::Named(NamedColor::Red))
         .to_nbt(ctx.version)?;
     let packet =
@@ -361,12 +367,33 @@ where
     let frame = to_frame!(packet, ctx.version);
     conn.send(frame).await?;
     conn.disconnect();
+    Ok(())
+}
 
-    let outcome = Served::LoggedIn {
-        username: authenticated.username,
-        profile_id: authenticated.profile_id,
-    };
-    finish(conn, outcome).await
+/// Send a play-state disconnect carrying `message`.
+///
+/// A third spelling of one idea, at a third packet id. Play's disconnect
+/// carries NBT like configuration's and sits at a different number in a
+/// different table, which is why this goes through the generated tables rather
+/// than a constant somebody has to remember correctly.
+async fn refuse_in_play<W>(
+    conn: &mut Conn<W>,
+    ctx: &SessionContext,
+    message: &str,
+) -> Result<(), SessionError>
+where
+    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    // Play's disconnect takes the *authored* component type, while
+    // configuration's takes the opaque NBT one. Same idea, two field types,
+    // two packets apart — and the type system is the only thing that will
+    // remember which is which.
+    let _ = ctx;
+    let reason = Component::text(message).colored(Color::Named(NamedColor::Red));
+    let packet = play::clientbound::Packet::from(play::clientbound::Disconnect { reason });
+    let frame = to_frame!(packet, ctx.version);
+    conn.send(frame).await?;
+    Ok(())
 }
 
 /// The session server for offline mode: there isn't one.

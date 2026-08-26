@@ -12,4 +12,5 @@ pub mod items;
 pub mod loot;
 pub mod recipes;
 pub mod registries;
+pub mod synced;
 pub mod tags;

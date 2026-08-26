@@ -366,6 +366,8 @@ dependencies = [
  "dust-config",
  "dust-net",
  "dust-protocol",
+ "dust-registry",
+ "flate2",
  "tokio",
 ]
 

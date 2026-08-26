@@ -100,6 +100,17 @@ fn recv_frame(stream: &mut TcpStream) -> (i32, Vec<u8>) {
     (id, payload[cursor..].to_vec())
 }
 
+/// Read a length-prefixed string off the front of a slice, returning it and
+/// the rest.
+fn read_string_at(bytes: &[u8]) -> (&str, &[u8]) {
+    let (len, rest) = read_var_int_from(bytes);
+    let len = len as usize;
+    (
+        std::str::from_utf8(&rest[..len]).expect("the wire is UTF-8"),
+        &rest[len..],
+    )
+}
+
 /// Read a VarInt out of a slice, returning it and the rest.
 fn read_var_int_from(bytes: &[u8]) -> (i32, &[u8]) {
     let mut result: i32 = 0;
@@ -128,12 +139,26 @@ fn recv_compressed_frame(stream: &mut TcpStream) -> (i32, Vec<u8>) {
     let mut payload = vec![0u8; len as usize];
     stream.read_exact(&mut payload).expect("the frame body");
     let (uncompressed_len, rest) = read_var_int_from(&payload);
-    assert_eq!(
-        uncompressed_len, 0,
-        "this test only exchanges packets below the threshold; a non-zero \
-         length here means the server compressed something it should not have"
-    );
-    let (id, body) = read_var_int_from(rest);
+    // Zero means "the rest is not compressed", which is what the server sends
+    // for anything under the threshold. Above it, the rest is a zlib stream and
+    // this field is what it inflates to — checked rather than trusted, because
+    // that length is the only thing standing between a decompressor and a peer
+    // that lies about how much it is about to produce.
+    let inflated = if uncompressed_len == 0 {
+        rest.to_vec()
+    } else {
+        let mut out = Vec::new();
+        flate2::read::ZlibDecoder::new(rest)
+            .read_to_end(&mut out)
+            .expect("the frame is a zlib stream");
+        assert_eq!(
+            out.len(),
+            uncompressed_len as usize,
+            "the announced uncompressed length must be the real one"
+        );
+        out
+    };
+    let (id, body) = read_var_int_from(&inflated);
     (id, body.to_vec())
 }
 
@@ -323,7 +348,7 @@ fn a_client_speaking_raw_protocol_gets_the_server_list_entry() {
 }
 
 #[test]
-fn an_offline_login_completes_and_then_says_the_world_is_not_ready() {
+fn an_offline_login_runs_the_whole_configuration_exchange_and_reaches_play() {
     let running = start("");
     let addr = running.addr;
     let mut stream = connect(addr);
@@ -359,13 +384,79 @@ fn an_offline_login_completes_and_then_says_the_world_is_not_ready() {
     // Login Acknowledged moves both ends into configuration.
     send_compressed_frame(&mut stream, 0x03, &[]);
 
-    // And configuration is where this server runs out of things to say. The
-    // disconnect here is the *configuration* one, which carries an NBT
-    // component rather than login's JSON — two spellings of one idea, and a
-    // server that used the wrong one renders nothing at all.
+    // Configuration, in the order a real 1.21.1 server sends it. Captured from
+    // one rather than read off a wiki, because the order is load-bearing and
+    // the wire is the only place it is written down.
     let (id, body) = recv_compressed_frame(&mut stream);
-    assert_eq!(id, 0x02, "disconnect is id 2 clientbound in configuration");
-    assert_eq!(body[0], 0x0a, "an NBT component starts with TAG_Compound");
+    assert_eq!(id, 0x01, "custom_payload carries the brand first");
+    let (channel, rest) = read_string_at(&body);
+    assert_eq!(channel, "minecraft:brand");
+    assert_eq!(
+        read_string_at(rest).0,
+        "Dust",
+        "not a lie about being vanilla"
+    );
+
+    let (id, body) = recv_compressed_frame(&mut stream);
+    assert_eq!(id, 0x0c, "update_enabled_features");
+    let (count, rest) = read_var_int_from(&body);
+    assert_eq!(count, 1);
+    assert_eq!(read_string_at(rest).0, "minecraft:vanilla");
+
+    let (id, body) = recv_compressed_frame(&mut stream);
+    assert_eq!(id, 0x0e, "select_known_packs");
+    // Echoed back verbatim, which is what a client that has the pack does.
+    send_compressed_frame(&mut stream, 0x07, &body);
+
+    // Eleven registries, names only. The entry payloads are absent because the
+    // pack was acknowledged, and absent is not the same as empty: an empty
+    // definition would put the client in a world with no dimension types.
+    let mut seen = Vec::new();
+    loop {
+        let (id, body) = recv_compressed_frame(&mut stream);
+        if id == 0x03 {
+            break; // finish_configuration
+        }
+        assert_eq!(id, 0x07, "only registry_data comes between");
+        let (registry, rest) = read_string_at(&body);
+        let registry = registry.to_owned();
+        let (count, mut rest) = read_var_int_from(rest);
+        for _ in 0..count {
+            let (_entry, after) = read_string_at(rest);
+            assert_eq!(after[0], 0, "no entry of {registry} may carry a payload");
+            rest = &after[1..];
+        }
+        assert!(rest.is_empty(), "{registry} had trailing bytes");
+        seen.push((registry, count));
+    }
+
+    // The eleven and their counts, as the real server sent them.
+    assert_eq!(
+        seen,
+        vec![
+            ("minecraft:worldgen/biome".to_owned(), 64),
+            ("minecraft:chat_type".to_owned(), 7),
+            ("minecraft:trim_pattern".to_owned(), 18),
+            ("minecraft:trim_material".to_owned(), 10),
+            ("minecraft:wolf_variant".to_owned(), 9),
+            ("minecraft:painting_variant".to_owned(), 50),
+            ("minecraft:dimension_type".to_owned(), 4),
+            ("minecraft:damage_type".to_owned(), 47),
+            ("minecraft:banner_pattern".to_owned(), 43),
+            ("minecraft:enchantment".to_owned(), 42),
+            ("minecraft:jukebox_song".to_owned(), 19),
+        ]
+    );
+
+    // Acknowledge, which is what actually moves both ends into Play.
+    send_compressed_frame(&mut stream, 0x03, &[]);
+
+    // And Play is where this server runs out of world. The disconnect here is
+    // the *play* one — a third packet id for one idea, in a third table, and
+    // it carries the authored component type rather than configuration's
+    // opaque NBT.
+    let (id, body) = recv_compressed_frame(&mut stream);
+    assert_eq!(id, 0x1d, "disconnect is id 0x1d clientbound in play");
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains("cannot serve a world yet"), "{text:?}");
 
