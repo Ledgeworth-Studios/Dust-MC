@@ -315,11 +315,8 @@ impl Heightmap {
     /// [`Heightmap::set_first_available`] panics if a matching state sits at a
     /// y past the ceiling, which cannot happen for containers of this world's
     /// own shape.
-    pub fn recompute_from_sections<F>(
-        &mut self,
-        sections: &[&PalettedContainer],
-        mut matches: F,
-    ) where
+    pub fn recompute_from_sections<F>(&mut self, sections: &[&PalettedContainer], mut matches: F)
+    where
         F: FnMut(u32) -> bool,
     {
         assert_eq!(
@@ -344,11 +341,18 @@ impl Heightmap {
         let min_y = self.world.min_y;
         for z in 0..16u32 {
             for x in 0..16u32 {
-                let top_down = sections.iter().enumerate().rev().flat_map(move |(index, section)| {
-                    let base = min_y + (index * 16) as i32;
-                    (0..16u32).rev().map(move |row| (base + row as i32, section.get_at(x, row, z)))
-                });
-                self.recompute_column(x, z, top_down, |state| matches(state));
+                let top_down =
+                    sections
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .flat_map(move |(index, section)| {
+                            let base = min_y + (index * 16) as i32;
+                            (0..16u32)
+                                .rev()
+                                .map(move |row| (base + row as i32, section.get_at(x, row, z)))
+                        });
+                self.recompute_column(x, z, top_down, &mut matches);
             }
         }
     }
@@ -636,11 +640,7 @@ mod tests {
         let mut map = Heightmap::new(HeightmapKind::WorldSurface, WorldHeight::OVERWORLD);
         for column in 0..COLUMNS {
             let (x, z) = ((column % 16) as u32, (column / 16) as u32);
-            map.set_first_available(
-                x,
-                z,
-                WorldHeight::OVERWORLD.min_y() + stored(column) as i32,
-            );
+            map.set_first_available(x, z, WorldHeight::OVERWORLD.min_y() + stored(column) as i32);
         }
         let longs = map.as_longs().to_vec();
 
@@ -651,12 +651,9 @@ mod tests {
         assert_eq!(longs, expected);
         assert!(map.storage().padding_is_zero());
 
-        let read = Heightmap::from_longs(
-            HeightmapKind::WorldSurface,
-            WorldHeight::OVERWORLD,
-            longs,
-        )
-        .expect("its own output");
+        let read =
+            Heightmap::from_longs(HeightmapKind::WorldSurface, WorldHeight::OVERWORLD, longs)
+                .expect("its own output");
         for column in 0..COLUMNS {
             let (x, z) = ((column % 16) as u32, (column / 16) as u32);
             assert_eq!(
@@ -698,7 +695,11 @@ mod tests {
                 for (first, second) in [(high, low), (low, high)] {
                     map.set_first_available(lx, lz, first);
                     map.set_first_available(rx, rz, second);
-                    assert_eq!(map.first_available(lx, lz), first, "{world:?} long {boundary}");
+                    assert_eq!(
+                        map.first_available(lx, lz),
+                        first,
+                        "{world:?} long {boundary}"
+                    );
                     assert_eq!(
                         map.first_available(rx, rz),
                         second,
@@ -775,19 +776,41 @@ mod tests {
         set.recompute_from_sections(&sections, |kind, state| state == kind as u32 + 1);
 
         let floor = 0;
-        assert_eq!(set.get(HeightmapKind::WorldSurfaceWg).first_available(2, 2), 24);
-        assert_eq!(set.get(HeightmapKind::WorldSurfaceWg).first_available(5, 5), floor);
+        assert_eq!(
+            set.get(HeightmapKind::WorldSurfaceWg).first_available(2, 2),
+            24
+        );
+        assert_eq!(
+            set.get(HeightmapKind::WorldSurfaceWg).first_available(5, 5),
+            floor
+        );
 
-        assert_eq!(set.get(HeightmapKind::WorldSurface).first_available(5, 5), 20);
-        assert_eq!(set.get(HeightmapKind::WorldSurface).first_available(2, 2), floor);
+        assert_eq!(
+            set.get(HeightmapKind::WorldSurface).first_available(5, 5),
+            20
+        );
+        assert_eq!(
+            set.get(HeightmapKind::WorldSurface).first_available(2, 2),
+            floor
+        );
 
-        assert_eq!(set.get(HeightmapKind::OceanFloorWg).first_available(2, 2), floor);
-        assert_eq!(set.get(HeightmapKind::OceanFloorWg).first_available(5, 5), floor);
+        assert_eq!(
+            set.get(HeightmapKind::OceanFloorWg).first_available(2, 2),
+            floor
+        );
+        assert_eq!(
+            set.get(HeightmapKind::OceanFloorWg).first_available(5, 5),
+            floor
+        );
 
         assert_eq!(set.get(HeightmapKind::OceanFloor).first_available(5, 5), 10);
-        assert_eq!(set.get(HeightmapKind::MotionBlocking).first_available(2, 2), floor);
         assert_eq!(
-            set.get(HeightmapKind::MotionBlockingNoLeaves).first_available(5, 5),
+            set.get(HeightmapKind::MotionBlocking).first_available(2, 2),
+            floor
+        );
+        assert_eq!(
+            set.get(HeightmapKind::MotionBlockingNoLeaves)
+                .first_available(5, 5),
             floor
         );
     }
@@ -807,10 +830,7 @@ mod tests {
             map.recompute_from_sections(&one, |_| true);
         }))
         .expect_err("the section count is wrong");
-        let message = err
-            .downcast_ref::<String>()
-            .cloned()
-            .unwrap_or_default();
+        let message = err.downcast_ref::<String>().cloned().unwrap_or_default();
         assert!(message.contains("needs 2 sections"), "{message}");
 
         // And a biome container would answer every question plausibly and
@@ -840,8 +860,7 @@ mod tests {
         for kind in HeightmapKind::ALL {
             let longs = set.get(kind).as_longs().to_vec();
             assert_eq!(longs.len(), 37, "{}", kind.nbt_key());
-            let read =
-                Heightmap::from_longs(kind, WorldHeight::OVERWORLD, longs).expect("its own");
+            let read = Heightmap::from_longs(kind, WorldHeight::OVERWORLD, longs).expect("its own");
             assert_eq!(*set.get(kind), read, "{}", kind.nbt_key());
         }
     }

@@ -38,10 +38,7 @@ pub const BYTES: usize = CELLS / 2;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LightArrayError {
     /// The array is not the 2048 bytes a section's light occupies.
-    WrongLength {
-        expected: usize,
-        found: usize,
-    },
+    WrongLength { expected: usize, found: usize },
 }
 
 impl std::fmt::Display for LightArrayError {
@@ -193,7 +190,7 @@ impl LightArray {
         assert!(index < CELLS, "cell {index} is past the end of a section");
         assert!(level < 16, "{level} does not fit in four bits");
         let byte = &mut self.nibbles[index / 2];
-        let previous = if index % 2 == 0 {
+        if index % 2 == 0 {
             let previous = *byte & 0x0f;
             *byte = (*byte & 0xf0) | level;
             previous
@@ -201,8 +198,7 @@ impl LightArray {
             let previous = *byte >> 4;
             *byte = (*byte & 0x0f) | level << 4;
             previous
-        };
-        previous
+        }
     }
 }
 
@@ -250,10 +246,7 @@ mod tests {
             for index in (start..CELLS).step_by(2) {
                 array.set_cell(index, level(index));
                 let before = array.get_cell(index ^ 1);
-                assert_eq!(
-                    before, 9,
-                    "writing cell {index} disturbed its neighbour"
-                );
+                assert_eq!(before, 9, "writing cell {index} disturbed its neighbour");
             }
             for index in (start..CELLS).step_by(2) {
                 assert_eq!(array.get_cell(index), level(index));
@@ -276,7 +269,11 @@ mod tests {
         let mut array = LightArray::new();
         array.set(3, 2, 1, 7);
         assert_eq!(array.get_cell(LightArray::index(3, 2, 1)), 7);
-        assert_eq!(array.get_cell(LightArray::index(1, 2, 3)), 0, "not the transposed cell");
+        assert_eq!(
+            array.get_cell(LightArray::index(1, 2, 3)),
+            0,
+            "not the transposed cell"
+        );
         array.set_cell(561, 11);
         assert_eq!(array.get(1, 2, 3), 11);
     }
@@ -358,18 +355,18 @@ mod tests {
     #[test]
     #[should_panic(expected = "does not fit in four bits")]
     fn a_level_past_fifteen_panics_rather_than_being_masked() {
-        LightArray::filled(16);
+        let _ = LightArray::filled(16);
     }
 
     #[test]
     #[should_panic(expected = "past the end")]
     fn a_cell_index_past_the_section_panics() {
-        LightArray::new().get_cell(CELLS);
+        let _ = LightArray::new().get_cell(CELLS);
     }
 
     #[test]
     #[should_panic(expected = "outside the section")]
     fn a_coordinate_past_the_edge_panics() {
-        LightArray::new().get(16, 0, 0);
+        let _ = LightArray::new().get(16, 0, 0);
     }
 }

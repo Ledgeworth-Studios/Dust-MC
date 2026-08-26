@@ -439,6 +439,18 @@ impl PalettedContainer {
         self.strategy
     }
 
+    /// How many ids the registry this container indexes has.
+    ///
+    /// The container never asks what a block or a biome *is*, but a chunk
+    /// rebuilt from parts needs to answer "is the container I was handed
+    /// indexing the same registry I am about to write it into" before it can
+    /// accept block-entity handles and heightmap predicates against it. This
+    /// is that question, not an invitation to reach for the registry itself.
+    #[must_use]
+    pub const fn registry_size(&self) -> u32 {
+        self.registry_size
+    }
+
     #[must_use]
     pub const fn len(&self) -> usize {
         self.strategy.len()

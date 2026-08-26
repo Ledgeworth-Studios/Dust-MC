@@ -10,6 +10,68 @@
 /// Chunks per region, along one axis. A region file holds 32 x 32 = 1024.
 pub const CHUNKS_PER_REGION: i32 = 32;
 
+/// A block's position in the world.
+///
+/// The derived ordering is the reason this type exists rather than a plain
+/// `(i32, i32, i32)`: block entities live in an ordered map keyed by
+/// position, the order they come out of that map is the order they are
+/// serialised in, and saved bytes that depend on iteration order need that
+/// order pinned somewhere with a name on it. It is `x`, then `y`, then `z` —
+/// the declaration order of the fields — and it is not up to each caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BlockPos {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+}
+
+impl BlockPos {
+    #[must_use]
+    pub const fn new(x: i32, y: i32, z: i32) -> Self {
+        Self { x, y, z }
+    }
+
+    /// The chunk column this block stands in.
+    ///
+    /// An arithmetic shift for the same reason as [`ChunkPos::region`]:
+    /// block -1 belongs to chunk -1, and `/` would send it to chunk 0.
+    #[must_use]
+    pub const fn chunk(self) -> ChunkPos {
+        ChunkPos {
+            x: self.x >> 4,
+            z: self.z >> 4,
+        }
+    }
+
+    /// This block's x within its chunk column, `0..16`.
+    #[must_use]
+    pub const fn local_x(self) -> u32 {
+        (self.x & 15) as u32
+    }
+
+    /// This block's y within its world, relative to the floor.
+    ///
+    /// The caller supplies the world because a y alone does not know where
+    /// the floor is; [`crate::heightmap::WorldHeight`] is deliberately not a
+    /// dependency of a coordinate triple.
+    #[must_use]
+    pub const fn local_y(self, min_y: i32) -> u32 {
+        (self.y - min_y) as u32
+    }
+
+    /// This block's z within its chunk column, `0..16`.
+    #[must_use]
+    pub const fn local_z(self) -> u32 {
+        (self.z & 15) as u32
+    }
+}
+
+impl std::fmt::Display for BlockPos {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "block ({}, {}, {})", self.x, self.y, self.z)
+    }
+}
+
 /// A chunk's position in the world, in chunks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChunkPos {
@@ -248,5 +310,59 @@ mod tests {
         assert_eq!(ChunkPos::new(1, 0).header_slot(), 1);
         assert_eq!(ChunkPos::new(0, 1).header_slot(), 32);
         assert_eq!(ChunkPos::new(31, 31).header_slot(), 1023);
+    }
+
+    #[test]
+    fn negative_blocks_land_in_negative_chunks() {
+        // The same arithmetic-shift rule as chunks in regions, one level
+        // down, with the same failure mode if written with `/`.
+        for (block, chunk) in [
+            ((0, 0, 0), (0, 0)),
+            ((15, -64, 15), (0, 0)),
+            ((16, 5, -1), (1, -1)),
+            ((-1, 320, 16), (-1, 1)),
+            ((-16, 0, -16), (-1, -1)),
+        ] {
+            let pos = BlockPos::new(block.0, block.1, block.2);
+            assert_eq!(pos.chunk(), ChunkPos::new(chunk.0, chunk.1), "{pos}");
+            let local = (pos.local_x(), pos.local_z());
+            assert!(local.0 < 16 && local.1 < 16, "{pos}");
+            // The chunk's own corner plus the locals must rebuild the block.
+            let rebuilt = BlockPos::new(
+                (chunk.0 << 4) + local.0 as i32,
+                block.1,
+                (chunk.1 << 4) + local.1 as i32,
+            );
+            assert_eq!(rebuilt, pos, "{pos}");
+        }
+        assert_eq!(BlockPos::new(-33, 70, 4).local_x(), 15);
+        assert_eq!(BlockPos::new(0, -64, 0).local_y(-64), 0);
+        assert_eq!(BlockPos::new(0, 319, 0).local_y(-64), 383);
+    }
+
+    #[test]
+    fn block_positions_order_by_x_then_y_then_z_and_that_order_is_pinned() {
+        // Block entities are stored in a map keyed by position and written
+        // out in its order, so saved bytes depend on this ordering. It is
+        // spelled out here rather than left to whatever order the fields
+        // happen to be declared in today.
+        let mut sorted = [
+            BlockPos::new(1, 0, 0),
+            BlockPos::new(0, 100, 0),
+            BlockPos::new(0, 0, 100),
+            BlockPos::new(0, 0, 0),
+            BlockPos::new(-1, 0, 0),
+        ];
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            [
+                BlockPos::new(-1, 0, 0),
+                BlockPos::new(0, 0, 0),
+                BlockPos::new(0, 0, 100),
+                BlockPos::new(0, 100, 0),
+                BlockPos::new(1, 0, 0),
+            ]
+        );
     }
 }
