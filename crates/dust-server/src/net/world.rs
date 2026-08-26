@@ -103,21 +103,21 @@ pub const SPAWN: (f64, f64, f64) = (0.5, SURFACE_Y as f64 + 1.0, 0.5);
 /// # Why a template column rather than a generator call per chunk
 ///
 /// Every column of a flat world is identical, so generating each one is doing
-/// the same work again — and that work is not cheap. `dust-world`'s bench puts
-/// generate-plus-light at **9.6 ms per overworld column in release**, almost
-/// all of it the sky-light seeding, which pushes a seed for every one of the
-/// ~97,000 cells above the terrain and walks them all. Twenty-five columns is
-/// a quarter of a second; a ten-chunk view distance would be four.
+/// the same work again — and that work is not free. `dust-world`'s bench puts
+/// an overworld column at **2.7 ms to generate and 0.57 ms to light**, in
+/// release. Twenty-five of them is eighty milliseconds, which is more than a
+/// tick.
 ///
 /// So the column is built and lit once, here, and the chunk packet is told
 /// which coordinates to put on it. That is correct for *this* world and is
 /// explicitly not a general answer: the moment two columns differ, the
-/// template goes and the cost comes back. What has to happen before then is
-/// vanilla's own refinement — sky light does not attenuate travelling straight
-/// down, so only the topmost open cell of each x/z needs seeding rather than
-/// the whole air column. `dust-world`'s propagation module notes that as
-/// deliberately deferred; this is the measurement that says when it stops
-/// being deferrable.
+/// template goes and the cost comes back.
+///
+/// When it does, the number to beat is the 2.7 ms, not the lighting. That
+/// split is recent: whole-region sky-light seeding cost 8.2 ms until
+/// `column_light` started seeding only the boundary of the lit region, and the
+/// bottleneck moved from the light engine to putting blocks in the container
+/// one at a time.
 #[derive(Debug, Clone)]
 pub struct FlatWorld {
     palette: Palette,
