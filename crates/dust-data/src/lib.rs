@@ -140,6 +140,7 @@ pub mod meta;
 pub mod overlay;
 pub mod pack;
 pub mod registry;
+pub mod reload;
 pub mod shape;
 pub mod tag;
 pub mod vocabulary;
@@ -164,6 +165,9 @@ pub use meta::{PackMeta, DUST_PACK_FORMAT};
 pub use overlay::{OverlainPack, OverlayPlan, Refusal};
 pub use pack::{DirectoryPack, PackError, PackSource, ZipPack};
 pub use registry::{Registries, RegistryDef, RegistryId, RegistryKind};
+pub use reload::{
+    Definition, RejectedReload, ReloadDiff, ReloadHandle, ReloadPolicy, Replacement, TagChange,
+};
 pub use shape::{AdvancementSkeleton, LootTableSkeleton, RecipeSkeleton, ShapeReport};
 pub use tag::{MergedTag, ResolvedTags, TagStats};
 pub use vocabulary::{Chained, Known, KnownNames, PackDefined, Unchecked, Vocabulary};
@@ -335,9 +339,19 @@ impl LoadedData {
         self.functions.get(registry)
     }
 
+    /// Every registry holding function files.
+    pub fn function_registries(&self) -> impl Iterator<Item = &RegistryId> {
+        self.functions.keys()
+    }
+
     /// One tag as merged, before references are followed.
     pub fn merged_tag(&self, registry: &RegistryId, name: &ResourceLocation) -> Option<&MergedTag> {
         self.tags.get(registry)?.get(name)
+    }
+
+    /// Every tag of one registry, merged, before references are followed.
+    pub fn merged_tags(&self, registry: &RegistryId) -> Option<&TagSet> {
+        self.tags.get(registry)
     }
 
     /// Follow every `#` reference and flatten every tag.
