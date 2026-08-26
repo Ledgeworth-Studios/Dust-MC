@@ -480,30 +480,140 @@ mod tests {
             .expect("watcher thread exits after completion");
     }
 
+    /// What a [`GateParker`] and its test share: permits granted, and how many
+    /// calls are currently parked waiting for one.
+    ///
+    /// The second number is the half that makes the test deterministic. A
+    /// permit count alone says what the test has offered; only the waiter count
+    /// says the watchdog has *arrived*, and every ordering this test states is
+    /// stated relative to that arrival.
+    #[derive(Default)]
+    struct Gate {
+        permits: u32,
+        waiting: u32,
+    }
+
+    /// A parker the test releases one park at a time.
+    ///
+    /// [`StepParker`] advances virtual time on the *watchdog's* schedule, which
+    /// is fine when a test wants the deadline to expire and wrong when it wants
+    /// to decide what the watchdog observes before time moves. A completion
+    /// stored from the test thread races such a parker: the watchdog can march
+    /// past grace and fire in the window between `request_stop` and the store,
+    /// and which one wins is the operating system's choice.
+    ///
+    /// So the test holds the crank. Each `park_until` announces itself, blocks
+    /// until the test grants a step, and only then moves the clock — which
+    /// makes "the watchdog observed completion" an ordering the test states
+    /// rather than one it hopes for.
+    struct GateParker {
+        clock: Arc<ManualClock>,
+        step_ns: u64,
+        gate: Arc<(std::sync::Mutex<Gate>, std::sync::Condvar)>,
+    }
+
+    impl GateParker {
+        fn new(clock: Arc<ManualClock>, step_ns: u64) -> Self {
+            Self {
+                clock,
+                step_ns,
+                gate: Arc::new((
+                    std::sync::Mutex::new(Gate::default()),
+                    std::sync::Condvar::new(),
+                )),
+            }
+        }
+
+        /// The handle a test drives the parker through from outside the loop.
+        fn crank(&self) -> Crank {
+            Crank(Arc::clone(&self.gate))
+        }
+    }
+
+    struct Crank(Arc<(std::sync::Mutex<Gate>, std::sync::Condvar)>);
+
+    impl Crank {
+        /// Block until a `park_until` call is waiting for a permit.
+        fn await_park(&self) {
+            let (lock, cvar) = &*self.0;
+            let mut gate = lock.lock().expect("gate mutex is never poisoned");
+            while gate.waiting == 0 {
+                gate = cvar.wait(gate).expect("gate mutex is never poisoned");
+            }
+        }
+
+        /// Let one parked call proceed.
+        fn release(&self) {
+            let (lock, cvar) = &*self.0;
+            lock.lock().expect("gate mutex is never poisoned").permits += 1;
+            cvar.notify_all();
+        }
+    }
+
+    impl Parker for GateParker {
+        fn park_until(&self, _deadline_ns: u64) {
+            let (lock, cvar) = &*self.gate;
+            let mut gate = lock.lock().expect("gate mutex is never poisoned");
+            gate.waiting += 1;
+            cvar.notify_all();
+            while gate.permits == 0 {
+                gate = cvar.wait(gate).expect("gate mutex is never poisoned");
+            }
+            gate.permits -= 1;
+            gate.waiting -= 1;
+            drop(gate);
+            self.clock.advance_ns(self.step_ns);
+        }
+    }
+
     #[test]
     fn a_completed_shutdown_never_fires_the_watchdog() {
         let clock = manual_clock();
         let fired_anyway = Arc::new(AtomicBool::new(false));
+        let parker = GateParker::new(Arc::clone(&clock), 2_000_000_000);
+        let crank = parker.crank();
+        let stop = Arc::new(StopState::default());
+        let stop_handle = StopHandle::new(Arc::clone(&stop));
+
+        // Requested *before* the watchdog exists, so arming is the first thing
+        // its loop does and there is no window in which it observes an
+        // un-armed, un-completed shutdown.
+        assert!(stop_handle.request_stop());
+
         let harness = WatchdogHarness {
-            stop: Arc::new(StopState::default()),
+            stop,
             complete: Arc::new(AtomicBool::new(false)),
             fired: Arc::clone(&fired_anyway),
             ticks_run: Arc::default(),
             clock: Arc::clone(&clock) as Arc<dyn Clock>,
-            parker: Box::new(StepParker::new(Arc::clone(&clock), 2_000_000_000)),
+            parker: Box::new(parker),
             policy: WatchdogPolicy::custom(1_000_000_000, |_| {
                 panic!("completion must pre-empt the watchdog");
             }),
         };
-        let stop_handle = StopHandle::new(Arc::clone(&harness.stop));
         let complete = Arc::clone(&harness.complete);
 
         let worker = thread::spawn(move || watch_dog(harness));
-        assert!(stop_handle.request_stop());
-        // Shutdown completes well inside grace.
+
+        // Pass one has run to its park: armed at zero, nothing complete, grace
+        // intact. Waiting for the park rather than assuming it is what stops
+        // the store below from landing before the watchdog ever looked.
+        crank.await_park();
+
+        // Completion lands while it is parked, and the step that releases it
+        // jumps virtual time two seconds — past a one-second grace. So pass two
+        // finds an *expired* deadline and a completed shutdown together, which
+        // is the case worth pinning: the check order, not the timing, is what
+        // keeps the watchdog quiet.
         complete.store(true, Ordering::SeqCst);
+        crank.release();
+
         worker.join().expect("watcher exits promptly on completion");
         assert!(!fired_anyway.load(Ordering::SeqCst));
+        assert!(
+            clock.now_ns() >= 1_000_000_000,
+            "the deadline must actually have passed, or this proves nothing"
+        );
     }
 
     #[test]
