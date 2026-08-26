@@ -84,6 +84,7 @@ pub mod heightmap;
 pub mod light;
 pub mod palette;
 pub mod region;
+pub mod slab;
 
 pub use bits::{BitStorage, BitStorageError};
 pub use chunk::{BlockEntityHandle, Chunk, NbtReader, NbtWriter};
@@ -93,3 +94,4 @@ pub use heightmap::{Heightmap, HeightmapKind, HeightmapSet, WorldHeight};
 pub use light::{LightArray, LightArrayError};
 pub use palette::{Palette, PaletteKind};
 pub use region::{ChunkPayload, Compression, RegionError, RegionFile};
+pub use slab::{Slab, SlabError, SlabKey};

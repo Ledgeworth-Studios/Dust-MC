@@ -31,7 +31,6 @@
 //! If `==` ever grows stricter than "same blocks, biomes, light, heightmaps
 //! and records", these tests are where it will first break.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use dust_world::chunk::Section;
@@ -40,7 +39,7 @@ use dust_world::light::LightArray;
 use dust_world::region::{Compression, MemoryStore, RegionFile};
 use dust_world::{
     BlockEntityHandle, BlockPos, Chunk, ChunkPos, NbtReader, NbtWriter, PalettedContainer,
-    RegionPos, Strategy, WorldHeight,
+    RegionPos, Slab, Strategy, WorldHeight,
 };
 
 const REGION: RegionPos = RegionPos::new(-4, 5);
@@ -233,9 +232,11 @@ impl NbtWriter for DirectFormat {
             put_long_array(&mut out, map.as_longs());
         }
 
-        // Block entities in key order, which BTreeMap guarantees.
-        out.extend_from_slice(&(chunk.block_entities().len() as u32).to_be_bytes());
-        for (pos, handle) in chunk.block_entities() {
+        // Block entities in position order, which is what the chunk's
+        // by-position walk guarantees whatever order they were built in.
+        out.extend_from_slice(&(chunk.block_entity_count() as u32).to_be_bytes());
+        for handle in chunk.block_entities_by_position() {
+            let pos = handle.position;
             out.extend_from_slice(&pos.x.to_be_bytes());
             out.extend_from_slice(&pos.y.to_be_bytes());
             out.extend_from_slice(&pos.z.to_be_bytes());
@@ -295,16 +296,16 @@ impl NbtReader for DirectFormat {
         }
 
         let entity_count = cursor.u32()? as usize;
-        let mut entities = BTreeMap::new();
+        let mut entities = Slab::new();
         for _ in 0..entity_count {
             let x = cursor.i32()?;
             let y = cursor.i32()?;
             let z = cursor.i32()?;
             let state = cursor.u32()?;
-            entities.insert(
-                BlockPos::new(x, y, z),
-                BlockEntityHandle { block_state: state },
-            );
+            entities.insert(BlockEntityHandle {
+                position: BlockPos::new(x, y, z),
+                block_state: state,
+            });
         }
 
         Ok(Chunk::from_parts(
@@ -375,14 +376,14 @@ fn interesting_chunk(pos: ChunkPos) -> Chunk {
         HeightmapKind::MotionBlockingNoLeaves => state != 0,
     });
 
-    chunk.insert_block_entity(
-        BlockPos::new(pos.x * 16 + 7, -30, pos.z * 16 + 7),
-        BlockEntityHandle { block_state: 43 },
-    );
-    chunk.insert_block_entity(
-        BlockPos::new(pos.x * 16 + 15, 15, pos.z * 16),
-        BlockEntityHandle { block_state: 77 },
-    );
+    chunk.insert_block_entity(BlockEntityHandle {
+        position: BlockPos::new(pos.x * 16 + 7, -30, pos.z * 16 + 7),
+        block_state: 43,
+    });
+    chunk.insert_block_entity(BlockEntityHandle {
+        position: BlockPos::new(pos.x * 16 + 15, 15, pos.z * 16),
+        block_state: 77,
+    });
     chunk
 }
 
@@ -450,7 +451,7 @@ fn a_chunk_survives_an_in_memory_round_trip_through_the_region_store() {
             kind.nbt_key()
         );
     }
-    assert_eq!(restored.block_entities().len(), 2);
+    assert_eq!(restored.block_entity_count(), 2);
 }
 
 #[test]
@@ -562,17 +563,24 @@ fn chunks_with_identical_contents_but_different_histories_save_identically() {
     }
 
     // Same treatment for the block-entity list: inserted in opposite orders,
-    // which only matters if the carrying structure's iteration is stable.
+    // which only matters if the save order follows contents rather than
+    // insertion history.
     let spots = [
         BlockPos::new(pos.x * 16 + 1, -20, pos.z * 16 + 2),
         BlockPos::new(pos.x * 16 + 3, -10, pos.z * 16 + 4),
         BlockPos::new(pos.x * 16 + 5, 0, pos.z * 16 + 6),
     ];
     for spot in spots {
-        straight.insert_block_entity(spot, BlockEntityHandle { block_state: 5 });
+        straight.insert_block_entity(BlockEntityHandle {
+            position: spot,
+            block_state: 5,
+        });
     }
     for spot in spots.iter().rev() {
-        scenic.insert_block_entity(*spot, BlockEntityHandle { block_state: 5 });
+        scenic.insert_block_entity(BlockEntityHandle {
+            position: *spot,
+            block_state: 5,
+        });
     }
 
     assert_eq!(

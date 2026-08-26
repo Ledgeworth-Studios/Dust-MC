@@ -44,23 +44,25 @@
 //!   answer "is this id in range" without that number and this crate does
 //!   not depend on the extracted tables. Whoever builds chunks supplies the
 //!   numbers once, at construction.
-//! * **Block entities are keyed by position in an ordered map.** The handle
-//!   they point at is a placeholder — one field, the owning block's state id
-//!   — standing in for the typed records the NBT merge will bring. The
-//!   carrying structure and its iteration order, though, are final: saved
-//!   bytes depend on both.
+//! * **Block entities live in a generational slab; positions are the saved
+//!   identity.** A record is addressed at run time by a key that survives
+//!   other records coming and going — [`slab::SlabKey`] pairs a slot with a
+//!   generation, so a key whose record was removed reports itself dead
+//!   instead of reading whoever moved into its slot. The position stands on
+//!   the record itself: it is what serialisation writes, in position order,
+//!   and it is what the next load turns back into keys. Keys never cross
+//!   the file boundary because nothing about them outlives the process.
 //!
 //! **What this module does not catch:** whether the ids mean anything. A
 //! chunk full of state ids past the end of the real block table is built
 //! happily if the caller claims a large enough registry, and only the layer
 //! above — which owns the tables — can disagree.
 
-use std::collections::BTreeMap;
-
 use crate::container::{NotInRegistry, PalettedContainer, Strategy};
 use crate::coords::{BlockPos, ChunkPos};
 use crate::heightmap::{HeightmapKind, HeightmapSet, WorldHeight};
 use crate::light::LightArray;
+use crate::slab::{Slab, SlabError, SlabKey};
 
 /// One sixteen-cubed slice of a chunk: block states, biomes, and the two
 /// light arrays.
@@ -158,15 +160,61 @@ impl Section {
 ///
 /// **This is the placeholder promised in the module documentation.** The real
 /// record is tagged NBT whose shape depends on the block, and parsing it is
-/// the NBT layer's job. What is settled now is where such records live (keyed
-/// by [`BlockPos`], in the chunk that position belongs to) and in what order
-/// they leave (the key order, which is why the key type pins its ordering).
+/// the NBT layer's job. What is settled now is where such records live — in
+/// the owning chunk's generational slab, addressed by [`SlabKey`] at run
+/// time — and what identifies them across a save: the position on the
+/// record, which serialisation writes in sorted order and nothing else
+/// about the key survives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockEntityHandle {
+    /// The block this record belongs to. Part of the record rather than the
+    /// slab's bookkeeping because it is the identity that crosses files:
+    /// keys are run-time handles and mean nothing after a load.
+    pub position: BlockPos,
     /// The block state id of the block that owns this entity. The owner's
     /// identity decides how the eventual NBT payload is interpreted, so it
     /// rides along even before the payload itself does.
     pub block_state: u32,
+}
+
+/// Why a block-entity operation did not happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockEntityError {
+    /// Another record already stands at that block. One block carries one
+    /// block entity; replacing one is remove-then-insert, so that both the
+    /// old key's death and the new key's birth are visible to whoever held
+    /// either.
+    PositionOccupied { position: BlockPos },
+    /// The key does not name a live record: its slot never existed here, or
+    /// its occupancy has been replaced since the key was issued.
+    UnknownKey(SlabError),
+}
+
+impl std::fmt::Display for BlockEntityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PositionOccupied { position } => write!(
+                f,
+                "{position} already holds a block entity; remove it before placing another"
+            ),
+            Self::UnknownKey(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for BlockEntityError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::UnknownKey(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<SlabError> for BlockEntityError {
+    fn from(e: SlabError) -> Self {
+        Self::UnknownKey(e)
+    }
 }
 
 /// Everything one chunk column of a world carries.
@@ -178,7 +226,7 @@ pub struct Chunk {
     biome_registry_size: u32,
     sections: Box<[Section]>,
     heightmaps: HeightmapSet,
-    block_entities: BTreeMap<BlockPos, BlockEntityHandle>,
+    block_entities: Slab<BlockEntityHandle>,
 }
 
 impl Chunk {
@@ -231,7 +279,7 @@ impl Chunk {
                 })
                 .collect(),
             heightmaps: HeightmapSet::new(world),
-            block_entities: BTreeMap::new(),
+            block_entities: Slab::new(),
         }
     }
 
@@ -259,7 +307,7 @@ impl Chunk {
         biome_registry_size: u32,
         sections: Vec<Section>,
         heightmaps: HeightmapSet,
-        block_entities: BTreeMap<BlockPos, BlockEntityHandle>,
+        block_entities: Slab<BlockEntityHandle>,
     ) -> Self {
         let expected = usize::try_from(world.height() / 16).expect("a sane world height");
         assert_eq!(
@@ -487,39 +535,101 @@ impl Chunk {
         self.heightmaps.recompute_from_sections(&sections, matches);
     }
 
-    /// The block entities, in [`BlockPos`] order.
+    /// How many block entities this chunk carries.
     #[must_use]
-    pub const fn block_entities(&self) -> &BTreeMap<BlockPos, BlockEntityHandle> {
-        &self.block_entities
+    pub fn block_entity_count(&self) -> usize {
+        self.block_entities.len()
     }
 
-    /// Attach a block entity to a block in this chunk, returning what was
-    /// there.
+    /// Attach a block entity to a block in this chunk, returning the key it
+    /// lives under.
     ///
     /// # Panics
     ///
-    /// If `pos` is not a block of this chunk. A record stored under a
-    /// position this chunk does not own would be written into whichever
-    /// region file happened to hold this chunk and silently vanish from the
-    /// one that owns the block, which is a caller bug worth catching loudly.
-    pub fn insert_block_entity(
+    /// If `handle.position` is not a block of this chunk, or already holds
+    /// another record. A record stored under a position this chunk does not
+    /// own would be written into whichever region file happened to hold this
+    /// chunk and silently vanish from the one that owns the block; two
+    /// records on one block have no format meaning. Both are caller bugs,
+    /// and [`Chunk::try_insert_block_entity`] names the second for paths
+    /// where data, not code, decides.
+    pub fn insert_block_entity(&mut self, handle: BlockEntityHandle) -> SlabKey {
+        match self.try_insert_block_entity(handle) {
+            Ok(key) => key,
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// [`Chunk::insert_block_entity`], with the occupied-position case named.
+    ///
+    /// # Panics
+    ///
+    /// If `handle.position` is not a block of this chunk. That check guards
+    /// every later write of the chunk, so refusing here is refusing before
+    /// the mistake can hide.
+    pub fn try_insert_block_entity(
         &mut self,
-        pos: BlockPos,
         handle: BlockEntityHandle,
-    ) -> Option<BlockEntityHandle> {
-        self.require_contains(pos);
-        self.block_entities.insert(pos, handle)
+    ) -> Result<SlabKey, BlockEntityError> {
+        self.require_contains(handle.position);
+        if self.block_entity_at(handle.position).is_some() {
+            return Err(BlockEntityError::PositionOccupied {
+                position: handle.position,
+            });
+        }
+        Ok(self.block_entities.insert(handle))
     }
 
     /// Take a block entity's record away, returning it.
-    pub fn remove_block_entity(&mut self, pos: BlockPos) -> Option<BlockEntityHandle> {
-        self.block_entities.remove(&pos)
+    ///
+    /// The returned record is detached from its key: the key dies with the
+    /// removal, and any other holder of it learns so through
+    /// [`BlockEntityError::UnknownKey`].
+    pub fn remove_block_entity(
+        &mut self,
+        key: SlabKey,
+    ) -> Result<BlockEntityHandle, BlockEntityError> {
+        self.block_entities.remove(key).map_err(From::from)
     }
 
-    /// A block entity's record, if this chunk holds one there.
+    /// A block entity's record, while its key is live.
+    pub fn block_entity(&self, key: SlabKey) -> Result<&BlockEntityHandle, BlockEntityError> {
+        self.block_entities.get(key).map_err(From::from)
+    }
+
+    /// The record standing at a block, with the key that addresses it.
+    ///
+    /// A scan over the slab's live records, which is the right shape for a
+    /// collection a handful long. Code walking many positions wants to keep
+    /// the keys it was handed at insert time instead.
     #[must_use]
-    pub fn block_entity(&self, pos: BlockPos) -> Option<&BlockEntityHandle> {
-        self.block_entities.get(&pos)
+    pub fn block_entity_at(&self, position: BlockPos) -> Option<(SlabKey, &BlockEntityHandle)> {
+        self.block_entities
+            .iter()
+            .find(|(_, handle)| handle.position == position)
+    }
+
+    /// Every record, in ascending slot order.
+    ///
+    /// Deterministic for a given history of edits, and stable across a
+    /// borrow — but not the order files are written in, because slot order
+    /// remembers which records were removed along the way. Serialisation
+    /// walks [`Chunk::block_entities_by_position`] instead, whose order is a
+    /// function of the contents alone.
+    pub fn block_entities(&self) -> impl Iterator<Item = (SlabKey, &BlockEntityHandle)> + '_ {
+        self.block_entities.iter()
+    }
+
+    /// Every record, ordered by position: the order a file names them in.
+    ///
+    /// Saved bytes depend on this order being a pure function of the chunk's
+    /// records — two chunks holding the same entities must save identically
+    /// whatever order they were built in, and however many were added and
+    /// removed since.
+    pub fn block_entities_by_position(&self) -> impl Iterator<Item = &BlockEntityHandle> {
+        let mut handles: Vec<&BlockEntityHandle> = self.block_entities.values().collect();
+        handles.sort_unstable_by_key(|a| a.position);
+        handles.into_iter()
     }
 
     fn require_contains(&self, pos: BlockPos) {
@@ -606,7 +716,7 @@ mod tests {
         assert_eq!(chunk.pos(), ChunkPos::new(-1, 2));
         assert_eq!(chunk.world(), WorldHeight::OVERWORLD);
         assert_eq!(chunk.section_count(), 24);
-        assert!(chunk.block_entities().is_empty());
+        assert_eq!(chunk.block_entity_count(), 0);
         // Every section answers for its own sixteen rows, top to bottom.
         for index in 0..24usize {
             let y = chunk.world().min_y() + index as i32 * 16;
@@ -676,29 +786,51 @@ mod tests {
         let here = BlockPos::new(-48 + 5, 10, 112 + 3);
         assert_eq!(here.chunk(), ChunkPos::new(-3, 7));
 
-        assert_eq!(
-            chunk.insert_block_entity(here, BlockEntityHandle { block_state: 91 }),
-            None
-        );
-        assert_eq!(chunk.block_entity(here).map(|h| h.block_state), Some(91));
+        let key = chunk.insert_block_entity(BlockEntityHandle {
+            position: here,
+            block_state: 91,
+        });
+        assert_eq!(chunk.block_entity(key).map(|h| h.block_state), Ok(91));
         assert_eq!(
             chunk
-                .insert_block_entity(here, BlockEntityHandle { block_state: 92 })
-                .map(|h| h.block_state),
-            Some(91),
-            "replacing returns the record that was there"
+                .block_entities_by_position()
+                .map(|h| h.position)
+                .collect::<Vec<_>>(),
+            vec![here],
+            "the record stands where it was put"
         );
+
+        let err = chunk
+            .try_insert_block_entity(BlockEntityHandle {
+                position: here,
+                block_state: 92,
+            })
+            .expect_err("one block, one record");
+        assert_eq!(err, BlockEntityError::PositionOccupied { position: here });
+        assert_eq!(chunk.block_entity_count(), 1, "the refusal stored nothing");
         assert_eq!(
-            chunk.remove_block_entity(here).map(|h| h.block_state),
-            Some(92)
+            chunk.remove_block_entity(key).map(|h| h.block_state),
+            Ok(91)
         );
-        assert_eq!(chunk.block_entity(here), None);
+        // The removal retired the slot's occupancy, and the dead key says so
+        // by name rather than answering with whoever comes next.
+        assert_eq!(
+            chunk.block_entity(key),
+            Err(BlockEntityError::UnknownKey(SlabError::StaleGeneration {
+                slot: key.slot(),
+                generation: key.generation(),
+                current_generation: key.generation() + 1,
+            }))
+        );
 
         // Another chunk's column, and a y outside this world.
         let elsewhere = BlockPos::new(-32, 10, 115);
         assert_ne!(elsewhere.chunk(), ChunkPos::new(-3, 7));
         let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            chunk.insert_block_entity(elsewhere, BlockEntityHandle { block_state: 1 });
+            chunk.insert_block_entity(BlockEntityHandle {
+                position: elsewhere,
+                block_state: 1,
+            });
         }))
         .expect_err("the position belongs to another chunk");
         let message = err.downcast_ref::<String>().cloned().unwrap_or_default();
@@ -706,7 +838,10 @@ mod tests {
 
         let above = BlockPos::new(-43, 32, 115);
         let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            chunk.insert_block_entity(above, BlockEntityHandle { block_state: 1 });
+            chunk.insert_block_entity(BlockEntityHandle {
+                position: above,
+                block_state: 1,
+            });
         }))
         .expect_err("y == max is outside this world");
         let message = err.downcast_ref::<String>().cloned().unwrap_or_default();
@@ -714,9 +849,9 @@ mod tests {
     }
 
     #[test]
-    fn block_entities_come_out_ordered_by_position_whatever_order_they_went_in() {
-        // Saved bytes depend on this order; it is the reason the key type
-        // pins its own ordering.
+    fn records_leave_in_position_order_and_keys_survive_each_other() {
+        // Saved bytes depend on the position order; the slab's slot order is
+        // a different thing entirely and must not leak into it.
         let mut chunk = empty_chunk();
         let scattered = [
             BlockPos::new(-46, 20, 118),
@@ -724,14 +859,47 @@ mod tests {
             BlockPos::new(-44, 31, 112),
             BlockPos::new(-48, 5, 112),
         ];
-        for pos in scattered {
-            chunk.insert_block_entity(pos, BlockEntityHandle { block_state: 1 });
+        for (n, pos) in scattered.iter().enumerate() {
+            chunk.insert_block_entity(BlockEntityHandle {
+                position: *pos,
+                block_state: 100 + n as u32,
+            });
         }
-        let keys: Vec<BlockPos> = chunk.block_entities().keys().copied().collect();
-        let mut sorted = keys.clone();
+
+        let positions: Vec<BlockPos> = chunk
+            .block_entities_by_position()
+            .map(|h| h.position)
+            .collect();
+        let mut sorted = positions.clone();
         sorted.sort_unstable();
-        assert_eq!(keys, sorted);
-        assert_eq!(keys[0], BlockPos::new(-48, 5, 112), "lowest x first");
+        assert_eq!(positions, sorted);
+        assert_eq!(positions[0], BlockPos::new(-48, 5, 112), "lowest x first");
+
+        // Remove the lowest-position record and add another; the save order
+        // follows contents, not history.
+        let lowest = BlockPos::new(-48, 5, 112);
+        let (key, handle) = chunk.block_entity_at(lowest).expect("still standing");
+        let state = handle.block_state;
+        chunk.remove_block_entity(key).expect("live");
+        chunk.insert_block_entity(BlockEntityHandle {
+            position: BlockPos::new(-47, 8, 114),
+            block_state: state + 50,
+        });
+
+        let positions: Vec<BlockPos> = chunk
+            .block_entities_by_position()
+            .map(|h| h.position)
+            .collect();
+        assert_eq!(
+            positions,
+            vec![
+                BlockPos::new(-48, 5, 113),
+                BlockPos::new(-47, 8, 114),
+                BlockPos::new(-46, 20, 118),
+                BlockPos::new(-44, 31, 112),
+            ],
+            "position order over what remains"
+        );
     }
 
     #[test]
@@ -852,7 +1020,7 @@ mod tests {
                 64,
                 vec![good.clone()],
                 HeightmapSet::new(world),
-                BTreeMap::new(),
+                Slab::new(),
             );
         }))
         .expect_err("one section cannot tile thirty-two rows");
@@ -867,7 +1035,7 @@ mod tests {
                 64,
                 vec![wrong_registry, good.clone()],
                 HeightmapSet::new(world),
-                BTreeMap::new(),
+                Slab::new(),
             );
         }))
         .expect_err("the section indexes another registry");
@@ -884,7 +1052,7 @@ mod tests {
                 64,
                 vec![good.clone(), good.clone()],
                 HeightmapSet::new(WorldHeight::OVERWORLD),
-                BTreeMap::new(),
+                Slab::new(),
             );
         }))
         .expect_err("the heightmaps are for another world");
