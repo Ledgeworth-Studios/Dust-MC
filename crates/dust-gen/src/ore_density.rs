@@ -19,13 +19,18 @@
 //! So: [`Baseline`] is whatever the loaded world says, and this module scales
 //! it.
 //!
+//! [`crate::vanilla_ores`] is one caller that happens to supply vanilla's, from
+//! a table `cargo xtask extract` produced by reading a server jar. Nothing here
+//! reaches for it; the dependency runs one way only, which is the whole point.
+//!
 //! # The identity property
 //!
 //! With default settings, [`resolve`] returns the baseline unchanged — not
 //! approximately, exactly. That is what allows the Phase 6 seed-for-seed parity
-//! test to run against a Dust that has this feature compiled in, and it is
-//! asserted directly in the tests below. Any change here that breaks it is a
-//! change that breaks vanilla parity.
+//! test to run against a Dust that has this feature compiled in. It is asserted
+//! in the tests below over invented placements, and again in
+//! [`crate::vanilla_ores`] over vanilla's real ones. Any change here that breaks
+//! it is a change that breaks vanilla parity.
 
 use dust_config::ore::{OreGroup, OresConfig};
 
@@ -276,13 +281,16 @@ mod tests {
     use super::*;
     use dust_config::ore::OreOverride;
 
-    /// A stand-in for the placements `xtask extract` will produce.
+    /// A stand-in for the placements `xtask extract` produces.
     ///
-    /// These numbers are invented, and that is on purpose: if they were the
-    /// real vanilla figures, a test asserting `3.0 × diamond` would be testing
-    /// this module's arithmetic *and* quietly asserting a copy of Mojang's data
-    /// that has no business being in the repository. Invented numbers test the
-    /// arithmetic and nothing else.
+    /// These numbers are invented, and that is still on purpose even now that
+    /// the real ones exist in [`crate::vanilla_ores`]. If a test here asserted
+    /// `3.0 × diamond` against the real figures it would be testing this
+    /// module's arithmetic *and* typing a copy of Mojang's data into a
+    /// hand-written file, which is the thing the extraction pipeline exists to
+    /// avoid. Invented numbers test the arithmetic and nothing else; the tests
+    /// that run against vanilla's own figures live next to the table they come
+    /// from and assert nothing about their values.
     fn fixture() -> Vec<Baseline> {
         vec![
             Baseline {
@@ -549,7 +557,11 @@ mod tests {
     //   outcome. Whether the generator draws it from the chunk's own random
     //   source — which is what makes a world reproducible from its seed — is a
     //   property of the generator, and is untestable until there is one.
-    // - The baselines are invented. These tests cannot tell whether Dust's real
-    //   ore placements match vanilla's; only the Phase 6 seed-for-seed
-    //   differential can.
+    // - The baselines *here* are invented, so nothing in this module's tests
+    //   depends on vanilla's figures being right. The identity property is
+    //   asserted against the extracted vanilla table as well, in
+    //   `crate::vanilla_ores` — but that only says the resolver leaves vanilla's
+    //   numbers alone, not that those numbers are what vanilla generates.
+    //   Whether Dust's real ore placements match vanilla's is still something
+    //   only the Phase 6 seed-for-seed differential can say.
 }
