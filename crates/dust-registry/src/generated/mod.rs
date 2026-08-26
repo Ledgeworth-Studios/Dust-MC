@@ -6,5 +6,6 @@
 
 pub mod blocks;
 pub mod commands;
+pub mod fluids;
 pub mod items;
 pub mod registries;

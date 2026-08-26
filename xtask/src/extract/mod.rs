@@ -36,6 +36,7 @@ mod blocks;
 mod codegen;
 mod commands;
 mod download;
+mod fluids;
 mod items;
 mod numbers;
 mod packets;
@@ -65,6 +66,8 @@ pub enum Domain {
     Blocks,
     /// Item default data components.
     Items,
+    /// Fluids and their block and bucket relationships.
+    Fluids,
     /// The brigadier command graph.
     Commands,
     /// Packet id tables for `dust-protocol`.
@@ -77,6 +80,7 @@ pub enum Domain {
 pub const ALL_DOMAINS: &[Domain] = &[
     Domain::Blocks,
     Domain::Items,
+    Domain::Fluids,
     Domain::Commands,
     Domain::Packets,
     Domain::Worldgen,
@@ -88,6 +92,7 @@ impl Domain {
         match self {
             Self::Blocks => "blocks",
             Self::Items => "items",
+            Self::Fluids => "fluids",
             Self::Commands => "commands",
             Self::Packets => "packets",
             Self::Worldgen => "worldgen",
@@ -102,7 +107,7 @@ impl Domain {
     fn needs_reports(self) -> bool {
         matches!(
             self,
-            Self::Blocks | Self::Items | Self::Commands | Self::Packets
+            Self::Blocks | Self::Items | Self::Fluids | Self::Commands | Self::Packets
         )
     }
 
@@ -288,6 +293,11 @@ pub fn run(options: &Options, workspace_root: &Path) -> Result<(), String> {
                 registries.as_ref().expect("parsed above"),
                 &context,
             )?,
+            Domain::Fluids => fluids_domain(
+                blocks.as_ref().expect("parsed above"),
+                registries.as_ref().expect("parsed above"),
+                &context,
+            )?,
             Domain::Commands => {
                 commands_domain(registries.as_ref().expect("parsed above"), &context)?
             }
@@ -446,6 +456,48 @@ fn commands_domain(flat: &registries::Registries, context: &Context) -> Result<O
         "{} command nodes, {} redirects",
         parsed.nodes.len(),
         parsed.redirects.len()
+    ))
+}
+
+/// Read the fluid registry against the block and item reports, and regenerate
+/// the fluid-relationships table.
+fn fluids_domain(
+    parsed_blocks: &blocks::Blocks,
+    flat: &registries::Registries,
+    context: &Context,
+) -> Result<Outcome, String> {
+    let parsed = fluids::parse(flat, parsed_blocks)?;
+
+    for fluid in &parsed.fluids {
+        let mut facts = Vec::new();
+        match (&fluid.block, &fluid.bucket) {
+            (Some(block), Some(bucket)) => facts.push(format!("{block}, carried by {bucket}")),
+            (Some(block), None) => facts.push(format!("held by {block}")),
+            (None, None) => {}
+            (None, Some(_)) => unreachable!("a bucket with no block is not derivable"),
+        }
+        if let Some(still) = &fluid.flowing_of {
+            facts.push(format!("the movement of {still}"));
+        }
+        println!(
+            "  {} at protocol id {}: {}",
+            fluid.name,
+            fluid.protocol_id,
+            if facts.is_empty() {
+                "no relationships the reports state".to_owned()
+            } else {
+                facts.join(", ")
+            }
+        );
+    }
+
+    let path = context.generated_registry_dir()?.join("fluids.rs");
+    std::fs::write(&path, codegen::fluids(&parsed, context.version)?)
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    println!("wrote {}", path.display());
+    Ok(format!(
+        "{} fluids joined against blocks and items",
+        parsed.fluids.len()
     ))
 }
 

@@ -205,8 +205,7 @@ pub fn parse(json: &[u8], registries: &Registries) -> Result<Commands, String> {
     // node the loop is about to visit.
     let names: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
     for node in &mut nodes {
-        node.children
-            .sort_by(|a, b| names[*a].cmp(&names[*b]));
+        node.children.sort_by(|a, b| names[*a].cmp(&names[*b]));
     }
 
     let mut parsers: BTreeMap<String, usize> = BTreeMap::new();

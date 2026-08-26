@@ -30,6 +30,7 @@
 
 pub mod commands;
 pub mod flat;
+pub mod fluids;
 pub mod generated;
 pub mod items;
 pub mod registry;
