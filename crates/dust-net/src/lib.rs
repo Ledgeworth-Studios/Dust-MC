@@ -1,5 +1,11 @@
-//! Sockets, sessions, framing, compression, encryption, session auth.
+//! Transport for the Minecraft protocol: framing, compression, encryption,
+//! connection state, and the sockets underneath them.
 //!
-//! Not implemented yet. This crate exists so the workspace shape from
-//! `Architecture.md` is real from the first commit rather than emerging
-//! by accident later.
+//! Crate docs are completed in the final pass; see the module docs.
+
+pub mod crypt;
+pub mod frame;
+pub mod login;
+pub mod state;
+pub mod testkeys;
+pub mod varint;
