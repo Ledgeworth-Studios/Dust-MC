@@ -75,6 +75,7 @@ pub fn parse(registries: &Registries) -> Result<Entities, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::registries::Registry;
     use super::*;
 
     #[test]
