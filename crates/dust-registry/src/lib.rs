@@ -36,6 +36,7 @@ pub mod items;
 pub mod loot;
 pub mod recipes;
 pub mod registry;
+pub mod tags;
 
 pub use commands::{ArgumentProperties, CommandDef, CommandGraph, NodeKind};
 pub use flat::{EntityType, Fluid, Item};

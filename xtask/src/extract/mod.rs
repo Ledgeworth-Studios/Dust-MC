@@ -45,6 +45,7 @@ mod packets;
 mod recipes;
 mod registries;
 mod sha1;
+mod tags;
 mod worldgen;
 
 use std::path::{Path, PathBuf};
@@ -79,6 +80,8 @@ pub enum Domain {
     Recipes,
     /// Loot tables: the inventory and the pool/condition/function vocabulary.
     Loot,
+    /// The five tag directories as overlayable baseline data.
+    Tags,
     /// Packet id tables for `dust-protocol`.
     Packets,
     /// Worldgen: the ore baseline in `dust-gen`.
@@ -94,6 +97,7 @@ pub const ALL_DOMAINS: &[Domain] = &[
     Domain::Commands,
     Domain::Recipes,
     Domain::Loot,
+    Domain::Tags,
     Domain::Packets,
     Domain::Worldgen,
 ];
@@ -109,6 +113,7 @@ impl Domain {
             Self::Commands => "commands",
             Self::Recipes => "recipes",
             Self::Loot => "loot",
+            Self::Tags => "tags",
             Self::Packets => "packets",
             Self::Worldgen => "worldgen",
         }
@@ -130,13 +135,17 @@ impl Domain {
                 | Self::Commands
                 | Self::Recipes
                 | Self::Loot
+                | Self::Tags
                 | Self::Packets
         )
     }
 
     /// Whether this domain reads the `--server` data pack tree.
     fn needs_data(self) -> bool {
-        matches!(self, Self::Recipes | Self::Loot | Self::Worldgen)
+        matches!(
+            self,
+            Self::Recipes | Self::Loot | Self::Tags | Self::Worldgen
+        )
     }
 }
 
@@ -331,6 +340,11 @@ pub fn run(options: &Options, workspace_root: &Path) -> Result<(), String> {
                 recipes_domain(registries.as_ref().expect("parsed above"), &context)?
             }
             Domain::Loot => loot_domain(registries.as_ref().expect("parsed above"), &context)?,
+            Domain::Tags => tags_domain(
+                blocks.as_ref().expect("parsed above"),
+                registries.as_ref().expect("parsed above"),
+                &context,
+            )?,
             Domain::Packets => packets_domain(&context)?,
             Domain::Worldgen => worldgen_domain(&context)?,
         };
@@ -596,6 +610,68 @@ fn recipes_domain(flat: &registries::Registries, context: &Context) -> Result<Ou
         "{} recipe files into {} shapes",
         parsed.total,
         parsed.shapes.len()
+    ))
+}
+
+/// Read the five tag directories and regenerate the baseline tag table.
+fn tags_domain(
+    parsed_blocks: &blocks::Blocks,
+    flat: &registries::Registries,
+    context: &Context,
+) -> Result<Outcome, String> {
+    let parsed = tags::parse(&context.data()?.join("data"), flat, parsed_blocks)?;
+
+    let per_registry = |registry: &str| -> usize {
+        parsed
+            .tags
+            .iter()
+            .filter(|t| t.registry == registry)
+            .count()
+    };
+    println!(
+        "read {} tags across the five registries (block {}, item {}, fluid {}, \
+         entity_type {}, game_event {})",
+        parsed.tags.len(),
+        per_registry("minecraft:block"),
+        per_registry("minecraft:item"),
+        per_registry("minecraft:fluid"),
+        per_registry("minecraft:entity_type"),
+        per_registry("minecraft:game_event")
+    );
+    println!(
+        "  every one of the {} plain memberships was checked against its registry's \
+         extracted table",
+        parsed.memberships - parsed.references
+    );
+    if parsed.duplicates_collapsed > 0 {
+        println!(
+            "  {} duplicate members collapsed — vanilla's own files repeat themselves, \
+             and a tag is a set",
+            parsed.duplicates_collapsed
+        );
+    }
+    println!(
+        "  all {} `#` references resolve inside this dataset; nothing dangles",
+        parsed.references
+    );
+    if parsed.skipped_directories.is_empty() {
+        println!("  no other tag directories were present");
+    } else {
+        println!(
+            "  directories seen but NOT taken — no extracted table to check their \
+             members against: {:?}",
+            parsed.skipped_directories
+        );
+    }
+
+    let path = context.generated_registry_dir()?.join("tags.rs");
+    std::fs::write(&path, codegen::tags(&parsed, context.version)?)
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    println!("wrote {}", path.display());
+    Ok(format!(
+        "{} tags, {} memberships",
+        parsed.tags.len(),
+        parsed.memberships
     ))
 }
 
