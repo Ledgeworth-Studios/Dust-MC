@@ -299,8 +299,8 @@ pub fn function_def(id: &str) -> Option<&'static SerializerDef> {
     FUNCTION_DEFS.iter().find(|def| def.id == id)
 }
 
-/// The baseline serializer ids as a [`Vocabulary`], over two pseudo-registries
-/// named `loot_condition` and `loot_function`.
+/// The baseline serializer ids as a [`Vocabulary`](crate::vocabulary::Vocabulary),
+/// over two pseudo-registries named `loot_condition` and `loot_function`.
 ///
 /// This is the marked-baseline half of the module: a provider built from the
 /// static tables above so a caller can ask "is `somemod:fancy_roll` one of

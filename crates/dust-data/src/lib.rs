@@ -100,12 +100,42 @@
 //! The other seam is NBT, which simply does not appear here: structures are
 //! [`registry::RegistryKind::Unread`] until `dust-nbt` lands.
 //!
-//! On top of the raw load sit three conveniences that share its rules instead
-//! of inventing their own: [`discover::discover`] reads a `datapacks/` folder
-//! into load order ([`discover::load_directory`] does discovery plus loading in one
-//! call), [`overlay`] layers a pack's own format alternatives, and
-//! [`LoadedData::diagnostic_dump`] renders the whole result — winners,
-//! losers, provenance, findings — as stable, diffable text.
+//! # The surface, module by module
+//!
+//! Reading runs bottom-up, so the map goes the same way:
+//!
+//! * [`location`] — `namespace:path`, defaulted at the parse boundary and
+//!   settled forever after;
+//! * [`registry`] — which directories under `data/<namespace>/` are
+//!   registries, and what kind of thing each holds;
+//! * [`pack`] — the two containers, directories and zips; [`zip`] is the
+//!   archive reader with its caps and refusals, [`inflate`] its
+//!   decompressor;
+//! * [`json`] and [`function`] — the two file readers, JSON with positions
+//!   and lines under Minecraft's comment rules;
+//! * [`meta`] — `pack.mcmeta`; [`overlay`] — a pack's own per-format layers,
+//!   applied as a name mapping over any container;
+//! * [`tag`] — the one resource that merges, and the resolver that flattens
+//!   it; [`shape`] — the skeletons pinning a recipe, loot table or
+//!   advancement to its raw document;
+//! * [`advancement`] and [`loot`] — the two opt-in passes over a finished
+//!   load: parent graphs, and misspelled serializer keys against the
+//!   baseline definitions;
+//! * [`vocabulary`] — the registry seam, with providers for what the packs
+//!   themselves defined and a chain for whoever supplies the real
+//!   registries later;
+//! * [`reload`] — the atomic stack swap a running server owns, with the
+//!   old-to-new diff and the policy that keeps a broken candidate out;
+//! * [`finding`] — how all of the above say what went wrong, named by pack
+//!   and file.
+//!
+//! Two conveniences tie it together for callers: [`discover::discover`]
+//! reads a `datapacks/` folder into load order
+//! ([`discover::load_directory`] does discovery plus loading in one call),
+//! and [`LoadedData::diagnostic_dump`] renders the whole result — winners,
+//! losers, provenance, findings — as stable, diffable text, the same
+//! guarantee [`ReloadDiff::render`](reload::ReloadDiff::render) gives a
+//! reload summary.
 //!
 //! # What the guards here do not catch
 //!
