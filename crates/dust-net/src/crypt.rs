@@ -58,8 +58,8 @@
 //!
 //! Nor does this module authenticate anybody. It takes a sixteen-byte secret
 //! and uses it. Whether that secret came from a client who is who they claim
-//! to be is [`crate::login`]'s question, and the part of that question that
-//! needs Mojang's session server is not answered anywhere in this crate.
+//! to be is [`crate::login`]'s question, asked of Mojang through
+//! [`crate::session`] once the switch has happened.
 
 use aes::cipher::KeyIvInit as _;
 use aes::Aes128;

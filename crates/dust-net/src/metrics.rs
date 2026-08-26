@@ -14,7 +14,7 @@
 //! pulls in no logging framework: `tracing` appears nowhere in this
 //! workspace's dependency graph, and adding it so that a struct of six
 //! integers could occasionally print itself would widen every build's audit
-//! for output the caller can format anyway. [`Conn::stats`] hands back a
+//! for output the caller can format anyway. [`Conn::stats`](crate::io::Conn::stats) hands back a
 //! snapshot; rendering it is the layer above's business.
 //!
 //! # What is counted, and where the count happens
@@ -33,7 +33,8 @@
 //!   before decompression expanded them. The wire is what the peer chose to
 //!   spend.
 //! * Errors are bucketed by kind at the single place each failure becomes a
-//!   [`ConnError`], so two code paths cannot disagree about what went wrong.
+//!   [`ConnError`](crate::io::ConnError), so two code paths cannot disagree
+//!   about what went wrong.
 //!   A connection that ends reports its ending once; the redundant
 //!   `Closed` errors every later call returns are not events and add
 //!   nothing.

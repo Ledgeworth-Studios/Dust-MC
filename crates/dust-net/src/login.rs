@@ -22,27 +22,25 @@
 //! 6. *The server asks Mojang's session server whether the player is who they
 //!    say they are*, using the digest [`server_id_hash`] computes.
 //!
-//! # Step 6 is not done here, deliberately
+//! # Step 6 lives in [`crate::session`] and [`crate::login_flow`]
 //!
-//! **The session-server call is Phase 1's job and this crate does not make
-//! it.** No HTTP client is a dependency of `dust-net`, no Mojang endpoint
-//! appears in it, and nothing in this module was tested against Mojang's
-//! infrastructure at all. The closest standing check is the ciphertext a
-//! real JVM produced after parsing this crate's key encoding — captured once
-//! in [`crate::testkeys`] so CI needs no Java — and even that stops short of
-//! an HTTP call.
+//! **The HTTP call itself is not made here, deliberately.** This module is
+//! the protocol half of step 6: it produces the digest the session server
+//! compares. The network half — `hasJoined`, recorded fixtures, TLS behind
+//! a feature — is [`crate::session`]'s; the orchestration that calls both in
+//! order is [`crate::login_flow`]'s.
 //!
 //! What is here is everything that can be built and checked without
-//! credentials: the key pair, the encoding a real client parses, the
-//! decryption, the token challenge, and the digest that the eventual HTTP call
-//! will put in its query string. [`server_id_hash`] is included precisely
-//! because it is the part of step 6 that is *protocol* rather than *network* —
-//! it has published test vectors, so it can be got right now instead of got
-//! wrong later against a server that only says "no".
+//! credentials or sockets: the key pair, the encoding a real client parses,
+//! the decryption, the token challenge, and the digest with its published
+//! vectors. [`server_id_hash`] sits precisely on the seam — protocol above,
+//! network below — so each side could be built against it before the other
+//! existed.
 //!
-//! Until step 6 exists, a Dust server must run in offline mode, where any
-//! client may claim any name. That is a statement about this crate's
-//! completeness, not a defensible configuration.
+//! Until online mode is wired end to end by the caller, a Dust server runs
+//! in offline mode, where any client may claim any name. That is now a
+//! configuration choice ([`crate::login_flow::AuthMode`]) rather than a gap,
+//! which is the only honest way for it to exist.
 //!
 //! # Why RSA-1024, which is not a size anyone should choose in 2026
 //!
