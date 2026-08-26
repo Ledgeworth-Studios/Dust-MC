@@ -91,16 +91,16 @@ fn every_membership_resolves_through_the_public_tables() {
 
 #[test]
 fn every_reference_resolves_to_a_tag_of_the_same_registry() {
-    let references = TAGS.iter().map(TagDef::references).flatten().count();
+    let references = TAGS.iter().flat_map(TagDef::references).count();
     assert!(references > 0, "no references were found any more");
     for tag in TAGS {
         for reference in tag.references() {
             let body = reference.strip_prefix('#').expect("starts with #");
-            let (namespace, id) = body.split_once(':').expect("namespaced");
-            assert_eq!(
-                namespace, "minecraft",
+            assert!(
+                body.starts_with("minecraft:"),
                 "{} references {} outside the minecraft namespace",
-                tag.id, reference
+                tag.id,
+                reference
             );
             assert!(
                 tags::from_id(tag.registry, body).is_some(),

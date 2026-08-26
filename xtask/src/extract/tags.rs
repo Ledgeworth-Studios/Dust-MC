@@ -304,9 +304,9 @@ fn list_namespaces(data_root: &Path) -> Result<Vec<String>, String> {
 mod tests {
     use super::*;
 
-    fn sample_tag(registry: &str, id: &str, members: &[&str]) -> Tag {
+    fn sample_tag(registry: &'static str, id: &str, members: &[&str]) -> Tag {
         Tag {
-            registry: registry.to_owned(),
+            registry,
             id: id.to_owned(),
             members: members.iter().map(|m| m.to_string()).collect(),
         }
@@ -322,7 +322,7 @@ mod tests {
 
     #[test]
     fn tags_sort_by_registry_then_id() {
-        let mut tags = vec![
+        let mut tags = [
             sample_tag("minecraft:block", "minecraft:logs", &[]),
             sample_tag("minecraft:block", "minecraft:aquarium_blocks", &[]),
             sample_tag("minecraft:item", "minecraft:arrows", &[]),
