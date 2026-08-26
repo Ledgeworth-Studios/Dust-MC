@@ -15,17 +15,25 @@ player count and favicon from `dust.toml`, runs login in either offline or
 online mode, syncs the eleven datapack registries a 1.21.1 client needs, streams
 chunks as players move, and keeps the connection up.
 
-The world is a superflat and is not pretending otherwise: worldgen is Phase 6.
-What exists is the whole path from the socket to the block table — framing,
-compression, encryption, the four connection states, the paletted section codec,
-the chunk packet, the light engine — exercised by something people can stand on.
+**It can serve a world Minecraft made.** Point `[server].world_source` at a
+region directory and Dust reads the columns out of it — blocks, their
+properties, biomes — and streams them. Without one it generates a superflat and
+does not pretend otherwise: worldgen is Phase 6, and a column a real world does
+not contain falls back to the flat one, because a world is a disc in an infinite
+plane and a player can walk off the edge of it.
+
+What exists either way is the whole path from the socket to the block table —
+framing, compression, encryption, the four connection states, the paletted
+section codec, the chunk packet, the light engine.
 
 **Not yet**, and each of these is stated where the code for it would go: no
 physics, block updates, drops, tool checks or reach validation, so a player may
 break bedrock from across the map; no inventory, so there is one placeable
 block; no tags; no light across chunk boundaries and no block light; no plugins;
-and the save format is Dust's own, not Anvil — a vanilla server cannot open a
-Dust world and Dust cannot open one of vanilla's.
+and **Anvil is read-only** — Dust opens a world Minecraft wrote and saves its own
+changes in its own format beside it, because writing Anvil means answering
+questions there is no way to check the answers to, and a writer that guessed
+would produce worlds that open until the day one does not.
 
 ## Try it
 
