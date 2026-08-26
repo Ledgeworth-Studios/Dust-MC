@@ -180,9 +180,12 @@ pub struct PackMeta {
     pub description: Option<Description>,
     /// `features.enabled` — the experimental feature flags this pack needs.
     pub features: Vec<String>,
-    /// `overlays.entries`, parsed but **not applied**. See [`Self::parse`].
+    /// `overlays.entries`. Parsed here, **applied by the loader** — see
+    /// [`crate::overlay`] for the layering rules and [`Overlay::applies_to`]
+    /// for the negotiation.
     pub overlays: Vec<Overlay>,
-    /// Whether a `filter` section is present. Also not applied.
+    /// Whether a `filter` section is present. Not applied; the parse reports
+    /// it so a pack author knows their filter is doing nothing.
     pub has_filter: bool,
 }
 

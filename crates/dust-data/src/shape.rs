@@ -37,7 +37,7 @@
 //! ships. They exist to be counted against — "this pack uses 12 recipe kinds,
 //! 3 of them outside the table" is a compatibility measurement — never to gate
 //! loading. A kind outside the table parses identically to one inside it;
-//! [`LootNode::is_known`] is how a caller says so.
+//! [`LootNode::is_known_entry`] is how a caller says so.
 
 use std::collections::BTreeMap;
 

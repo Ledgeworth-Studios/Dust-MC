@@ -34,7 +34,7 @@
 //! with one error rather than picking a winner, for two reasons: the operator
 //! cannot see which of them was meant to win, and a silent pick would decide
 //! the question by which of the two sorts later — a rule nobody could be
-//! expected to know. [`load`] independently refuses duplicate ids among
+//! expected to know. [`crate::load`] independently refuses duplicate ids among
 //! whatever list it is handed, so the invariant holds no matter how the list
 //! was built.
 

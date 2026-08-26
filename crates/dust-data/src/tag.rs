@@ -65,7 +65,7 @@
 //!
 //! Whether a *non-reference* entry names anything real. `#minecraft:logs`
 //! containing `minecraft:stobe` resolves to a set containing
-//! `minecraft:stobe`, and only a [`Vocabulary`](crate::Vocabulary) can say that
+//! `minecraft:stobe`, and only a [`Vocabulary`] can say that
 //! is not a block. With the default [`Unchecked`](crate::vocabulary::Unchecked)
 //! vocabulary, no entry is checked and [`TagStats::unvalidated_entries`] counts
 //! every one of them, so that "0 problems" is never mistaken for "0 problems

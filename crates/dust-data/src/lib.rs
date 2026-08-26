@@ -92,6 +92,16 @@
 //! [`tag::TagStats::unvalidated_entries`] counts every entry nothing checked.
 //! "No problems" must never be able to mean "no check ran".
 //!
+//! The other seam is NBT, which simply does not appear here: structures are
+//! [`registry::RegistryKind::Unread`] until `dust-nbt` lands.
+//!
+//! On top of the raw load sit three conveniences that share its rules instead
+//! of inventing their own: [`discover::discover`] reads a `datapacks/` folder
+//! into load order ([`discover::load_directory`] does discovery plus loading in one
+//! call), [`overlay`] layers a pack's own format alternatives, and
+//! [`LoadedData::diagnostic_dump`] renders the whole result — winners,
+//! losers, provenance, findings — as stable, diffable text.
+//!
 //! # What the guards here do not catch
 //!
 //! * **Well-formed is not correct.** A recipe with no ingredients is valid JSON
@@ -99,6 +109,9 @@
 //!   tell. Half-validating it would be the two readers again.
 //! * **`pack_format` is a claim.** A pack declaring 48 and containing 1.16 loot
 //!   tables passes here and fails later.
+//! * **The skeleton spine is best effort by design.** A recipe whose `result`
+//!   names nothing parseable comes back with `None`, not a finding — deciding
+//!   whether that is broken belongs to whoever reads recipes for real.
 //! * **Unknown keys are only checked in the shapes this crate owns** —
 //!   `pack.mcmeta` and tag files. A misspelled key inside a recipe is invisible
 //!   from here, by the same argument as above.
@@ -119,10 +132,11 @@ pub mod pack;
 pub mod registry;
 pub mod shape;
 pub mod tag;
-#[cfg(test)]
-mod testing;
 pub mod vocabulary;
 pub mod zip;
+
+#[cfg(test)]
+mod testing;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -484,7 +498,7 @@ pub struct NamespaceView<'a> {
 /// Pack ids must be unique within one load. The id is on every finding and
 /// every provenance line, so two packs answering to one name would make the
 /// whole report ambiguous; a duplicate is refused (the later of the two) with
-/// an error saying so. [`discover`] refuses at discovery time as well, which
+/// an error saying so. [`discover::discover`] refuses at discovery time as well, which
 /// is where an operator actually meets the problem.
 pub fn load(packs: &[&dyn PackSource], options: &LoadOptions) -> LoadedData {
     let mut data = LoadedData {
