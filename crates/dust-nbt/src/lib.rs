@@ -92,4 +92,5 @@ pub mod write;
 pub use compression::Compression;
 pub use error::{Error, Result};
 pub use read::{Limits, Mode, Named};
+pub use snbt::{NumericStyle, PrintProfile};
 pub use tag::{Compound, List, ListError, Tag, TagType};
