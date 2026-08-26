@@ -331,6 +331,29 @@ impl Joined {
         self.read_for(stream, Duration::from_millis(50));
     }
 
+    /// Read until a packet of `id` arrives, returning its body.
+    ///
+    /// Bounded by the socket's read timeout rather than by a count, so a
+    /// packet that never comes fails as a `None` here instead of hanging the
+    /// suite.
+    fn wait_for(&mut self, stream: &mut TcpStream, id: i32) -> Option<Vec<u8>> {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("a read timeout");
+        while let Some((got, body)) = try_recv_compressed_frame(stream) {
+            match got {
+                _ if got == id => return Some(body),
+                39 => self.chunks += 1,
+                33 => self.forgets += 1,
+                84 => self.centres += 1,
+                38 => send_compressed_frame(stream, 24, &body),
+                29 => panic!("the server disconnected while waiting for {id}"),
+                _ => {}
+            }
+        }
+        None
+    }
+
     fn drain_until_quiet(&mut self, stream: &mut TcpStream) {
         self.read_for(stream, Duration::from_millis(750));
     }
@@ -362,9 +385,14 @@ impl Joined {
 /// The sequence is asserted in its own test; here it is walked through so a
 /// later test can start from a joined player without repeating it.
 fn join(stream: &mut TcpStream, addr: SocketAddr) -> Joined {
+    join_as(stream, addr, "Walker")
+}
+
+/// Join under a chosen name, so two clients in one test are two players.
+fn join_as(stream: &mut TcpStream, addr: SocketAddr, name: &str) -> Joined {
     handshake(stream, 767, addr, 2);
     let mut body = Vec::new();
-    write_string("Walker", &mut body);
+    write_string(name, &mut body);
     body.extend_from_slice(&[0u8; 16]);
     send_frame(stream, 0x00, &body);
 
@@ -710,6 +738,49 @@ fn a_player_walking_a_thousand_blocks_is_streamed_the_world_as_they_go() {
         "the square at spawn plus five columns per crossing — a resend would \
          push this above it and nothing else would show"
     );
+
+    running.finish();
+}
+
+/// Two players, one world: what one breaks, the other is told about.
+///
+/// This is the first test in the project where two connections share
+/// anything, and it is the property that makes the thing a *server* rather
+/// than a generator with a socket on it. The second client is watching a
+/// column it did not edit, so the only way the change reaches it is the
+/// broadcast — a per-connection world would pass every other test here and
+/// fail this one.
+#[test]
+fn a_block_one_player_breaks_is_announced_to_another() {
+    let running = start("");
+    let addr = running.addr;
+
+    let mut watcher_stream = connect(addr);
+    let mut watcher = join_as(&mut watcher_stream, addr, "Watcher");
+    let mut breaker_stream = connect(addr);
+    let _breaker = join_as(&mut breaker_stream, addr, "Breaker");
+
+    // The surface block at the spawn column. Encoded the way the protocol
+    // packs a position — 26 bits of x, 26 of z, 12 of y, in that order — by
+    // hand, because a helper shared with the server would agree with it about
+    // a layout neither of them checked.
+    let (x, y, z) = (3i64, -60i64, 5i64);
+    let packed = ((x & 0x3ff_ffff) << 38) | ((z & 0x3ff_ffff) << 12) | (y & 0xfff);
+
+    let mut body = packed.to_be_bytes().to_vec();
+    body.insert(0, 0); // status: start digging, which is what creative sends
+    body.push(1); // face
+    write_var_int(1, &mut body); // sequence
+    send_compressed_frame(&mut breaker_stream, 36, &body);
+
+    // The watcher must be told, and told the right block at the right place.
+    let update = watcher
+        .wait_for(&mut watcher_stream, 9)
+        .expect("the watcher is told about the break");
+    let position = i64::from_be_bytes(update[..8].try_into().expect("eight bytes"));
+    assert_eq!(position, packed, "the same block, not a neighbour");
+    let (state, _) = read_var_int_from(&update[8..]);
+    assert_eq!(state, 0, "broken to air");
 
     running.finish();
 }

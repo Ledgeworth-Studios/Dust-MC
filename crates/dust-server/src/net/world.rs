@@ -162,6 +162,11 @@ impl FlatWorld {
         world
     }
 
+    /// The block states this world is built from.
+    pub fn palette(&self) -> Palette {
+        self.palette
+    }
+
     pub fn height(&self) -> WorldHeight {
         self.height
     }

@@ -45,12 +45,12 @@ use dust_world::coords::ChunkPos;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::configure::{configure, Configured};
+use super::edits::{Edit, SharedWorld};
 use super::finish;
 use super::play as play_mod;
 use super::status::StatusPolicy;
 use super::view::{self, View};
 use super::world;
-use super::world::FlatWorld;
 use crate::to_frame;
 
 /// What one connection turned out to be, once it ended.
@@ -89,8 +89,9 @@ pub struct SessionContext {
     pub status: StatusPolicy,
     pub conn: ConnConfig,
     pub auth: Authority,
-    /// The world a joining player is put into.
-    pub world: FlatWorld,
+    /// The world a joining player is put into, with whatever players have
+    /// changed in it.
+    pub world: SharedWorld,
     /// How many columns out from the player are streamed on join.
     pub view_distance: u32,
     /// `minecraft:overworld`'s id in the dimension-type registry, as it was
@@ -104,6 +105,27 @@ pub struct SessionContext {
     /// Shared with the accept loop. A session counts the player inside it,
     /// because only a session knows when one has arrived and when it has left.
     pub counters: std::sync::Arc<super::listen::Counters>,
+    /// Air, and the one block a player can place.
+    ///
+    /// Resolved at boot alongside the world's own palette rather than looked
+    /// up per click: `Block::from_name` is a scan over the whole block table,
+    /// and a right-click is not the place for one.
+    pub blocks: PlaceableBlocks,
+    /// For the one thing this layer has to say that is not a packet: a session
+    /// that fell behind on block changes.
+    pub logger: crate::logging::Logger,
+}
+
+/// The block states a session can put into the world.
+#[derive(Debug, Clone, Copy)]
+pub struct PlaceableBlocks {
+    /// What breaking a block leaves behind.
+    pub air: u32,
+    /// What placing one puts down.
+    ///
+    /// One block, because there is no inventory and what a player is holding
+    /// is not knowable here yet. Stated rather than dressed up as a choice.
+    pub placeable: u32,
 }
 
 /// How this server decides who a joining player is.
@@ -407,6 +429,12 @@ where
     )
     .await?;
 
+    // Subscribed *before* the first column is generated, so an edit made in
+    // the window between generating a chunk and starting to listen is heard
+    // rather than missed. A duplicate is harmless — setting a block to the
+    // state it already holds is not observable — and a miss is a wrong world.
+    let mut edits = ctx.world.subscribe();
+
     // The view is the server's record of what this client holds. Every column
     // it sends and every one it forgets goes through it, so the record cannot
     // drift from the client's actual contents.
@@ -426,7 +454,7 @@ where
     )
     .await?;
 
-    keep_alive_loop(conn, ctx, view).await
+    play_loop(conn, ctx, view, &mut edits).await
 }
 
 /// Bring the client's loaded columns in line with a new centre.
@@ -457,12 +485,16 @@ where
         .await?;
     }
     for pos in &change.send {
-        send_play(
-            conn,
-            play_mod::chunk_packet(ctx.world.column(), *pos, ctx.version)?,
-            ctx.version,
-        )
-        .await?;
+        // An untouched column is the template, sent without a clone; an edited
+        // one is built. Almost every column is untouched, and the branch is
+        // here rather than inside `chunk` so the common case does not allocate
+        // a megabyte to change nothing.
+        let packet = if ctx.world.is_edited(*pos) {
+            play_mod::chunk_packet(&ctx.world.chunk(*pos), *pos, ctx.version)?
+        } else {
+            play_mod::chunk_packet(ctx.world.template(), *pos, ctx.version)?
+        };
+        send_play(conn, packet, ctx.version).await?;
     }
     for pos in &change.forget {
         send_play(
@@ -491,10 +523,11 @@ where
 /// packets decode — a client walking around a world sends a steady stream of
 /// position updates, and a decoder that got one wrong would fail here rather
 /// than the first time somebody built on it.
-async fn keep_alive_loop<W>(
+async fn play_loop<W>(
     conn: &mut Conn<W>,
     ctx: &SessionContext,
     mut view: View,
+    edits: &mut tokio::sync::broadcast::Receiver<Edit>,
 ) -> Result<(), SessionError>
 where
     W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -516,6 +549,48 @@ where
                 .await?;
                 next_id = next_id.wrapping_add(1);
             }
+            edit = edits.recv() => {
+                match edit {
+                    Ok(edit) => {
+                        // Only if the client is holding the column. Sending an
+                        // update for a chunk it does not have makes it apply
+                        // the change to nothing and then receive the column
+                        // again later with the change already in it — harmless
+                        // twice over, and a packet for no reason.
+                        if view.holds(view::column_of(
+                            f64::from(edit.position.x),
+                            f64::from(edit.position.z),
+                        )) {
+                            send_play(
+                                conn,
+                                play::clientbound::BlockUpdate {
+                                    location: edit.position,
+                                    block_id: VarInt(edit.state as i32),
+                                },
+                                ctx.version,
+                            )
+                            .await?;
+                        }
+                    }
+                    // The sender is gone: the server is stopping, and this
+                    // session is about to be too.
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                    // This session fell far enough behind that edits were
+                    // dropped. Its world is now wrong in a way it cannot know
+                    // about, so the columns it holds are resent rather than
+                    // patched — which is the only repair available, since what
+                    // was missed is exactly what is not known.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        ctx.logger.warn(
+                            "dust::net",
+                            format!("a session missed {missed} block change(s); resending its columns"),
+                        );
+                        let centre = view.centre().unwrap_or_else(|| ChunkPos::new(0, 0));
+                        view = View::default();
+                        stream(conn, ctx, &mut view, centre).await?;
+                    }
+                }
+            }
             frame = conn.next_frame() => {
                 let Some(frame) = frame? else { return Ok(()) };
                 let mut reader = Reader::new(&frame.body);
@@ -531,6 +606,54 @@ where
                     }
                     Ok(play::serverbound::Packet::MovePlayerPosRot(m)) => {
                         moved(conn, ctx, &mut view, m.x, m.z).await?;
+                    }
+                    // Digging. Only the finish counts: the start and the
+                    // cancel are a client telling the server what its
+                    // animation is doing, and a server that broke a block on
+                    // the start would break blocks the player let go of.
+                    //
+                    // In creative mode the client sends only StartDigging and
+                    // expects the block gone, which is why that is honoured
+                    // too — the join packet says creative, so this is the case
+                    // that actually happens.
+                    Ok(play::serverbound::Packet::PlayerAction(action)) => {
+                        use play::serverbound::PlayerActionKind::{FinishDigging, StartDigging};
+                        if matches!(action.status, StartDigging | FinishDigging) {
+                            ctx.world.set_block(action.location, ctx.blocks.air);
+                        }
+                        // The sequence number is acknowledged whatever
+                        // happened. The client predicted the change locally
+                        // and holds that prediction until it is told the
+                        // server has caught up; an unacknowledged sequence
+                        // leaves the block flickering back and forth.
+                        send_play(
+                            conn,
+                            play::clientbound::BlockChangedAck {
+                                sequence: action.sequence,
+                            },
+                            ctx.version,
+                        )
+                        .await?;
+                    }
+                    // Placing. The block goes on the *face* that was clicked,
+                    // not in the block that was clicked — a right-click on the
+                    // top of the ground puts a block above it, and putting it
+                    // in the clicked cell would replace the ground instead.
+                    Ok(play::serverbound::Packet::UseItemOnBlock(use_on)) => {
+                        let target = offset(use_on.hit.location, use_on.hit.face);
+                        // There is no inventory, so there is nothing to place
+                        // but the world's own surface block. Stated rather
+                        // than dressed up: what a player is holding is not
+                        // knowable here yet.
+                        ctx.world.set_block(target, ctx.blocks.placeable);
+                        send_play(
+                            conn,
+                            play::clientbound::BlockChangedAck {
+                                sequence: use_on.sequence,
+                            },
+                            ctx.version,
+                        )
+                        .await?;
                     }
                     Ok(_) => {}
                     // A packet this server has no definition for is not a
@@ -564,6 +687,29 @@ where
     W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     stream(conn, ctx, view, view::column_of(x, z)).await
+}
+
+/// The block one step off `face` from `location`.
+///
+/// The face numbering is the protocol's: 0 down, 1 up, 2 north, 3 south,
+/// 4 west, 5 east. An unknown face returns the clicked block itself, which
+/// places into the block that was clicked — wrong, and the least wrong of the
+/// available answers for a number this server does not recognise.
+fn offset(location: dust_protocol::types::Position, face: u8) -> dust_protocol::types::Position {
+    let (dx, dy, dz) = match face {
+        0 => (0, -1, 0),
+        1 => (0, 1, 0),
+        2 => (0, 0, -1),
+        3 => (0, 0, 1),
+        4 => (-1, 0, 0),
+        5 => (1, 0, 0),
+        _ => (0, 0, 0),
+    };
+    dust_protocol::types::Position {
+        x: location.x + dx,
+        y: location.y + dy,
+        z: location.z + dz,
+    }
 }
 
 /// The entity id the player is given.

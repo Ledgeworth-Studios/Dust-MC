@@ -40,6 +40,7 @@ pub(crate) use dust_protocol::wire::Writer;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 pub mod configure;
+pub mod edits;
 pub mod favicon;
 pub mod listen;
 pub mod play;
@@ -103,7 +104,8 @@ where
     }
 }
 
+pub use edits::{Edit, EditedWorld, SharedWorld};
 pub use favicon::{Favicon, FaviconError};
 pub use listen::{Counters, Listener, ListenerHandle, NetStats};
-pub use session::{Authority, Served, SessionContext, SessionError};
+pub use session::{Authority, PlaceableBlocks, Served, SessionContext, SessionError};
 pub use status::StatusPolicy;

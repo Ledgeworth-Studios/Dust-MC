@@ -780,7 +780,9 @@ impl Server {
             .id_of("minecraft:overworld")
             .ok_or_else(|| fail("the dimension types have no overworld".to_owned()))?
             as u32;
-        let world = crate::net::world::FlatWorld::new(palette, plains, biomes.entries.len() as u32);
+        let world = std::sync::Arc::new(crate::net::edits::EditedWorld::new(
+            crate::net::world::FlatWorld::new(palette, plains, biomes.entries.len() as u32),
+        ));
 
         // Shared between the accept loop and every session on it: the accept
         // loop counts connections, and the sessions count the players inside
@@ -799,6 +801,11 @@ impl Server {
             world,
             view_distance: VIEW_DISTANCE,
             overworld_dimension_type: overworld,
+            blocks: crate::net::PlaceableBlocks {
+                air: palette.air,
+                placeable: palette.grass,
+            },
+            logger: self.options.logger.clone(),
             counters: std::sync::Arc::clone(&counters),
         });
 

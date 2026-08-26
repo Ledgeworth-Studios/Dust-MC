@@ -91,6 +91,11 @@ impl View {
         }
     }
 
+    /// The column the view is centred on, or `None` before the first move.
+    pub fn centre(&self) -> Option<ChunkPos> {
+        self.centre
+    }
+
     /// How many columns the client is holding.
     pub fn loaded(&self) -> usize {
         self.loaded.len()
