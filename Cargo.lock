@@ -364,6 +364,9 @@ version = "0.0.0"
 dependencies = [
  "ctrlc",
  "dust-config",
+ "dust-net",
+ "dust-protocol",
+ "tokio",
 ]
 
 [[package]]

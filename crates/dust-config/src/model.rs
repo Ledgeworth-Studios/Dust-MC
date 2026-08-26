@@ -62,6 +62,12 @@ pub struct ServerConfig {
     /// suppressed.
     #[config(restart)]
     pub log_level: LogLevel,
+
+    /// Path to the icon shown beside this server in the client's list, or empty
+    /// for none. Must be a 64x64 PNG; the client silently shows nothing for a
+    /// picture it cannot use, so the server refuses one at boot instead.
+    #[config(restart)]
+    pub favicon: String,
 }
 
 impl Default for ServerConfig {
@@ -74,6 +80,7 @@ impl Default for ServerConfig {
             max_catchup_ticks: 20,
             shutdown_timeout_secs: 10,
             log_level: LogLevel::default(),
+            favicon: String::new(),
         }
     }
 }

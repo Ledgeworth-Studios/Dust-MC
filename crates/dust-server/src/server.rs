@@ -46,6 +46,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use dust_config::model::LogLevel;
 use dust_config::{ConfigError, DustConfig};
@@ -130,7 +131,10 @@ impl Phase {
         match self {
             Self::ConfigLoad => "configuration released".to_owned(),
             Self::WorldDirs => "directories left on disk".to_owned(),
-            Self::NetworkBind => "placeholder released".to_owned(),
+            // Overridden by the teardown, which knows the address and the
+            // counters. This is the wording for a caller that unwinds a phase
+            // list without a listener in hand.
+            Self::NetworkBind => "listener released".to_owned(),
             Self::TickLoop => format!("stopped after {ticks_run} tick(s)"),
         }
     }
@@ -261,6 +265,7 @@ impl std::error::Error for ServerError {}
 pub struct LiveMetrics {
     ticks_observed: Arc<AtomicU64>,
     stop: Arc<StopState>,
+    bound: Arc<OnceLock<SocketAddr>>,
 }
 
 impl LiveMetrics {
@@ -273,6 +278,21 @@ impl LiveMetrics {
     pub fn is_stop_requested(&self) -> bool {
         self.stop.is_stopped()
     }
+
+    /// The address the listener actually took, once phase 3 has completed.
+    ///
+    /// Not the same as `[server].bind`, and the difference is the reason this
+    /// exists: `0.0.0.0:0` and `127.0.0.1:0` both mean "any free port", and the
+    /// number the operating system chose is knowable only after the bind. An
+    /// operator wants it in the log and a test wants it to connect to; both
+    /// would otherwise have to parse it back out of a log line.
+    ///
+    /// A `OnceLock` because a listener binds once per run and never rebinds, so
+    /// "not yet" and "never" are the same answer and neither is a lock anybody
+    /// contends for.
+    pub fn bound_addr(&self) -> Option<SocketAddr> {
+        self.bound.get().copied()
+    }
 }
 
 impl fmt::Debug for LiveMetrics {
@@ -280,6 +300,7 @@ impl fmt::Debug for LiveMetrics {
         f.debug_struct("LiveMetrics")
             .field("ticks_observed", &self.ticks_observed())
             .field("is_stop_requested", &self.is_stop_requested())
+            .field("bound_addr", &self.bound_addr())
             .finish()
     }
 }
@@ -382,6 +403,9 @@ struct Shared {
     complete: Arc<AtomicBool>,
     ticks_observed: Arc<AtomicU64>,
     watchdog_fired: Arc<AtomicBool>,
+    /// Published by phase 3 the moment the socket is taken. See
+    /// [`LiveMetrics::bound_addr`].
+    bound: Arc<OnceLock<SocketAddr>>,
 }
 
 impl fmt::Debug for Shared {
@@ -408,6 +432,10 @@ pub struct Server {
     shared: Shared,
     stop_handle: StopHandle,
     tracker: Arc<ThreadTracker>,
+    /// Set by phase 3, released by the teardown at phase 3's position. Held on
+    /// the server rather than in a local so that the failure paths and the
+    /// happy path release it through the same code.
+    listener: Option<crate::net::ListenerHandle>,
 }
 
 impl fmt::Debug for Server {
@@ -427,6 +455,7 @@ impl Server {
             complete: Arc::new(AtomicBool::new(false)),
             ticks_observed: Arc::new(AtomicU64::new(0)),
             watchdog_fired: Arc::new(AtomicBool::new(false)),
+            bound: Arc::new(OnceLock::new()),
         };
         let stop_handle = StopHandle::new(Arc::clone(&shared.stop));
         Self {
@@ -435,6 +464,7 @@ impl Server {
             shared,
             stop_handle,
             tracker: Arc::new(ThreadTracker::default()),
+            listener: None,
         }
     }
 
@@ -449,6 +479,7 @@ impl Server {
         LiveMetrics {
             ticks_observed: Arc::clone(&self.shared.ticks_observed),
             stop: Arc::clone(&self.shared.stop),
+            bound: Arc::clone(&self.shared.bound),
         }
     }
 
@@ -485,7 +516,8 @@ impl Server {
 
         // ---- Phase 2: world directories --------------------------------
         if let Err(mut e) = self.start_world_dirs(&mut transcript) {
-            self.teardown(completed, &mut transcript, 0);
+            let mut listener = self.listener.take();
+            self.teardown(completed, &mut transcript, 0, &mut listener);
             e.attach(std::mem::take(&mut transcript));
             return Err(e);
         }
@@ -497,9 +529,10 @@ impl Server {
             }
         }
 
-        // ---- Phase 3: network placeholder ------------------------------
-        if let Err(mut e) = self.start_network_placeholder(&mut transcript) {
-            self.teardown(completed, &mut transcript, 0);
+        // ---- Phase 3: bind and serve -----------------------------------
+        if let Err(mut e) = self.start_network(&mut transcript) {
+            let mut listener = self.listener.take();
+            self.teardown(completed, &mut transcript, 0, &mut listener);
             e.attach(std::mem::take(&mut transcript));
             return Err(e);
         }
@@ -559,7 +592,8 @@ impl Server {
         completed.push(Phase::TickLoop);
 
         // ---- Shutdown: exact reverse of everything completed ------------
-        self.teardown(completed, &mut transcript, summary.ticks_run);
+        let mut listener = self.listener.take();
+        self.teardown(completed, &mut transcript, summary.ticks_run, &mut listener);
 
         // Release the watchdog first so a not-yet-fired one retires quietly;
         // one that already fired has already done its worst. The extra wake
@@ -649,40 +683,83 @@ impl Server {
         }
     }
 
-    /// Validate and resolve `[server] bind`. No socket is opened: binding is
-    /// dust-net's job, and doing it twice teaches the wrong lesson. What the
-    /// placeholder proves today is that a bad bind stops the boot here,
-    /// cleanly, with an error naming the setting.
-    fn start_network_placeholder(
-        &self,
-        transcript: &mut Vec<TranscriptEntry>,
-    ) -> Result<(), ServerError> {
-        let bind = self
+    /// Resolve `[server] bind`, take the port, and start serving on it.
+    ///
+    /// The socket is bound **here**, synchronously, inside the ordered boot —
+    /// not inside the task that accepts on it. That is the whole point of this
+    /// phase existing where it does. A port already in use, an address the
+    /// machine does not have, a privileged port without the privilege: each is
+    /// an error that stops the boot with the setting named, the earlier phases
+    /// unwound in reverse, and a non-zero exit. Bound from inside a spawned
+    /// task instead, every one of them would produce a server that started
+    /// cleanly, ticked forever and answered nothing.
+    ///
+    /// The favicon is read here too, for the same reason and one more: a client
+    /// shows *nothing* for a picture it cannot use, which is indistinguishable
+    /// from a server that set none. An operator who points the setting at the
+    /// wrong file has to be told, and boot is the only moment anybody is
+    /// listening.
+    fn start_network(&mut self, transcript: &mut Vec<TranscriptEntry>) -> Result<(), ServerError> {
+        let config = self
             .config
             .as_ref()
-            .expect("config staged before network phase")
-            .server
-            .bind
-            .clone();
-        match resolve_bind(&bind) {
-            Ok(addr) => {
-                transcript.push(TranscriptEntry {
-                    phase: Phase::NetworkBind,
-                    direction: Direction::Start,
-                    detail: format!("{bind} resolves to {addr}; binding deferred"),
-                });
-                Ok(())
+            .expect("config staged before network phase");
+        let bind = config.server.bind.clone();
+        let motd = config.server.motd.clone();
+        let max_players = config.server.max_players;
+        let favicon_path = config.server.favicon.clone();
+
+        let fail = |message: String| -> ServerError {
+            ServerError::NetworkBind {
+                bind: bind.clone(),
+                message,
+                transcript: Vec::new(),
             }
-            Err(message) => {
-                let err = ServerError::NetworkBind {
-                    bind: bind.clone(),
-                    message,
-                    transcript: Vec::new(),
-                };
-                self.options.logger.error("dust::server", format!("{err}"));
-                Err(err)
-            }
-        }
+        };
+
+        let addr = resolve_bind(&bind).map_err(&fail)?;
+
+        let favicon = if favicon_path.is_empty() {
+            None
+        } else {
+            let icon = crate::net::Favicon::load(std::path::Path::new(&favicon_path))
+                .map_err(|e| fail(e.to_string()))?;
+            Some(icon)
+        };
+
+        // The one version this server speaks. It is resolved by name from the
+        // generated table rather than written as a constant, so that the day
+        // there are two, this line is where the choice becomes visible instead
+        // of being spread through the code that assumed one.
+        let version = dust_protocol::version::V1_21_1;
+
+        let listener = crate::net::Listener::bind(addr).map_err(|e| fail(e.to_string()))?;
+        let bound = listener.addr();
+
+        let ctx = std::sync::Arc::new(crate::net::SessionContext {
+            version,
+            status: crate::net::StatusPolicy::new(version, motd, max_players, favicon),
+            conn: dust_net::io::ConnConfig::default(),
+        });
+
+        let handle = listener
+            .serve(ctx, self.options.logger.clone())
+            .map_err(|e| fail(format!("could not start serving: {e}")))?;
+
+        transcript.push(TranscriptEntry {
+            phase: Phase::NetworkBind,
+            direction: Direction::Start,
+            detail: format!(
+                "listening on {bound} for protocol {} ({})",
+                version.number(),
+                version.name()
+            ),
+        });
+        // Published only after the handle exists, so an observer that sees an
+        // address knows there is something accepting on it.
+        let _ = self.shared.bound.set(bound);
+        self.listener = Some(handle);
+        Ok(())
     }
 
     /// The hot loop. Checks stop **between** passes; a batch in flight always
@@ -734,12 +811,37 @@ impl Server {
         completed: Vec<Phase>,
         transcript: &mut Vec<TranscriptEntry>,
         ticks_run: u64,
+        listener: &mut Option<crate::net::ListenerHandle>,
     ) {
         for phase in completed.into_iter().rev() {
+            // The listener is released *at the position the transcript claims
+            // it is*, rather than wherever the handle happens to go out of
+            // scope. Symmetry that is only true of the log is not symmetry.
+            let detail = if phase == Phase::NetworkBind {
+                match listener.take() {
+                    Some(handle) => {
+                        let addr = handle.addr();
+                        let stats = handle.stats();
+                        handle.shutdown();
+                        format!(
+                            "released {addr} after {} connection(s): {} ping(s), \
+                             {} login(s) refused, {} failed",
+                            stats.accepted, stats.status_served, stats.logins_refused, stats.failed
+                        )
+                    }
+                    // The bind failed, so the phase never completed and this
+                    // arm is unreachable from `run`. Written honestly rather
+                    // than as an unwrap, because a future caller could unwind a
+                    // list this function did not build.
+                    None => "nothing was listening".to_owned(),
+                }
+            } else {
+                phase.teardown_detail(ticks_run)
+            };
             transcript.push(TranscriptEntry {
                 phase,
                 direction: Direction::Stop,
-                detail: phase.teardown_detail(ticks_run),
+                detail,
             });
         }
     }
@@ -747,14 +849,15 @@ impl Server {
     /// Graceful abort: stop arrived during startup. Everything completed is
     /// torn down in reverse and the report says so.
     fn abort_startup(
-        self,
+        mut self,
         completed: Vec<Phase>,
         mut transcript: Vec<TranscriptEntry>,
         started_at: u64,
     ) -> ShutdownReport {
         // No helper threads exist on this path: the watchdog spawns only
         // once the tick loop begins.
-        self.teardown(completed, &mut transcript, 0);
+        let mut listener = self.listener.take();
+        self.teardown(completed, &mut transcript, 0, &mut listener);
         ShutdownReport {
             interrupted: true,
             ticks_run: 0,
@@ -898,6 +1001,29 @@ mod tests {
         sink: Arc<Mutex<Vec<u8>>>,
     }
 
+    /// A config for a test, with a listener that cannot collide.
+    ///
+    /// Every boot now takes a real port, and two things follow that the tests
+    /// have to say out loud. The bind is **loopback**, so a unit test never
+    /// opens a port to the network; and it is **port 0**, so the operating
+    /// system picks a free one and two tests running in parallel — which is
+    /// the default — cannot fight over it. Without this, the suite would pass
+    /// alone and fail together, which is the shape of flakiness that costs the
+    /// most to diagnose.
+    ///
+    /// A config text that names `bind` itself is left alone: those tests are
+    /// about the bind.
+    fn with_test_bind(config_text: &str) -> String {
+        if config_text.contains("bind") {
+            return config_text.to_owned();
+        }
+        if let Some(rest) = config_text.strip_prefix("[server]\n") {
+            format!("[server]\nbind = \"127.0.0.1:0\"\n{rest}")
+        } else {
+            format!("[server]\nbind = \"127.0.0.1:0\"\n{config_text}")
+        }
+    }
+
     /// Build (but do not start) a virtual-time run of `dust server`.
     fn boot(config_text: &str, configure: impl FnOnce(&mut ServerOptions)) -> (Run, Server) {
         let clock = Arc::new(ManualClock::new());
@@ -907,7 +1033,7 @@ mod tests {
             Level::Info,
             Arc::clone(&clock) as Arc<dyn Clock>,
         );
-        let config_path = write_config(config_text);
+        let config_path = write_config(&with_test_bind(config_text));
         let mut options = ServerOptions {
             config_path: config_path.clone(),
             clock: Arc::clone(&clock) as Arc<dyn Clock>,

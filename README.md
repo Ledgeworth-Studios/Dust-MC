@@ -3,18 +3,33 @@
 A Minecraft Java Edition server, written in Rust.
 
 Dust is being built from nothing. It is not usable yet, and this README will say
-so until it is. What exists today is the workspace, the configuration system and
-the gates that keep the rest honest.
+so until it is — but it now answers.
 
 ## Status
 
-Stage 0 — groundwork, and the first crates the server stands on. Phases 0.1
-through 0.4 are done, and Phase 0.5 extracts the vanilla data the rest of the
-server needs: blocks, items, entity types, fluids, tags, recipes, loot tables,
-commands and packets. NBT, the world storage, the protocol codec, the datapack
-loader and the network transport all exist as crates, and the server process
-skeleton runs behind the `dust server` command — lifecycle, tick loop, clean
-shutdown. Nothing here accepts a connection yet.
+**Dust answers the server-list ping.** `dust server` binds `[server].bind`,
+serves the handshake and status exchange over protocol 767, builds the entry
+from the MOTD, player count and favicon in `dust.toml`, returns the eight bytes
+a client measures its round trip with, and refuses a login attempt with a
+reason the client can render rather than a dropped socket. That is the first
+half of Phase 1 of the build plan.
+
+What proves it is a test that speaks the protocol by hand — its own VarInts,
+its own length prefixes, sharing no code with the server — because a client
+built on Dust's own framing would agree with Dust under any convention,
+including a wrong one. What that test cannot prove is that a *real* client is
+happy with the document, and no claim is made here that one has been pointed at
+it: that is the differential harness's job and it is not built yet.
+
+**Nobody can play yet.** Login, the configuration state and the play state are
+not implemented, so a client that clicks Join is told so and disconnected.
+
+Underneath it: Stage 0's workspace, configuration system and gates; the vanilla
+data extractor (blocks, items, entity types, fluids, tags, recipes, loot
+tables, commands, packets, worldgen); and the crates the rest stands on — NBT,
+world storage with paletted containers, heightmaps and a light engine, the
+1.21.1 protocol codec, the datapack loader, and a network transport with
+framing, compression, encryption and session authentication.
 
 ## Vanilla data
 

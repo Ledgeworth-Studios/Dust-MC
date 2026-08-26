@@ -57,6 +57,22 @@ impl TickParticipant for Counter {
     }
 }
 
+/// A config for a test, with a listener that cannot collide.
+///
+/// Booting now takes a real port. Loopback so no test opens a port to the
+/// network, and port 0 so the operating system picks a free one — these tests
+/// run in parallel with each other and with the crate's unit tests, and a
+/// fixed port would make the suite pass alone and fail together.
+fn with_test_bind(config_text: &str) -> String {
+    if config_text.contains("bind") {
+        return config_text.to_owned();
+    }
+    match config_text.strip_prefix("[server]\n") {
+        Some(rest) => format!("[server]\nbind = \"127.0.0.1:0\"\n{rest}"),
+        None => format!("[server]\nbind = \"127.0.0.1:0\"\n{config_text}"),
+    }
+}
+
 /// Everything a test needs to watch and stop a running server.
 struct Running {
     metrics: LiveMetrics,
@@ -72,7 +88,7 @@ struct Running {
 fn start(config_text: &str, extras: Vec<Box<dyn TickParticipant>>) -> Running {
     let clock = Arc::new(ManualClock::new());
     let options = ServerOptions {
-        config_path: write_config(config_text),
+        config_path: write_config(&with_test_bind(config_text)),
         clock: Arc::clone(&clock) as Arc<dyn Clock>,
         loop_parker: stepping(clock, TICK_NS),
         watchdog: WatchdogSetting::Custom(dust_server::WatchdogPolicy::custom(
@@ -96,6 +112,21 @@ fn wait_for(running: &Running, minimum_ticks: u64) {
     for _ in 0..50_000_000 {
         if running.metrics.ticks_observed() >= minimum_ticks {
             return;
+        }
+        // A server whose boot failed never ticks, and to a spin loop that is
+        // indistinguishable from one that is merely slow. The run thread has
+        // already finished in that case, and saying so turns "stuck at 0" —
+        // which names no cause at all — into the phase error that actually
+        // happened.
+        if running
+            .worker
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            panic!(
+                "the run thread exited before reaching {minimum_ticks} tick(s); \
+                 the boot failed rather than stalled"
+            );
         }
         std::thread::yield_now();
     }

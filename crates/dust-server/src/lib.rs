@@ -76,6 +76,7 @@ pub mod clock;
 pub mod engine;
 pub mod histogram;
 pub mod logging;
+pub mod net;
 pub mod participant;
 pub mod server;
 pub mod stop;

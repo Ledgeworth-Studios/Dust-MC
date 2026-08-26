@@ -17,6 +17,21 @@ path = "src/main.rs"
 [dependencies]
 ctrlc.workspace = true
 dust-config.workspace = true
+dust-net.workspace = true
+dust-protocol.workspace = true
+
+# The network runtime. dust-net picked tokio and explains why in its own
+# manifest; this crate takes the same one because a second runtime in one
+# process is two schedulers competing for the same cores.
+tokio = { version = "1", default-features = false, features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
 
 [lints]
 workspace = true
