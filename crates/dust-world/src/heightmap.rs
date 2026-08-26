@@ -31,6 +31,7 @@
 //! them, since there is no registry yet to check the values against.
 
 use crate::bits::{BitStorage, BitStorageError};
+use crate::container::{PalettedContainer, Strategy};
 use crate::palette::ceil_log2;
 
 /// The number of columns in a chunk: 16 x 16.
@@ -289,6 +290,68 @@ impl Heightmap {
         }
         self.set_first_available(x, z, first_available);
     }
+
+    /// Recompute every column from a chunk's sections.
+    ///
+    /// `sections` are the chunk's block-state containers in bottom-up order,
+    /// one per sixteen rows of the world. The scan walks each column from the
+    /// top of the world down — top section first, row fifteen before row zero
+    /// — and stops at the first state `matches` accepts, so a column whose
+    /// interesting block is near the surface never reads the stone below it.
+    /// This is [`Heightmap::recompute_column`] with the column iterator built
+    /// from sections, which is what a chunk actually has; the predicate stays
+    /// a parameter for the same reason it is there.
+    ///
+    /// # Panics
+    ///
+    /// If the section list does not tile the world exactly — one container per
+    /// sixteen rows — or if any container is not a block-state container. A
+    /// biome container passed by mistake would answer every question with a
+    /// plausible biome id and compute a heightmap of them; that is a caller
+    /// bug, and it is named here rather than buried in the numbers.
+    ///
+    /// # Panics (from the predicate path)
+    ///
+    /// [`Heightmap::set_first_available`] panics if a matching state sits at a
+    /// y past the ceiling, which cannot happen for containers of this world's
+    /// own shape.
+    pub fn recompute_from_sections<F>(
+        &mut self,
+        sections: &[&PalettedContainer],
+        mut matches: F,
+    ) where
+        F: FnMut(u32) -> bool,
+    {
+        assert_eq!(
+            sections.len() * 16,
+            self.world.height as usize,
+            "a world {} rows tall needs {} sections, and {} were supplied",
+            self.world.height,
+            self.world.height / 16,
+            sections.len()
+        );
+        for section in sections {
+            assert_eq!(
+                section.strategy(),
+                Strategy::BLOCK_STATES,
+                "a heightmap is recomputed from block-state sections of {} cells, and one \
+                 container here holds {} cells instead",
+                Strategy::BLOCK_STATES.len(),
+                section.len()
+            );
+        }
+
+        let min_y = self.world.min_y;
+        for z in 0..16u32 {
+            for x in 0..16u32 {
+                let top_down = sections.iter().enumerate().rev().flat_map(move |(index, section)| {
+                    let base = min_y + (index * 16) as i32;
+                    (0..16u32).rev().map(move |row| (base + row as i32, section.get_at(x, row, z)))
+                });
+                self.recompute_column(x, z, top_down, |state| matches(state));
+            }
+        }
+    }
 }
 
 /// The six heightmaps of one chunk.
@@ -322,6 +385,23 @@ impl HeightmapSet {
     /// The ones a fully generated chunk writes to disk.
     pub fn persisted(&self) -> impl Iterator<Item = &Heightmap> {
         self.maps.iter().filter(|m| m.kind().persisted())
+    }
+
+    /// Recompute all six heightmaps from a chunk's sections in one call.
+    ///
+    /// The six maps disagree about which states count, and this crate cannot
+    /// know any of their answers, so `matches` is asked per kind: it receives
+    /// the [`HeightmapKind`] and a block state, and says whether that map
+    /// counts it. Each map is still walked lazily on its own, so a predicate
+    /// that is expensive for one kind does not slow the others.
+    pub fn recompute_from_sections<F>(&mut self, sections: &[&PalettedContainer], mut matches: F)
+    where
+        F: FnMut(HeightmapKind, u32) -> bool,
+    {
+        for slot in 0..self.maps.len() {
+            let kind = self.maps[slot].kind();
+            self.maps[slot].recompute_from_sections(sections, |state| matches(kind, state));
+        }
     }
 
     fn slot(kind: HeightmapKind) -> usize {
@@ -491,6 +571,278 @@ mod tests {
                 "{}",
                 kind.nbt_key()
             );
+        }
+    }
+
+    /// A stored height varied enough that two columns landing in the wrong
+    /// slots of each other would be noticed, and deterministic, because a
+    /// hand-checked vector must stay hand-checkable.
+    fn stored(index: usize) -> u32 {
+        ((index * 37 + 11) % 385) as u32
+    }
+
+    #[test]
+    fn the_nine_bit_words_hold_seven_columns_at_the_vanilla_offsets() {
+        // The layout, written out rather than derived from any loop in this
+        // module: seven nine-bit columns share each long at bit offsets 0, 9,
+        // 18, 27, 36, 45 and 54, leaving bit 63 of every long as padding. The
+        // expectations below are that arithmetic done once by hand, against
+        // concrete values -- not a second implementation of the packing.
+        let mut map = Heightmap::new(HeightmapKind::MotionBlocking, WorldHeight::OVERWORLD);
+        for column in 0..14usize {
+            // Column n sits at x = n % 16, z = n / 16; all fourteen fit in the
+            // z == 0 edge of the chunk.
+            let (x, z) = ((column % 16) as u32, (column / 16) as u32);
+            let value = stored(column);
+            map.set_first_available(x, z, WorldHeight::OVERWORLD.min_y() + value as i32);
+        }
+
+        let longs = map.as_longs();
+        assert_eq!(longs.len(), 37);
+        assert_eq!(
+            longs[0],
+            stored(0) as i64
+                | ((stored(1) as i64) << 9)
+                | ((stored(2) as i64) << 18)
+                | ((stored(3) as i64) << 27)
+                | ((stored(4) as i64) << 36)
+                | ((stored(5) as i64) << 45)
+                | ((stored(6) as i64) << 54),
+            "columns 0..7 pack into the first long"
+        );
+        assert_eq!(
+            longs[1],
+            stored(7) as i64
+                | ((stored(8) as i64) << 9)
+                | ((stored(9) as i64) << 18)
+                | ((stored(10) as i64) << 27)
+                | ((stored(11) as i64) << 36)
+                | ((stored(12) as i64) << 45)
+                | ((stored(13) as i64) << 54),
+            "columns 7..13 pack into the second long"
+        );
+        assert!(
+            longs[2..].iter().all(|l| *l == 0),
+            "every column past 13 was left empty"
+        );
+        assert!(map.storage().padding_is_zero());
+    }
+
+    #[test]
+    fn reading_the_words_back_yields_the_columns_they_were_written_from() {
+        // The same layout read backwards through the public door: the longs
+        // above, decoded by vanilla's rule -- column c lives in long c / 7 at
+        // shift (c % 7) * 9 -- must come back as the values put in.
+        let mut map = Heightmap::new(HeightmapKind::WorldSurface, WorldHeight::OVERWORLD);
+        for column in 0..COLUMNS {
+            let (x, z) = ((column % 16) as u32, (column / 16) as u32);
+            map.set_first_available(
+                x,
+                z,
+                WorldHeight::OVERWORLD.min_y() + stored(column) as i32,
+            );
+        }
+        let longs = map.as_longs().to_vec();
+
+        let mut expected = vec![0i64; 37];
+        for column in 0..COLUMNS {
+            expected[column / 7] |= (stored(column) as i64) << ((column % 7) * 9);
+        }
+        assert_eq!(longs, expected);
+        assert!(map.storage().padding_is_zero());
+
+        let read = Heightmap::from_longs(
+            HeightmapKind::WorldSurface,
+            WorldHeight::OVERWORLD,
+            longs,
+        )
+        .expect("its own output");
+        for column in 0..COLUMNS {
+            let (x, z) = ((column % 16) as u32, (column / 16) as u32);
+            assert_eq!(
+                read.first_available(x, z),
+                WorldHeight::OVERWORLD.min_y() + stored(column) as i32,
+                "column {column}"
+            );
+        }
+    }
+
+    #[test]
+    fn columns_either_side_of_every_word_boundary_move_independently() {
+        // The pair that shares a word boundary is the pair an off-by-one in
+        // the shift arithmetic corrupts: write the last column of one long and
+        // the first of the next, then swap them, at every boundary there is.
+        // Three worlds cover both widths a heightmap actually uses: 384 rows
+        // and 256 rows are nine bits, 255 rows is eight.
+        for world in [
+            WorldHeight::OVERWORLD,
+            WorldHeight::NETHER,
+            WorldHeight::new(0, 255),
+        ] {
+            let bits = world.heightmap_bits();
+            let per_long = crate::bits::values_per_long(bits);
+            let longs = crate::bits::long_count(COLUMNS, bits);
+            let mut map = Heightmap::new(HeightmapKind::OceanFloor, world);
+
+            for boundary in 0..longs.saturating_sub(1) {
+                let left = boundary * per_long + per_long - 1;
+                let right = left + 1;
+                if right >= COLUMNS {
+                    break;
+                }
+                let (lx, lz) = ((left % 16) as u32, (left / 16) as u32);
+                let (rx, rz) = ((right % 16) as u32, (right / 16) as u32);
+                let high = world.max_y_exclusive();
+                let low = world.min_y() + 1;
+
+                for (first, second) in [(high, low), (low, high)] {
+                    map.set_first_available(lx, lz, first);
+                    map.set_first_available(rx, rz, second);
+                    assert_eq!(map.first_available(lx, lz), first, "{world:?} long {boundary}");
+                    assert_eq!(
+                        map.first_available(rx, rz),
+                        second,
+                        "{world:?} long {boundary}"
+                    );
+                }
+            }
+            assert!(map.storage().padding_is_zero(), "{world:?}");
+        }
+    }
+
+    #[test]
+    fn recomputing_from_sections_walks_each_column_from_the_top_of_the_world() {
+        use crate::container::PalettedContainer;
+
+        // A two-section world, small enough that every number in the test can
+        // be checked by eye: y runs 0..32, the bottom section holds rows 0..16
+        // and the top section rows 16..32.
+        let registry = 26_684;
+        let mut bottom = PalettedContainer::filled(Strategy::BLOCK_STATES, registry, 0);
+        let mut top = PalettedContainer::filled(Strategy::BLOCK_STATES, registry, 0);
+
+        // Column (3, 4): one counted state at y = 20, nothing else anywhere.
+        top.set_at(3, 4, 4, 9);
+        // Column (15, 15): one counted state down in the bottom section, at
+        // y = 5, under air all the way up.
+        bottom.set_at(15, 5, 15, 7);
+
+        let sections = [&bottom, &top];
+        let mut map = Heightmap::new(HeightmapKind::WorldSurface, WorldHeight::new(0, 32));
+        map.recompute_from_sections(&sections, |state| state != 0);
+
+        assert_eq!(map.first_available(3, 4), 21, "the block at 20 is counted");
+        assert_eq!(map.highest_taken(3, 4), Some(20));
+        assert_eq!(
+            map.first_available(15, 15),
+            6,
+            "a deep block is found through sixteen rows of air"
+        );
+        assert_eq!(map.first_available(0, 0), 0, "an untouched column is floor");
+        for z in 0..16u32 {
+            for x in 0..16u32 {
+                if (x, z) == (3, 4) || (x, z) == (15, 15) {
+                    continue;
+                }
+                assert_eq!(
+                    map.first_available(x, z),
+                    0,
+                    "column ({x}, {z}) should be empty"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_set_recompute_feeds_each_map_its_own_predicate() {
+        use crate::container::PalettedContainer;
+
+        // Six maps, six answers about the same two columns. The predicate
+        // counts a state only for the kind whose ordinal matches it minus one,
+        // which makes the expected heightmap of every kind different and
+        // hand-checkable: kind 0 counts the state 1 pillar, kind 1 the state 2
+        // pillar above it, kind 3 the state 4 block down below, and kinds 2,
+        // 4 and 5 count nothing at all.
+        let registry = 26_684;
+        let mut bottom = PalettedContainer::filled(Strategy::BLOCK_STATES, registry, 0);
+        let mut top = PalettedContainer::filled(Strategy::BLOCK_STATES, registry, 0);
+        top.set_at(2, 7, 2, 1); // y = 23, column (2, 2)
+        top.set_at(5, 3, 5, 2); // y = 19, column (5, 5)
+        bottom.set_at(5, 9, 5, 4); // y = 9, column (5, 5)
+
+        let sections = [&bottom, &top];
+        let mut set = HeightmapSet::new(WorldHeight::new(0, 32));
+        set.recompute_from_sections(&sections, |kind, state| state == kind as u32 + 1);
+
+        let floor = 0;
+        assert_eq!(set.get(HeightmapKind::WorldSurfaceWg).first_available(2, 2), 24);
+        assert_eq!(set.get(HeightmapKind::WorldSurfaceWg).first_available(5, 5), floor);
+
+        assert_eq!(set.get(HeightmapKind::WorldSurface).first_available(5, 5), 20);
+        assert_eq!(set.get(HeightmapKind::WorldSurface).first_available(2, 2), floor);
+
+        assert_eq!(set.get(HeightmapKind::OceanFloorWg).first_available(2, 2), floor);
+        assert_eq!(set.get(HeightmapKind::OceanFloorWg).first_available(5, 5), floor);
+
+        assert_eq!(set.get(HeightmapKind::OceanFloor).first_available(5, 5), 10);
+        assert_eq!(set.get(HeightmapKind::MotionBlocking).first_available(2, 2), floor);
+        assert_eq!(
+            set.get(HeightmapKind::MotionBlockingNoLeaves).first_available(5, 5),
+            floor
+        );
+    }
+
+    #[test]
+    fn recomputing_from_a_section_list_that_does_not_tile_the_world_is_named() {
+        use crate::container::PalettedContainer;
+
+        let registry = 26_684;
+        let section = PalettedContainer::filled(Strategy::BLOCK_STATES, registry, 0);
+
+        // One section cannot cover thirty-two rows; the missing sixteen would
+        // silently read as air and flatten every column.
+        let one = [&section];
+        let mut map = Heightmap::new(HeightmapKind::WorldSurface, WorldHeight::new(0, 32));
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            map.recompute_from_sections(&one, |_| true);
+        }))
+        .expect_err("the section count is wrong");
+        let message = err
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(message.contains("needs 2 sections"), "{message}");
+
+        // And a biome container would answer every question plausibly and
+        // wrongly, so the shape is checked too.
+        let biomes = PalettedContainer::filled(Strategy::BIOMES, 64, 0);
+        let wrong_shape = [&biomes, &biomes];
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            map.recompute_from_sections(&wrong_shape, |_| true);
+        }))
+        .expect_err("biomes are not block states");
+        let message = err.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(message.contains("holds 64 cells"), "{message}");
+    }
+
+    #[test]
+    fn all_six_maps_round_trip_through_longs_at_once() {
+        let mut set = HeightmapSet::new(WorldHeight::OVERWORLD);
+        for kind in HeightmapKind::ALL {
+            let map = set.get_mut(kind);
+            for column in 0..COLUMNS {
+                let value = (column * 31 + kind as usize * 97 + 5) % 385;
+                let (x, z) = ((column % 16) as u32, (column / 16) as u32);
+                map.set_first_available(x, z, -64 + value as i32);
+            }
+        }
+
+        for kind in HeightmapKind::ALL {
+            let longs = set.get(kind).as_longs().to_vec();
+            assert_eq!(longs.len(), 37, "{}", kind.nbt_key());
+            let read =
+                Heightmap::from_longs(kind, WorldHeight::OVERWORLD, longs).expect("its own");
+            assert_eq!(*set.get(kind), read, "{}", kind.nbt_key());
         }
     }
 }
