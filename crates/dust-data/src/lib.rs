@@ -126,6 +126,7 @@
 //! * **A vocabulary is optional and its absence is the default.** Read the
 //!   unvalidated count before believing a clean run.
 
+pub mod advancement;
 pub mod discover;
 pub mod finding;
 pub mod function;
@@ -148,6 +149,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
+pub use advancement::{validate as validate_advancements, AdvancementCycle, AdvancementReport};
 pub use discover::{discover, load_directory};
 pub use finding::{error_count, Finding, Severity};
 pub use function::{FunctionFile, FunctionLine, LoadedFunction};
