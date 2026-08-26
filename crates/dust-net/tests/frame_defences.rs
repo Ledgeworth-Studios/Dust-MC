@@ -69,6 +69,7 @@ fn decoder(compression: Compress) -> FrameDecoder {
 
 #[test]
 fn a_length_prefix_claiming_two_gigabytes_is_refused() {
+    let _gate = support::serial();
     let mut decoder = decoder(Compress::Disabled);
     let mut bytes = var_int(2_000_000_000);
     bytes.push(0x00);
@@ -84,6 +85,7 @@ fn a_length_prefix_claiming_two_gigabytes_is_refused() {
 
 #[test]
 fn the_cap_is_refused_before_anything_is_allocated() {
+    let _gate = support::serial();
     // The distinction the previous test cannot draw: rejecting a two-gigabyte
     // claim *after* reserving two gigabytes is still a denial of service. This
     // is grouped into one `#[test]` because the allocator is process-wide and
@@ -106,6 +108,7 @@ fn the_cap_is_refused_before_anything_is_allocated() {
 
 #[test]
 fn a_frame_of_exactly_the_limit_is_accepted_and_one_byte_more_is_not() {
+    let _gate = support::serial();
     // A boundary written the wrong way round is the most common way a cap
     // stops matching vanilla, and it fails in the direction nobody notices:
     // honest clients disconnect.
@@ -143,6 +146,7 @@ fn a_frame_of_exactly_the_limit_is_accepted_and_one_byte_more_is_not() {
 
 #[test]
 fn a_negative_length_prefix_is_refused_as_negative() {
+    let _gate = support::serial();
     // The bug this is written against: casting the signed prefix to `usize`
     // before the range check. `-1 as usize` is 18446744073709551615, which is
     // greater than the cap and so would still be *refused* — but `-1 as u32 as
@@ -160,6 +164,7 @@ fn a_negative_length_prefix_is_refused_as_negative() {
 
 #[test]
 fn an_empty_frame_is_refused() {
+    let _gate = support::serial();
     let mut decoder = decoder(Compress::Disabled);
     decoder.feed(&[0x00]);
     assert_eq!(decoder.next_frame(), Err(FrameError::Empty));
@@ -171,6 +176,7 @@ fn an_empty_frame_is_refused() {
 
 #[test]
 fn a_frame_claiming_to_be_uncompressed_above_the_threshold_is_refused() {
+    let _gate = support::serial();
     // The client says "data length 0, this was too small to compress" and then
     // sends something that was not too small. Accepting it lets any client opt
     // out of compression while the server keeps paying for the bandwidth.
@@ -188,6 +194,7 @@ fn a_frame_claiming_to_be_uncompressed_above_the_threshold_is_refused() {
 
 #[test]
 fn a_frame_claiming_to_be_compressed_below_the_threshold_is_refused() {
+    let _gate = support::serial();
     // The other direction. A server that checks only the first still accepts
     // this, and the pair is what makes the wire form a function of the payload
     // size rather than something the client picks.
@@ -205,6 +212,7 @@ fn a_frame_claiming_to_be_compressed_below_the_threshold_is_refused() {
 
 #[test]
 fn a_payload_of_exactly_the_threshold_is_compressed_not_sent_raw() {
+    let _gate = support::serial();
     // Vanilla compresses at `>= threshold`. Written as `>`, every payload of
     // exactly the threshold is a protocol error against a real client, and no
     // round-trip test inside this crate can see it because the encoder and the
@@ -251,6 +259,7 @@ fn bomb() -> (Vec<u8>, usize) {
 
 #[test]
 fn a_bomb_that_declares_its_real_size_is_refused_before_decompressing() {
+    let _gate = support::serial();
     let (compressed, expanded) = bomb();
     assert!(
         compressed.len() < 128 * 1024,
@@ -276,6 +285,7 @@ fn a_bomb_that_declares_its_real_size_is_refused_before_decompressing() {
 
 #[test]
 fn a_bomb_that_lies_about_its_size_is_stopped_mid_expansion() {
+    let _gate = support::serial();
     // The interesting one. The frame declares a small, plausible, in-range
     // size so the cheap pre-check passes, and the stream then expands to
     // sixty-four megabytes. Only a bound on the decompressor's *output* stops
@@ -319,6 +329,7 @@ fn a_bomb_that_lies_about_its_size_is_stopped_mid_expansion() {
 
 #[test]
 fn the_absolute_cap_bounds_a_frame_that_declares_a_legal_size() {
+    let _gate = support::serial();
     // The second of the two bounds, on its own. The declared length is within
     // `max_frame_len` but above this connection's `max_decompressed_len`, so
     // only the absolute cap can refuse it.
@@ -353,6 +364,7 @@ fn the_absolute_cap_bounds_a_frame_that_declares_a_legal_size() {
 
 #[test]
 fn a_declared_length_that_disagrees_with_what_decompressed_is_refused() {
+    let _gate = support::serial();
     // Under the bound, and still a lie: the stream really does decompress, to
     // a size other than the one declared. Accepting it at its real size would
     // mean every length calculation downstream was written against a number
@@ -371,6 +383,7 @@ fn a_declared_length_that_disagrees_with_what_decompressed_is_refused() {
 
 #[test]
 fn bytes_after_the_end_of_the_zlib_stream_are_refused() {
+    let _gate = support::serial();
     // A frame whose compressed data ends early carries a tail the decompressor
     // never saw. Two implementations that disagree about whether the tail is
     // part of the frame is exactly the shape of a request smuggling bug.
@@ -391,6 +404,7 @@ fn bytes_after_the_end_of_the_zlib_stream_are_refused() {
 
 #[test]
 fn corrupt_compressed_data_is_a_named_error() {
+    let _gate = support::serial();
     let mut inner = var_int(400);
     inner.extend_from_slice(&[0x78, 0x9c, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
     let mut wire = var_int(inner.len() as i32);
@@ -406,6 +420,7 @@ fn corrupt_compressed_data_is_a_named_error() {
 
 #[test]
 fn a_compressed_frame_whose_header_is_a_bad_varint_is_refused() {
+    let _gate = support::serial();
     let mut inner = vec![0x80, 0x80, 0x80, 0x80, 0x80];
     inner.extend_from_slice(&[0u8; 8]);
     let mut wire = var_int(inner.len() as i32);
@@ -425,6 +440,7 @@ fn a_compressed_frame_whose_header_is_a_bad_varint_is_refused() {
 
 #[test]
 fn a_frame_arriving_one_byte_at_a_time_is_reassembled() {
+    let _gate = support::serial();
     // What a socket actually does. A decoder that needs whole frames per read
     // works on loopback and fails on the internet.
     let frame = Frame::new(0x2C, vec![0x9F; 300]);
@@ -446,6 +462,7 @@ fn a_frame_arriving_one_byte_at_a_time_is_reassembled() {
 
 #[test]
 fn several_frames_in_one_read_are_all_returned() {
+    let _gate = support::serial();
     let encoder = FrameEncoder::new(Limits::default());
     let frames: Vec<Frame> = (0..9)
         .map(|i| Frame::new(i, vec![i as u8; (i as usize) * 7]))
@@ -467,6 +484,7 @@ fn several_frames_in_one_read_are_all_returned() {
 
 #[test]
 fn a_burst_of_small_frames_does_not_grow_the_buffer() {
+    let _gate = support::serial();
     // The compaction rule. Without it the read buffer keeps every frame the
     // connection ever received, and an attacker's cheapest packet — a tiny
     // one — is also the one that costs the most memory.
@@ -485,6 +503,7 @@ fn a_burst_of_small_frames_does_not_grow_the_buffer() {
 
 #[test]
 fn round_trips_through_the_decoder_in_both_modes() {
+    let _gate = support::serial();
     // Deliberately last, and deliberately labelled. This proves the encoder
     // and the decoder in this crate agree with each other. It does not prove
     // either agrees with Minecraft, and it would pass just as green with the
@@ -527,6 +546,7 @@ fn round_trips_through_the_decoder_in_both_modes() {
 
 #[test]
 fn the_encoder_refuses_to_emit_an_oversized_frame() {
+    let _gate = support::serial();
     // A server that can be talked into sending a frame no client will accept
     // has been talked into disconnecting its own players.
     let limits = Limits {

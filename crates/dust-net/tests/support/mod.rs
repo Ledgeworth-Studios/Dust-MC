@@ -6,6 +6,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 /// Bytes currently held by live allocations.
 static LIVE: AtomicUsize = AtomicUsize::new(0);
@@ -67,4 +68,21 @@ pub fn reset_peak() -> usize {
 /// returned.
 pub fn peak_above(baseline: usize) -> usize {
     PEAK.load(Ordering::Relaxed).saturating_sub(baseline)
+}
+
+/// The gate every test in an allocator-measuring binary passes through.
+///
+/// The harness runs a binary's tests on parallel threads, and the peak
+/// counters are process-wide, so a measurement taken while any other test is
+/// allocating measures the both of them. Holding this lock for the whole body
+/// of every test in such a binary — not only the measuring ones — makes the
+/// runs sequential and the numbers mean what they say. The cost is nil: these
+/// suites run in milliseconds either way.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+pub fn serial() -> MutexGuard<'static, ()> {
+    match SERIAL.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }

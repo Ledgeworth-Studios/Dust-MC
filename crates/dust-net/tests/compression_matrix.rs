@@ -77,10 +77,6 @@ fn claimed_data_length(wire: &[u8]) -> i32 {
     data_len
 }
 
-fn payload_len(id: i32, body: usize) -> usize {
-    Frame::new(id, vec![0u8; body]).payload_len()
-}
-
 #[test]
 fn the_disabled_mode_has_no_header_at_all() {
     let frame = Frame::new(0x21, vec![0xAB; 40]);
