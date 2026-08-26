@@ -12,6 +12,38 @@
 //! width of the global palette and is only known at run time — so the type
 //! would have carried half the configuration and a field the other half, which
 //! is worse than putting both in the same place.
+//!
+//! # Equality is content equality, and why it has to be
+//!
+//! Two containers are [`PartialEq`] when every cell decodes to the same id and
+//! both index the same registry — never when their palettes happen to look
+//! alike. A container's tier and entry list are *history*: a section dragged
+//! up to the hashed tier with three hundred junk states and then rewritten
+//! holds exactly what a section written once holds, but its palette still
+//! carries dead entries from the journey. Structural comparison of that
+//! machinery answers "were these built the same way", which is a question
+//! about editing history and not about blocks; round trips through a file,
+//! where serialisation re-palettes from contents alone, would otherwise read
+//! as lossy.
+//!
+//! What makes content equality *safe* rather than merely convenient is that
+//! the canonical form is already defined: [`PalettedContainer::to_parts`]
+//! compacts entries into first-appearance order over the cells and repacks at
+//! the disk width, so two containers are content-equal exactly when their
+//! `to_parts` output matches. That equivalence is asserted by tests here, and
+//! equality itself compares cell values directly so it does not have to build
+//! the canonical form to answer.
+//!
+//! # The hashed-palette ordering caveat
+//!
+//! A [`Hashed`](crate::palette::PaletteKind::Hashed) palette keeps its entries
+//! in an insertion-ordered vector with a hash map beside it as a reverse
+//! index. Nothing iterates the map — entries leave in vector order, which is
+//! deterministic within a process — but the vector's contents depend on the
+//! order values were first inserted, so `palette()` and `storage()` expose
+//! history. Code comparing those views compares how two containers were
+//! *built*; code comparing containers should compare containers, which is
+//! what the `PartialEq` here guarantees.
 
 use crate::bits::{BitStorage, BitStorageError};
 use crate::palette::{ceil_log2, Palette, PaletteKind};
@@ -256,12 +288,23 @@ impl From<BitStorageError> for ContainerError {
 }
 
 /// A cube of registry ids: block states for a section, or biomes for one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Equality is content equality; see the module documentation for what that
+/// deliberately ignores and why.
+#[derive(Debug, Clone, Eq)]
 pub struct PalettedContainer {
     strategy: Strategy,
     registry_size: u32,
     palette: Palette,
     storage: BitStorage,
+}
+
+impl PartialEq for PalettedContainer {
+    /// Every cell decodes to the same id, in the same shape, over the same
+    /// registry — whatever each side's palette has been through.
+    fn eq(&self, other: &Self) -> bool {
+        self.equivalent(other)
+    }
 }
 
 impl PalettedContainer {
@@ -432,6 +475,26 @@ impl PalettedContainer {
             storage.set(cell, index);
         }
         (entries, Some(storage.into_longs()))
+    }
+
+    /// Whether both containers hold the same ids in the same cells, whatever
+    /// their palettes look like.
+    ///
+    /// This is what [`PartialEq`] delegates to; it exists as a named method
+    /// for call sites that want to say "contents" at the type rather than
+    /// lean on an operator whose structural reading a reader might assume.
+    /// Two containers are equivalent when they share a strategy and registry,
+    /// and their canonical forms — [`PalettedContainer::to_parts`] — match.
+    /// The parts are compared because they are the one form this crate
+    /// already defines as content-determined; the cell-by-cell walk that
+    /// would answer directly is exactly the walk `to_parts` performs, and
+    /// routing through the canonical form keeps one definition of "same
+    /// contents" load-bearing instead of two.
+    #[must_use]
+    pub fn equivalent(&self, other: &Self) -> bool {
+        self.strategy == other.strategy
+            && self.registry_size == other.registry_size
+            && self.to_parts() == other.to_parts()
     }
 
     #[must_use]
@@ -949,5 +1012,119 @@ mod tests {
         let (entries, data) = container.to_parts();
         assert_eq!(entries, vec![12]);
         assert_eq!(data, None);
+    }
+
+    #[test]
+    fn containers_with_one_history_each_but_the_same_cells_are_equal() {
+        // The whole point of content equality: one container written straight
+        // to its target pattern, another dragged past every tier first and
+        // rewritten in a scrambled cell order. Their palettes remember none of
+        // that; neither may `==`.
+        let pattern: Vec<u32> = (0..4096)
+            .map(|cell| (cell * 31 % 50) as u32 * 11 + 3)
+            .collect();
+
+        let mut direct = PalettedContainer::filled(Strategy::BLOCK_STATES, BLOCK_STATES_1_21_1, 0);
+        for (cell, value) in pattern.iter().enumerate() {
+            direct.set(cell, *value);
+        }
+
+        let mut scenic = PalettedContainer::filled(Strategy::BLOCK_STATES, BLOCK_STATES_1_21_1, 0);
+        for cell in 0..300usize {
+            scenic.set(cell, cell as u32 * 13 + 5_000);
+        }
+        assert_eq!(scenic.palette_kind(), Global);
+        for step in 0..4096usize {
+            let cell = (step * 2897 + 1301) % 4096;
+            scenic.set(cell, pattern[cell]);
+        }
+
+        // The two sides sit in different tiers with different entry lists;
+        // only the decoded cells are compared.
+        assert_ne!(direct.palette_kind(), scenic.palette_kind());
+        assert_ne!(direct.palette().len(), scenic.palette().len());
+        assert_eq!(direct, scenic, "same contents are equal however built");
+    }
+
+    #[test]
+    fn dead_palette_entries_do_not_make_two_equal_containers_unequal() {
+        // A hashed container keeps entries no cell references any more -- they
+        // are what makes later edits cheap, and they are invisible outside the
+        // container. Equality must stay blind to them or a rewritten section
+        // would stop equalling itself as it was before the rewrite.
+        let mut pruned = PalettedContainer::filled(Strategy::BLOCK_STATES, BLOCK_STATES_1_21_1, 0);
+        for cell in 0..4096usize {
+            pruned.set(cell, (cell % 40) as u32 + 7);
+        }
+        let mut littered = pruned.clone();
+        // Fill the rest of an eight-bit hashed palette with values nothing
+        // references: same cells throughout, forty dead entries alongside.
+        let mut next = 500u32;
+        while littered.palette().len() < 256 {
+            let value = next;
+            next += 3;
+            // Write through cell 0 twice: once to land the value in the
+            // palette, once to put the original block back. The entry stays
+            // behind with no cell referencing it.
+            let keeper = littered.get(0);
+            littered.set(0, value);
+            littered.set(0, keeper);
+        }
+        assert_eq!(littered.palette_kind(), Hashed);
+        assert_eq!(littered.palette().len(), 256);
+
+        assert_eq!(pruned, littered, "dead entries are not contents");
+        for cell in 0..4096 {
+            assert_eq!(littered.get(cell), pruned.get(cell), "cell {cell}");
+        }
+    }
+
+    #[test]
+    fn equivalence_is_exactly_agreement_of_the_canonical_parts() {
+        // The claim the module documentation makes: content equality and
+        // agreement of the canonical form are the same relation, so a caller
+        // can use either. Swept over every tier rather than sampled, because
+        // each tier is a different internal representation of the same idea.
+        for distinct in [1usize, 2, 16, 17, 64, 256, 257, 1000] {
+            let mut left =
+                PalettedContainer::filled(Strategy::BLOCK_STATES, BLOCK_STATES_1_21_1, 0);
+            let mut right =
+                PalettedContainer::filled(Strategy::BLOCK_STATES, BLOCK_STATES_1_21_1, 0);
+            for step in 0..4096usize {
+                // The value a cell holds is a function of the cell alone, so
+                // visiting the cells in any order ends at the same contents;
+                // what differs is the order values entered each palette.
+                let cell_left = step;
+                let cell_right = (step * 3373 + 11) % 4096;
+                let decode = |cell: usize| ((cell * 7919) % 4096 % distinct) as u32 * 5 + 1;
+                left.set(cell_left, decode(cell_left));
+                right.set(cell_right, decode(cell_right));
+            }
+            assert_eq!(left.to_parts(), right.to_parts(), "{distinct} distinct");
+            assert!(left.equivalent(&right), "{distinct} distinct");
+        }
+    }
+
+    #[test]
+    fn different_cells_registries_or_shapes_are_named_as_unequal() {
+        let mut a = PalettedContainer::filled(Strategy::BIOMES, BIOMES_1_21_1, 0);
+        a.set_at(0, 0, 0, 3);
+        let mut b = PalettedContainer::filled(Strategy::BIOMES, BIOMES_1_21_1, 0);
+        b.set_at(0, 0, 0, 4);
+        assert_ne!(a, b, "different values in one cell");
+
+        let mut c = PalettedContainer::filled(Strategy::BIOMES, 300, 0);
+        c.set_at(0, 0, 0, 3);
+        assert_ne!(
+            a, c,
+            "the same ids mean nothing across different registries"
+        );
+        assert!(!a.equivalent(&c));
+
+        // A states container and a biomes container cannot hold the same
+        // cells because they do not have the same number of cells; the shape
+        // is part of what equality compares.
+        let states = PalettedContainer::filled(Strategy::BLOCK_STATES, BLOCK_STATES_1_21_1, 0);
+        assert_ne!(a, states);
     }
 }

@@ -24,15 +24,12 @@
 //! When it lands, it replaces `DirectFormat` below and these tests keep
 //! running unchanged against it.
 //!
-//! One consequence shows up as a helper rather than an `==`:
-//! `Chunk`'s derived equality includes each container's *in-memory* palette
-//! shape, and a serialised chunk deliberately does not carry that shape --
-//! vanilla re-palettes on every write, entries in first-appearance order
-//! over the cells. So a chunk that went through a file and came back holds
-//! the same blocks, biomes, light, heightmaps and records with its palettes
-//! rebuilt canonically. The tests call that equivalent, and check it cell by
-//! cell; the determinism tests separately pin that the canonical form is a
-//! pure function of those contents.
+//! Equality of a round-tripped chunk with its original is plain `==`. That is
+//! deliberate and load-bearing: container equality in this crate is content
+//! equality -- every cell decoding to the same id -- so the palette shape a
+//! serialisation normalises away cannot make a restored chunk read as unequal.
+//! If `==` ever grows stricter than "same blocks, biomes, light, heightmaps
+//! and records", these tests are where it will first break.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -395,52 +392,6 @@ fn encode(chunk: &Chunk) -> Vec<u8> {
         .expect("a sound chunk encodes")
 }
 
-/// The equivalence a round trip can honestly promise: identical identity,
-/// identical contents cell by cell, identical heightmaps, light and records.
-/// Deliberately *not* `==`, which also compares each container's in-memory
-/// palette -- the thing serialisation normalises away. See the module
-/// documentation.
-fn assert_chunks_equivalent(left: &Chunk, right: &Chunk) {
-    assert_eq!(left.pos(), right.pos());
-    assert_eq!(left.world(), right.world());
-    assert_eq!(left.block_registry_size(), right.block_registry_size());
-    assert_eq!(left.biome_registry_size(), right.biome_registry_size());
-    assert_eq!(left.section_count(), right.section_count());
-    for index in 0..left.section_count() {
-        let (a, b) = (&left.sections()[index], &right.sections()[index]);
-        assert_eq!(a.states().len(), b.states().len());
-        for cell in 0..a.states().len() {
-            assert_eq!(
-                a.states().get(cell),
-                b.states().get(cell),
-                "section {index}, block cell {cell}"
-            );
-        }
-        for cell in 0..a.biomes().len() {
-            assert_eq!(
-                a.biomes().get(cell),
-                b.biomes().get(cell),
-                "section {index}, biome cell {cell}"
-            );
-        }
-        assert_eq!(a.sky_light(), b.sky_light(), "section {index} sky light");
-        assert_eq!(
-            a.block_light(),
-            b.block_light(),
-            "section {index} block light"
-        );
-    }
-    for kind in HeightmapKind::ALL {
-        assert_eq!(
-            left.heightmaps().get(kind).as_longs(),
-            right.heightmaps().get(kind).as_longs(),
-            "{}",
-            kind.nbt_key()
-        );
-    }
-    assert_eq!(left.block_entities(), right.block_entities());
-}
-
 fn cycle_through_memory(chunk: &Chunk, timestamp: i32) -> Chunk {
     let bytes = encode(chunk);
     let mut file = RegionFile::open(MemoryStore::new(), REGION).expect("opens");
@@ -468,7 +419,10 @@ fn a_chunk_survives_an_in_memory_round_trip_through_the_region_store() {
     let original = interesting_chunk(pos);
     let restored = cycle_through_memory(&original, 1_234_567_890);
 
-    assert_chunks_equivalent(&restored, &original);
+    assert_eq!(
+        restored, original,
+        "the chunk that came back is the chunk that left"
+    );
 
     // Spot-check the parts that matter most, in case the helper ever grows a
     // blind spot. The middle section's junk layer tops out at y = -16 in
@@ -544,7 +498,10 @@ fn a_chunk_survives_a_round_trip_through_a_file_on_disk() {
     let restored = DirectFormat
         .read_chunk(pos, world(), stored.as_bytes())
         .expect("decodes");
-    assert_chunks_equivalent(&restored, &original);
+    assert_eq!(
+        restored, original,
+        "the chunk that came back is the chunk that left"
+    );
 }
 
 #[test]
@@ -672,7 +629,7 @@ fn many_chunks_across_a_region_round_trip_together() {
         let restored = DirectFormat
             .read_chunk(*pos, world(), stored.as_bytes())
             .expect("decodes");
-        assert_chunks_equivalent(&restored, &expected);
+        assert_eq!(restored, expected);
         assert_eq!(reopened.timestamp(*pos), Some(index as i32));
     }
 }
