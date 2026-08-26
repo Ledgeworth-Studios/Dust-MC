@@ -66,6 +66,7 @@ pub mod bits;
 pub mod container;
 pub mod coords;
 pub mod heightmap;
+pub mod light;
 pub mod palette;
 pub mod region;
 
@@ -73,5 +74,6 @@ pub use bits::{BitStorage, BitStorageError};
 pub use container::{ContainerError, PalettedContainer, Strategy};
 pub use coords::{ChunkPos, RegionPos};
 pub use heightmap::{Heightmap, HeightmapKind, HeightmapSet, WorldHeight};
+pub use light::{LightArray, LightArrayError};
 pub use palette::{Palette, PaletteKind};
 pub use region::{ChunkPayload, Compression, RegionError, RegionFile};
