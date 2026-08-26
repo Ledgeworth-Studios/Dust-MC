@@ -24,7 +24,8 @@
 //!    merely unreliable but attacker-selectable.
 //! 3. **SNBT**, the textual form used by commands and `/data`:
 //!    `{Count:1b,id:"minecraft:stone"}`. This is [`snbt::parse`] and
-//!    [`snbt::to_string`].
+//!    [`snbt::to_string`], or [`snbt::to_string_with`] under an explicit
+//!    [`PrintProfile`] when the presentation matters.
 //!
 //! The fourth is **Bedrock Edition NBT**, which is little-endian, has a
 //! VarInt-length variant for network use, and is not implemented here at all.

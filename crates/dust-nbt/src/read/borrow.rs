@@ -530,7 +530,7 @@ impl<'input> CompoundView<'input> {
 ///
 /// let document = borrow::from_bytes(&original)?;
 /// assert_eq!(document.root_name(), "level");
-/// assert_eq!(document.root(), borrow::Value::Long(3955));
+/// assert_eq!(document.root(), &borrow::Value::Long(3955));
 /// # Ok(())
 /// # }
 /// ```
