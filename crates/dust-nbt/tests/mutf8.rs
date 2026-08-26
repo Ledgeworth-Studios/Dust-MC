@@ -180,13 +180,15 @@ fn lone_surrogates_are_an_error_that_names_the_surrogate() {
             value: 0xd83d
         })
     );
-    // A high surrogate at the very end of the payload.
+    // A high surrogate at the very end of the payload. The string carries its
+    // own length, so nothing is truncated: the payload is complete and holds a
+    // surrogate with no partner, which is what the error names and where it
+    // names it.
     assert_eq!(
         mutf8::decode(&[0x41, 0xed, 0xa0, 0xbd]),
-        Err(Mutf8Error::Truncated {
+        Err(Mutf8Error::UnpairedSurrogate {
             offset: 1,
-            needed: 6,
-            available: 3
+            value: 0xd83d
         })
     );
 }

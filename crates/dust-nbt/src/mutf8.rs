@@ -64,6 +64,18 @@
 //! surrogate in it, and will refuse the whole document rather than the one
 //! string. If that ever turns up in the wild it is a decision to revisit, not a
 //! bug in this function.
+//!
+//! # Which error an unpaired surrogate produces
+//!
+//! Always [`Mutf8Error::UnpairedSurrogate`], at the *high* surrogate's own
+//! offset, whether its partner is missing outright, cut off by the end of the
+//! payload, or present but not a low surrogate. A string carries its own length
+//! prefix, so bytes that stop after a complete high surrogate are not a
+//! truncated document — they are a complete document that holds a character
+//! Java permits and Rust cannot, and [`Mutf8Error::Truncated`] would send an
+//! operator looking for corruption that is not there. `Truncated` stays
+//! reserved for a sequence cut short mid-way, where bytes genuinely are
+//! missing: `ed a0` or `c2` at the end of a payload.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -92,6 +104,10 @@ pub enum Mutf8Error {
     /// anything but `U+0000`, or a three-byte form below `U+0800`.
     Overlong { offset: usize, value: u32 },
     /// A surrogate with no partner, which no `String` can hold.
+    ///
+    /// Also the error for a high surrogate whose partner is cut off by the end
+    /// of the payload or is not a low surrogate; see the module note on this
+    /// error. The offset is the high surrogate's own.
     UnpairedSurrogate { offset: usize, value: u32 },
 }
 
@@ -255,14 +271,16 @@ pub fn encode(text: &str) -> Vec<u8> {
 /// caller that only wants to compare a key against a name do so without
 /// allocating at all.
 pub fn decode(bytes: &[u8]) -> Result<Cow<'_, str>, Mutf8Error> {
-    // `00`, `c0` and `ed` are the only bytes whose meaning differs between the
-    // two encodings — a raw NUL that this encoding forbids, the lead of the
-    // two-byte NUL, and the lead of a surrogate half. A payload with none of
-    // them means the same thing in both, so `from_utf8` settles it. The scan is
-    // the shape the optimiser vectorises, and it lets the common case — every
-    // key and nearly every value in a real document — skip the decoder and the
+    // `00`, `c0`, and everything from `ed` up are the only bytes whose meaning
+    // differs between the two encodings: a raw NUL that this encoding forbids,
+    // the lead of the two-byte NUL, the lead of a surrogate half — and the lead
+    // of standard UTF-8's four-byte form, which `readUTF` refuses and which
+    // must not be waved through by `from_utf8`. A payload with none of them
+    // means the same thing in both, so `from_utf8` settles it. The scan is the
+    // shape the optimiser vectorises, and it lets the common case — every key
+    // and nearly every value in a real document — skip the decoder and the
     // allocation entirely.
-    if !bytes.iter().any(|&b| b == 0 || b == 0xc0 || b == 0xed) {
+    if !bytes.iter().any(|&b| b == 0 || b == 0xc0 || b >= 0xed) {
         if let Ok(text) = std::str::from_utf8(bytes) {
             return Ok(Cow::Borrowed(text));
         }
@@ -348,10 +366,13 @@ fn decode_slow(bytes: &[u8]) -> Result<String, Mutf8Error> {
 
 fn read_low_surrogate(bytes: &[u8], index: usize, start: usize) -> Result<u32, Mutf8Error> {
     let Some(window) = bytes.get(index..index + 3) else {
-        return Err(Mutf8Error::Truncated {
+        // The payload ended before a partner could appear. A document is not
+        // truncated here — the string carries its own length, so these are all
+        // the bytes it has — and what it holds is a high surrogate with
+        // nothing to complete it, which is the thing to name.
+        return Err(Mutf8Error::UnpairedSurrogate {
             offset: start,
-            needed: 6,
-            available: bytes.len() - start,
+            value: high_surrogate_value(bytes, start),
         });
     };
     if window[0] & 0xf0 != 0xe0 || window[1] & 0xc0 != 0x80 || window[2] & 0xc0 != 0x80 {
