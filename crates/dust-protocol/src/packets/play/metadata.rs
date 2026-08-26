@@ -153,7 +153,13 @@ impl MetadataValue {
         }
     }
 
-    fn read<R: WireRead + ?Sized>(
+    /// Read one value known to have this serializer id.
+    ///
+    /// Public because callers that walk metadata by hand — tooling, tests,
+    /// and eventually dust-sim's entity code — need the same dispatch the
+    /// entries list uses, and because keeping it public is what makes the
+    /// closed/open boundary inspectable from outside.
+    pub fn read<R: WireRead + ?Sized>(
         serializer: i32,
         input: &mut R,
         version: ProtocolVersion,

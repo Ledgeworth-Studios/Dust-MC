@@ -60,10 +60,18 @@ const TAG_BYTE: u8 = 1;
 
 /// How deep a component may nest before both directions give up.
 ///
-/// The same bound [`nbt::scan`] applies, and for the same reason: `decode`
-/// recurses on attacker-reachable bytes, a stack overflow in Rust is an abort
-/// no caller can catch, and the limit is the entire defence.
-const MAX_DEPTH: u32 = nbt::MAX_DEPTH;
+/// The bound [`nbt::scan`] applies to the underlying NBT, and for the same
+/// reason: decoding recurses on attacker-reachable bytes, a stack overflow in
+/// Rust is an abort no caller can catch, and the limit is the entire defence.
+///
+/// One component level inside an `extra` list is a compound **and** a list,
+/// and the scanner charges for both, so the encoder spends two of this budget
+/// per level. That keeps the two sides honest with each other: anything this
+/// module writes is something it will read back.
+pub const MAX_DEPTH: u32 = nbt::MAX_DEPTH;
+
+/// The budget one `extra` level costs against [`MAX_DEPTH`].
+pub const DEPTH_PER_LEVEL: u32 = 2;
 
 /// One node of a formatted message.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -298,6 +306,21 @@ fn encode_at_depth<W: WireWrite + ?Sized>(
     }
 
     write_tag(out, TAG_COMPOUND);
+    write_compound_payload(component, out, depth)
+}
+
+/// The compound's entries and terminating byte, **without** its leading tag.
+///
+/// Split from [`encode_at_depth`] because an NBT list declares one element
+/// type for all its members and then writes their payloads bare — so children
+/// of an `extra` list that are compounds must not repeat a tag the list
+/// already stated. Getting this wrong double-tags every child, which scans
+/// fine as garbage and renders as nothing.
+fn write_compound_payload<W: WireWrite + ?Sized>(
+    component: &Component,
+    out: &mut W,
+    depth: u32,
+) -> Result<(), EncodeError> {
     // An NBT compound entry is the **type byte first**, then the name, then
     // the payload — the opposite order to how one reads a map, and the kind
     // of thing the round trips exist to catch. Every branch below follows it.
@@ -333,15 +356,37 @@ fn encode_at_depth<W: WireWrite + ?Sized>(
         }
     }
     if !component.extra.is_empty() {
-        let count = i32::try_from(component.extra.len()).map_err(|_| EncodeError::TooManyElements {
-            count: component.extra.len(),
+        // An NBT list is homogeneous: one element type, then count, then the
+        // payloads with no tags. If every child is a plain string they travel
+        // as string elements — the form vanilla emits for `["a","b"]` — and
+        // otherwise every child travels as a compound, wrapping any plain
+        // ones, because a mixed list cannot be spelled in NBT at all.
+        let all_bare = component.extra.iter().all(is_bare_string);
+        let element = if all_bare { TAG_STRING } else { TAG_COMPOUND };
+        let count = i32::try_from(component.extra.len()).map_err(|_| {
+            EncodeError::TooManyElements {
+                count: component.extra.len(),
+            }
         })?;
-        write_key(out, "extra");
         write_tag(out, TAG_LIST);
-        write_tag(out, TAG_COMPOUND);
-        out.write_var_int(count);
+        write_key(out, "extra");
+        write_tag(out, element);
+        out.write_i32(count);
         for child in &component.extra {
-            encode_at_depth(child, out, depth + 1)?;
+            if all_bare {
+                let Body::Text(text) = &child.body else {
+                    unreachable!("checked by `all_bare`");
+                };
+                write_nbt_string(out, text);
+            } else {
+                if depth + DEPTH_PER_LEVEL > MAX_DEPTH {
+                    return Err(EncodeError::Unsupported {
+                        field: "text component",
+                        why: "the tree nests deeper than the decoder will read",
+                    });
+                }
+                write_compound_payload(child, out, depth + DEPTH_PER_LEVEL)?;
+            }
         }
     }
     write_tag(out, TAG_END);
@@ -478,17 +523,35 @@ fn read_compound(
                 }
             }
             ("extra", TAG_LIST) => {
+                // The list declares one element type for all children, then a
+                // big-endian count, then the payloads with no tags — the same
+                // homogeneity rule the encoder follows.
                 let element = reader.byte()?;
-                if element != TAG_COMPOUND {
-                    return Err(DecodeError::Unsupported {
-                        field: "text component extra",
-                        why: "children must be compounds; this list holds something else",
-                    });
-                }
-                let count = read_var_int_len(reader)?;
-                extra.reserve(count.min(reader.bytes.len()));
-                for _ in 0..count {
-                    extra.push(read_component(reader, depth + 1)?);
+                let count = read_list_len(reader)?;
+                match element {
+                    TAG_STRING => {
+                        extra.reserve(count.min(reader.bytes.len()));
+                        for _ in 0..count {
+                            extra.push(Component::text(read_nbt_string(reader)?));
+                        }
+                    }
+                    TAG_COMPOUND => {
+                        extra.reserve(count.min(reader.bytes.len()));
+                        for _ in 0..count {
+                            extra.push(read_compound(reader, depth + 1)?);
+                        }
+                    }
+                    other => {
+                        return Err(DecodeError::Unsupported {
+                            field: "text component extra",
+                            why: if other == TAG_END && count == 0 {
+                                "an empty list still spells its element type"
+                            } else {
+                                "children are strings or compounds; this list holds something \
+                                 else"
+                            },
+                        });
+                    }
                 }
             }
             (key, _) => {
@@ -502,22 +565,14 @@ fn read_compound(
     Ok(Component { body, style, extra })
 }
 
-fn read_var_int_len(reader: &mut ReaderAtEnd<'_>) -> Result<usize, DecodeError> {
-    let mut value: u32 = 0;
-    let mut shift = 0;
-    loop {
-        let byte = reader.byte()?;
-        value |= u32::from(byte & 0x7F) << shift;
-        if byte & 0x80 == 0 {
-            return usize::try_from(value).map_err(|_| DecodeError::Nbt {
-                why: "a list length does not fit the address space",
-            });
-        }
-        shift += 7;
-        if shift >= 32 {
-            return Err(DecodeError::VarIntTooLong { bits: 32 });
-        }
-    }
+fn read_list_len(reader: &mut ReaderAtEnd<'_>) -> Result<usize, DecodeError> {
+    // An NBT list count is a signed 32-bit big-endian integer, and a negative
+    // one is a hostile input rather than an empty list.
+    let bytes = reader.take(4)?;
+    let value = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    usize::try_from(value).map_err(|_| DecodeError::Nbt {
+        why: "a list length is negative",
+    })
 }
 
 fn read_nbt_string(reader: &mut ReaderAtEnd<'_>) -> Result<String, DecodeError> {

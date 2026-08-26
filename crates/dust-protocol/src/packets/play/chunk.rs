@@ -163,7 +163,57 @@ wire_struct! {
         block_mask: crate::types::BitSet,
         empty_sky_mask: crate::types::BitSet,
         empty_block_mask: crate::types::BitSet,
-        sky_arrays: Vec<PrefixedBytes<LIGHT_SECTION_BYTES>>,
-        block_arrays: Vec<PrefixedBytes<LIGHT_SECTION_BYTES>>,
+        sky_arrays: Vec<LightArray>,
+        block_arrays: Vec<LightArray>,
+    }
+}
+
+/// One section's light values: exactly [`LIGHT_SECTION_BYTES`] bytes, half a
+/// byte per block, low nibble first.
+///
+/// Its own type rather than prefixed bytes because the length is a constant
+/// of the format, not data: the prefix on the wire must be 2048, and a value
+/// that said otherwise is structural nonsense best caught at the byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LightArray(pub Vec<u8>);
+
+impl Default for LightArray {
+    fn default() -> Self {
+        Self(vec![0; LIGHT_SECTION_BYTES])
+    }
+}
+
+impl Decode for LightArray {
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        _version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        let len = input.read_var_int()?;
+        let len = usize::try_from(len).map_err(|_| DecodeError::NegativeLength {
+            field: "light array",
+            value: len,
+        })?;
+        if len != LIGHT_SECTION_BYTES {
+            return Err(DecodeError::StringTooLong {
+                limit: LIGHT_SECTION_BYTES,
+                actual: len,
+            });
+        }
+        input.read_vec(LIGHT_SECTION_BYTES).map(Self)
+    }
+}
+
+impl Encode for LightArray {
+    fn encode<W: WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        _version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        let len = i32::try_from(self.0.len()).map_err(|_| EncodeError::TooManyElements {
+            count: self.0.len(),
+        })?;
+        out.write_var_int(len);
+        out.write_slice(&self.0);
+        Ok(())
     }
 }

@@ -270,7 +270,7 @@ fn play_frames(out: &mut Vec<Frame>) {
     use dust_protocol::packets::play::chat::{
         AcknowledgedMessage, ChatFilter, MessageAcknowledgement, SignatureBytes,
     };
-    use dust_protocol::packets::play::chunk::{BlockEntity, ChunkData, LightData};
+    use dust_protocol::packets::play::chunk::{BlockEntity, ChunkData, LightArray, LightData};
     use dust_protocol::packets::play::clientbound as cb;
     use dust_protocol::packets::play::metadata::{MetadataEntries, MetadataValue};
     use dust_protocol::packets::play::player_info::{
@@ -281,7 +281,6 @@ fn play_frames(out: &mut Vec<Frame>) {
         Abilities, BlockChangeEntry, ChunkSectionPosition, DeathLocation, EntityDelta,
         EntityVelocity, GameModeByte, PreviousGameMode, TeleportFlags,
     };
-    use dust_protocol::types::BitSet;
 
     let signature: SignatureBytes = core::array::from_fn(|i| (i * 7 + 3) as u8);
 
@@ -319,8 +318,8 @@ fn play_frames(out: &mut Vec<Frame>) {
             block_mask: bitset(&[5]),
             empty_sky_mask: bitset(&[]),
             empty_block_mask: bitset(&[0, 1, 2, 3]),
-            sky_arrays: vec![PrefixedBytes(vec![0xFF; 2048]); 3],
-            block_arrays: vec![PrefixedBytes(vec![0x00; 2048])],
+            sky_arrays: vec![LightArray(vec![0xFF; 2048]); 3],
+            block_arrays: vec![LightArray(vec![0x00; 2048])],
         },
     }));
     out.push(frame!(cb, Play, Clientbound, cb::KeepAlive { id: i64::MIN + 7 }));
