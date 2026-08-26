@@ -1,0 +1,4 @@
+# The vanilla corpus: region files a real Minecraft server wrote, plus the
+# scratch server directories used to produce and re-check them. Mojang's, not
+# ours, and never committed. `tools/generate-corpus.sh` recreates it.
+.corpus/
