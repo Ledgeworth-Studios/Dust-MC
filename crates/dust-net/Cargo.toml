@@ -8,6 +8,110 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+# Every dependency here is reachable by bytes an unauthenticated stranger sent,
+# so the feature lists are narrow on purpose: a feature that is off cannot drag
+# in a crate nobody read.
+
+# The async runtime. `io` explains why tokio rather than another; in short, it
+# is the only runtime whose cancellation story survives the read timeouts this
+# crate needs.
+tokio = { version = "1", default-features = false, features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+
+# zlib. `rust_backend` selects miniz_oxide over a vendored C zlib. The frame
+# decoder is the first code an attacker reaches, and `unsafe_code = "deny"` at
+# the workspace root would be a claim about only the Rust half of this process
+# if the decompressor underneath it were C.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+# AES-128 and the CFB8 mode Minecraft encrypts its stream with. RustCrypto
+# rather than hand-rolled: `crypt` is not the place for this repository to be
+# the only implementation of a cipher mode in the room.
+#
+# The 0.9 line rather than the 0.8 line for a licence-tooling reason, not a
+# cryptographic one — see the note on `rsa` below.
+aes = "0.9"
+cfb8 = "0.9"
+
+# RSA-1024 for the login key exchange.
+#
+# **This is a release candidate, deliberately.** The released `rsa` 0.9 line
+# depends on `num-bigint-dig`, whose manifest spells its licence with Cargo's
+# legacy `MIT/Apache-2.0` slash syntax. `cargo xtask licenses` cannot evaluate
+# that spelling and — correctly, since a licence checker that guesses is worse
+# than none — refuses it rather than assuming. `rsa` 0.10 replaced the bignum
+# with `crypto-bigint`, which spells the same dual licence the SPDX way. The
+# 0.8-line RustCrypto crates are excluded for the same reason: they reach
+# `generic-array` 0.14, whose build dependency `version_check` also uses the
+# slash spelling.
+#
+# The real fix is one line in `xtask/src/licenses.rs` — treat `/` as `OR`, the
+# meaning Cargo documents for it. That file is not this crate's to change.
+rsa = { version = "0.10.0-rc.18", default-features = false, features = [
+    "std",
+    "encoding",
+] }
+
+# The OS CSPRNG, for the server keypair and the verify token. Not `rand`: the
+# only randomness this crate needs is "give me n unpredictable bytes", and
+# taking the whole distribution library to get it widens the audit for nothing.
+# The OS CSPRNG, for the server key pair and the verify token. Only `os_rng`:
+# the distributions, the thread-local generator and the seedable PRNGs are all
+# off, because the only randomness this crate wants is "give me n
+# unpredictable bytes from the operating system".
+#
+# The 0.10 line, because that is the one built on the `rand_core` 0.10 that
+# `rsa` 0.10 speaks. Two `rand_core` versions in one graph compile happily and
+# then fail to satisfy `rsa`'s `CryptoRng` bound, because they are two
+# different traits with the same name — an error that reads as if the OS
+# CSPRNG were not a CSPRNG.
+rand = { version = "0.10", default-features = false, features = ["sys_rng"] }
+
+# The SHA-1 the login handshake hashes the server id with. Not a security
+# choice — the protocol specifies SHA-1 and Mojang's session server checks it,
+# so this is interoperability with a fixed wire format, not cryptography.
+sha1 = "0.11"
+
+[dev-dependencies]
+# The tests build decompression bombs and hand-rolled malformed frames, which
+# means constructing zlib streams the encoder in this crate would never emit.
+# A test that can only produce what the code under test produces cannot test
+# what an attacker produces.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+tokio = { version = "1", default-features = false, features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+
+# The mock client in `tests/login_session.rs` plays the client's half of the
+# key exchange, which means *encrypting* under the server's public key;
+# `login.rs` itself only ever decrypts. Same version pin and the same licence
+# reasoning as the main dependency above, and no new crate enters the graph.
+rsa = { version = "0.10.0-rc.18", default-features = false, features = [
+    "std",
+    "encoding",
+] }
+
+# Raw AES blocks for the independent CFB8 implementation the known-answer
+# test in `tests/crypto_hardening.rs` computes its vectors with.
+aes = "0.9"
+
+# PKCS#1 v1.5 padding is randomized, so the mock client needs a source of
+# unpredictability for its encryption. Same pin as the main dependency; the
+# OS generator only, for the reasons given there.
+rand = { version = "0.10", default-features = false, features = ["sys_rng"] }
 
 [lints]
 workspace = true
