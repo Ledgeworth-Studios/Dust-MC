@@ -527,13 +527,20 @@ mod tests {
         // The mechanism the growing Play definitions rely on: a pair outside
         // the complete list gets its definitions validated but is not required
         // to cover its table yet.
-        let table = [(
-            ConnectionState::Play,
-            Direction::Clientbound,
-            "minecraft:explode",
-        )];
+        let table = [
+            (
+                ConnectionState::Play,
+                Direction::Clientbound,
+                "minecraft:explode",
+            ),
+            (
+                ConnectionState::Play,
+                Direction::Clientbound,
+                "minecraft:not_written_yet",
+            ),
+        ];
         static CLAIMED: &[PacketMeta] = &[PacketMeta {
-            name: "minecraft:login",
+            name: "minecraft:explode",
             state: ConnectionState::Play,
             direction: Direction::Clientbound,
             versions: &["1.21.1"],
@@ -542,14 +549,14 @@ mod tests {
             .iter()
             .flat_map(|&s| Direction::ALL.map(move |d| (s, d)))
             .collect();
-        let problems = undefined_in("1.21.1", &table, &[CLAIMED]);
-        assert!(!problems.is_empty(), "`minecraft:explode` is undefined");
+
+        // Held complete, every unclaimed packet is a complaint; incomplete,
+        // only `minecraft:not_written_yet`'s absence is tolerated and nothing
+        // else is wrong.
         let problems =
             undefined_in_partial("1.21.1", &table, &[CLAIMED], &all_complete);
-        assert!(
-            !problems.is_empty(),
-            "holding every pair complete must report the gap"
-        );
+        assert_eq!(problems.len(), 1, "{problems:#?}");
+        assert!(problems[0].contains("not_written_yet"), "{problems:#?}");
         let problems = undefined_in_partial("1.21.1", &table, &[CLAIMED], &[]);
         assert!(problems.is_empty(), "{problems:#?}");
     }
@@ -559,26 +566,34 @@ mod tests {
         // What happens when Play/clientbound is added to COMPLETE_PAIRS while
         // packets are still missing: one complaint per missing packet. This is
         // the check that makes graduation irreversible without finishing.
+        let version = ProtocolVersion::from_name("1.21.1").expect("the table exists");
         let mut table = Vec::new();
-        for (_, name) in ProtocolVersion::from_name("1.21.1")
-            .expect("the table exists")
-            .table(ConnectionState::Play, Direction::Clientbound)
-            .packets()
-        {
-            table.push((ConnectionState::Play, Direction::Clientbound, name));
+        for state in ConnectionState::ALL {
+            for direction in Direction::ALL {
+                for (_, name) in version.table(state, direction).packets() {
+                    table.push((state, direction, name));
+                }
+            }
         }
         let problems = undefined_in_partial(
-            "1.21.1",
+            version.name(),
             &table,
             GROUPS,
             &[(ConnectionState::Play, Direction::Clientbound)],
         );
+        let play_clientbound_missing = unclaimed_for(version)
+            .into_iter()
+            .filter(|(state, direction, _)| {
+                (*state, *direction) == (ConnectionState::Play, Direction::Clientbound)
+            })
+            .count();
+        assert!(
+            play_clientbound_missing > 0,
+            "the premise is that packets remain"
+        );
         assert_eq!(
             problems.len(),
-            unclaimed_for(ProtocolVersion::from_name("1.21.1").unwrap())
-                .iter()
-                .filter(|(s, d, _)| (*s, *d) == (ConnectionState::Play, Direction::Clientbound))
-                .count(),
+            play_clientbound_missing,
             "every unclaimed packet of a graduated pair is a complaint"
         );
     }
