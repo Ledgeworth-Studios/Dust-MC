@@ -21,7 +21,7 @@
 
 use crate::types::{BitSet, Decode, Encode, FixedBitSet, VarInt};
 use crate::wire::{DecodeError, EncodeError, WireRead, WireWrite};
-use crate::{wire_struct, ProtocolVersion};
+use crate::{var_int_enum, wire_struct, ProtocolVersion};
 
 /// How many bytes a chat signature always is.
 ///
@@ -167,5 +167,14 @@ impl Encode for ChatFilter {
             }
         }
         Ok(())
+    }
+}
+
+var_int_enum! {
+    /// What a chat-completions update does to the client's hint set.
+    pub enum ChatCompletionsAction {
+        Add = 0,
+        Remove = 1,
+        Set = 2,
     }
 }

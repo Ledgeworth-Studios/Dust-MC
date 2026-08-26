@@ -24,8 +24,8 @@ use dust_protocol::packets::common::{
 };
 use dust_protocol::packets::{configuration, handshake, login, status};
 use dust_protocol::types::{
-    Angle, BitSet, BoundedString, ChatVisibility, FixedBitSet, Identifier, MainHand, NextState,
-    Position, PrefixedBytes, ResourcePackResult, RestOfPacket, Uuid, VarInt,
+    BitSet, BoundedString, ChatVisibility, FixedBitSet, Identifier, MainHand, NextState, Position,
+    PrefixedBytes, ResourcePackResult, RestOfPacket, Uuid, VarInt,
 };
 use dust_protocol::version;
 use dust_protocol::wire::{DecodeError, Reader, Writer};
@@ -539,7 +539,7 @@ fn play_frames(out: &mut Vec<Frame>) {
         Abilities, BlockChangeEntry, ChunkSectionPosition, DeathLocation, EntityDelta,
         EntityVelocity, GameModeByte, PreviousGameMode, TeleportFlags,
     };
-    use dust_protocol::types::{ProtocolString, Slot};
+    use dust_protocol::types::{ProtocolString, Slot, VarLong};
 
     let signature: SignatureBytes = core::array::from_fn(|i| (i * 7 + 3) as u8);
 
@@ -1241,6 +1241,30 @@ fn play_frames(out: &mut Vec<Frame>) {
                         category: CraftingBookCategory::Equipment,
                     },
                 },
+                Recipe {
+                    id: id("minecraft:baked_potato"),
+                    kind: RecipeKind::Cooking {
+                        type_id: 15,
+                        data: dust_protocol::packets::play::containers::CookingData {
+                            group: ProtocolString::new("food").expect("fits"),
+                            category: CookingBookCategory::Food,
+                            ingredient: Ingredient {
+                                items: vec![Slot::Present {
+                                    count: 1,
+                                    item_id: 144,
+                                    removed_components: vec![],
+                                }],
+                            },
+                            result: Slot::Present {
+                                count: 1,
+                                item_id: 145,
+                                removed_components: vec![],
+                            },
+                            experience: 0.35,
+                            cooking_time: VarInt(100),
+                        },
+                    },
+                },
             ],
         }
     ));
@@ -1300,6 +1324,899 @@ fn play_frames(out: &mut Vec<Frame>) {
                 action: SeenAdvancementsAction::OpenedTab,
                 tab: Some(id("minecraft:recipes/root")),
             },
+        }
+    ));
+
+    // ---- wave three: the remaining clientbound families ----
+    use dust_protocol::packets::play::attributes::{AttributeModifier, AttributeProperty};
+    use dust_protocol::packets::play::containers::StatisticEntry;
+    use dust_protocol::packets::play::containers::{
+        CookingBookCategory, MerchantOffersBody, RecipeBookAction, RecipeBookBody,
+        RecipeBookSettings, TradeItem, TradeOffer,
+    };
+    use dust_protocol::packets::play::scoreboard::{
+        CollisionRule, NameTagVisibility, ObjectiveMode, ObjectiveRenderType, ScoreboardSlot,
+        TeamBody, TeamInfo, TeamMethod,
+    };
+    use dust_protocol::packets::play::{
+        Anchor, DamageSourcePosition, Difficulty, DifficultyByte, EffectFlags, EntityLinkKind,
+        ExplosionInteraction, ExplosionRecord, Gamemode, Hand, LookAtTarget, OffsetEntityId,
+        RespawnFlags,
+    };
+    use dust_protocol::types::Angle;
+
+    out.push(frame!(cb, Play, Clientbound, cb::BundleDelimiter {}));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::Animate {
+            entity_id: VarInt(31),
+            animation: 0,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::AwardStats {
+            statistics: vec![
+                StatisticEntry {
+                    category: VarInt(1),
+                    statistic: VarInt(42),
+                    value: VarInt(9001),
+                },
+                StatisticEntry {
+                    category: VarInt(2),
+                    statistic: VarInt(-5),
+                    value: VarInt(0),
+                },
+            ],
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::BlockChangedAck {
+            sequence: VarInt(404)
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::BlockDestruction {
+            entity_id: VarInt(88),
+            location: Position::new(64, -51, 1000),
+            destroy_stage: 7,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::BlockEntityData {
+            location: Position::new(-9, 128, 9),
+            kind: VarInt(13),
+            data: some_nbt(),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::BlockEvent {
+            location: Position::new(0, 320, -1),
+            action_id: 1,
+            action_parameter: 15,
+            block_type: VarInt(220),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::ChangeDifficulty {
+            difficulty: DifficultyByte(Difficulty::Hard),
+            locked: true,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::ChunkBatchFinished {
+            batch_size: VarInt(17)
+        }
+    ));
+    out.push(frame!(cb, Play, Clientbound, cb::ChunkBatchStart {}));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::ChunksBiomes {
+            chunks: vec![dust_protocol::packets::play::chunk::ChunkBiomesEntry {
+                chunk_z: -7,
+                chunk_x: 33,
+                data: PrefixedBytes(vec![0x11; 24]),
+            }],
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::ClearTitles { reset: true }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::ContainerClose { window_id: 12 }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::ContainerSetData {
+            window_id: 1,
+            property: 3,
+            value: 200,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::CookieRequest {
+            key: id("dust:session")
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::Cooldown {
+            item_id: VarInt(88),
+            cooldown_ticks: VarInt(25),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::CustomChatCompletions {
+            action: dust_protocol::packets::play::chat::ChatCompletionsAction::Add,
+            entries: vec![
+                ProtocolString::new("Notch").expect("fits"),
+                ProtocolString::new("Dinnerbone").expect("fits"),
+            ],
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::DamageEvent {
+            entity_id: VarInt(19),
+            source_type: VarInt(37),
+            source_cause: OffsetEntityId(Some(4)),
+            source_direct: OffsetEntityId(None),
+            source_position: Some(DamageSourcePosition {
+                x: 8.5,
+                y: -60.25,
+                z: 512.125,
+            }),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::DisguisedChat {
+            message: dust_protocol::text::Component::text("[Server] hello"),
+            chat_type: VarInt(6),
+            sender_name: dust_protocol::text::Component::text("Console"),
+            target_name: None,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::EntityEvent {
+            entity_id: -40,
+            status: 7,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::Explode {
+            x: -16.5,
+            y: 65.0,
+            z: 999.75,
+            radius: 4.0,
+            records: vec![
+                ExplosionRecord { x: 1, y: 0, z: -1 },
+                ExplosionRecord { x: 0, y: 2, z: 0 },
+            ],
+            player_motion_x: 0.5,
+            player_motion_y: -0.25,
+            player_motion_z: 1.5,
+            block_interaction: ExplosionInteraction::DestroyWithDecay,
+            small_particle: ParticleValue::None { id: 21 },
+            large_particle: ParticleValue::BlockState {
+                id: 1,
+                state: VarInt(77),
+            },
+            sound: SoundId::Id(VarInt(14)),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::ForgetLevelChunk {
+            chunk_z: -30000,
+            chunk_x: 29999,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::GameEvent {
+            event: 7,
+            value: 0.75,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::HorseScreenOpen {
+            window_id: 20,
+            slot_count: VarInt(17),
+            entity_id: 123456,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::HurtAnimation {
+            entity_id: VarInt(19),
+            yaw: 137.5,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::InitializeBorder {
+            center_x: 0.5,
+            center_z: -0.5,
+            old_diameter: 59_999_968.0,
+            new_diameter: 10_000.0,
+            lerp_speed: VarLong(-1_000),
+            portal_boundary: VarInt(29_999_984),
+            warning_blocks: VarInt(5),
+            warning_time: VarInt(15),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::LevelEvent {
+            event: 1010,
+            position: Position::new(-1, 64, 1),
+            data: VarInt(1129).0,
+            global: false,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::LightUpdate {
+            chunk_x: VarInt(-3),
+            chunk_z: VarInt(19),
+            light: LightData {
+                sky_mask: bitset(&[0]),
+                block_mask: bitset(&[1, 5]),
+                empty_sky_mask: bitset(&[]),
+                empty_block_mask: bitset(&[2]),
+                sky_arrays: vec![],
+                block_arrays: vec![LightArray(
+                    vec![0x0F; dust_protocol::packets::play::chunk::LIGHT_SECTION_BYTES]
+                )],
+            },
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::MerchantOffers {
+            window_id: VarInt(9),
+            body: MerchantOffersBody {
+                offers: vec![TradeOffer::simple(
+                    TradeItem {
+                        item_id: VarInt(15),
+                        count: VarInt(20),
+                    },
+                    Slot::Present {
+                        count: 1,
+                        item_id: 16,
+                        removed_components: vec![3],
+                    },
+                )],
+                villager_level: VarInt(3),
+                experience: VarInt(10),
+                regular_villager: true,
+                can_restock: true,
+            },
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::MoveVehicle {
+            x: 0.0,
+            y: -64.0,
+            z: 128.0,
+            yaw: 90.0,
+            pitch: -20.0,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::OpenBook { hand: Hand::Off }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::OpenScreen {
+            window_id: 3,
+            menu_kind: VarInt(14),
+            title: dust_protocol::text::Component::text("Chest").bold(true),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::OpenSignEditor {
+            location: Position::new(5, -50, -5),
+            is_front_text: false,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::PlaceGhostRecipe {
+            window_id: 3,
+            recipe: id("minecraft:oak_planks"),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::PlayerCombatEnd {
+            duration_in_ticks: VarInt(240)
+        }
+    ));
+    out.push(frame!(cb, Play, Clientbound, cb::PlayerCombatEnter {}));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::PlayerCombatKill {
+            player_id: VarInt(1),
+            killer_id: VarInt(999),
+            message: dust_protocol::text::Component::translate("death.fell.accident", None),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::PlayerLookAt {
+            anchor: Anchor::Eyes,
+            x: 0.5,
+            y: 70.0,
+            z: 0.5,
+            target: Some(LookAtTarget {
+                entity_id: VarInt(17),
+                anchor: Anchor::Feet,
+            }),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::RecipeBookUnlock {
+            body: RecipeBookBody {
+                action: RecipeBookAction::Init,
+                settings: RecipeBookSettings {
+                    crafting_open: true,
+                    crafting_filter: false,
+                    ..RecipeBookSettings::default()
+                },
+                changed: vec![id("minecraft:oak_planks"), id("minecraft:stick")],
+                highlighted: Some(vec![id("minecraft:furnace")]),
+            },
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::RemoveMobEffect {
+            entity_id: VarInt(22),
+            effect: VarInt(10),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::ResetScore {
+            entity_name: ProtocolString::new("Notch").expect("fits"),
+            objective: None,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::ResourcePackPop {
+            uuid: Some(Uuid(5))
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::ResourcePackPush {
+            uuid: Uuid(6),
+            url: s("https://example.invalid/p.zip"),
+            hash: s("0123456789012345678901234567890123456789"),
+            forced: true,
+            prompt_message: Some(dust_protocol::nbt::TextComponent(some_nbt())),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::Respawn {
+            dimension_type: VarInt(2),
+            dimension_name: id("minecraft:the_end"),
+            hashed_seed: i64::MAX - 3,
+            game_mode: GameModeByte(dust_protocol::packets::play::Gamemode::Spectator),
+            previous_game_mode: PreviousGameMode(Some(Gamemode::Creative)),
+            debug: false,
+            flat: false,
+            death_location: None,
+            portal_cooldown: VarInt(0),
+            flags: RespawnFlags(RespawnFlags::KEEP_ENTITIES),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::ServerData {
+            motd: dust_protocol::text::Component::text("Dust").colored(
+                dust_protocol::text::Color::Named(dust_protocol::text::NamedColor::Gold)
+            ),
+            icon: None,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::SetActionBarText {
+            text: dust_protocol::text::Component::text("respawning..."),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::SetBorderCenter {
+            center_x: 100.0,
+            center_z: -100.0,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::SetBorderLerpSize {
+            old_diameter: 6000.0,
+            new_diameter: 100.0,
+            lerp_speed: VarLong(86_400_000),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::SetBorderSize {
+            diameter: 59_999_968.0
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::SetBorderWarningDelay {
+            warning_time: VarInt(30)
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::SetBorderWarningDistance {
+            warning_blocks: VarInt(2)
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::SetCamera {
+            camera_entity_id: VarInt(-2)
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::SetCenterChunk {
+            chunk_z: VarInt(-187),
+            chunk_x: VarInt(45),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::SetChunkCacheRadius {
+            distance: VarInt(10)
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::SetDefaultSpawnPosition {
+            location: Position::new(0, 64, 0),
+            angle: -179.75,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::DisplayObjective {
+            slot: ScoreboardSlot::TeamColor(4),
+            score_name: ProtocolString::new("money").expect("fits"),
+            display_text: Some(dust_protocol::text::Component::text("Coins")),
+            render_type: Some(ObjectiveRenderType::Integer),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::LinkEntities {
+            attached_to: -3,
+            connecting_entity: 44,
+            link_kind: EntityLinkKind::Ride,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::SetEntityMotion {
+            entity_id: VarInt(17),
+            velocity: EntityVelocity {
+                x: i16::MIN + 1,
+                y: 8000,
+                z: i16::MAX,
+            },
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::SetExperience {
+            experience_bar: 0.5,
+            total_experience: VarInt(1024),
+            level: VarInt(33),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::SetHealth {
+            health: 0.5,
+            food: VarInt(20),
+            food_saturation: 5.0,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::UpdateObjectives {
+            objective_name: ProtocolString::new("health").expect("fits"),
+            body: {
+                use dust_protocol::packets::play::scoreboard::UpdateObjectivesBody;
+                UpdateObjectivesBody {
+                    mode: ObjectiveMode::Create,
+                    display_name: Some(dust_protocol::text::Component::text("Health")),
+                    render_type: Some(ObjectiveRenderType::Hearts),
+                    number_format: Some(None),
+                }
+            },
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::SetPassengers {
+            vehicle_id: VarInt(44),
+            passengers: vec![VarInt(1), VarInt(2)],
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::UpdateTeams {
+            team_name: ProtocolString::new("red").expect("fits"),
+            body: TeamBody {
+                method: TeamMethod::Create,
+                info: Some(TeamInfo {
+                    display_name: dust_protocol::text::Component::text("Red Team"),
+                    friendly_flags: 0x03,
+                    name_tag_visibility: NameTagVisibility::HideForOtherTeams,
+                    collision_rule: CollisionRule::PushOwnTeam,
+                    colour: VarInt(14),
+                    prefix: dust_protocol::text::Component::text("[R] "),
+                    suffix: dust_protocol::text::Component::text(""),
+                }),
+                members: vec![
+                    ProtocolString::new("Notch").expect("fits"),
+                    ProtocolString::new("jeb_").expect("fits"),
+                ],
+            },
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::UpdateScore {
+            entity_name: ProtocolString::new("Notch").expect("fits"),
+            body: {
+                use dust_protocol::packets::play::scoreboard::UpdateScoreBody;
+                UpdateScoreBody {
+                    objective: ProtocolString::new("money").expect("fits"),
+                    score: VarInt(i32::MAX),
+                    display: None,
+                    number_format: None,
+                }
+            },
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::SetSimulationDistance {
+            distance: VarInt(8)
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::SetSubtitleText {
+            text: dust_protocol::text::Component::text("the subtitle"),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::SetTime {
+            world_age: -1_700_000_000_000,
+            time_of_day: 18_000,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::SetTitleText {
+            text: dust_protocol::text::Component::text("The Title"),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::SetTitlesAnimation {
+            fade_in: 10,
+            stay: 70,
+            fade_out: 20,
+        }
+    ));
+    out.push(frame!(cb, Play, Clientbound, cb::StartConfiguration {}));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::SetTabListHeaderFooter {
+            header: dust_protocol::text::Component::text("header"),
+            footer: dust_protocol::text::Component::text("footer"),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::TagQueryResponse {
+            transaction_id: VarInt(3),
+            nbt: some_nbt(),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::TakeItemEntity {
+            collected_entity_id: VarInt(90),
+            collector_entity_id: VarInt(1),
+            pickup_item_count: VarInt(64),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::TeleportEntity {
+            entity_id: VarInt(19),
+            x: 30_000_000.0,
+            y: -2048.0,
+            z: -30_000_000.0,
+            yaw: Angle(255),
+            pitch: Angle(127),
+            on_ground: false,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::TickingState {
+            tick_rate: 20.0,
+            frozen: true,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::TickStep {
+            tick_steps: VarInt(3)
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::Transfer {
+            host: s("elsewhere.example"),
+            port: VarInt(25566),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::UpdateAttributes {
+            entity_id: VarInt(120),
+            properties: vec![AttributeProperty {
+                attribute_id: VarInt(8),
+                base: 0.1,
+                modifiers: vec![AttributeModifier {
+                    id: id("minecraft:effect/speed"),
+                    amount: 0.3,
+                    operation: 2,
+                }],
+            }],
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::ApplyMobEffect {
+            entity_id: VarInt(17),
+            effect_id: VarInt(1),
+            amplifier: VarInt(0),
+            duration: VarInt(-1),
+            flags: EffectFlags(EffectFlags::SHOW_PARTICLES | EffectFlags::SHOW_ICON),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::UpdateTags {
+            registries: vec![dust_protocol::packets::common::TagRegistry {
+                registry: id("minecraft:block"),
+                tags: vec![dust_protocol::packets::common::Tag {
+                    name: id("minecraft:mineable/axe"),
+                    entries: vec![VarInt(0)],
+                }],
+            }],
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::ProjectilePower {
+            entity_id: VarInt(77),
+            acceleration_power: 1.6,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::CustomReportDetails {
+            details: vec![dust_protocol::packets::common::ReportDetail {
+                title: s("phase"),
+                description: s("wave-three"),
+            }],
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::ServerLinks {
+            links: vec![dust_protocol::packets::common::ServerLink {
+                label: dust_protocol::packets::common::ServerLinkLabel::BuiltIn(
+                    dust_protocol::packets::common::BuiltInLinkLabel::Status
+                ),
+                url: s("https://example.invalid/status"),
+            }],
         }
     ));
 }

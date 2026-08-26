@@ -482,3 +482,276 @@ var_int_enum! {
         PickupAll = 6,
     }
 }
+
+/// One villager trade: what goes in, what comes out, and the bookkeeping the
+/// client renders around it.
+///
+/// The inputs use [`TradeItem`] — id, count and inline components — while the
+/// output is a full [`Slot`]. The output is where enchantments live, which is
+/// why it is the side that can refuse; the refusal inherits Slot's own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TradeOffer {
+    pub buy_a: TradeItem,
+    pub sell: Slot,
+    /// The second input of a two-item trade; absent for most trades.
+    pub buy_b: Option<TradeItem>,
+    /// Whether the trade is currently greyed out.
+    pub disabled: bool,
+    pub uses: i32,
+    pub max_uses: i32,
+    pub villager_xp: i32,
+    /// Added to the price when reputation or demand adjusts it; zero or
+    /// negative.
+    pub special_price: i32,
+    /// How strongly reputation and demand move the price. Low (0.05) or
+    /// high (0.2) in vanilla data.
+    pub price_multiplier: f32,
+    pub demand: i32,
+}
+
+impl Decode for TradeOffer {
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        let buy_a = TradeItem::decode(input, version)?;
+        let sell = Slot::decode(input, version)?;
+        let buy_b = Option::<TradeItem>::decode(input, version)?;
+        let disabled = input.read_bool()?;
+        let uses = input.read_i32()?;
+        let max_uses = input.read_i32()?;
+        let villager_xp = input.read_i32()?;
+        let special_price = input.read_i32()?;
+        let price_multiplier = input.read_f32()?;
+        let demand = input.read_i32()?;
+        Ok(Self {
+            buy_a,
+            sell,
+            buy_b,
+            disabled,
+            uses,
+            max_uses,
+            villager_xp,
+            special_price,
+            price_multiplier,
+            demand,
+        })
+    }
+}
+
+impl Encode for TradeOffer {
+    fn encode<W: WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        self.buy_a.encode(out, version)?;
+        self.sell.encode(out, version)?;
+        self.buy_b.encode(out, version)?;
+        out.write_bool(self.disabled);
+        out.write_i32(self.uses);
+        out.write_i32(self.max_uses);
+        out.write_i32(self.villager_xp);
+        out.write_i32(self.special_price);
+        out.write_f32(self.price_multiplier);
+        out.write_i32(self.demand);
+        Ok(())
+    }
+}
+
+/// Everything after the window id on a merchant offer sync.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MerchantOffersBody {
+    pub offers: Vec<TradeOffer>,
+    /// The trader's progression tier, 1..=5, shown above the trade list.
+    pub villager_level: VarInt,
+    pub experience: VarInt,
+    /// False for the wandering trader, which hides level and restock hints.
+    pub regular_villager: bool,
+    pub can_restock: bool,
+}
+
+impl Decode for MerchantOffersBody {
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        Ok(Self {
+            offers: Vec::<TradeOffer>::decode(input, version)?,
+            villager_level: VarInt::decode(input, version)?,
+            experience: VarInt::decode(input, version)?,
+            regular_villager: input.read_bool()?,
+            can_restock: input.read_bool()?,
+        })
+    }
+}
+
+impl Encode for MerchantOffersBody {
+    fn encode<W: WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        self.offers.encode(out, version)?;
+        self.villager_level.encode(out, version)?;
+        self.experience.encode(out, version)?;
+        out.write_bool(self.regular_villager);
+        out.write_bool(self.can_restock);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The recipe book: which recipes the client may craft
+// ---------------------------------------------------------------------------
+
+var_int_enum! {
+    /// How a recipe-book update changes the client's set.
+    ///
+    /// `Init` replaces everything and carries the highlighted half; add and
+    /// remove patch one list.
+    pub enum RecipeBookAction {
+        Init = 0,
+        Add = 1,
+        Remove = 2,
+    }
+}
+
+/// The eight display booleans the recipe book keeps per tab group, in wire
+/// order: open then filtered for crafting, furnace, blast furnace and
+/// smoker.
+///
+/// A struct rather than eight loose fields because the order is load-bearing
+/// and a definition with eight `bool`s named only by position is how the
+/// furnace flag ends up driving the smoker's icon. They are client-side
+/// display state; nothing here decides what may be crafted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RecipeBookSettings {
+    pub crafting_open: bool,
+    pub crafting_filter: bool,
+    pub furnace_open: bool,
+    pub furnace_filter: bool,
+    pub blast_furnace_open: bool,
+    pub blast_furnace_filter: bool,
+    pub smoker_open: bool,
+    pub smoker_filter: bool,
+}
+
+impl RecipeBookSettings {
+    const FIELDS: usize = 8;
+
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        _version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        let mut flags = [false; Self::FIELDS];
+        for flag in &mut flags {
+            *flag = input.read_bool()?;
+        }
+        Ok(Self {
+            crafting_open: flags[0],
+            crafting_filter: flags[1],
+            furnace_open: flags[2],
+            furnace_filter: flags[3],
+            blast_furnace_open: flags[4],
+            blast_furnace_filter: flags[5],
+            smoker_open: flags[6],
+            smoker_filter: flags[7],
+        })
+    }
+
+    fn encode<W: WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        _version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        out.write_bool(self.crafting_open);
+        out.write_bool(self.crafting_filter);
+        out.write_bool(self.furnace_open);
+        out.write_bool(self.furnace_filter);
+        out.write_bool(self.blast_furnace_open);
+        out.write_bool(self.blast_furnace_filter);
+        out.write_bool(self.smoker_open);
+        out.write_bool(self.smoker_filter);
+        Ok(())
+    }
+}
+
+/// Everything after the packet id on a recipe-book sync.
+///
+/// Two id lists travel together because the book shows two collections: what
+/// the player may craft (`changed`) and, on init, what the book highlights
+/// as uncrafted (`highlighted`). Add and remove carry an empty highlight
+/// list rather than omitting the section — the field count does not move
+/// with the action, so a reader cannot be left guessing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecipeBookBody {
+    pub action: RecipeBookAction,
+    pub settings: RecipeBookSettings,
+    pub changed: Vec<Identifier>,
+    /// Present only when [`RecipeBookAction::Init`] resets the book.
+    pub highlighted: Option<Vec<Identifier>>,
+}
+
+impl Decode for RecipeBookBody {
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        let action = RecipeBookAction::decode(input, version)?;
+        let settings = RecipeBookSettings::decode(input, version)?;
+        let changed = Vec::<Identifier>::decode(input, version)?;
+        let highlighted = if action == RecipeBookAction::Init {
+            Some(Vec::<Identifier>::decode(input, version)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            action,
+            settings,
+            changed,
+            highlighted,
+        })
+    }
+}
+
+impl Encode for RecipeBookBody {
+    fn encode<W: WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        self.action.encode(out, version)?;
+        self.settings.encode(out, version)?;
+        self.changed.encode(out, version)?;
+        if self.action == RecipeBookAction::Init {
+            return match &self.highlighted {
+                Some(list) => list.encode(out, version),
+                None => Err(EncodeError::Unsupported {
+                    field: "recipe book highlights",
+                    why: "an init carries the highlighted recipes and none were given",
+                }),
+            };
+        }
+        Ok(())
+    }
+}
+
+impl TradeOffer {
+    /// A trade with no second input and no bookkeeping history, for tests
+    /// and for building offers from data.
+    pub fn simple(buy_a: TradeItem, sell: Slot) -> Self {
+        Self {
+            buy_a,
+            sell,
+            buy_b: None,
+            disabled: false,
+            uses: 0,
+            max_uses: 7,
+            villager_xp: 2,
+            special_price: 0,
+            price_multiplier: 0.05,
+            demand: 0,
+        }
+    }
+}

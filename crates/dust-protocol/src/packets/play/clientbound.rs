@@ -14,15 +14,21 @@ use crate::packets::play::advancements::AdvancementsBody;
 use crate::packets::play::boss_bar::BossEventBody;
 use crate::packets::play::chunk::{BlockEntity, ChunkData, LightData};
 use crate::packets::play::commands::{CommandsBody, SuggestionMatch};
-use crate::packets::play::containers::{EquipmentEntries, Recipe};
+use crate::packets::play::containers::{EquipmentEntries, MerchantOffersBody, Recipe};
 use crate::packets::play::map_item::MapDataBody;
 use crate::packets::play::metadata::MetadataEntries;
 use crate::packets::play::particle::ParticleValue;
 use crate::packets::play::player_info::PlayerInfoBody;
 use crate::packets::play::sound::{SoundCategory, SoundId, StopSoundBody};
 use crate::packets::play::{chat as chat_fields, TeleportFlags};
-use crate::packets::play::{Abilities, BlockChangeEntry, ChunkSectionPosition, DeathLocation};
-use crate::packets::play::{EntityDelta, EntityVelocity, GameModeByte, PreviousGameMode};
+use crate::packets::play::{
+    Abilities, BlockChangeEntry, ChunkSectionPosition, DeathLocation, DifficultyByte,
+};
+use crate::packets::play::{
+    Anchor, DamageSourcePosition, EffectFlags, EntityDelta, EntityLinkKind, EntityVelocity,
+    ExplosionInteraction, ExplosionRecord, GameModeByte, Hand, LookAtTarget, OffsetEntityId,
+    PreviousGameMode, RespawnFlags,
+};
 use crate::text::Component;
 use crate::types::{Angle, BoundedString, Identifier, Position, RestOfPacket, Uuid, VarInt};
 
@@ -373,5 +379,628 @@ packet_group! {
         start: VarInt,
         length: VarInt,
         matches: Vec<SuggestionMatch>,
+    },
+
+    /// Marks the end of a bundle: every packet since the last delimiter is
+    /// one atomic group the client must apply together.
+    ///
+    /// The body is empty on purpose — the delimiter *is* the message.
+    "minecraft:bundle_delimiter" => BundleDelimiter {},
+
+    /// An entity swung an arm, took damage or left a nest egg. `animation`
+    /// is the protocol's own byte table; the meanings belong to the entity
+    /// that sent it, not to this crate.
+    "minecraft:animate" => Animate {
+        entity_id: VarInt,
+        animation: u8,
+    },
+
+    /// The player's statistic counters, in full. There is no delta form:
+    /// statistics change rarely and the whole map is cheaper than tracking
+    /// what the client still believes.
+    "minecraft:award_stats" => AwardStats {
+        statistics: Vec<crate::packets::play::containers::StatisticEntry>,
+    },
+
+    /// The server acknowledges a client interaction by sequence number,
+    /// closing out the block-change prediction the client made for it.
+    "minecraft:block_changed_ack" => BlockChangedAck {
+        sequence: VarInt,
+    },
+
+    /// A block-breaking animation progresses (or clears, at stage outside
+    /// 0..=9). One entity per stage; several miners on one block each get
+    /// their own crack.
+    "minecraft:block_destruction" => BlockDestruction {
+        entity_id: VarInt,
+        location: Position,
+        destroy_stage: i8,
+    },
+
+    /// A block entity's data changed — chest contents, sign text, beacon
+    /// effects. The NBT is delimited here and interpreted elsewhere.
+    "minecraft:block_entity_data" => BlockEntityData {
+        location: Position,
+        kind: VarInt,
+        data: Nbt,
+    },
+
+    /// A block does something: piston extends, note block plays, chest
+    /// lid opens. Two free-form bytes plus the block's type id; the meaning
+    /// of the bytes belongs to the block, which is why they stay raw.
+    "minecraft:block_event" => BlockEvent {
+        location: Position,
+        action_id: u8,
+        action_parameter: u8,
+        block_type: VarInt,
+    },
+
+    /// Sets the world difficulty and whether the player may change it.
+    ///
+    /// Travels as a bare byte, never as a VarInt — see [`DifficultyByte`].
+    "minecraft:change_difficulty" => ChangeDifficulty {
+        difficulty: DifficultyByte,
+        locked: bool,
+    },
+
+    /// Ends a chunk batch, telling the client how many chunks it contained;
+    /// the client uses its own timing over the batch to pace the next one.
+    "minecraft:chunk_batch_finished" => ChunkBatchFinished {
+        batch_size: VarInt,
+    },
+
+    /// Marks where a chunk batch begins. Nothing but a boundary marker.
+    "minecraft:chunk_batch_start" => ChunkBatchStart {},
+
+    /// Biome sections for chunks the client already holds.
+    ///
+    /// The payload per chunk is a blob like a chunk column's — see
+    /// [`crate::packets::play::chunk::ChunkBiomesEntry`] — with z before x,
+    /// because the pair reads as one big-endian long.
+    "minecraft:chunks_biomes" => ChunksBiomes {
+        chunks: Vec<crate::packets::play::chunk::ChunkBiomesEntry>,
+    },
+
+    /// Clears the title and subtitle, optionally resetting their timings
+    /// too.
+    "minecraft:clear_titles" => ClearTitles {
+        reset: bool,
+    },
+
+    /// Close a container window. Id 0 is the player's own inventory.
+    "minecraft:container_close" => ContainerClose {
+        window_id: u8,
+    },
+
+    /// A container's progress bars moved — furnace fuel, enchantment seed,
+    /// stonecutter selection. Which property means what depends on the open
+    /// screen, so both halves travel raw.
+    "minecraft:container_set_data" => ContainerSetData {
+        window_id: u8,
+        property: i16,
+        value: i16,
+    },
+
+    /// Asks whether the client still holds a cookie set earlier.
+    "minecraft:cookie_request" => CookieRequest {
+        key: Identifier,
+    },
+
+    /// Puts an item type on cooldown — ender pearls, shields. Zero ticks
+    /// clears it.
+    "minecraft:cooldown" => Cooldown {
+        item_id: VarInt,
+        cooldown_ticks: VarInt,
+    },
+
+    /// Hints for chat auto-completion: names worth offering while typing.
+    ///
+    /// Add and remove patch the set; Set replaces it wholesale.
+    "minecraft:custom_chat_completions" => CustomChatCompletions {
+        action: chat_fields::ChatCompletionsAction,
+        entries: Vec<crate::types::ProtocolString>,
+    },
+
+    /// An entity was hurt: by what, through what chain, and from where.
+    ///
+    /// The two causes are offset ids — **id + 1**, zero meaning none; see
+    /// [`OffsetEntityId`]. The position rides along only for damages with no
+    /// entity behind them, like `/damage` with explicit coordinates.
+    "minecraft:damage_event" => DamageEvent {
+        entity_id: VarInt,
+        source_type: VarInt,
+        source_cause: OffsetEntityId,
+        source_direct: OffsetEntityId,
+        source_position: Option<DamageSourcePosition>,
+    },
+
+    /// Chat from nobody in particular — console `/say`, command feedback.
+    ///
+    /// No signing envelope exists to lay out: the message formats itself
+    /// through the chat-type registry exactly as a player message would,
+    /// minus everything cryptographic.
+    "minecraft:disguised_chat" => DisguisedChat {
+        message: Component,
+        chat_type: VarInt,
+        sender_name: Component,
+        target_name: Option<Component>,
+    },
+
+    /// An entity did something status-shaped: wolf tamed, villager angry,
+    /// living flame extinguished. The byte's meaning varies per entity type,
+    /// so it stays a byte.
+    "minecraft:entity_event" => EntityEvent {
+        entity_id: i32,
+        status: u8,
+    },
+
+    /// An explosion went off: blocks removed, the player pushed, particles
+    /// and sound chosen by the server rather than guessed per strength.
+    ///
+    /// The records are offsets from the centre — three signed bytes each,
+    /// see [`ExplosionRecord`] — and the two particles carry their own
+    /// option blocks via [`ParticleValue`].
+    "minecraft:explode" => Explode {
+        x: f64,
+        y: f64,
+        z: f64,
+        radius: f32,
+        records: Vec<ExplosionRecord>,
+        player_motion_x: f32,
+        player_motion_y: f32,
+        player_motion_z: f32,
+        block_interaction: ExplosionInteraction,
+        small_particle: ParticleValue,
+        large_particle: ParticleValue,
+        sound: SoundId,
+    },
+
+    /// A chunk column left the view distance. Z first, then x — the pair
+    /// reads as one long, high half z.
+    "minecraft:forget_level_chunk" => ForgetLevelChunk {
+        chunk_z: i32,
+        chunk_x: i32,
+    },
+
+    /// Weather shifts, gamemode changes, rain thickens. The event table is
+    /// the protocol's own; the value's meaning follows the event.
+    "minecraft:game_event" => GameEvent {
+        event: u8,
+        value: f32,
+    },
+
+    /// Opens the horse's inventory — the one screen with its own packet,
+    /// because the client needs the horse's id to fill the saddle slots.
+    "minecraft:horse_screen_open" => HorseScreenOpen {
+        window_id: u8,
+        slot_count: VarInt,
+        entity_id: i32,
+    },
+
+    /// Plays the damage-tilt bobbing: which way the hit came from.
+    "minecraft:hurt_animation" => HurtAnimation {
+        entity_id: VarInt,
+        yaw: f32,
+    },
+
+    /// The world border's complete state in one packet, sent on join and
+    /// after configuration. Speed is real-time milliseconds, not ticks.
+    "minecraft:initialize_border" => InitializeBorder {
+        center_x: f64,
+        center_z: f64,
+        old_diameter: f64,
+        new_diameter: f64,
+        lerp_speed: crate::types::VarLong,
+        portal_boundary: VarInt,
+        warning_blocks: VarInt,
+        warning_time: VarInt,
+    },
+
+    /// A world-level effect: record starts, gate breaks, dragon breathes.
+    /// The data field's meaning follows the event; `global` opts out of
+    /// distance falloff for the few effects that must be heard everywhere.
+    "minecraft:level_event" => LevelEvent {
+        event: i32,
+        position: Position,
+        data: i32,
+        global: bool,
+    },
+
+    /// Light levels for one chunk, without the chunk itself. Same layout as
+    /// the light half of a chunk column; see [`LightData`].
+    "minecraft:light_update" => LightUpdate {
+        chunk_x: VarInt,
+        chunk_z: VarInt,
+        light: LightData,
+    },
+
+    /// A trader presents its wares. See [`MerchantOffersBody`] for the
+    /// trade layout; note the window id is a VarInt here where every other
+    /// container packet spells a byte.
+    "minecraft:merchant_offers" => MerchantOffers {
+        window_id: VarInt,
+        body: MerchantOffersBody,
+    },
+
+    /// A vehicle the player is riding moved: absolute position and facing.
+    /// The client echoes it back serverbound when it drives.
+    "minecraft:move_vehicle" => MoveVehicle {
+        x: f64,
+        y: f64,
+        z: f64,
+        yaw: f32,
+        pitch: f32,
+    },
+
+    /// Open a written book the player is holding.
+    "minecraft:open_book" => OpenBook {
+        hand: Hand,
+    },
+
+    /// Open a container screen: which menu layout, titled how.
+    ///
+    /// `menu_kind` ids into the `minecraft:menu` registry; resolving the id
+    /// to slot arrangements is the screen layer's business, not the wire's.
+    "minecraft:open_screen" => OpenScreen {
+        window_id: u8,
+        menu_kind: VarInt,
+        title: Component,
+    },
+
+    /// Point the sign editor at one face of one sign.
+    "minecraft:open_sign_editor" => OpenSignEditor {
+        location: Position,
+        is_front_text: bool,
+    },
+
+    /// Show one recipe as a ghost in the crafting grid until the player
+    /// fills it or moves.
+    "minecraft:place_ghost_recipe" => PlaceGhostRecipe {
+        window_id: u8,
+        recipe: Identifier,
+    },
+
+    /// Combat ended: how long since the last attack. Unused by the vanilla
+    /// client beyond bookkeeping, and shaped accordingly.
+    "minecraft:player_combat_end" => PlayerCombatEnd {
+        duration_in_ticks: VarInt,
+    },
+
+    /// The player entered combat. No fields; the state is the message.
+    "minecraft:player_combat_enter" => PlayerCombatEnter {},
+
+    /// The player died, and here is why.
+    "minecraft:player_combat_kill" => PlayerCombatKill {
+        player_id: VarInt,
+        killer_id: VarInt,
+        message: Component,
+    },
+
+    /// Turn the player's view toward a point or an entity.
+    ///
+    /// When an entity is targeted, its own anchor — feet or eyes, chosen
+    /// independently of the player's — decides the exact aim point; see
+    /// [`LookAtTarget`].
+    "minecraft:player_look_at" => PlayerLookAt {
+        anchor: Anchor,
+        x: f64,
+        y: f64,
+        z: f64,
+        target: Option<LookAtTarget>,
+    },
+
+    /// Which recipes the client may craft, and how the book displays.
+    ///
+    /// Ids, not layouts — the layouts came earlier in update_recipes; see
+    /// [`RecipeBookBody`].
+    "minecraft:recipe" => RecipeBookUnlock {
+        body: crate::packets::play::containers::RecipeBookBody,
+    },
+
+    /// One mob effect ended on one entity. Removing an effect the client
+    /// never saw is allowed to be silent.
+    "minecraft:remove_mob_effect" => RemoveMobEffect {
+        entity_id: VarInt,
+        effect: VarInt,
+    },
+
+    /// Remove a score, from one objective or from all of them at once.
+    "minecraft:reset_score" => ResetScore {
+        entity_name: crate::types::ProtocolString,
+        objective: Option<crate::types::ProtocolString>,
+    },
+
+    /// Pop one pushed resource pack, or all of them when the uuid is
+    /// absent. Same layout as its configuration twin.
+    "minecraft:resource_pack_pop" => ResourcePackPop {
+        uuid: Option<Uuid>,
+    },
+
+    /// Push a resource pack, url first, hash for verification, prompt if
+    /// the client wants to ask. Same layout as its configuration twin.
+    "minecraft:resource_pack_push" => ResourcePackPush {
+        uuid: Uuid,
+        url: BoundedString<256>,
+        hash: BoundedString<40>,
+        forced: bool,
+        prompt_message: Option<crate::nbt::TextComponent>,
+    },
+
+    /// Respawned, possibly in another dimension.
+    ///
+    /// The spawn info mirrors the join packet's second half; the flags keep
+    /// entity metadata and entities across same-world respawns so the end
+    /// credits do not rebuild the world.
+    "minecraft:respawn" => Respawn {
+        dimension_type: VarInt,
+        dimension_name: Identifier,
+        hashed_seed: i64,
+        game_mode: GameModeByte,
+        previous_game_mode: PreviousGameMode,
+        debug: bool,
+        flat: bool,
+        death_location: Option<DeathLocation>,
+        portal_cooldown: VarInt,
+        flags: RespawnFlags,
+    },
+
+    /// The server list ping's play-state cousin: description plus optional
+    /// icon, shown before join.
+    "minecraft:server_data" => ServerData {
+        motd: Component,
+        icon: Option<crate::types::PrefixedBytes<1_048_576>>,
+    },
+
+    /// One line above the hotbar. Equivalent to system chat with overlay
+    /// set, minus chat-blocking semantics.
+    "minecraft:set_action_bar_text" => SetActionBarText {
+        text: Component,
+    },
+
+    /// Move the world border's centre.
+    "minecraft:set_border_center" => SetBorderCenter {
+        center_x: f64,
+        center_z: f64,
+    },
+
+    /// Resize the border gradually: from, to, and how long in milliseconds.
+    "minecraft:set_border_lerp_size" => SetBorderLerpSize {
+        old_diameter: f64,
+        new_diameter: f64,
+        lerp_speed: crate::types::VarLong,
+    },
+
+    /// Resize the border immediately.
+    "minecraft:set_border_size" => SetBorderSize {
+        diameter: f64,
+    },
+
+    /// How long the red border warning shows before the wall arrives.
+    "minecraft:set_border_warning_delay" => SetBorderWarningDelay {
+        warning_time: VarInt,
+    },
+
+    /// How close to the wall the warning begins, in blocks.
+    "minecraft:set_border_warning_distance" => SetBorderWarningDistance {
+        warning_blocks: VarInt,
+    },
+
+    /// Spectate from this entity's viewpoint instead of the player's.
+    "minecraft:set_camera" => SetCamera {
+        camera_entity_id: VarInt,
+    },
+
+    /// Which chunk sits at the centre of the client's view grid. Z first,
+    /// then x, matching the unload packet.
+    "minecraft:set_chunk_cache_center" => SetCenterChunk {
+        chunk_z: VarInt,
+        chunk_x: VarInt,
+    },
+
+    /// How far the client should render, when the server decides it rather
+    /// than the client's own setting.
+    "minecraft:set_chunk_cache_radius" => SetChunkCacheRadius {
+        distance: VarInt,
+    },
+
+    /// Where compasses point and players respawn: a position and the angle
+    /// to face there.
+    "minecraft:set_default_spawn_position" => SetDefaultSpawnPosition {
+        location: Position,
+        angle: f32,
+    },
+
+    /// Which objective shows in a sidebar slot, and none anymore.
+    "minecraft:set_display_objective" => DisplayObjective {
+        slot: crate::packets::play::scoreboard::ScoreboardSlot,
+        score_name: crate::types::ProtocolString,
+        display_text: Option<Component>,
+        render_type: Option<crate::packets::play::scoreboard::ObjectiveRenderType>,
+    },
+
+    /// Attach or detach one entity from another: leashes, riding.
+    ///
+    /// Both ids are plain ints here — the leash half of this packet predates
+    /// most of the protocol's VarInt discipline and kept its widths.
+    "minecraft:set_entity_link" => LinkEntities {
+        attached_to: i32,
+        connecting_entity: i32,
+        link_kind: EntityLinkKind,
+    },
+
+    /// An entity's velocity was set abruptly — knockback, explosion, launch.
+    /// Units are 1/8000 blocks per tick; see [`EntityVelocity`].
+    "minecraft:set_entity_motion" => SetEntityMotion {
+        entity_id: VarInt,
+        velocity: EntityVelocity,
+    },
+
+    /// The experience bar's shape: fill, points, level.
+    "minecraft:set_experience" => SetExperience {
+        experience_bar: f32,
+        total_experience: VarInt,
+        level: VarInt,
+    },
+
+    /// Health, hunger, saturation. At health zero the death screen waits
+    /// for combat_kill's reason.
+    "minecraft:set_health" => SetHealth {
+        health: f32,
+        food: VarInt,
+        food_saturation: f32,
+    },
+
+    /// Create, remove or retitle a scoreboard objective.
+    "minecraft:set_objective" => UpdateObjectives {
+        objective_name: crate::types::ProtocolString,
+        body: crate::packets::play::scoreboard::UpdateObjectivesBody,
+    },
+
+    /// Who rides whom. One vehicle, many passengers.
+    "minecraft:set_passengers" => SetPassengers {
+        vehicle_id: VarInt,
+        passengers: Vec<VarInt>,
+    },
+
+    /// Create, dissolve or edit a team — colours, friendly fire, members.
+    "minecraft:set_player_team" => UpdateTeams {
+        team_name: crate::types::ProtocolString,
+        body: crate::packets::play::scoreboard::TeamBody,
+    },
+
+    /// Set one score under one objective.
+    "minecraft:set_score" => UpdateScore {
+        entity_name: crate::types::ProtocolString,
+        body: crate::packets::play::scoreboard::UpdateScoreBody,
+    },
+
+    /// How far simulation runs — weather, crops, mob AI — as opposed to
+    /// rendering.
+    "minecraft:set_simulation_distance" => SetSimulationDistance {
+        distance: VarInt,
+    },
+
+    /// The smaller line under a title.
+    "minecraft:set_subtitle_text" => SetSubtitleText {
+        text: Component,
+    },
+
+    /// World clock: total age, and time-of-day whose sign says whether the
+    /// sun moves at all.
+    "minecraft:set_time" => SetTime {
+        world_age: i64,
+        time_of_day: i64,
+    },
+
+    /// The big line in the middle of the screen.
+    "minecraft:set_title_text" => SetTitleText {
+        text: Component,
+    },
+
+    /// Title fade-in, hold and fade-out, in ticks. Ints here, not VarInts —
+    /// three of the protocol's few remaining fixed-width counters.
+    "minecraft:set_titles_animation" => SetTitlesAnimation {
+        fade_in: i32,
+        stay: i32,
+        fade_out: i32,
+    },
+
+    /// Play-state ends; back to configuration for a reload or transfer.
+    /// The client answers with its acknowledgement, and the connection
+    /// walks configuration again.
+    "minecraft:start_configuration" => StartConfiguration {},
+
+    /// The tab list's header and footer, either of which may be empty.
+    "minecraft:tab_list" => SetTabListHeaderFooter {
+        header: Component,
+        footer: Component,
+    },
+
+    /// Answers a serverbound block-entity tag query: the NBT, or nothing.
+    "minecraft:tag_query" => TagQueryResponse {
+        transaction_id: VarInt,
+        nbt: Nbt,
+    },
+
+    /// An item entity merged into someone's inventory: what flew to whom,
+    /// and how many.
+    "minecraft:take_item_entity" => TakeItemEntity {
+        collected_entity_id: VarInt,
+        collector_entity_id: VarInt,
+        pickup_item_count: VarInt,
+    },
+
+    /// An entity jumped somewhere in one move — too far for deltas.
+    /// Absolute coordinates, angles as bytes, ground flag for fall damage.
+    "minecraft:teleport_entity" => TeleportEntity {
+        entity_id: VarInt,
+        x: f64,
+        y: f64,
+        z: f64,
+        yaw: Angle,
+        pitch: Angle,
+        on_ground: bool,
+    },
+
+    /// Whether the world ticks at all, and how fast.
+    "minecraft:ticking_state" => TickingState {
+        tick_rate: f32,
+        frozen: bool,
+    },
+
+    /// Advance the world a fixed number of ticks while frozen — the
+    /// single-step button, spelled as a packet.
+    "minecraft:ticking_step" => TickStep {
+        tick_steps: VarInt,
+    },
+
+    /// Transfer the player to another server without dropping the
+    /// connection. Same layout as its configuration twin.
+    "minecraft:transfer" => Transfer {
+        host: BoundedString<256>,
+        port: VarInt,
+    },
+
+    /// An entity's attributes changed: base values and every modifier.
+    /// Modifier ids are identifiers on this version — see
+    /// [`crate::packets::play::attributes::AttributeModifier`].
+    "minecraft:update_attributes" => UpdateAttributes {
+        entity_id: VarInt,
+        properties: Vec<crate::packets::play::attributes::AttributeProperty>,
+    },
+
+    /// A mob effect began or changed: which effect, how strong, how long,
+    /// and how it presents. Flags are bits — see [`EffectFlags`].
+    "minecraft:update_mob_effect" => ApplyMobEffect {
+        entity_id: VarInt,
+        effect_id: VarInt,
+        amplifier: VarInt,
+        duration: VarInt,
+        flags: EffectFlags,
+    },
+
+    /// Every tag for every synced registry. Same layout as configuration's
+    /// update_tags; play gets its own copy because registries can change
+    /// across a reconfiguration.
+    "minecraft:update_tags" => UpdateTags {
+        registries: Vec<crate::packets::common::TagRegistry>,
+    },
+
+    /// A projectile was launched or deflected: how hard it accelerates.
+    "minecraft:projectile_power" => ProjectilePower {
+        entity_id: VarInt,
+        acceleration_power: f64,
+    },
+
+    /// Key-value pairs that land in the crash report's environment
+    /// section. Same layout as its configuration twin.
+    "minecraft:custom_report_details" => CustomReportDetails {
+        details: Vec<crate::packets::common::ReportDetail>,
+    },
+
+    /// The links a server may show on the pause screen: bug tracker, rules,
+    /// whatever it declares. Same layout as its configuration twin.
+    "minecraft:server_links" => ServerLinks {
+        links: Vec<crate::packets::common::ServerLink>,
     },
 }

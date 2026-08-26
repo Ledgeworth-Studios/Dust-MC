@@ -40,6 +40,7 @@
 //! layout changes. See [`chat`].
 
 pub mod advancements;
+pub mod attributes;
 pub mod boss_bar;
 pub mod chat;
 pub mod chunk;
@@ -50,10 +51,11 @@ pub mod map_item;
 pub mod metadata;
 pub mod particle;
 pub mod player_info;
+pub mod scoreboard;
 pub mod serverbound;
 pub mod sound;
 
-use crate::types::{Decode, Encode, Identifier, Position};
+use crate::types::{Decode, Encode, Identifier, Position, VarInt};
 use crate::wire::{DecodeError, EncodeError, WireRead, WireWrite};
 use crate::{var_int_enum, wire_struct, ProtocolVersion};
 
@@ -464,5 +466,223 @@ impl Encode for BlockChangeEntry {
     ) -> Result<(), EncodeError> {
         out.write_var_long(self.0 as i64);
         Ok(())
+    }
+}
+
+/// An entity id the wire spells as **id + 1**, so that zero can mean "none".
+///
+/// The damage event's two causes use this spelling. It looks like an
+/// `Option<i32>` and is one — but a plain `Option` codec would write a
+/// boolean, not an offset integer, which is why it has its own type: the
+/// offset is the kind of detail that round-trips perfectly against itself
+/// and means nothing to vanilla.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OffsetEntityId(pub Option<i32>);
+
+impl Decode for OffsetEntityId {
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        _version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        let raw = input.read_var_int()?;
+        // Zero is "no entity"; anything else is id + 1.
+        Ok(Self((raw != 0).then(|| raw - 1)))
+    }
+}
+
+impl Encode for OffsetEntityId {
+    fn encode<W: WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        _version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        let raw = match self.0 {
+            None => 0,
+            Some(id) => id + 1,
+        };
+        out.write_var_int(raw);
+        Ok(())
+    }
+}
+
+/// Where a damage came from, when the source has no entity: three doubles.
+///
+/// A struct rather than bare fields because the whole triple is optional as
+/// one unit, and `Option<(f64, f64, f64)>` reads as a tuple that happens to
+/// be optional rather than a position that happens to be three floats.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DamageSourcePosition {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+impl Decode for DamageSourcePosition {
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        _version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        Ok(Self {
+            x: input.read_f64()?,
+            y: input.read_f64()?,
+            z: input.read_f64()?,
+        })
+    }
+}
+
+impl Encode for DamageSourcePosition {
+    fn encode<W: WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        _version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        out.write_f64(self.x);
+        out.write_f64(self.y);
+        out.write_f64(self.z);
+        Ok(())
+    }
+}
+
+var_int_enum! {
+    /// How an explosion interacts with the blocks it touches.
+    ///
+    /// The client renders differently for each; the server decides, so this
+    /// travels one way.
+    pub enum ExplosionInteraction {
+        Keep = 0,
+        Destroy = 1,
+        DestroyWithDecay = 2,
+        TriggerBlock = 3,
+    }
+}
+
+var_int_enum! {
+    /// Which end of an entity "look at" measures from.
+    pub enum Anchor {
+        Feet = 0,
+        Eyes = 1,
+    }
+}
+
+/// The entity half of a look-at: whose position to face, and from where on
+/// that entity.
+///
+/// The anchor repeats because the target entity's anchor is independent of
+/// the player's own; flattening them into one field would make the packet's
+/// two anchors read as one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LookAtTarget {
+    pub entity_id: VarInt,
+    pub anchor: Anchor,
+}
+
+var_int_enum! {
+    /// Whether an entity link is being made or broken.
+    ///
+    /// One link kind per packet; the ids are the protocol's own and a third
+    /// from a future peer is refused by name.
+    pub enum EntityLinkKind {
+        Remove = 0,
+        Ride = 1,
+    }
+}
+
+/// The status-effect presentation bits: ambient, particles, icon.
+///
+/// A newtype over the byte rather than bare `u8` fields because all three
+/// bits travel together and game code asks single questions of them —
+/// "does this look like a drink?", "is this hidden?" — which reads better
+/// through [`EffectFlags::has`] than through shifts at every call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EffectFlags(pub u8);
+
+impl EffectFlags {
+    pub const AMBIENT: u8 = 0x01;
+    pub const SHOW_PARTICLES: u8 = 0x02;
+    pub const SHOW_ICON: u8 = 0x04;
+
+    pub fn has(self, flag: u8) -> bool {
+        self.0 & flag != 0
+    }
+}
+
+impl Decode for EffectFlags {
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        _version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        input.read_u8().map(Self)
+    }
+}
+
+impl Encode for EffectFlags {
+    fn encode<W: WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        _version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        out.write_u8(self.0);
+        Ok(())
+    }
+}
+
+/// The respawn packet's keep flags, as one byte.
+///
+/// Bit 0 keeps entity metadata across the dimension change and bit 1 keeps
+/// the entities themselves; both clear means a fresh world. The bits exist
+/// so respawning in place — end credits, `/respawn` — does not force the
+/// client to rebuild everything it already knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RespawnFlags(pub u8);
+
+impl RespawnFlags {
+    pub const KEEP_ENTITY_METADATA: u8 = 0x01;
+    pub const KEEP_ENTITIES: u8 = 0x02;
+
+    pub fn has(self, flag: u8) -> bool {
+        self.0 & flag != 0
+    }
+}
+
+impl Decode for RespawnFlags {
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        _version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        input.read_u8().map(Self)
+    }
+}
+
+impl Encode for RespawnFlags {
+    fn encode<W: WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        _version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        out.write_u8(self.0);
+        Ok(())
+    }
+}
+
+impl Decode for LookAtTarget {
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        Ok(Self {
+            entity_id: VarInt::decode(input, version)?,
+            anchor: Anchor::decode(input, version)?,
+        })
+    }
+}
+
+impl Encode for LookAtTarget {
+    fn encode<W: WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        self.entity_id.encode(out, version)?;
+        self.anchor.encode(out, version)
     }
 }

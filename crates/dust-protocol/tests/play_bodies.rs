@@ -716,3 +716,130 @@ fn boss_bar_actions_carry_exactly_their_own_fields() {
         })
     ));
 }
+
+use dust_protocol::types::ProtocolString;
+
+#[test]
+fn the_offset_entity_id_spells_none_as_zero_and_ids_shifted_by_one() {
+    use dust_protocol::packets::play::OffsetEntityId;
+
+    let mut writer = Writer::new();
+    OffsetEntityId(None)
+        .encode(&mut writer, v())
+        .expect("encodes");
+    assert_eq!(writer.as_bytes(), &[0], "none is the reserved zero");
+
+    let mut writer = Writer::new();
+    OffsetEntityId(Some(0))
+        .encode(&mut writer, v())
+        .expect("encodes");
+    // Entity zero is wire one: the shift is what keeps zero free.
+    assert_eq!(writer.as_bytes(), &[1]);
+    assert_eq!(
+        OffsetEntityId::decode(&mut Reader::new(writer.as_bytes()), v()).expect("decodes"),
+        OffsetEntityId(Some(0))
+    );
+
+    let mut writer = Writer::new();
+    OffsetEntityId(Some(i32::MAX - 1))
+        .encode(&mut writer, v())
+        .expect("encodes");
+    assert_eq!(
+        OffsetEntityId::decode(&mut Reader::new(writer.as_bytes()), v()).expect("decodes"),
+        OffsetEntityId(Some(i32::MAX - 1))
+    );
+}
+
+#[test]
+fn team_methods_carry_only_their_own_sections() {
+    use dust_protocol::packets::play::scoreboard::{
+        CollisionRule, NameTagVisibility, TeamBody, TeamInfo, TeamMethod,
+    };
+
+    // Remove-team is the method varint and nothing else.
+    let mut writer = Writer::new();
+    TeamBody {
+        method: TeamMethod::Remove,
+        info: None,
+        members: vec![],
+    }
+    .encode(&mut writer, v())
+    .expect("encodes");
+    assert_eq!(writer.len(), 1);
+
+    // A create without its descriptive fields would desynchronise the
+    // client's reader; it is refused rather than written hollow.
+    assert!(matches!(
+        TeamBody {
+            method: TeamMethod::Create,
+            info: None,
+            members: vec![],
+        }
+        .encode(&mut Writer::new(), v()),
+        Err(EncodeError::Unsupported { .. })
+    ));
+
+    let full = TeamBody {
+        method: TeamMethod::Create,
+        info: Some(TeamInfo {
+            display_name: dust_protocol::text::Component::text("Blue"),
+            friendly_flags: 0,
+            name_tag_visibility: NameTagVisibility::Always,
+            collision_rule: CollisionRule::Never,
+            colour: VarInt(11),
+            prefix: dust_protocol::text::Component::text(""),
+            suffix: dust_protocol::text::Component::text(""),
+        }),
+        members: vec![ProtocolString::new("jeb_").expect("fits")],
+    };
+    let mut writer = Writer::new();
+    full.encode(&mut writer, v()).expect("encodes");
+    assert_eq!(
+        TeamBody::decode(&mut Reader::new(writer.as_bytes()), v()).expect("decodes"),
+        full
+    );
+
+    // The visibility words are strings on this version, not enum ids.
+    let mut writer = Writer::new();
+    ProtocolString::new("hideForOtherTeams")
+        .expect("fits")
+        .encode(&mut writer, v())
+        .expect("encodes");
+    assert_eq!(writer.len(), 1 + 17);
+}
+
+#[test]
+fn objective_updates_treat_number_format_as_an_option_of_an_option() {
+    use dust_protocol::packets::play::containers::NumberFormat;
+    use dust_protocol::packets::play::scoreboard::{
+        ObjectiveMode, ObjectiveRenderType, UpdateObjectivesBody,
+    };
+
+    fn body(format: Option<Option<NumberFormat>>) -> UpdateObjectivesBody {
+        UpdateObjectivesBody {
+            mode: ObjectiveMode::Update,
+            display_name: Some(dust_protocol::text::Component::text("obj")),
+            render_type: Some(ObjectiveRenderType::Integer),
+            number_format: format,
+        }
+    }
+
+    // No boolean at all; absent boolean; present blank. Three different
+    // messages, each one byte longer than the last — the option-of-an-option
+    // is what keeps them distinct on the wire.
+    let mut previous_len = None;
+    for format in [None, Some(None), Some(Some(NumberFormat::Blank))] {
+        let mut writer = Writer::new();
+        body(format.clone())
+            .encode(&mut writer, v())
+            .expect("encodes");
+        match previous_len {
+            None => {}
+            Some(previous) => assert_eq!(writer.len(), previous + 1, "{format:?}"),
+        }
+        previous_len = Some(writer.len());
+        let back = UpdateObjectivesBody::decode(&mut Reader::new(writer.as_bytes()), v())
+            .expect("decodes");
+        assert_eq!(back, body(format), "format changed on the way round");
+    }
+}

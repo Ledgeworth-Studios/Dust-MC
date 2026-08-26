@@ -217,3 +217,43 @@ impl Encode for LightArray {
         Ok(())
     }
 }
+
+/// One chunk's biome sections, as the biome half of a chunk column.
+///
+/// Like [`ChunkData`], the payload is a blob this crate delimits and does
+/// not interpret: the palettes inside are the world crate's, and the same
+/// bound guards the allocation. The coordinate order is the wire's own — z
+/// before x — because the client reads the pair as one big-endian long with
+/// z in the high half, and a reader that swapped them would file every
+/// biome under its mirrored chunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkBiomesEntry {
+    pub chunk_z: i32,
+    pub chunk_x: i32,
+    pub data: PrefixedBytes<CHUNK_DATA_MAX_BYTES>,
+}
+
+impl Decode for ChunkBiomesEntry {
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        Ok(Self {
+            chunk_z: input.read_i32()?,
+            chunk_x: input.read_i32()?,
+            data: PrefixedBytes::decode(input, version)?,
+        })
+    }
+}
+
+impl Encode for ChunkBiomesEntry {
+    fn encode<W: WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        out.write_i32(self.chunk_z);
+        out.write_i32(self.chunk_x);
+        self.data.encode(out, version)
+    }
+}
