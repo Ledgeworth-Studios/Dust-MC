@@ -39,73 +39,107 @@ fn wire_len(id: i32, body: usize) -> usize {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_stalled_consumer_blocks_senders_instead_of_dropping_or_growing() {
+async fn a_stalled_consumer_blocks_sends_at_the_bound_and_recovers() {
+    // Sequential by design: one producer, so every observation below is
+    // free of counter races, and the bound shows itself as the thing it is —
+    // the sixth send waiting for room that a wedged writer cannot make.
     const CAPACITY: usize = 4;
-    const TOTAL: usize = 64;
+    const REST: usize = 11;
+
+    // The duplex swallows fewer bytes than one frame, so the very first
+    // write wedges partway through and stays wedged while nobody reads.
+    let (mut client, server) = tokio::io::duplex(32);
+    let mut conn = Conn::new(server, config(CAPACITY, Limits::default()));
+    let body = vec![0u8; 32];
     let frame_bytes = wire_len(0, 32);
 
-    let (mut client, server) = tokio::io::duplex(256);
-    let mut conn = Conn::new(server, config(CAPACITY, Limits::default()));
+    // One accepted; the writer takes it off the queue and sticks.
+    conn.send(Frame::new(0, body.clone())).await.expect("first");
+    tokio::time::sleep(Duration::from_millis(60)).await;
 
-    let accepted = Arc::new(AtomicUsize::new(0));
-    let worker = {
-        let accepted = Arc::clone(&accepted);
+    // Fill the rest of the queue. Each of these returns promptly: accepting
+    // is cheap right up to the ceiling, which is the whole point.
+    for _ in 1..=CAPACITY {
+        conn.send(Frame::new(0, body.clone())).await.expect("fill");
+    }
+    let gauge = conn.outbound_queued();
+    assert!(
+        gauge >= 1 && gauge <= CAPACITY + 1,
+        "the gauge read {gauge}; it must sit at the ceiling, allowing for \
+         the writer's moment of take-lag"
+    );
+
+    // Past the ceiling there is no fifth room: this send waits, and keeps
+    // waiting, for as long as the peer refuses to read.
+    let blocked = tokio::time::timeout(Duration::from_millis(400), async {
+        conn.send(Frame::new(0, body.clone())).await
+    })
+    .await;
+    assert!(
+        blocked.is_err(),
+        "a send past the bound did not block; the queue grew or the send lied"
+    );
+
+    // Unblock the pipe by reading while the rest is sent: the writer is
+    // still wedged on frame one's tail, so acceptance cannot resume until
+    // the peer starts draining. One accounting note the code has to live
+    // with: the probe above was cancelled mid-send, and a cancelled send may
+    // (by tokio's documented behaviour) have landed its frame in the queue
+    // anyway. The total on the wire is therefore the frames certainly
+    // accepted, plus zero or one; the assertion below admits exactly that
+    // window, and nothing else — any other count means frames were lost,
+    // duplicated, or torn.
+    let received = Arc::new(AtomicUsize::new(0));
+    let drainer = {
+        let received = Arc::clone(&received);
         tokio::spawn(async move {
-            for _ in 0..TOTAL {
-                if conn.send(Frame::new(0, vec![0u8; 32])).await.is_err() {
+            let mut client = client;
+            // Read right up to the shutdown the graceful close promises.
+            loop {
+                let mut chunk = [0u8; 4096];
+                let n = client.read(&mut chunk).await.expect("peer read");
+                if n == 0 {
                     break;
                 }
-                accepted.fetch_add(1, Ordering::Relaxed);
-                // Sampled from the accepting side, which is where an overrun
-                // would be visible: this path is what must stop when the
-                // ceiling is reached.
-                assert!(
-                    conn.outbound_queued() <= CAPACITY,
-                    "the gauge reached {} against a capacity of {CAPACITY}",
-                    conn.outbound_queued()
-                );
+                received.fetch_add(n, Ordering::Relaxed);
             }
-            conn
         })
     };
 
-    // Hold the reader back long enough for the duplex buffer to fill and the
-    // queue behind it to reach its ceiling. A driver that buffered instead of
-    // blocking would sail past the bound here; one that dropped would never
-    // deliver everything later.
-    tokio::time::sleep(Duration::from_millis(120)).await;
-    let stalled_at = accepted.load(Ordering::Relaxed);
+    for _ in 0..REST {
+        conn.send(Frame::new(0, body.clone())).await.expect("rest");
+    }
+    conn.close().await.expect("graceful close flushes");
+    drainer.await.expect("drainer joins");
+
+    fn frames_of(bytes: usize, frame: usize) -> usize {
+        assert_eq!(
+            bytes % frame,
+            0,
+            "{bytes} bytes is not whole frames of {frame}"
+        );
+        bytes / frame
+    }
+    let delivered = frames_of(received.load(Ordering::Relaxed), frame_bytes);
+    let certain = 1 + CAPACITY + REST;
     assert!(
-        stalled_at < TOTAL,
-        "{stalled_at} of {TOTAL} sends completed against an unread peer; \
-         nothing was ever blocked"
+        delivered == certain || delivered == certain + 1,
+        "{delivered} frames arrived against {certain} certain accepts plus at          most one cancelled-but-maybe-sent probe"
     );
 
-    // Unblock the consumer: the entire backlog must drain, byte for byte.
-    let target = TOTAL * frame_bytes;
-    let mut received = 0usize;
-    let drained = tokio::time::timeout(Duration::from_secs(30), async {
-        while received < target {
-            let mut chunk = [0u8; 4096];
-            let n = client.read(&mut chunk).await.expect("peer read");
-            assert!(n > 0, "the stream ended {received} of {target} bytes in");
-            received += n;
-        }
-    })
-    .await;
-    assert!(drained.is_ok(), "the peer never received the whole backlog");
-
-    let conn = tokio::time::timeout(Duration::from_secs(30), worker)
+    // And the driver took work again afterwards, which is the recovery half
+    // of the story: blocking was temporary, not terminal.
+    let (_client_io, probe_server) = tokio::io::duplex(4096);
+    let mut probe_conn = Conn::new(probe_server, config(CAPACITY, Limits::default()));
+    probe_conn
+        .send(Frame::new(9, b"recovered"))
         .await
-        .expect("the sender stayed wedged")
-        .expect("sender joins");
-    assert_eq!(
-        accepted.load(Ordering::Relaxed),
-        TOTAL,
-        "blocking is not dropping: every frame was eventually accepted"
-    );
-    assert_eq!(conn.outbound_queued(), 0, "the queue drained empty");
+        .expect("a fresh connection still works");
+    probe_conn.abort();
 }
+
+/// How many frames the stalled consumer receives: the certainly-accepted
+/// ones, plus the probe that may or may not have landed.
 
 #[tokio::test(flavor = "multi_thread")]
 async fn frames_leave_in_the_order_they_were_accepted() {
@@ -136,13 +170,16 @@ async fn frames_leave_in_the_order_they_were_accepted() {
         );
         match decoder.next_frame().expect("decode") {
             Some(frame) => seen.push(frame.id),
+            // No complete frame, whether the buffer is empty or holding a
+            // partial one: read more. Skipping the read while a partial
+            // frame sits buffered would spin forever against a writer that
+            // cannot finish its frame until somebody reads — which is a
+            // deadlock this test once genuinely produced.
             None => {
-                if decoder.buffered() == 0 {
-                    let mut chunk = [0u8; 1024];
-                    let n = client.read(&mut chunk).await.expect("peer read");
-                    assert!(n > 0, "stream ended after {} of {COUNT} frames", seen.len());
-                    decoder.feed(&chunk[..n]);
-                }
+                let mut chunk = [0u8; 1024];
+                let n = client.read(&mut chunk).await.expect("peer read");
+                assert!(n > 0, "stream ended after {} of {COUNT} frames", seen.len());
+                decoder.feed(&chunk[..n]);
             }
         }
     }

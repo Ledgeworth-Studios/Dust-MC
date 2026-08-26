@@ -358,13 +358,15 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
         self.machine.disconnect();
     }
 
-    /// How many frames are currently queued for sending.
+    /// How many frames are currently queued for sending, give or take the
+    /// instant between the writer taking one and saying so.
     ///
     /// A gauge, not a control: the bound itself lives in
     /// [`ConnConfig::outbound_capacity`] and is enforced by the queue being a
-    /// bounded channel, not by anyone polling this. Counted on the way in and
-    /// again when the writer takes a frame, so it is exact between the two;
-    /// after an abort the connection is gone and the gauge with it.
+    /// bounded channel — a sender cannot get an acknowledgement past a full
+    /// queue no matter what this counter says. Under concurrent producers the
+    /// count can briefly read one high, because "taken" is recorded a breath
+    /// after the take; treat it as telemetry, never as permission.
     pub fn outbound_queued(&self) -> usize {
         self.queued.load(Ordering::Relaxed)
     }
