@@ -415,6 +415,10 @@ fn commands_domain(flat: &registries::Registries, context: &Context) -> Result<O
         "  {} distinct parsers, every one an entry of the command_argument_type registry",
         parsed.parsers.len()
     );
+    println!(
+        "  every one of the {} numbers in the file is present by value in what was read",
+        parsed.number_count
+    );
     if parsed.unchecked_registries.is_empty() {
         println!("  every registry a resource argument names was in the registry report");
     } else {

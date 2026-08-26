@@ -201,10 +201,12 @@ pub fn parse(json: &[u8], registries: &Registries) -> Result<Commands, String> {
     // Children were collected in the report's order; they are stored in name
     // order because the crate binary-searches them. The two agree on 1.21.1,
     // which is what `check_child_order_is_name_order` above just insisted on.
-    for index in 0..nodes.len() {
-        let mut children = std::mem::take(&mut nodes[index].children);
-        children.sort_by(|a, b| nodes[*a].name.cmp(&nodes[*b].name));
-        nodes[index].children = children;
+    // Names are read through a copy because a child of one node is another
+    // node the loop is about to visit.
+    let names: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
+    for node in &mut nodes {
+        node.children
+            .sort_by(|a, b| names[*a].cmp(&names[*b]));
     }
 
     let mut parsers: BTreeMap<String, usize> = BTreeMap::new();
