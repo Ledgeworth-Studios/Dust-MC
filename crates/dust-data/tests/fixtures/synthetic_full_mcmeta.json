@@ -1,0 +1,15 @@
+{
+  "pack": {
+    "pack_format": 48,
+    "description": { "text": "A synthetic pack", "extra": [{ "text": ", written for these tests" }] },
+    "supported_formats": { "min_inclusive": 46, "max_inclusive": 48 }
+  },
+  "overlays": {
+    "entries": [
+      { "directory": "overlay_older", "formats": [15, 45] },
+      { "directory": "overlay_current", "formats": 48 }
+    ]
+  },
+  "features": { "enabled": ["minecraft:bundle"] },
+  "filter": { "block": [] }
+}
