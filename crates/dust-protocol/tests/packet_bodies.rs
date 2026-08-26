@@ -537,3 +537,64 @@ fn a_packet_takes_its_id_from_the_generated_table_and_not_from_a_constant() {
     let mut writer = Writer::new();
     assert!(packet.encode(&mut writer, v()).is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// The worklist's end state, pinned
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_unclaimed_worklist_is_exactly_the_blocked_set() {
+    use dust_protocol::packets::unclaimed_for;
+    use dust_protocol::{version, ConnectionState as State, Direction};
+
+    // Every packet left unclaimed must be one of these, with the blocker
+    // that keeps it out. A definition added to Play either shrinks this list
+    // or updates it on purpose — silently growing it is how a worklist stops
+    // being one.
+    let blocked: &[(State, Direction, &str)] = &[
+        // The Slot wall: an item stack whose added components have no length
+        // cannot be stepped over. See `Slot` for why partial decoding is not
+        // available here.
+        (
+            State::Play,
+            Direction::Clientbound,
+            "minecraft:container_set_content",
+        ),
+        (State::Play, Direction::Clientbound, "minecraft:container_set_slot"),
+        // The chat-signing wall: offline-first means no session keys, and
+        // these packets exist to carry them. See `play::chat`.
+        (State::Play, Direction::Clientbound, "minecraft:delete_chat"),
+        (State::Play, Direction::Serverbound, "minecraft:chat_command"),
+        (
+            State::Play,
+            Direction::Serverbound,
+            "minecraft:chat_command_signed",
+        ),
+        (
+            State::Play,
+            Direction::Serverbound,
+            "minecraft:chat_session_update",
+        ),
+        // Development-only pair; neither half means anything alone.
+        (State::Play, Direction::Clientbound, "minecraft:debug_sample"),
+        (
+            State::Play,
+            Direction::Serverbound,
+            "minecraft:debug_sample_subscription",
+        ),
+    ];
+
+    let mut actual = unclaimed_for(version::V1_21_1);
+    let mut expected: Vec<_> = blocked.to_vec();
+    actual.sort_by_key(|&(s, d, n)| (s, d, n));
+    expected.sort_by_key(|&(s, d, n)| (s, d, n));
+
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "the worklist moved: {actual:#?} — update this test deliberately"
+    );
+    for (got, want) in actual.iter().zip(expected.iter()) {
+        assert_eq!(got, want, "the worklist moved — update this test deliberately");
+    }
+}

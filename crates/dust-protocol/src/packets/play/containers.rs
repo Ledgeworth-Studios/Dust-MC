@@ -606,6 +606,22 @@ impl Encode for MerchantOffersBody {
 // ---------------------------------------------------------------------------
 
 var_int_enum! {
+    /// Which tab group a recipe-book toggle or setting belongs to.
+    ///
+    /// Not [`CraftingBookCategory`] and not [`CookingBookCategory`]: this
+    /// splits by *machine* — crafting, furnace, blast furnace, smoker —
+    /// because that is how the book groups its display toggles. Three
+    /// four-value tables where one sparse union would do; conflating any two
+    /// puts a furnace flag where a food tab belongs.
+    pub enum RecipeBookType {
+        Crafting = 0,
+        Furnace = 1,
+        BlastFurnace = 2,
+        Smoker = 3,
+    }
+}
+
+var_int_enum! {
     /// How a recipe-book update changes the client's set.
     ///
     /// `Init` replaces everything and carries the highlighted half; add and

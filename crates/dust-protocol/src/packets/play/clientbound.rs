@@ -526,6 +526,16 @@ packet_group! {
         target_name: Option<Component>,
     },
 
+    /// An experience orb appeared. The orb is an entity like any other but
+    /// arrives early and often, so it gets a cheaper packet than add_entity.
+    "minecraft:add_experience_orb" => ExperienceOrbSpawn {
+        entity_id: VarInt,
+        x: f64,
+        y: f64,
+        z: f64,
+        experience: i16,
+    },
+
     /// An entity did something status-shaped: wolf tamed, villager angry,
     /// living flame extinguished. The byte's meaning varies per entity type,
     /// so it stays a byte.
@@ -990,6 +1000,14 @@ packet_group! {
     "minecraft:projectile_power" => ProjectilePower {
         entity_id: VarInt,
         acceleration_power: f64,
+    },
+
+    /// Hand a cookie to the client for later retrieval — including by
+    /// another server after a transfer. Same layout as its configuration
+    /// twin.
+    "minecraft:store_cookie" => StoreCookie {
+        key: Identifier,
+        payload: crate::types::PrefixedBytes<5120>,
     },
 
     /// Key-value pairs that land in the crash report's environment

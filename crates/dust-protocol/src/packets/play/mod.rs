@@ -2,14 +2,33 @@
 //!
 //! # Where this state stands
 //!
-//! The families defined here are the ones every other part of a server talks
-//! through: join and position sync, the serverbound movement family, liveness,
-//! kicks, the world's block and chunk updates, the entity visibility family,
-//! the tab list, plugin channels and both chat directions. What is *not* here
-//! yet is tracked rather than guessed — [`crate::packets::unclaimed_for`] lists
-//! every packet this version's table still has that no definition claims, and
-//! the pair does not graduate into [`crate::packets::COMPLETE_PAIRS`] until
-//! that list is empty.
+//! Every packet this version's table lists is defined here except eight, and
+//! those eight are blocked rather than skipped. Each carries one of three
+//! walls, named so nobody has to rediscover which one applies:
+//!
+//! | Packet | Direction | Blocker |
+//! | --- | --- | --- |
+//! | `minecraft:container_set_content` | clientbound | **Slot wall** — its body is an array of item stacks |
+//! | `minecraft:container_set_slot` | clientbound | **Slot wall** — same array shape, one slot |
+//! | `minecraft:delete_chat` | clientbound | **Chat signing** — removes messages by signature digest |
+//! | `minecraft:chat_command` | serverbound | **Chat signing** — unsigned commands still ride the signed-chat envelope |
+//! | `minecraft:chat_command_signed` | serverbound | **Chat signing** — argument signatures and acknowledgements |
+//! | `minecraft:chat_session_update` | serverbound | **Chat signing** — session keys this crate never verifies |
+//! | `minecraft:debug_sample` | clientbound | **Dev-only** — F3 debug samples; the vanilla server gates them on operator status |
+//! | `minecraft:debug_sample_subscription` | serverbound | **Dev-only** — subscribes to the above |
+//!
+//! The Slot wall is [`crate::types::Slot`]'s: a component-bearing stack has no
+//! length to skip past, and inventories are made of nothing else. The signing
+//! wall is [`chat`]'s: Dust is offline-first, and the day online mode arrives,
+//! the layouts there are where verification plugs in. The dev pair is a pair
+//! because neither half means anything alone.
+//!
+//! [`crate::packets::unclaimed_for`] returns exactly this list for 1.21.1, and
+//! a test pins it: a packet added here must either leave that list or update
+//! it deliberately.
+//!
+//! When every Play packet is defined, both pairs graduate into
+//! [`crate::packets::COMPLETE_PAIRS`] and become guarded from drift.
 //!
 //! # The three shapes the macro cannot say, and what each became
 //!

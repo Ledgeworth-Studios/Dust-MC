@@ -1327,6 +1327,415 @@ fn play_frames(out: &mut Vec<Frame>) {
         }
     ));
 
+    // ---- wave four: the serverbound families ----
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::QueryBlockNbt {
+            transaction_id: VarInt(6),
+            location: Position::new(-300, 100, 300),
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::ChangeDifficulty {
+            difficulty: DifficultyByte(Difficulty::Normal),
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::AcknowledgeMessage { offset: VarInt(-2) }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::ChunkBatchReceived {
+            chunks_per_tick: 3.75,
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::ClientCommand {
+            action: dust_protocol::packets::play::serverbound::ClientStatusAction::PerformRespawn,
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::CommandSuggestionsRequest {
+            transaction_id: VarInt(9),
+            text: s::<32_500>("gamerule keepInv"),
+        }
+    ));
+    out.push(frame!(sb, Play, Serverbound, sb::AcknowledgeConfiguration {}));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::ClickContainerButton {
+            window_id: VarInt(2),
+            button_id: VarInt(1),
+        }
+    ));
+    out.push(frame!(sb, Play, Serverbound, sb::CloseContainer { window_id: 0 }));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::SlotChangedState {
+            slot_id: VarInt(4),
+            screen_handler_id: VarInt(1),
+            new_state: true,
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::CookieResponse {
+            key: id("dust:session"),
+            payload: Some(PrefixedBytes(vec![9; 16])),
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::EditBook {
+            slot: VarInt(0),
+            pages: vec![s::<8192>("once upon a time"), s::<8192>("the end")],
+            title: Some(s::<128>("A Dusty Book")),
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::QueryEntityNbt {
+            transaction_id: VarInt(7),
+            entity_id: VarInt(-11),
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::InteractEntity {
+            entity_id: VarInt(88),
+            kind: dust_protocol::packets::play::serverbound::InteractionKind::Attack,
+            sneaking: true,
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::JigsawGenerate {
+            location: Position::new(1, -12, -1),
+            levels: VarInt(6),
+            keep_jigsaws: false,
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::LockDifficulty { locked: true }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::MoveVehicle {
+            x: -0.25,
+            y: 63.5,
+            z: 0.75,
+            yaw: 270.0,
+            pitch: 0.125,
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::PaddleBoat {
+            left_paddle: true,
+            right_paddle: false,
+        }
+    ));
+    out.push(frame!(sb, Play, Serverbound, sb::PickItem { slot: VarInt(4) }));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::PlaceRecipe {
+            window_id: 1,
+            recipe: id("minecraft:oak_planks"),
+            craft_all: false,
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::PlayerAction {
+            status: dust_protocol::packets::play::serverbound::PlayerActionKind::FinishDigging,
+            location: Position::new(10, 62, -10),
+            face: 1,
+            sequence: VarInt(77),
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::PlayerCommand {
+            body: dust_protocol::packets::play::serverbound::PlayerCommandBody {
+                entity_id: VarInt(1),
+                action_id: dust_protocol::packets::play::serverbound::PlayerCommandAction::StartJumpWithHorse,
+                jump_boost: Some(VarInt(42)),
+            },
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::PlayerInput {
+            sideways: -0.5,
+            forward: 1.0,
+            flags: dust_protocol::packets::play::serverbound::InputFlags(
+                dust_protocol::packets::play::serverbound::InputFlags::SNEAK,
+            ),
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::RecipeBookChangeSettings {
+            book_category: dust_protocol::packets::play::containers::RecipeBookType::Furnace,
+            gui_open: true,
+            filtering_craftable: false,
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::SeenRecipe {
+            recipe: id("minecraft:bread"),
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::RenameItem {
+            item_name: s::<32_767>("Sharpness V, Sweeping III"),
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::ResourcePackResponse {
+            uuid: Uuid(6),
+            result: dust_protocol::types::ResourcePackResult::Accepted,
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::SelectTrade { selected_slot: VarInt(2) }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::UpdateBeacon {
+            primary: Some(VarInt(1)),
+            secondary: Some(VarInt(12)),
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::UpdateCommandBlock {
+            location: Position::new(0, 90, 0),
+            command: s::<32_767>("say hi"),
+            mode: dust_protocol::packets::play::serverbound::CommandBlockMode::Auto,
+            flags: dust_protocol::packets::play::serverbound::CommandBlockFlags(
+                dust_protocol::packets::play::serverbound::CommandBlockFlags::ALWAYS_ACTIVE,
+            ),
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::UpdateCommandBlockMinecart {
+            entity_id: VarInt(400),
+            command: s::<32_767>("effect give @p speed"),
+            track_output: false,
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::SetCreativeModeSlot {
+            slot: 45,
+            item: Slot::Present {
+                count: 64,
+                item_id: 7,
+                removed_components: vec![],
+            },
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::UpdateJigsaw {
+            location: Position::new(-5, 20, 5),
+            name: id("minecraft:village/plains/houses"),
+            target: id("minecraft:village/plains/terminators"),
+            pool: id("minecraft:village/plains"),
+            final_state: s::<32_767>("minecraft:oak_planks"),
+            joint_type: s::<32_767>("roll"),
+            selection_priority: VarInt(1),
+            placement_priority: VarInt(0),
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::UpdateStructureBlock {
+            location: Position::new(3, 33, -3),
+            action: dust_protocol::packets::play::serverbound::StructureBlockAction::Load,
+            mode: dust_protocol::packets::play::serverbound::StructureBlockMode::Save,
+            template_name: s::<32_767>("dust:ship"),
+            offset_x: -2,
+            offset_y: 1,
+            offset_z: 0,
+            size_x: 10,
+            size_y: 20,
+            size_z: 15,
+            mirror: dust_protocol::packets::play::serverbound::StructureBlockMirror::FrontBack,
+            rotation: dust_protocol::packets::play::serverbound::StructureBlockRotation::Clockwise90,
+            metadata: s::<32_767>(""),
+            integrity: 0.5,
+            seed: dust_protocol::types::VarLong(-4_242_424_242),
+            flags: dust_protocol::packets::play::serverbound::StructureBlockFlags(
+                dust_protocol::packets::play::serverbound::StructureBlockFlags::SHOW_BOUNDING_BOX,
+            ),
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::UpdateSign {
+            location: Position::new(-40, 70, 40),
+            is_front_text: true,
+            lines: [
+                s::<8192>("line one"),
+                s::<8192>("two"),
+                s::<8192>(""),
+                s::<8192>("four"),
+            ],
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::SwingArm { hand: Hand::Main }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::SpectateTeleport { target: Uuid(0xFEED) }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::UseItemOnBlock {
+            hand: Hand::Main,
+            hit: dust_protocol::packets::play::serverbound::BlockHit {
+                location: Position::new(15, 80, -15),
+                face: 3,
+                cursor_x: 0.25,
+                cursor_y: 0.5,
+                cursor_z: 0.0,
+                inside_block: false,
+            },
+            sequence: VarInt(78),
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::UseItem {
+            hand: Hand::Off,
+            sequence: VarInt(79),
+            yaw: -170.0,
+            pitch: 45.0,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::ExperienceOrbSpawn {
+            entity_id: VarInt(55),
+            x: -0.5,
+            y: 32.5,
+            z: 100.5,
+            experience: 3,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::StoreCookie {
+            key: id("dust:carried"),
+            payload: PrefixedBytes(vec![7; 8]),
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::ClientInformation {
+            locale: s("en_GB"),
+            view_distance: 10,
+            chat_mode: dust_protocol::types::ChatVisibility::Full,
+            chat_colors: true,
+            displayed_skin_parts: 0b0111_1111,
+            main_hand: dust_protocol::types::MainHand::Right,
+            text_filtering_enabled: false,
+            allow_server_listings: true,
+        }
+    ));
+
     // ---- wave three: the remaining clientbound families ----
     use dust_protocol::packets::play::attributes::{AttributeModifier, AttributeProperty};
     use dust_protocol::packets::play::containers::StatisticEntry;
