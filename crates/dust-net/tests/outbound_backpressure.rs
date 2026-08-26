@@ -48,7 +48,7 @@ async fn a_stalled_consumer_blocks_sends_at_the_bound_and_recovers() {
 
     // The duplex swallows fewer bytes than one frame, so the very first
     // write wedges partway through and stays wedged while nobody reads.
-    let (mut client, server) = tokio::io::duplex(32);
+    let (client, server) = tokio::io::duplex(32);
     let mut conn = Conn::new(server, config(CAPACITY, Limits::default()));
     let body = vec![0u8; 32];
     let frame_bytes = wire_len(0, 32);
@@ -64,7 +64,7 @@ async fn a_stalled_consumer_blocks_sends_at_the_bound_and_recovers() {
     }
     let gauge = conn.outbound_queued();
     assert!(
-        gauge >= 1 && gauge <= CAPACITY + 1,
+        (1..=CAPACITY + 1).contains(&gauge),
         "the gauge read {gauge}; it must sit at the ceiling, allowing for \
          the writer's moment of take-lag"
     );
