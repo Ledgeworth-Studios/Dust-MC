@@ -16,6 +16,11 @@ flate2.workspace = true
 # inflating deflate streams — see `tests/support/mod.rs`.
 flate2.workspace = true
 
+# The generated-document suites: round-trips through both binary dialects and
+# the SNBT printer/parser differential. The strategies live with the rest of
+# the test plumbing in `tests/support/mod.rs`.
+proptest = "1"
+
 [lints.rust]
 # The stub of this crate opted out of the workspace `unsafe_code = "deny"` in
 # anticipation of a zero-copy reader that would need it. The implementation
