@@ -447,6 +447,13 @@ where
     )
     .await?;
 
+    // Abilities before the position, as a real server sends them. This is
+    // where creative flight is *granted*: the game mode in the join packet
+    // does not grant it, and a client that is never sent this walks.
+    send_play(conn, play_mod::abilities(true), version).await?;
+    send_play(conn, play_mod::frozen_at_noon(), version).await?;
+    send_play(conn, play_mod::default_spawn(world::SPAWN), version).await?;
+
     // Before the chunks, not after: a client uses its position to decide which
     // columns it wants, and one told about columns before it knows where it is
     // throws them away.

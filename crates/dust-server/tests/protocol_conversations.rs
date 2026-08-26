@@ -695,6 +695,27 @@ fn an_offline_login_runs_the_whole_configuration_exchange_and_reaches_play() {
     assert_eq!(count, 3, "three dimensions are named");
     assert_eq!(read_string_at(rest).0, "minecraft:overworld");
 
+    // Abilities, and this is the one whose absence is felt: a creative client
+    // that is never sent it cannot fly, because the flags are where flight is
+    // granted and the game mode in the join packet does not grant it. Found by
+    // diffing this server's join sequence against a real one's.
+    let (id, body) = recv_compressed_frame(&mut stream);
+    assert_eq!(id, 56, "player_abilities");
+    assert_ne!(body[0] & 0x04, 0, "ALLOW_FLYING, or creative mode walks");
+    assert_ne!(body[0] & 0x01, 0, "and invulnerable, as creative is");
+
+    let (id, body) = recv_compressed_frame(&mut stream);
+    assert_eq!(id, 100, "set_time");
+    let time_of_day = i64::from_be_bytes(body[8..16].try_into().expect("eight bytes"));
+    assert!(
+        time_of_day < 0,
+        "a negative time_of_day is what freezes the cycle; a positive one \
+         would start the sun moving on a server whose clock does not tick"
+    );
+
+    let (id, _) = recv_compressed_frame(&mut stream);
+    assert_eq!(id, 86, "set_default_spawn_position");
+
     // The position comes before the chunks, and that order matters: a client
     // uses where it is to decide which columns it wants, and one told about
     // columns first throws them away.
