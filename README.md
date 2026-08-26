@@ -9,23 +9,44 @@ the gates that keep the rest honest.
 ## Status
 
 Stage 0 — groundwork. Phases 0.1 through 0.4 are done, and Phase 0.5 extracts
-the block registry and the packet id tables. No server code. Nothing here
-accepts a connection.
+the vanilla data the rest of the server stands on: blocks, items, entity
+types, fluids, tags, recipes, loot tables, commands and packets. No server
+code. Nothing here accepts a connection.
 
 ## Vanilla data
 
-Dust ships no Mojang data and no Mojang assets. What the repository holds is the
-extractor, and the Rust that results from running it:
+Dust ships no Mojang data and no Mojang assets. What the repository holds is
+the extractor, and the Rust that results from running it:
 
 ```
 cargo xtask extract --version 1.21.1
 ```
 
-That resolves the version through Mojang's manifest, downloads the server jar to
-a gitignored cache, verifies its SHA-1, runs Minecraft's own data generators and
-regenerates the tables in `dust-registry` and `dust-protocol`. It needs a network and a JDK 21 or
-newer, runs by hand a few times per Minecraft release, and is deliberately not
-part of `just verify` — what CI checks is the generated code.
+That resolves the version through Mojang's manifest, downloads the server jar
+to a gitignored cache, verifies its SHA-1 against the manifest **on every
+run** — including when the jar is already cached — runs Minecraft's own data
+generators and regenerates the tables in `dust-registry`, `dust-protocol` and
+`dust-gen`. It needs a network and a JDK 21 or newer, runs by hand a few times
+per Minecraft release, and is deliberately not part of `just verify` — what CI
+checks is the generated code.
+
+The work is split into domains: blocks, items, entities, fluids, tags,
+recipes, loot, commands, packets and worldgen. A full run regenerates
+everything; each domain prints what it found and how long it took. Two things
+make re-runs cheap:
+
+- **The generator output is cached.** The `--reports` and `--server` trees are
+  kept under `.dust-extract/`, keyed by version, and reused until deleted —
+  running Minecraft's generators is the slow part, and nothing about reading
+  them gets faster by repeating it.
+- **`--only` extracts one domain at a time**: `cargo xtask extract --version
+  1.21.1 --only tags` reads the cached trees and rewrites just that domain's
+  table. A misspelled domain is refused rather than quietly extracting
+  everything.
+
+A full cold run — download plus both generators plus every table — takes a few
+minutes, almost all of it inside Java. A warm run against the cache takes
+seconds.
 
 ## Building
 
