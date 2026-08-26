@@ -84,8 +84,8 @@ mod tests {
         // the entity default reaches the generated file as its own constant,
         // through code this test owns.
         let mut registries = sample_registries();
-        registries.registries[0].default = Some("minecraft:wither".to_owned());
-        assert!(parse(&registries).is_ok(), "the wither is an entry");
+        registries.registries[0].default = Some("minecraft:villager".to_owned());
+        assert!(parse(&registries).is_ok(), "the villager is an entry");
 
         registries.registries[0].default = Some("minecraft:not_an_entity".to_owned());
         let err = parse(&registries).expect_err("must not be accepted");
