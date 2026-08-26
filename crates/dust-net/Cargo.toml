@@ -95,5 +95,23 @@ tokio = { version = "1", default-features = false, features = [
     "time",
 ] }
 
+# The mock client in `tests/login_session.rs` plays the client's half of the
+# key exchange, which means *encrypting* under the server's public key;
+# `login.rs` itself only ever decrypts. Same version pin and the same licence
+# reasoning as the main dependency above, and no new crate enters the graph.
+rsa = { version = "0.10.0-rc.18", default-features = false, features = [
+    "std",
+    "encoding",
+] }
+
+# Raw AES blocks for the independent CFB8 implementation the known-answer
+# test in `tests/crypto_hardening.rs` computes its vectors with.
+aes = "0.9"
+
+# PKCS#1 v1.5 padding is randomized, so the mock client needs a source of
+# unpredictability for its encryption. Same pin as the main dependency; the
+# OS generator only, for the reasons given there.
+rand = { version = "0.10", default-features = false, features = ["sys_rng"] }
+
 [lints]
 workspace = true
