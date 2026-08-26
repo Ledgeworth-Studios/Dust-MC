@@ -896,7 +896,6 @@ mod tests {
         metrics: LiveMetrics,
         stop: StopHandle,
         sink: Arc<Mutex<Vec<u8>>>,
-        config_path: PathBuf,
     }
 
     /// Build (but do not start) a virtual-time run of `dust server`.
@@ -927,7 +926,6 @@ mod tests {
             metrics: server.metrics(),
             stop: server.stop_handle(),
             sink,
-            config_path,
         };
         (run, server)
     }
