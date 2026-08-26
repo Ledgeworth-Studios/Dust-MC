@@ -1,35 +1,54 @@
-//! Which packet id means what, per protocol version.
+//! Minecraft's wire protocol: which packet id means what, and what is in one.
 //!
-//! # What this crate is, and what it is not yet
+//! # What this crate is, and what it is not
 //!
 //! Every Minecraft frame starts with a packet id, and that id is meaningless on
 //! its own. It is an index within one (connection state, direction) pair: id 0
 //! is `minecraft:intention` from a client mid-handshake, `minecraft:status_response`
 //! from a server answering a ping, and `minecraft:accept_teleportation` from a
-//! client in play. This crate holds the table that turns the pair and the
-//! number into a name, and the name back into a number.
+//! client in play. [`generated::packets`] holds the table that turns the pair
+//! and the number into a name and back.
 //!
-//! That is *all* it holds. There are no packet bodies here: no field layouts,
-//! no VarInt framing, no length prefixes, no compression, no encryption, and
-//! nothing that touches a socket. Those are Phase 1, and this table is the
-//! thing they are built on top of rather than a first draft of them. A reader
-//! looking for where a `ClientboundLoginPacket`'s fields are decoded has not
-//! found it yet, and is not missing it.
+//! [`packets`] holds the **bodies** for every packet of handshake, status,
+//! login and configuration — everything a connection uses before it reaches
+//! Play — plus the core of Play itself: join and movement, the world and
+//! entity families, chat and the tab list. What is missing from Play is a
+//! list, not a secret: see [`packets::unclaimed_for`]. [`types`] holds the
+//! field types those bodies are built from.
+//!
+//! What is *not* here, and is not missing:
+//!
+//! - **Framing, compression, encryption, sockets.** `dust-net` owns those. The
+//!   contract between the two is [`wire`], and a body reaches this crate with
+//!   its length prefix stripped and its compression and encryption undone.
+//! - **NBT.** `dust-nbt` owns it. This crate delimits an NBT value and does not
+//!   interpret it; see [`nbt`].
+//! - **Registry contents.** `dust-registry` owns those. The configuration state
+//!   carries registry sync, and this crate carries the entry ids and the blobs;
+//!   see [`packets::common::RegistryEntry`]. The same holds inside Play: chunk
+//!   sections are a blob plus a trait, and the world crate fills both in —
+//!   see [`packets::play`].
+//!
+//! Those first three are **seams**, not gaps. Each one is a trait or an opaque
+//! type that another crate will implement or replace, and each one has a
+//! differential test in [`conformance`] written *now*, so that the day two
+//! implementations of one format exist in this workspace, a disagreement
+//! between them is a red test rather than a bug in production.
 //!
 //! # Why a version dimension exists before there is a second version
 //!
 //! Decision D3 targets 1.21.1 first and commits the protocol layer to being
 //! multi-version from the first commit, because retrofitting that dimension
 //! later is a rewrite and is the most common architectural regret in this
-//! space. Packet ids are the sharpest case: they are renumbered nearly every
-//! release, so a table that assumed one version would need to be threaded
-//! through every call site the day a second appeared.
+//! space. Packet ids are the sharpest case — they are renumbered nearly every
+//! release — and field layouts are not far behind.
 //!
 //! So there is only one 1.21.1 today, and it is still reached as
 //! [`version::V1_21_1`] — a row in a generated table, not a global. Every
-//! lookup takes a [`ProtocolVersion`]. Adding 1.21.4 is
-//! `cargo xtask extract --version 1.21.4`: a generated module appears next to
-//! this one, a row appears in the version table, and no call site changes.
+//! lookup and every codec takes a [`ProtocolVersion`]. Adding 1.21.4 is
+//! `cargo xtask extract --version 1.21.4` plus a triage pass over the packet
+//! definitions, which the coverage test in [`packets`] will not let anybody
+//! skip.
 //!
 //! [`ProtocolVersion`] is deliberately not an enum. An enum would make adding a
 //! version a change to a type, and every `match` on it a thing to revisit; a
@@ -39,15 +58,25 @@
 //!
 //! # What the tests do and do not prove
 //!
-//! `tests/packet_ids.rs` round-trips every packet in every pair in every
-//! version. That proves the two directions of the lookup agree with each other,
-//! which they would under any consistent numbering, including a wrong one. What
-//! proves the table agrees with *Minecraft* is [`ProtocolVersion::samples`],
-//! which is taken from Mojang's report at extraction time and carries its own
-//! state and direction as strings, so it survives nothing that the table
-//! survives.
+//! `tests/packet_ids.rs` round-trips every packet id and `tests/packet_bodies.rs`
+//! round-trips every packet body. Neither proves the format is right: a round
+//! trip agrees with itself under any self-consistent convention, including a
+//! wrong one. Three things outside this crate are what make the difference —
+//! [`ProtocolVersion::samples`], taken from Mojang's report at extraction time;
+//! the vector tables in [`conformance`], computed by a separate implementation
+//! written from the format description; and `tests/vanilla_conformance.rs`,
+//! which speaks to a real vanilla 1.21.1 server and is the only one of the
+//! three that can catch a field list that is self-consistent, agrees with every
+//! table here, and is not what Minecraft sends.
 
+pub mod conformance;
 pub mod generated;
+pub mod nbt;
+pub mod packets;
+pub mod text;
+pub mod types;
+pub mod varint;
+pub mod wire;
 
 use generated::packets::VERSIONS;
 

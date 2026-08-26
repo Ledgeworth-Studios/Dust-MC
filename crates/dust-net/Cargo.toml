@@ -12,6 +12,12 @@ authors.workspace = true
 # so the feature lists are narrow on purpose: a feature that is off cannot drag
 # in a crate nobody read.
 
+# The wire primitives this crate frames. The VarInt is the case that makes the
+# dependency direction what it is: there is one implementation of it, and it
+# lives in `dust-protocol` because every field codec reads one first and
+# nothing may depend on this crate. See `src/varint.rs`.
+dust-protocol = { workspace = true }
+
 # The async runtime. `io` explains why tokio rather than another; in short, it
 # is the only runtime whose cancellation story survives the read timeouts this
 # crate needs.

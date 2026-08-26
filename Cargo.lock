@@ -266,6 +266,7 @@ version = "0.0.0"
 dependencies = [
  "aes",
  "cfb8",
+ "dust-protocol",
  "flate2",
  "rand 0.10.2",
  "rsa",
@@ -280,6 +281,9 @@ version = "0.0.0"
 [[package]]
 name = "dust-protocol"
 version = "0.0.0"
+dependencies = [
+ "proptest",
+]
 
 [[package]]
 name = "dust-registry"

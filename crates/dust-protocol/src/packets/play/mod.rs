@@ -1,0 +1,388 @@
+//! Play: the connection once the world exists.
+//!
+//! # Where this state stands
+//!
+//! The families defined here are the ones every other part of a server talks
+//! through: join and position sync, the serverbound movement family, liveness,
+//! kicks, the world's block and chunk updates, the entity visibility family,
+//! the tab list, plugin channels and both chat directions. What is *not* here
+//! yet is tracked rather than guessed — [`crate::packets::unclaimed_for`] lists
+//! every packet this version's table still has that no definition claims, and
+//! the pair does not graduate into [`crate::packets::COMPLETE_PAIRS`] until
+//! that list is empty.
+//!
+//! # The three shapes the macro cannot say, and what each became
+//!
+//! [`packet_group`](crate::packet_group) defines bodies whose fields are a
+//! fixed sequence. Three Play packets are not that, and each got a different
+//! treatment worth naming before copying:
+//!
+//! - **A value-dependent tail** (entity metadata: entries until a terminator)
+//!   became a named field type that owns the loop — [`metadata::MetadataEntries`].
+//!   The packet definition stays declarative; the branch hides inside one type
+//!   with one job.
+//! - **A header that decides later fields' shapes** (player info update: a
+//!   bitmask selecting six per-entry layouts) could not be split across fields,
+//!   because a field cannot see the one before it. It became a single body
+//!   struct holding everything after the id — see [`player_info`].
+//! - **A blob another crate owns** (chunk sections) stayed bytes on this side
+//!   of a trait — see [`chunk::Section`]. The envelope is exact; the contents
+//!   are dust-world's.
+//!
+//! # What this crate refuses to know about chat signing
+//!
+//! Since 1.19 the chat packets carry RSA signatures, session keys and message
+//! acknowledgements. Dust is offline-first and verifies none of that, but the
+//! fields are *laid out* here in full, because a decoder that skipped what it
+//! did not understand could not find the end of the packet. Signatures travel
+//! as opaque byte arrays ([`chat::SignatureBytes`]); the day online mode
+//! arrives, verification plugs in where those bytes are interpreted, and no
+//! layout changes. See [`chat`].
+
+pub mod chat;
+pub mod chunk;
+pub mod clientbound;
+pub mod metadata;
+pub mod player_info;
+pub mod serverbound;
+
+use crate::types::{Decode, Encode, Identifier, Position};
+use crate::wire::{DecodeError, EncodeError, WireRead, WireWrite};
+use crate::{wire_struct, ProtocolVersion};
+
+crate::var_int_enum! {
+    /// How a player may interact with the world.
+    ///
+    /// The ids are the registry's own and appear in more than one encoding:
+    /// the join packet carries the current mode as a bare byte, the tab list
+    /// carries it as a VarInt. Both spellings resolve through
+    /// [`Gamemode::from_discriminant`], so there is exactly one table to get
+    /// right.
+    pub enum Gamemode {
+        Survival = 0,
+        Creative = 1,
+        Adventure = 2,
+        Spectator = 3,
+    }
+}
+
+/// The join packet's spelling of [`Gamemode`]: one unsigned byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GameModeByte(pub Gamemode);
+
+impl Decode for GameModeByte {
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        _version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        let raw = input.read_u8()?;
+        let gamemode =
+            Gamemode::from_discriminant(i32::from(raw)).ok_or(DecodeError::UnknownVariant {
+                name: "Gamemode",
+                value: i32::from(raw),
+            })?;
+        Ok(Self(gamemode))
+    }
+}
+
+impl Encode for GameModeByte {
+    fn encode<W: WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        _version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        out.write_u8(self.0.discriminant() as u8);
+        Ok(())
+    }
+}
+
+/// The join packet's spelling of the *previous* [`Gamemode`]: a signed byte
+/// where −1 means "there was no previous mode".
+///
+/// A fresh join has no previous mode, which makes the sentinel load-bearing:
+/// modelling this as a bare [`Gamemode`] would force a lie onto every first
+/// spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PreviousGameMode(pub Option<Gamemode>);
+
+impl Decode for PreviousGameMode {
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        _version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        let raw = input.read_i8()?;
+        Ok(Self(match raw {
+            -1 => None,
+            other => Some(Gamemode::from_discriminant(i32::from(other)).ok_or(
+                DecodeError::UnknownVariant {
+                    name: "Gamemode",
+                    value: i32::from(other),
+                },
+            )?),
+        }))
+    }
+}
+
+impl Encode for PreviousGameMode {
+    fn encode<W: WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        _version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        let raw = match self.0 {
+            None => -1,
+            Some(mode) => mode.discriminant() as i8,
+        };
+        out.write_i8(raw);
+        Ok(())
+    }
+}
+
+wire_struct! {
+    /// Where the player died, carried back on join so the client can show it.
+    ///
+    /// On the wire this is one boolean followed by two fields, which is the
+    /// protocol's "optional" spelled across three slots instead of one; the
+    /// struct is what makes it one thing again.
+    pub struct DeathLocation {
+        dimension: Identifier,
+        position: Position,
+    }
+}
+
+wire_struct! {
+    /// An entity's motion, in units of 1/8000 of a block per tick.
+    ///
+    /// The unit is the protocol's own and appears wherever entities move
+    /// abruptly — spawns carry an initial velocity, hits carry the knockback.
+    /// The three shorts stay together because every user wants all three and
+    /// the unit is easy to lose when they travel apart.
+    pub struct EntityVelocity {
+        x: i16,
+        y: i16,
+        z: i16,
+    }
+}
+
+wire_struct! {
+    /// An entity position change, in units of 1/4096 of a block.
+    ///
+    /// Distinct from [`EntityVelocity`] in meaning and in unit, and the two
+    /// are separate types precisely so that a delta cannot be written where a
+    /// velocity belongs — they are the same Rust shape, three `i16`s, and a
+    /// swap would compile forever and look like lag.
+    pub struct EntityDelta {
+        x: i16,
+        y: i16,
+        z: i16,
+    }
+}
+
+/// Which parts of a position sync are relative to the client's current values.
+///
+/// A cleared flag means absolute: "you are at these coordinates". A set flag
+/// means relative: "move this far". The distinction decides whether a lost
+/// packet drifts the client permanently, so the flags are a named type rather
+/// than a bare byte — code that syncs positions should be able to ask
+/// [`TeleportFlags::is_relative`] instead of knowing that bit 3 is pitch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TeleportFlags(pub u8);
+
+impl TeleportFlags {
+    pub const X: u8 = 0x01;
+    pub const Y: u8 = 0x02;
+    pub const Z: u8 = 0x04;
+    pub const PITCH: u8 = 0x08;
+    pub const YAW: u8 = 0x10;
+
+    /// Whether this axis is relative. The naming follows the protocol's own,
+    /// where yaw is rotation about the X axis and pitch about the Y axis —
+    /// which is why the constants and the axis names do not line up.
+    pub fn is_relative(self, mask: u8) -> bool {
+        self.0 & mask != 0
+    }
+}
+
+impl Decode for TeleportFlags {
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        _version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        input.read_u8().map(Self)
+    }
+}
+
+impl Encode for TeleportFlags {
+    fn encode<W: WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        _version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        out.write_u8(self.0);
+        Ok(())
+    }
+}
+
+/// The player ability bits, as the client toggles and the server grants them.
+///
+/// One subtlety lives in the combination, not the bits: flying set while
+/// allow-flying is clear is a player who cannot stop flying. That is why
+/// [`Abilities::can_stop_flying`] exists — it is the question the game logic
+/// actually asks, and asking it through two field reads invites getting one of
+/// them backwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Abilities(pub u8);
+
+impl Abilities {
+    pub const INVULNERABLE: u8 = 0x01;
+    pub const FLYING: u8 = 0x02;
+    pub const ALLOW_FLYING: u8 = 0x04;
+    pub const INSTANT_BREAK: u8 = 0x08;
+
+    pub fn has(self, flag: u8) -> bool {
+        self.0 & flag != 0
+    }
+
+    pub fn can_stop_flying(self) -> bool {
+        !self.has(Self::FLYING) || self.has(Self::ALLOW_FLYING)
+    }
+}
+
+impl Decode for Abilities {
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        _version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        input.read_u8().map(Self)
+    }
+}
+
+impl Encode for Abilities {
+    fn encode<W: WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        _version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        out.write_u8(self.0);
+        Ok(())
+    }
+}
+
+/// A packed chunk-section coordinate: where one 16³ slice of the world sits.
+///
+/// The packing is the block-position packing's sibling with different widths —
+/// 22 bits each for x and z and 20 for y, signed — and the same failure mode:
+/// a reader that masks without sign-extending works around spawn and breaks
+/// under the ocean. The shifts below are arithmetic for exactly the reason
+/// [`crate::types::Position`] documents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChunkSectionPosition(pub i64);
+
+impl ChunkSectionPosition {
+    pub fn pack(x: i32, y: i32, z: i32) -> Self {
+        Self(
+            ((i64::from(x) & 0x3F_FFFF) << 42)
+                | ((i64::from(z) & 0x3F_FFFF) << 20)
+                | (i64::from(y) & 0xF_FFFF),
+        )
+    }
+
+    pub fn x(self) -> i32 {
+        (self.0 >> 42) as i32
+    }
+
+    pub fn y(self) -> i32 {
+        ((self.0 << 44) >> 44) as i32
+    }
+
+    pub fn z(self) -> i32 {
+        ((self.0 << 22) >> 42) as i32
+    }
+}
+
+impl Decode for ChunkSectionPosition {
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        _version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        input.read_i64().map(Self)
+    }
+}
+
+impl Encode for ChunkSectionPosition {
+    fn encode<W: WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        _version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        out.write_i64(self.0);
+        Ok(())
+    }
+}
+
+/// One changed block inside a multi-block change, packed as the wire packs it.
+///
+/// The long holds twelve bits of block state above twelve bits of
+/// section-local coordinates, and the coordinate nibbles run **y lowest** — z
+/// above it and x above that — which is the opposite order to nearly everything
+/// else in the protocol and therefore exactly the order an implementation gets
+/// wrong once and ships. The accessors here are the single place that order is
+/// written down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BlockChangeEntry(pub u64);
+
+impl BlockChangeEntry {
+    pub const STATE_BITS: u32 = 12;
+
+    /// Pack from a state id and section-local coordinates, each masked to its
+    /// nibble as vanilla masks. A coordinate outside 0..16 is a caller bug,
+    /// not a wire concern; masking keeps the long well-formed regardless.
+    pub fn pack(state_id: u32, local_x: u8, local_y: u8, local_z: u8) -> Self {
+        Self(
+            (u64::from(state_id) << Self::STATE_BITS)
+                | (u64::from(local_x & 0xF) << 8)
+                | (u64::from(local_z & 0xF) << 4)
+                | u64::from(local_y & 0xF),
+        )
+    }
+
+    pub fn state_id(self) -> u32 {
+        (self.0 >> Self::STATE_BITS) as u32
+    }
+
+    pub fn local_x(self) -> u8 {
+        ((self.0 >> 8) & 0xF) as u8
+    }
+
+    pub fn local_y(self) -> u8 {
+        (self.0 & 0xF) as u8
+    }
+
+    pub fn local_z(self) -> u8 {
+        ((self.0 >> 4) & 0xF) as u8
+    }
+}
+
+impl Decode for BlockChangeEntry {
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        _version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        // The entry travels as a VarLong. Its bits fit in the low twenty-four
+        // places for any block registry that will exist soon, so the two's
+        // complement round trip through i64 is exact; casting is reading the
+        // unsigned meaning of the same bytes, which is what vanilla stores.
+        input.read_var_long().map(|bits| Self(bits as u64))
+    }
+}
+
+impl Encode for BlockChangeEntry {
+    fn encode<W: WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        _version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        out.write_var_long(self.0 as i64);
+        Ok(())
+    }
+}
