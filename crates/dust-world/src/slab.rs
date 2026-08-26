@@ -33,7 +33,12 @@
 /// crossed a boundary — the network, a log line — and arrive untrusted;
 /// validating one costs the same lookup as using it and reports the same
 /// errors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// The derived ordering is slot first, generation second. Nothing in the
+/// slab depends on it; it exists so callers can put keys in ordered
+/// collections without wrapping them, which keeps key sets as boring to
+/// iterate as the keys themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SlabKey {
     slot: u32,
     generation: u32,
