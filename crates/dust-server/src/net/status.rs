@@ -9,6 +9,29 @@
 //! front of them answers with a third. So the packet layer ends at "a
 //! length-prefixed string travels here", and this module owns the string.
 //!
+//! # What a real 1.21.1 server sends, and where Dust differs on purpose
+//!
+//! Captured by pinging a vanilla 1.21.1 server, because a document that is
+//! valid JSON can still be the wrong document and no unit test would say so:
+//!
+//! ```text
+//! {"version":{"name":"1.21.1","protocol":767},
+//!  "description":"A Minecraft Server",
+//!  "players":{"max":20,"online":0}}
+//! ```
+//!
+//! Two things Dust used to send and no longer does, because that capture said
+//! otherwise: an empty `players.sample`, and an explicit
+//! `"enforcesSecureChat":false`. Each key's own note below records what the
+//! wrong reasoning was.
+//!
+//! One deliberate difference remains. Vanilla writes a plain MOTD as a bare
+//! string, since a string *is* a text component; Dust writes `{"text":"…"}`.
+//! Both are valid and the client renders them identically, and the object form
+//! is chosen because it is unambiguous: an operator whose MOTD happens to begin
+//! with a brace would have it parsed as a component rather than shown, and a
+//! MOTD is arbitrary operator text.
+//!
 //! # Why the version name is not a constant
 //!
 //! When a client's protocol number does not match the server's, the client
@@ -73,17 +96,27 @@ impl StatusPolicy {
     ///   maximum is presentation, not admission control: the gateway may admit
     ///   more across several backends, which is why the configuration says so
     ///   at its own field.
-    /// * `players.sample` — the hover list. Empty and present, rather than
-    ///   absent: some third-party list clients treat a missing `sample` as a
-    ///   malformed document, and an empty array costs two bytes.
+    /// * `players.sample` — the hover list, **omitted when empty**, which is
+    ///   what a real 1.21.1 server does. Checked rather than assumed: a vanilla
+    ///   server with nobody on it sends `{"max":20,"online":0}` and no
+    ///   `sample` key at all. Dust sent an empty array here first, on the
+    ///   theory that some list clients dislike a missing key; that theory had
+    ///   no evidence behind it and vanilla's behaviour is evidence against, so
+    ///   it went.
     /// * `description` — a text component. Still *JSON* here on 1.21.1, unlike
     ///   every other component since 1.20.3, which is the trap this whole
     ///   packet is known for.
     /// * `favicon` — omitted entirely when there is none. A `null` is not the
     ///   same thing to every client that parses this.
-    /// * `enforcesSecureChat` — false, and it must be present. Dust does not
-    ///   sign chat, and a client that believes a server enforces signing will
-    ///   warn about unsigned messages once in play.
+    /// * `enforcesSecureChat` — **omitted**, which means false. The client's
+    ///   codec reads this field with a default of `false`, so absent and
+    ///   `false` are the same statement, and vanilla omits it: a real 1.21.1
+    ///   server sends no such key whether `enforce-secure-profile` is on or
+    ///   off. Dust sent an explicit `false` first with a comment claiming the
+    ///   key had to be present or the client would warn about unsigned
+    ///   messages — which had the sense backwards, since it is the *true* value
+    ///   that makes a client expect signatures. The day Dust signs chat, this
+    ///   is where `true` goes.
     pub fn render(&self, online: u32) -> String {
         let mut json = String::with_capacity(256);
         json.push_str(r#"{"version":{"name":""#);
@@ -93,7 +126,7 @@ impl StatusPolicy {
         let _ = write!(json, r#"","protocol":{}}},"#, self.version.number());
         let _ = write!(
             json,
-            r#""players":{{"max":{},"online":{online},"sample":[]}},"#,
+            r#""players":{{"max":{},"online":{online}}},"#,
             self.max_players
         );
         json.push_str(r#""description":{"text":""#);
@@ -108,7 +141,7 @@ impl StatusPolicy {
             escape_json_into(favicon.data_uri(), &mut json);
             json.push('"');
         }
-        json.push_str(r#","enforcesSecureChat":false}"#);
+        json.push('}');
         json
     }
 }
@@ -209,18 +242,25 @@ mod tests {
     }
 
     #[test]
-    fn the_sample_is_present_and_empty_rather_than_absent() {
+    fn an_empty_sample_is_omitted_the_way_vanilla_omits_it() {
+        // Captured from a real 1.21.1 server with nobody connected: the whole
+        // players object is `{"max":20,"online":0}`. Dust sent `"sample":[]`
+        // here until that capture said otherwise, on a theory about
+        // third-party list clients that had no evidence behind it.
         let json = policy("hi").render(0);
-        assert!(json.contains(r#""sample":[]"#), "{json}");
+        assert!(!json.contains("sample"), "{json}");
+        assert!(
+            json.contains(r#""players":{"max":20,"online":0}"#),
+            "{json}"
+        );
     }
 
     #[test]
-    fn secure_chat_enforcement_is_stated_rather_than_left_out() {
-        // Absent is not the same as false to a client deciding whether to warn
-        // about unsigned messages.
-        assert!(policy("hi")
-            .render(0)
-            .contains(r#""enforcesSecureChat":false"#));
+    fn secure_chat_enforcement_is_omitted_because_dust_does_not_enforce_it() {
+        // Absent and `false` are the same statement to the client's codec, and
+        // vanilla sends no key at all — with enforce-secure-profile on *or*
+        // off, which was checked against a running server rather than assumed.
+        assert!(!policy("hi").render(0).contains("enforcesSecureChat"));
     }
 
     #[test]
