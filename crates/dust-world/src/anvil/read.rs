@@ -1,150 +1,49 @@
-//! Reading a chunk out of a world Minecraft wrote.
+//! Turning the NBT a region file holds into a [`Chunk`].
 //!
-//! # What this is and is not
+//! The format this reads is written down once, in [the module
+//! documentation](super), together with the four facts about it that a reader
+//! gets wrong quietly. What is here is the walk itself, and the decisions about
+//! what to do when the file says something this build was not expecting.
 //!
-//! [`region`](crate::region) reads the *container* — the 4 KiB sectors, the
-//! offsets, the per-chunk compression — and hands back a decompressed NBT
-//! document. This turns that document into a [`Chunk`]. It is the half of
-//! Anvil that is about Minecraft rather than about files.
+//! # Light is not read, and heightmaps are
 //!
-//! **Read only.** Writing an Anvil chunk means answering questions this crate
-//! has no way to check the answers to — which of the twenty-odd fields a
-//! vanilla server insists on, what a `Status` of `minecraft:full` promises,
-//! whether a `block_entities` list may be empty or must be absent — and a
-//! writer that guessed would produce worlds that open until the day one does
-//! not. Reading is checkable against a world that already exists, which is
-//! what `tests/anvil.rs` does.
+//! Both are derived data — a cache of an answer some engine computed about the
+//! blocks — so the two being treated differently needs a reason, and it is this:
+//! **Dust can reproduce the light and cannot reproduce the heightmaps.**
 //!
-//! # The layout, from a real 1.21.1 world
+//! A chunk's stored `SkyLight` and `BlockLight` are a cache of what a light
+//! engine produced, and this server has its own engine. Reading them would mean
+//! serving light no code here can reproduce, and being unable to tell a stale
+//! cache from a fresh one. So every section is loaded dark and lit again.
 //!
-//! ```text
-//! root compound
-//!   DataVersion : Int          3955 for 1.21.1
-//!   xPos, zPos  : Int          the column, in chunk coordinates
-//!   yPos        : Int          the index of the lowest section, in sections
-//!   Status      : String       minecraft:full when it is finished
-//!   sections    : List<Compound>
-//!     Y            : Byte      the section's own y, in sections, signed
-//!     block_states : Compound  { palette: List<Compound>, data: LongArray? }
-//!     biomes       : Compound  { palette: List<String>,   data: LongArray? }
-//! ```
+//! A heightmap is a cache of a *predicate*, and vanilla's four maps use four
+//! different ones: `WORLD_SURFACE` is not-air, `OCEAN_FLOOR` is blocks-motion,
+//! `MOTION_BLOCKING` is blocks-motion-or-fluid, and `MOTION_BLOCKING_NO_LEAVES`
+//! is that with leaves taken out. Dust's recompute takes a *single* closure and
+//! every caller in the tree passes not-air — right for the first and wrong for
+//! the other three. Discarding the file's maps and substituting that would not
+//! be recovering the data; it would be replacing four answers with one, three
+//! times over. So they are read, and a caller with a better predicate is free
+//! to recompute.
 //!
-//! Two things about that shape are worth stating because they are where a
-//! reader goes wrong quietly.
-//!
-//! **`data` is absent when the palette has one entry**, and its absence means
-//! "every cell is that entry" rather than "no cells". A reader that treated a
-//! missing array as an empty section would turn a solid section of stone into
-//! air, and the chunk would still load.
-//!
-//! **The indices in `data` point into the palette that was written beside
-//! them**, not at registry ids, and they are packed at `ceil_log2(palette
-//! length)` bits with a floor of four — *not* at the width the container will
-//! use in memory. That difference is [`Strategy::disk_bits`], and it exists
-//! because on disk a section indexes its own palette while in memory a large
-//! one indexes the whole registry.
-//!
-//! # Blocks are resolved by name, and unknown ones are an error
-//!
-//! A palette entry is `{ Name: "minecraft:stone", Properties: {...} }`. The
-//! name is resolved through a caller-supplied lookup, because which id a block
-//! has is `dust-registry`'s business and this crate does not depend on it.
-//!
-//! Properties are read and passed to the lookup, so a chunk of stairs comes
-//! back facing the way it was written. They arrive as `(name, value)` pairs of
-//! strings, which is how the file spells them, and turning those into a state
-//! id is the registry's job — this crate does not know that `facing` has six
-//! values or which of them is which.
-//!
-//! Even so, **a palette can list one block name twice** and resolve to one id:
-//! a lookup may legitimately ignore a property it does not model, and two
-//! entries differing only in that property then collapse. The file is not wrong
-//! and neither is the reader; the indices still point where they should. See
-//! the note in [`read_container`] for why that rules out the fast path through
-//! `PalettedContainer::from_parts`.
-
-use std::collections::HashMap;
+//! **The differential found this, not a unit test.** The first version of this
+//! reader ignored `Heightmaps` entirely, and every chunk came back carrying the
+//! default map — which is invisible in-process, because the one caller that
+//! serves chunks recomputes before sending. It surfaced the moment a written
+//! chunk went to a real server: blocks and biomes identical on all 25 chunks,
+//! heightmaps different on all 25. It is worth naming the shape: this was not
+//! code that was wrong, it was **code that was never written**, and no test over
+//! the code that exists can find a field nobody read.
 
 use dust_nbt::{Compound, Tag};
 
 use crate::chunk::{Chunk, Section};
 use crate::container::{PalettedContainer, Strategy};
 use crate::coords::ChunkPos;
-use crate::heightmap::WorldHeight;
+use crate::heightmap::{Heightmap, HeightmapKind, WorldHeight, COLUMNS};
 use crate::light::LightArray;
 
-/// The data version 1.21.1 writes.
-pub const DATA_VERSION_1_21_1: i32 = 3955;
-
-/// What could not be read.
-#[derive(Debug)]
-pub enum AnvilError {
-    /// A field the format requires is missing or the wrong type.
-    Field { name: &'static str },
-    /// A block name the caller's lookup does not know.
-    UnknownBlock { name: String },
-    /// A biome name the caller's lookup does not know.
-    UnknownBiome { name: String },
-    /// The section list does not fit the world it claims to be part of.
-    SectionOutOfRange { y: i32 },
-    /// A packed array is the wrong length for its palette.
-    BadPacking { cells: usize, longs: usize },
-    /// The container refused what the file described. Carried rather than
-    /// flattened: "no usable palette" names the field and not the problem, and
-    /// the problem is the thing somebody debugging a world needs.
-    Container(crate::container::ContainerError),
-}
-
-impl std::fmt::Display for AnvilError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Field { name } => write!(f, "the chunk has no usable {name}"),
-            Self::UnknownBlock { name } => write!(f, "no block is called {name}"),
-            Self::UnknownBiome { name } => write!(f, "no biome is called {name}"),
-            Self::SectionOutOfRange { y } => {
-                write!(f, "section y={y} is outside the world this chunk is in")
-            }
-            Self::Container(e) => write!(f, "the section's palette is not usable: {e}"),
-            Self::BadPacking { cells, longs } => write!(
-                f,
-                "{longs} long(s) cannot hold {cells} indices at the width the \
-                 palette implies"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for AnvilError {}
-
-/// How a caller turns the names in a chunk into ids.
-///
-/// A trait rather than two closures because the two lookups are always
-/// supplied together and always come from the same registry snapshot; a caller
-/// that could pass a block table from one version and a biome table from
-/// another would be a caller able to build a chunk neither table describes.
-pub trait Names {
-    /// The state id of a block, by name and property values.
-    ///
-    /// `properties` is what the palette entry carried, as `(name, value)`
-    /// pairs — `("facing", "north")`, `("waterlogged", "false")`. A block with
-    /// none has an empty slice, which is the common case and the one the
-    /// implementation should be fast for.
-    ///
-    /// A property the block does not have, or a value it does not take, is the
-    /// implementation's to decide about. Refusing the whole state is defensible
-    /// and so is ignoring the pair; what is not is silently returning the
-    /// default, since that turns one wrong property into a block that looks
-    /// right and is not.
-    fn block(&self, name: &str, properties: &[(&str, &str)]) -> Option<u32>;
-    /// A biome's id, by name. This must be its position in the registry the
-    /// *client* was told about, not an internal one — the two are the same
-    /// number only if somebody made them so.
-    fn biome(&self, name: &str) -> Option<u32>;
-    /// How many block states exist, for the containers' bounds.
-    fn block_registry_size(&self) -> u32;
-    /// How many biomes exist.
-    fn biome_registry_size(&self) -> u32;
-}
+use super::{AnvilError, Names};
 
 /// Read one chunk from the NBT a region file gave back.
 pub fn chunk(root: &Compound, world: WorldHeight, names: &impl Names) -> Result<Chunk, AnvilError> {
@@ -211,6 +110,33 @@ pub fn chunk(root: &Compound, world: WorldHeight, names: &impl Names) -> Result<
             LightArray::filled(0),
             LightArray::filled(0),
         );
+    }
+
+    // Absent, and a key that is absent from a present compound, both leave the
+    // default in place: a chunk that has not been generated far enough to have
+    // heightmaps is a real state and not a damaged file. A key that is *there*
+    // and unreadable is the opposite, and stops the read.
+    if let Some(Tag::Compound(maps)) = root.get("Heightmaps") {
+        for (key, value) in maps.iter() {
+            // An unrecognised key is skipped rather than refused. The two `_WG`
+            // maps are not written by a full chunk and a datapack-shaped mod
+            // may add its own; neither is a reason to reject a world.
+            let Some(kind) = HeightmapKind::from_nbt_key(key) else {
+                continue;
+            };
+            let Tag::LongArray(longs) = value else {
+                return Err(AnvilError::Field {
+                    name: "a heightmap",
+                });
+            };
+            *chunk.heightmaps_mut().get_mut(kind) =
+                Heightmap::from_longs(kind, world, longs.clone()).map_err(|_| {
+                    AnvilError::BadPacking {
+                        cells: COLUMNS,
+                        longs: longs.len(),
+                    }
+                })?;
+        }
     }
 
     Ok(chunk)
@@ -367,31 +293,128 @@ fn int(root: &Compound, name: &'static str) -> Result<i32, AnvilError> {
     }
 }
 
-/// A [`Names`] backed by two maps, for callers that already have the tables.
-#[derive(Debug, Default)]
-pub struct NameTables {
-    /// Keyed by name alone: this is for tests and for callers that have a flat
-    /// table, and it ignores properties by construction.
-    pub blocks: HashMap<String, u32>,
-    pub biomes: HashMap<String, u32>,
-    pub block_registry_size: u32,
-    pub biome_registry_size: u32,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::anvil::NameTables;
+    use dust_nbt::{List, TagType};
 
-impl Names for NameTables {
-    fn block(&self, name: &str, _properties: &[(&str, &str)]) -> Option<u32> {
-        self.blocks.get(name).copied()
+    fn tables() -> NameTables {
+        let mut tables = NameTables {
+            block_registry_size: 32,
+            biome_registry_size: 8,
+            ..NameTables::default()
+        };
+        tables.blocks.insert("minecraft:air".into(), 0);
+        tables.biomes.insert("minecraft:plains".into(), 1);
+        tables
     }
 
-    fn biome(&self, name: &str) -> Option<u32> {
-        self.biomes.get(name).copied()
+    /// The smallest root the reader accepts: a position and an empty section
+    /// list. Everything the tests below vary is added on top.
+    fn bare_root() -> Compound {
+        let mut root = Compound::new();
+        root.insert("xPos", Tag::Int(0));
+        root.insert("zPos", Tag::Int(0));
+        root.insert("sections", Tag::List(List::new(TagType::End)));
+        root
     }
 
-    fn block_registry_size(&self) -> u32 {
-        self.block_registry_size
+    /// 256 columns at nine bits, packed seven to a long with the top bit of
+    /// each long unused — 37 longs, which is what a real file carries and what
+    /// 36 would be if the packing straddled.
+    fn heightmap_longs(value: i64) -> Vec<i64> {
+        let mut longs = vec![0i64; 37];
+        for column in 0..COLUMNS {
+            let long = column / 7;
+            let shift = (column % 7) * 9;
+            longs[long] |= value << shift;
+        }
+        longs
     }
 
-    fn biome_registry_size(&self) -> u32 {
-        self.biome_registry_size
+    /// The regression the differential found: a reader that ignores
+    /// `Heightmaps` loses them silently, because the only in-process caller
+    /// recomputes before it uses them.
+    #[test]
+    fn the_heightmaps_a_file_carries_are_read_and_not_discarded() {
+        let mut maps = Compound::new();
+        maps.insert("MOTION_BLOCKING", Tag::LongArray(heightmap_longs(70)));
+        let mut root = bare_root();
+        root.insert("Heightmaps", Tag::Compound(maps));
+
+        let chunk = chunk(&root, WorldHeight::OVERWORLD, &tables()).expect("read");
+        let map = chunk.heightmaps().get(HeightmapKind::MotionBlocking);
+        // `first_available` is the row above the highest taken one, and the
+        // stored number is that row's offset from the world's floor: 70 above
+        // y=-64 is y=6.
+        assert_eq!(map.first_available(0, 0), 6);
+        assert_eq!(map.first_available(15, 15), 6);
+        // A map the file did not carry keeps the default, rather than being
+        // filled in with a neighbour's numbers.
+        assert_eq!(
+            chunk
+                .heightmaps()
+                .get(HeightmapKind::WorldSurface)
+                .first_available(0, 0),
+            -64
+        );
+    }
+
+    #[test]
+    fn a_chunk_with_no_heightmaps_at_all_reads_with_the_defaults() {
+        let chunk = chunk(&bare_root(), WorldHeight::OVERWORLD, &tables()).expect("read");
+        for kind in HeightmapKind::ALL {
+            assert_eq!(
+                chunk.heightmaps().get(kind).first_available(0, 0),
+                -64,
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// Absent is a state; present and unreadable is a contradiction. The two
+    /// are treated differently on purpose, and this is the difference.
+    #[test]
+    fn a_heightmap_that_is_there_and_unreadable_stops_the_read() {
+        let mut maps = Compound::new();
+        maps.insert("MOTION_BLOCKING", Tag::String("about eighty".into()));
+        let mut root = bare_root();
+        root.insert("Heightmaps", Tag::Compound(maps));
+        assert!(matches!(
+            chunk(&root, WorldHeight::OVERWORLD, &tables()),
+            Err(AnvilError::Field {
+                name: "a heightmap"
+            })
+        ));
+
+        let mut maps = Compound::new();
+        maps.insert("OCEAN_FLOOR", Tag::LongArray(vec![0; 12]));
+        let mut root = bare_root();
+        root.insert("Heightmaps", Tag::Compound(maps));
+        assert!(matches!(
+            chunk(&root, WorldHeight::OVERWORLD, &tables()),
+            Err(AnvilError::BadPacking { longs: 12, .. })
+        ));
+    }
+
+    /// The two `_WG` maps are absent from every finished chunk, and a datapack
+    /// may add a key of its own. Neither is a damaged world.
+    #[test]
+    fn a_heightmap_key_this_build_does_not_know_is_skipped_rather_than_refused() {
+        let mut maps = Compound::new();
+        maps.insert("WORLD_SURFACE", Tag::LongArray(heightmap_longs(70)));
+        maps.insert("SOMEBODYS_OWN_MAP", Tag::LongArray(vec![0; 3]));
+        let mut root = bare_root();
+        root.insert("Heightmaps", Tag::Compound(maps));
+
+        let chunk = chunk(&root, WorldHeight::OVERWORLD, &tables()).expect("read");
+        assert_eq!(
+            chunk
+                .heightmaps()
+                .get(HeightmapKind::WorldSurface)
+                .first_available(0, 0),
+            6
+        );
     }
 }

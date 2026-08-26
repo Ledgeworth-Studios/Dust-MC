@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use dust_world::anvil::write::Carried;
 use dust_world::anvil::{self, NameTables};
 use dust_world::coords::{ChunkPos, RegionPos};
 use dust_world::heightmap::WorldHeight;
@@ -215,5 +216,115 @@ fn a_section_with_no_data_array_is_uniform_rather_than_empty() {
         checked > 0,
         "no section in this world had a palette of one and no data array, so \
          the case this test exists for was never exercised"
+    );
+}
+
+/// Every chunk of a real region, written back out and read again.
+///
+/// # What this proves, stated narrowly on purpose
+///
+/// That the writer and the reader agree, over real input rather than over
+/// fixtures somebody here invented — which is more than a synthetic round trip
+/// and is still **not** the question. Both halves are this crate's, so they
+/// agree with each other under any self-consistent convention, including one
+/// where every packed index is off by one in the same direction. That is the
+/// same argument Phase 0.5 made about registry round trips and it holds here.
+///
+/// The check that does answer the question is `cargo xtask harness rewrite`,
+/// which hands the bytes to Minecraft. This exists because it fails in seconds
+/// and that one takes seven minutes, so a broken writer should not have to wait
+/// for a JVM to say so.
+#[test]
+#[ignore = "needs a real world; set DUST_ANVIL_WORLD to a region directory"]
+fn a_real_chunk_written_and_read_again_is_the_chunk_it_was() {
+    let Some(dir) = world_dir() else {
+        panic!("DUST_ANVIL_WORLD is not set; see this file's own documentation");
+    };
+    let mut region = RegionFile::open_in(&dir, RegionPos::new(0, 0)).expect("open the region");
+
+    let mut checked = 0usize;
+    let mut with_entities = 0usize;
+    for pos in region.chunk_positions().collect::<Vec<_>>() {
+        let payload = region.read_chunk(pos).expect("read").expect("present");
+        let named = dust_nbt::read::from_bytes(payload.as_bytes()).expect("nbt");
+        let dust_nbt::Tag::Compound(root) = &named.tag else {
+            continue;
+        };
+        let tables = tables_for(root);
+        let before = anvil::chunk(root, WorldHeight::OVERWORLD, &tables).expect("parse");
+
+        let carried = Carried::read_from(root);
+        let written = anvil::write::chunk(&before, &tables, &carried)
+            .unwrap_or_else(|e| panic!("{pos:?}: {e}"));
+
+        // Through bytes, not through the compound. Serialising and parsing is
+        // where a palette entry's type or a long array's length would go wrong,
+        // and comparing the compound to itself would skip exactly that.
+        let bytes = dust_nbt::write::to_vec("", &dust_nbt::Tag::Compound(written)).expect("write");
+        let again = dust_nbt::read::from_bytes(&bytes).expect("read back");
+        let dust_nbt::Tag::Compound(again) = &again.tag else {
+            panic!("the root this wrote is a compound");
+        };
+        let after = anvil::chunk(again, WorldHeight::OVERWORLD, &tables)
+            .unwrap_or_else(|e| panic!("{pos:?} on the way back: {e}"));
+
+        assert_eq!(after.pos(), before.pos(), "{pos:?} moved");
+        assert_eq!(
+            after.sections().len(),
+            before.sections().len(),
+            "{pos:?} changed height"
+        );
+        for (index, (a, b)) in after.sections().iter().zip(before.sections()).enumerate() {
+            assert!(
+                a.states().equivalent(b.states()),
+                "{pos:?} section {index} holds different blocks"
+            );
+            assert!(
+                a.biomes().equivalent(b.biomes()),
+                "{pos:?} section {index} holds different biomes"
+            );
+        }
+
+        // The heightmaps are written from the chunk rather than recomputed on
+        // the way back in, so this compares what the file carried against what
+        // the file carries now.
+        for kind in dust_world::heightmap::HeightmapKind::ALL {
+            if !kind.persisted() {
+                continue;
+            }
+            assert_eq!(
+                after.heightmaps().get(kind).as_longs(),
+                before.heightmaps().get(kind).as_longs(),
+                "{pos:?} {kind:?} changed"
+            );
+        }
+
+        // Carrying is the whole reason `Carried` exists, and a test that only
+        // ever ran over chunks with nothing to carry would be green for the
+        // wrong reason. The count below is what makes that visible.
+        assert_eq!(
+            Carried::read_from(again),
+            carried,
+            "{pos:?} lost what a chunk cannot model"
+        );
+        if carried
+            .block_entities
+            .as_ref()
+            .is_some_and(|l| !l.is_empty())
+        {
+            with_entities += 1;
+        }
+        checked += 1;
+    }
+
+    assert!(checked > 100, "only {checked} chunks were written back");
+    // A pregenerated overworld region has dungeons in it, and a dungeon has a
+    // chest. Zero here does not mean the carrying is broken — it means this
+    // world could not have told the difference, which is worth failing over
+    // rather than passing quietly.
+    assert!(
+        with_entities > 0,
+        "none of the {checked} chunks carried a block entity, so nothing here \
+         exercised the one field a `Chunk` provably cannot reconstruct"
     );
 }
