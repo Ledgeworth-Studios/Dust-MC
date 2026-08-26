@@ -9,5 +9,6 @@ pub mod commands;
 pub mod entity_types;
 pub mod fluids;
 pub mod items;
+pub mod loot;
 pub mod recipes;
 pub mod registries;

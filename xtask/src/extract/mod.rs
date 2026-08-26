@@ -39,6 +39,7 @@ mod download;
 mod entities;
 mod fluids;
 mod items;
+mod loot;
 mod numbers;
 mod packets;
 mod recipes;
@@ -76,6 +77,8 @@ pub enum Domain {
     Commands,
     /// Recipe shapes: the serialiser vocabulary and the keys each takes.
     Recipes,
+    /// Loot tables: the inventory and the pool/condition/function vocabulary.
+    Loot,
     /// Packet id tables for `dust-protocol`.
     Packets,
     /// Worldgen: the ore baseline in `dust-gen`.
@@ -90,6 +93,7 @@ pub const ALL_DOMAINS: &[Domain] = &[
     Domain::Fluids,
     Domain::Commands,
     Domain::Recipes,
+    Domain::Loot,
     Domain::Packets,
     Domain::Worldgen,
 ];
@@ -104,6 +108,7 @@ impl Domain {
             Self::Fluids => "fluids",
             Self::Commands => "commands",
             Self::Recipes => "recipes",
+            Self::Loot => "loot",
             Self::Packets => "packets",
             Self::Worldgen => "worldgen",
         }
@@ -124,13 +129,14 @@ impl Domain {
                 | Self::Fluids
                 | Self::Commands
                 | Self::Recipes
+                | Self::Loot
                 | Self::Packets
         )
     }
 
     /// Whether this domain reads the `--server` data pack tree.
     fn needs_data(self) -> bool {
-        matches!(self, Self::Recipes | Self::Worldgen)
+        matches!(self, Self::Recipes | Self::Loot | Self::Worldgen)
     }
 }
 
@@ -324,6 +330,7 @@ pub fn run(options: &Options, workspace_root: &Path) -> Result<(), String> {
             Domain::Recipes => {
                 recipes_domain(registries.as_ref().expect("parsed above"), &context)?
             }
+            Domain::Loot => loot_domain(registries.as_ref().expect("parsed above"), &context)?,
             Domain::Packets => packets_domain(&context)?,
             Domain::Worldgen => worldgen_domain(&context)?,
         };
@@ -589,6 +596,45 @@ fn recipes_domain(flat: &registries::Registries, context: &Context) -> Result<Ou
         "{} recipe files into {} shapes",
         parsed.total,
         parsed.shapes.len()
+    ))
+}
+
+/// Walk every loot table and regenerate the inventory plus the vocabulary.
+fn loot_domain(flat: &registries::Registries, context: &Context) -> Result<Outcome, String> {
+    let parsed = loot::parse(&context.data()?.join("data"), flat)?;
+
+    println!(
+        "read {} loot tables across {} categories from the data pack",
+        parsed.tables.len(),
+        parsed.categories.len()
+    );
+    for (category, count) in &parsed.categories {
+        println!("  {category:<28} {count}");
+    }
+    let by_kind =
+        |kind: loot::Kind| -> usize { parsed.vocabulary.iter().filter(|u| u.kind == kind).count() };
+    println!(
+        "  vocabulary in use: {} condition type(s), {} function type(s), {} entry \
+         type(s), each checked against its registry in the report",
+        by_kind(loot::Kind::Condition),
+        by_kind(loot::Kind::Function),
+        by_kind(loot::Kind::Entry)
+    );
+    println!(
+        "  the same condition and function counts were re-tallied by a second pass that \
+         reads strings without structure: {} rows, compared table-against-table by \
+         dust-registry's tests",
+        parsed.source.len()
+    );
+
+    let path = context.generated_registry_dir()?.join("loot.rs");
+    std::fs::write(&path, codegen::loot(&parsed, context.version))
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    println!("wrote {}", path.display());
+    Ok(format!(
+        "{} tables, {} vocabulary items",
+        parsed.tables.len(),
+        parsed.vocabulary.len()
     ))
 }
 

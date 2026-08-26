@@ -33,6 +33,7 @@ pub mod flat;
 pub mod fluids;
 pub mod generated;
 pub mod items;
+pub mod loot;
 pub mod recipes;
 pub mod registry;
 
