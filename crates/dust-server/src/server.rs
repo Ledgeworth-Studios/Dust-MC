@@ -882,6 +882,10 @@ impl Server {
         // arrived.
         let counters = std::sync::Arc::new(crate::net::Counters::default());
 
+        // Everybody connected, shared with the console so `list` and `say`
+        // reach the same players the sessions do.
+        let roster: std::sync::Arc<crate::net::players::Roster> = std::sync::Arc::default();
+
         let listener = crate::net::Listener::bind(addr).map_err(|e| fail(e.to_string()))?;
         let bound = listener.addr();
 
@@ -899,7 +903,7 @@ impl Server {
             },
             logger: self.options.logger.clone(),
             positions: std::sync::Arc::clone(&positions),
-            roster: std::sync::Arc::default(),
+            roster: std::sync::Arc::clone(&roster),
             player_entity_type: crate::net::play::player_entity_type().ok_or_else(|| {
                 fail("the generated entity table has no minecraft:player".to_owned())
             })?,
@@ -920,6 +924,19 @@ impl Server {
                 if online_mode { "online" } else { "offline" }
             ),
         });
+        // The operator's line in, started once there is something to talk to.
+        // It reads on its own thread because a blocking read on a terminal
+        // cannot be polled, and it is detached because a shutdown must not
+        // wait for somebody to press return.
+        crate::console::spawn(self.options.logger.clone(), {
+            let console = crate::console::Console {
+                stop: self.stop_handle.clone(),
+                roster: std::sync::Arc::clone(&roster),
+                logger: self.options.logger.clone(),
+            };
+            move |command| console.run(command)
+        });
+
         // Published only after the handle exists, so an observer that sees an
         // address knows there is something accepting on it.
         let _ = self.shared.bound.set(bound);

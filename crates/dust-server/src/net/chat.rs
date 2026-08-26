@@ -59,6 +59,17 @@ pub fn left(name: &str) -> Component {
     Component::text(format!("{name} left the game")).colored(Color::Named(NamedColor::Yellow))
 }
 
+/// `[Server] message`, which is how a console `say` reads to a player.
+///
+/// The prefix is a separate node from the message for the same reason a
+/// player's name is: whatever the operator typed must not be able to become
+/// formatting.
+pub fn server_said(message: &str) -> Component {
+    Component::text("[Server] ")
+        .colored(Color::Named(NamedColor::LightPurple))
+        .with_extra(vec![Component::text(message.to_owned())])
+}
+
 /// Whether a message is worth relaying at all.
 ///
 /// Empty and whitespace-only messages are dropped: a client cannot normally

@@ -42,7 +42,10 @@ cargo run -p dust-server -- server
 ```
 
 Then add `localhost` to a 1.21.1 client's server list. Set `online_mode = false`
-in `dust.toml` first unless you want Mojang consulted.
+in `dust.toml` first unless you want Mojang consulted, and point
+`world_source` at a `region` directory if you have a world to serve.
+
+The console takes `stop`, `list` and `say`, with or without a leading slash.
 
 ## How it is checked
 

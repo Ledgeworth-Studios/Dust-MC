@@ -73,6 +73,7 @@
 
 pub mod cli;
 pub mod clock;
+pub mod console;
 pub mod engine;
 pub mod histogram;
 pub mod logging;
