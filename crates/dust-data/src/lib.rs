@@ -39,35 +39,43 @@
 //! way to *remove* a vanilla entry, since a tag has no subtract. See
 //! [`tag`] for the whole argument and for what the resolver does not catch.
 //!
+//! One pack can carry its own layers too: an `overlays` section in
+//! `pack.mcmeta` lists directories that stand in for the pack's own `data/`
+//! when their format range matches. Those stack by the same rule — later wins
+//! per file, with the base at the bottom — and [`overlay`] is where the exact
+//! semantics live.
+//!
 //! # What this crate deliberately does not model
 //!
-//! Recipes, loot tables and advancements stay as [`serde_json::Value`]. They
-//! are not turned into Rust structs here and they should not be turned into
-//! generated Rust anywhere.
+//! Recipes, loot tables and advancements stay as [`serde_json::Value`] in the
+//! loaded data. What this crate adds on top is a **skeleton** — see
+//! [`shape`] — which pulls out only the identifying spine of those three
+//! shapes: the serializer id each one opens with (`"type":
+//! "minecraft:crafting_shaped"`), and the handful of reference targets a
+//! report needs (a recipe's result, an advancement's parent). The full raw
+//! document travels alongside the skeleton everywhere, so the skeleton can
+//! never disagree with the file it came from: it is a summary pinned to the
+//! thing it summarises, not a second reader. Generating structs for these
+//! shapes as well would give Dust **two readers for one schema, and two
+//! readers of one schema disagree**: one learns a new recipe type and the
+//! other does not, and the result is a recipe that loads and then does
+//! nothing.
 //!
 //! The line is between an **identifier** and a **schema**. Block state ids,
 //! registry ids and packet ids became generated Rust in Phase 0.5 because the
 //! wire format depends on them: a codec writing id 1,234 cannot go and read a
-//! file to find out what it means. A recipe is the other thing — it is the
-//! datapack schema, the shape an operator's own files are full of, and reading
-//! those files is this crate's entire job. Generating structs for them as well
-//! would give Dust **two readers for one schema, and two readers of one schema
-//! disagree**: one learns a new recipe type and the other does not, and the
-//! result is a recipe that loads and then does nothing. This project already
-//! made the identical argument about configuration, where environment
-//! overrides are overlaid onto the parsed TOML *before* deserialisation so that
-//! an override cannot reach the server having skipped a check.
-//!
-//! So: this crate answers *what files exist, which pack won, and is the JSON
-//! well-formed*. The crate that consumes a recipe decides what a recipe is, and
-//! [`json::unknown_keys`] is public so it reports its unknown keys in the same
-//! words this one does.
+//! file to find out what it means. Recipes and loot tables are the datapack
+//! schema, the shape an operator's own files are full of, and reading those
+//! files is this crate's entire job — but *reading* them means holding them,
+//! not deciding them. The crate that consumes a recipe decides what a recipe
+//! is, and [`json::unknown_keys`] is public so it reports its unknown keys in
+//! the same words this one does.
 //!
 //! Also not modelled, on purpose: `function/` (`.mcfunction` is a command
-//! language, not data), `structure/` (NBT, which belongs to `dust-nbt`), pack
-//! `overlays` and `filter` sections, and feature flags. The first two are
+//! language, not data), `structure/` (NBT, which belongs to `dust-nbt`),
+//! pack `filter` sections, and feature flags. The first two are
 //! [`registry::RegistryKind::Unread`] so their directories are not mistaken for
-//! typos; the last three parse and produce a warning saying they are not
+//! typos; the last two parse and produce a warning saying they are not
 //! applied. Nothing is skipped silently.
 //!
 //! # The `dust-registry` seam
@@ -100,14 +108,19 @@
 //! * **A vocabulary is optional and its absence is the default.** Read the
 //!   unvalidated count before believing a clean run.
 
+pub mod discover;
 pub mod finding;
 pub mod inflate;
 pub mod json;
 pub mod location;
 pub mod meta;
+pub mod overlay;
 pub mod pack;
 pub mod registry;
+pub mod shape;
 pub mod tag;
+#[cfg(test)]
+mod testing;
 pub mod vocabulary;
 pub mod zip;
 
@@ -115,11 +128,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
+pub use discover::{discover, load_directory};
 pub use finding::{error_count, Finding, Severity};
 pub use location::{LocationError, ResourceLocation, MINECRAFT};
 pub use meta::{PackMeta, DUST_PACK_FORMAT};
+pub use overlay::{OverlainPack, OverlayPlan, Refusal};
 pub use pack::{DirectoryPack, PackError, PackSource, ZipPack};
 pub use registry::{Registries, RegistryDef, RegistryId, RegistryKind};
+pub use shape::{AdvancementSkeleton, LootTableSkeleton, RecipeSkeleton, ShapeReport};
 pub use tag::{MergedTag, ResolvedTags, TagStats};
 pub use vocabulary::{Known, Vocabulary};
 
@@ -181,13 +197,28 @@ pub struct PackReport {
     pub id: String,
     pub origin: String,
     pub meta: Option<PackMeta>,
-    /// `false` when the pack was refused — an unreadable `pack.mcmeta`, or a
-    /// format Dust does not read under [`UnknownFormat::Reject`].
+    /// `false` when the pack was refused — an unreadable `pack.mcmeta`, a
+    /// format Dust does not read under [`UnknownFormat::Reject`], or an id
+    /// another pack in the same load already holds.
     pub loaded: bool,
     /// Files this pack contributed a resource or a tag from.
     pub files_read: usize,
-    /// Files in the pack that were not read, for any reason.
+    /// Files in the pack that were not read, for any reason — including files
+    /// inside overlays whose formats did not match.
     pub files_skipped: usize,
+    /// What each namespace held, by name. A namespace with files seen but
+    /// nothing read is where a mistyped registry directory shows up twice
+    /// over; this is the per-namespace roll-up of it, for the diagnostics.
+    pub namespaces: BTreeMap<String, NamespaceTally>,
+}
+
+/// Per-namespace file counts for one pack.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NamespaceTally {
+    /// Files under `data/<namespace>/`.
+    pub files_seen: usize,
+    /// Files that became a resource or part of a tag.
+    pub files_read: usize,
 }
 
 /// The counts a load produces.
@@ -219,6 +250,13 @@ pub struct LoadedData {
 }
 
 impl LoadedData {
+    /// Put discovery findings ahead of the load's own, without reordering
+    /// either group. Used by [`discover::load_directory`].
+    pub(crate) fn prepend_findings(&mut self, mut extra: Vec<Finding>) {
+        extra.append(&mut self.findings);
+        self.findings = extra;
+    }
+
     pub fn packs(&self) -> &[PackReport] {
         &self.packs
     }
@@ -280,6 +318,160 @@ impl LoadedData {
         }
         out
     }
+
+    /// Every resource and tag whose name sits in `namespace`, with provenance.
+    ///
+    /// This is the merged view an integrator actually consumes: one name, one
+    /// winning [`Resource`], whoever lost still listed under
+    /// [`Resource::overridden`]. Tags come back in their merged-but-unresolved
+    /// form; [`Self::resolve_tags`] is the flattened view.
+    pub fn namespace(&self, namespace: &str) -> NamespaceView<'_> {
+        let resources = self
+            .resources
+            .iter()
+            .map(|(registry, entries)| {
+                (
+                    registry,
+                    entries
+                        .iter()
+                        .filter(|(name, _)| name.namespace() == namespace)
+                        .collect::<BTreeMap<_, _>>(),
+                )
+            })
+            .filter(|(_, entries)| !entries.is_empty())
+            .collect();
+        let tags = self
+            .tags
+            .iter()
+            .map(|(registry, entries)| {
+                (
+                    registry,
+                    entries
+                        .iter()
+                        .filter(|(name, _)| name.namespace() == namespace)
+                        .collect::<BTreeMap<_, _>>(),
+                )
+            })
+            .filter(|(_, entries)| !entries.is_empty())
+            .collect();
+        NamespaceView { resources, tags }
+    }
+
+    /// The whole load as a human-readable provenance report: which pack won
+    /// every resource, where each tag's lines came from, what was refused and
+    /// why.
+    ///
+    /// Written for the person staring at a modpack asking "why is this recipe
+    /// wrong", and built to be the foundation of the Phase 10 feasibility
+    /// tooling, which needs exactly this answer for hundreds of packs at once.
+    /// That is why it is a *stable* rendering — every line is derived from
+    /// ordered maps, so two loads of the same packs produce byte-identical
+    /// text, and a diff between two dumps is meaningful without anyone writing
+    /// a parser first. A structured API already exists alongside it
+    /// ([`Self::registry`], [`Self::namespace`], [`Resource::overridden`],
+    /// [`PackReport`]); this is the same facts said once, readably.
+    pub fn diagnostic_dump(&self) -> String {
+        let mut out = String::new();
+        let stats = &self.stats;
+        out.push_str(&format!(
+            "datapack load: {} pack(s) offered, {} loaded\n",
+            stats.packs_offered, stats.packs_loaded
+        ));
+
+        out.push_str("packs:\n");
+        for pack in &self.packs {
+            match (&pack.meta, pack.loaded) {
+                (Some(meta), true) => {
+                    out.push_str(&format!(
+                        "  {} [loaded] {} — format {} (accepting {}), read {} of \
+                         {} file(s)\n",
+                        pack.id,
+                        pack.origin,
+                        meta.pack_format,
+                        meta.supported,
+                        pack.files_read,
+                        pack.files_read + pack.files_skipped,
+                    ));
+                }
+                (Some(meta), false) => {
+                    out.push_str(&format!(
+                        "  {} [refused] {} — format {} (accepting {})\n",
+                        pack.id, pack.origin, meta.pack_format, meta.supported,
+                    ));
+                }
+                (None, _) => {
+                    out.push_str(&format!("  {} [refused] {}\n", pack.id, pack.origin));
+                }
+            }
+            if pack.namespaces.is_empty() {
+                continue;
+            }
+            let names: Vec<String> = pack
+                .namespaces
+                .iter()
+                .map(|(name, tally)| format!("{name} ({}/{})", tally.files_read, tally.files_seen))
+                .collect();
+            out.push_str(&format!("    namespaces: {}\n", names.join(", ")));
+        }
+
+        out.push_str("resources:\n");
+        if self.resources.is_empty() {
+            out.push_str("  <none>\n");
+        }
+        for (registry, entries) in &self.resources {
+            out.push_str(&format!("  {registry}: {} resource(s)\n", entries.len()));
+            for (name, resource) in entries {
+                out.push_str(&format!("    {name} <- {}", resource.pack));
+                if !resource.overridden.is_empty() {
+                    out.push_str(&format!(" (displaced: {})", resource.overridden.join(", ")));
+                }
+                out.push_str(&format!("\n      {}\n", resource.file));
+            }
+        }
+
+        out.push_str("tags:\n");
+        if self.tags.is_empty() {
+            out.push_str("  <none>\n");
+        }
+        for (registry, tags) in &self.tags {
+            out.push_str(&format!("  {registry}: {} tag(s)\n", tags.len()));
+            for (name, tag) in tags {
+                let sources: Vec<String> = tag
+                    .sources
+                    .iter()
+                    .map(|source| format!("{} ({})", source.pack, source.file))
+                    .collect();
+                out.push_str(&format!(
+                    "    #{name}: {} written entr{} from {}\n",
+                    tag.entries.len(),
+                    if tag.entries.len() == 1 { "y" } else { "ies" },
+                    sources.join(", "),
+                ));
+            }
+        }
+
+        out.push_str(&format!(
+            "totals: {} file(s) seen, {} read; {} resource(s); {} tag(s); {} \
+             override(s)\n",
+            stats.files_seen, stats.files_read, stats.resources, stats.tags, stats.overrides,
+        ));
+
+        out.push_str(&format!("findings: {}\n", self.findings.len()));
+        for finding in &self.findings {
+            out.push_str(&format!("  {finding}\n"));
+        }
+        out
+    }
+}
+
+/// One namespace's slice through the merged data, filtered by name.
+///
+/// Per-registry maps of only the entries whose namespace matched. Built by
+/// [`LoadedData::namespace`].
+#[derive(Debug, Default)]
+pub struct NamespaceView<'a> {
+    pub resources: BTreeMap<&'a RegistryId, BTreeMap<&'a ResourceLocation, &'a Resource>>,
+    pub tags: BTreeMap<&'a RegistryId, BTreeMap<&'a ResourceLocation, &'a MergedTag>>,
 }
 
 /// Read every pack in order, later overriding earlier.
@@ -288,6 +480,12 @@ impl LoadedData {
 /// produces forty findings from one run; making an operator fix one, restart,
 /// and be told about the next teaches them to distrust the server rather than
 /// the file.
+///
+/// Pack ids must be unique within one load. The id is on every finding and
+/// every provenance line, so two packs answering to one name would make the
+/// whole report ambiguous; a duplicate is refused (the later of the two) with
+/// an error saying so. [`discover`] refuses at discovery time as well, which
+/// is where an operator actually meets the problem.
 pub fn load(packs: &[&dyn PackSource], options: &LoadOptions) -> LoadedData {
     let mut data = LoadedData {
         stats: LoadStats {
@@ -297,7 +495,34 @@ pub fn load(packs: &[&dyn PackSource], options: &LoadOptions) -> LoadedData {
         ..LoadedData::default()
     };
 
+    let mut seen_ids: BTreeSet<&str> = BTreeSet::new();
     for source in packs {
+        // Refuse without listing: nothing in a duplicate can be trusted to a
+        // provenance line, because every line it produced would be
+        // indistinguishable from the other pack's.
+        if !seen_ids.insert(source.id()) {
+            data.findings.push(Finding::error(
+                source.id(),
+                "",
+                format!(
+                    "is named `{}`, which a pack earlier in this load already \
+                     has. Two packs cannot answer to one id — every finding and \
+                     every `this came from` line would name both — so this one \
+                     has not been loaded. Rename one of them.",
+                    source.id()
+                ),
+            ));
+            data.packs.push(PackReport {
+                id: source.id().to_owned(),
+                origin: source.origin(),
+                meta: None,
+                loaded: false,
+                files_read: 0,
+                files_skipped: 0,
+                namespaces: BTreeMap::new(),
+            });
+            continue;
+        }
         let report = load_pack(*source, options, &mut data);
         if report.loaded {
             data.stats.packs_loaded += 1;
@@ -318,6 +543,10 @@ struct PackTally {
     unread_registries: BTreeMap<String, usize>,
     legacy_directories: BTreeMap<String, RegistryId>,
     non_json: BTreeMap<String, usize>,
+    /// Files seen under each namespace. Read counts are kept separately so a
+    /// namespace that held files but contributed nothing is visible as such.
+    namespace_files: BTreeMap<String, usize>,
+    namespace_reads: BTreeMap<String, usize>,
 }
 
 fn load_pack(source: &dyn PackSource, options: &LoadOptions, data: &mut LoadedData) -> PackReport {
@@ -330,6 +559,7 @@ fn load_pack(source: &dyn PackSource, options: &LoadOptions, data: &mut LoadedDa
         loaded: false,
         files_read: 0,
         files_skipped: 0,
+        namespaces: BTreeMap::new(),
     };
 
     let listing = match source.list() {
@@ -343,6 +573,9 @@ fn load_pack(source: &dyn PackSource, options: &LoadOptions, data: &mut LoadedDa
             return report;
         }
     };
+    // Every physical path counts against the pack even when an overlay makes
+    // it invisible: the diagnostics answer "what does this pack hold", not
+    // "what did this format use".
     data.stats.files_seen += listing.len();
 
     let Some(meta) = read_meta(source, &id, &listing, data) else {
@@ -383,14 +616,52 @@ fn load_pack(source: &dyn PackSource, options: &LoadOptions, data: &mut LoadedDa
     }
 
     report.loaded = true;
+
+    // Overlays are planned once, from the listing already in hand, and the
+    // rest of the load runs over the layered view — every rule below this
+    // point stays written against "a pack", not "a pack plus its overlays".
+    let plan = OverlayPlan::build(&listing, &meta.overlays, options.pack_format);
+    for (directory, refusal) in &plan.refused {
+        data.findings.push(Finding::error(
+            &id,
+            "pack.mcmeta",
+            format!(
+                "declares an overlay entry whose directory `{directory}` {}. \
+                 Nothing has been read from it.",
+                refusal.reason()
+            ),
+        ));
+    }
+
     let mut tally = PackTally::default();
 
-    for path in &listing {
-        if read_file(source, &id, path, options, data, &mut tally) {
-            report.files_read += 1;
-        } else {
-            report.files_skipped += 1;
+    if plan.applied.is_empty() {
+        for path in &listing {
+            if read_file(source, &id, path, options, data, &mut tally) {
+                report.files_read += 1;
+            }
         }
+    } else {
+        let layered = OverlainPack::new(source, plan);
+        for path in layered.list().expect("an overlay view lists without io") {
+            if read_file(&layered, &id, &path, options, data, &mut tally) {
+                report.files_read += 1;
+            }
+        }
+    }
+
+    // Whatever was listed and did not become a resource or a tag — inert
+    // overlay files included — is accounted for here rather than one increment
+    // at a time, so the two numbers can never drift apart.
+    report.files_skipped = listing.len() - report.files_read;
+    for (namespace, files) in &tally.namespace_files {
+        report.namespaces.insert(
+            namespace.clone(),
+            NamespaceTally {
+                files_seen: *files,
+                files_read: tally.namespace_reads.get(namespace).copied().unwrap_or(0),
+            },
+        );
     }
 
     report_tally(&id, &tally, options, data);
@@ -492,6 +763,13 @@ fn read_file(
         ));
         return false;
     };
+    // Counted before anything decides whether the file is readable, so the
+    // per-namespace roll-up says "held N files" rather than "held the files
+    // that happened to load".
+    *tally
+        .namespace_files
+        .entry(namespace.to_owned())
+        .or_default() += 1;
 
     let Some(matched) = options.registries.classify(relative) else {
         let directory = Registries::unmatched_directory(relative);
@@ -567,6 +845,37 @@ fn read_file(
         }
     };
 
+    // Three registries open with a serializer id — `"type": "minecraft:…"` —
+    // and without it no consumer can even pick a schema to read the rest by.
+    // That is not shape-checking ahead of the reader (the crate documentation's
+    // refusal stands); it is checking that the one key every variant of the
+    // shape shares is present, which is as far as this layer can see without
+    // becoming a second opinion about what a recipe is.
+    if matches!(matched.def.kind, RegistryKind::Content)
+        && matches!(
+            matched.def.key.as_str(),
+            "recipe" | "loot_table" | "advancement"
+        )
+    {
+        let spine = value.get("type").and_then(Value::as_str);
+        if spine.is_none() {
+            data.findings.push(
+                Finding::warning(
+                    id,
+                    path,
+                    format!(
+                        "has no string `type` naming what kind of {} it is. Every \
+                         one starts with `\"type\": \"minecraft:…\"`; without it \
+                         nothing downstream can tell which reader to use, so this \
+                         file will have no effect.",
+                        matched.def.key
+                    ),
+                )
+                .about(name.clone()),
+            );
+        }
+    }
+
     match matched.def.kind {
         RegistryKind::Tag(of) => {
             let (file, findings) = TagFile::parse(&value, id, path);
@@ -584,6 +893,10 @@ fn read_file(
         }
         _ => insert_resource(&matched, name, value, id, path, data),
     }
+    *tally
+        .namespace_reads
+        .entry(namespace.to_owned())
+        .or_default() += 1;
     data.stats.files_read += 1;
     true
 }
@@ -679,65 +992,25 @@ fn report_tally(id: &str, tally: &PackTally, options: &LoadOptions, data: &mut L
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A pack held entirely in memory, so the loader's rules can be tested
-    /// without a filesystem and without a fixture to keep in step.
-    #[derive(Debug)]
-    struct MemoryPack {
-        id: String,
-        files: BTreeMap<String, Vec<u8>>,
-    }
-
-    impl MemoryPack {
-        fn new(id: &str, files: &[(&str, &str)]) -> Self {
-            Self {
-                id: id.to_owned(),
-                files: files
-                    .iter()
-                    .map(|(path, body)| ((*path).to_owned(), body.as_bytes().to_vec()))
-                    .collect(),
-            }
-        }
-
-        fn with_meta(id: &str, files: &[(&str, &str)]) -> Self {
-            let mut all = vec![(
-                "pack.mcmeta",
-                r#"{"pack":{"pack_format":48,"description":"test"}}"#,
-            )];
-            all.extend_from_slice(files);
-            Self::new(id, &all)
-        }
-    }
-
-    impl PackSource for MemoryPack {
-        fn id(&self) -> &str {
-            &self.id
-        }
-
-        fn origin(&self) -> String {
-            format!("<memory:{}>", self.id)
-        }
-
-        fn list(&self) -> Result<Vec<String>, PackError> {
-            Ok(self.files.keys().cloned().collect())
-        }
-
-        fn read(&self, path: &str) -> Result<Option<Vec<u8>>, PackError> {
-            Ok(self.files.get(path).cloned())
-        }
-    }
+    use crate::testing::MemPack;
 
     fn location(text: &str) -> ResourceLocation {
         ResourceLocation::parse(text).expect("valid")
     }
 
+    /// A recipe with its spine filled in, for the tests that are about
+    /// something other than the missing-`type` warning.
+    fn typed_recipe() -> &'static str {
+        r#"{"type":"minecraft:crafting_shaped"}"#
+    }
+
     #[test]
     fn a_later_pack_overrides_an_earlier_one_and_the_earlier_is_remembered() {
-        let base = MemoryPack::with_meta(
+        let base = MemPack::with_meta(
             "base",
             &[("data/minecraft/recipe/stick.json", r#"{"result":"stick"}"#)],
         );
-        let over = MemoryPack::with_meta(
+        let over = MemPack::with_meta(
             "over",
             &[("data/minecraft/recipe/stick.json", r#"{"result":"twig"}"#)],
         );
@@ -755,14 +1028,14 @@ mod tests {
 
     #[test]
     fn tags_merge_where_recipes_override() {
-        let base = MemoryPack::with_meta(
+        let base = MemPack::with_meta(
             "base",
             &[(
                 "data/minecraft/tags/block/logs.json",
                 r#"{"values":["minecraft:oak_log"]}"#,
             )],
         );
-        let over = MemoryPack::with_meta(
+        let over = MemPack::with_meta(
             "over",
             &[(
                 "data/minecraft/tags/block/logs.json",
@@ -783,7 +1056,7 @@ mod tests {
 
     #[test]
     fn a_pack_with_no_mcmeta_is_refused_and_the_reason_is_specific() {
-        let pack = MemoryPack::new("broken", &[("data/minecraft/recipe/stick.json", "{}")]);
+        let pack = MemPack::new("broken", &[("data/minecraft/recipe/stick.json", "{}")]);
         let data = load(&[&pack], &LoadOptions::default());
         assert_eq!(data.stats().packs_loaded, 0);
         assert_eq!(data.error_count(), 1, "{:?}", data.findings());
@@ -792,7 +1065,7 @@ mod tests {
 
     #[test]
     fn a_pack_zipped_one_level_too_high_is_told_so() {
-        let pack = MemoryPack::new(
+        let pack = MemPack::new(
             "wrapped",
             &[
                 ("my_pack/pack.mcmeta", r#"{"pack":{"pack_format":48}}"#),
@@ -811,7 +1084,7 @@ mod tests {
 
     #[test]
     fn an_incompatible_format_refuses_the_pack_without_stopping_the_load() {
-        let old = MemoryPack::new(
+        let old = MemPack::new(
             "old",
             &[
                 (
@@ -821,7 +1094,7 @@ mod tests {
                 ("data/minecraft/recipe/stick.json", "{}"),
             ],
         );
-        let current = MemoryPack::with_meta("current", &[("data/minecraft/recipe/rod.json", "{}")]);
+        let current = MemPack::with_meta("current", &[("data/minecraft/recipe/rod.json", "{}")]);
         let data = load(&[&old, &current], &LoadOptions::default());
 
         assert_eq!(data.stats().packs_loaded, 1);
@@ -837,14 +1110,14 @@ mod tests {
 
     #[test]
     fn the_escape_hatch_loads_it_and_keeps_saying_so() {
-        let old = MemoryPack::new(
+        let old = MemPack::new(
             "old",
             &[
                 (
                     "pack.mcmeta",
                     r#"{"pack":{"pack_format":15,"description":"d"}}"#,
                 ),
-                ("data/minecraft/recipe/stick.json", "{}"),
+                ("data/minecraft/recipe/stick.json", typed_recipe()),
             ],
         );
         let options = LoadOptions {
@@ -862,7 +1135,7 @@ mod tests {
 
     #[test]
     fn one_run_reports_every_broken_file_rather_than_the_first() {
-        let pack = MemoryPack::with_meta(
+        let pack = MemPack::with_meta(
             "messy",
             &[
                 ("data/minecraft/recipe/a.json", "{"),
@@ -876,7 +1149,7 @@ mod tests {
 
     #[test]
     fn a_directory_that_is_not_a_registry_is_one_finding_and_not_one_per_file() {
-        let pack = MemoryPack::with_meta(
+        let pack = MemPack::with_meta(
             "typo",
             &[
                 ("data/minecraft/recipies/a.json", "{}"),
@@ -898,8 +1171,7 @@ mod tests {
 
     #[test]
     fn a_legacy_directory_loads_and_says_it_should_be_renamed() {
-        let pack =
-            MemoryPack::with_meta("old_layout", &[("data/minecraft/recipes/stick.json", "{}")]);
+        let pack = MemPack::with_meta("old_layout", &[("data/minecraft/recipes/stick.json", "{}")]);
         let data = load(&[&pack], &LoadOptions::default());
         assert_eq!(data.error_count(), 0, "{:?}", data.findings());
         assert!(data
@@ -916,7 +1188,7 @@ mod tests {
 
     #[test]
     fn a_directory_dust_knows_and_does_not_read_says_which_it_is() {
-        let pack = MemoryPack::with_meta(
+        let pack = MemPack::with_meta(
             "with_functions",
             &[("data/minecraft/function/tick.mcfunction", "say hi")],
         );
@@ -931,14 +1203,14 @@ mod tests {
 
     #[test]
     fn a_namespace_directory_holds_registries_and_not_loose_files() {
-        let pack = MemoryPack::with_meta("loose", &[("data/minecraft/stray.json", "{}")]);
+        let pack = MemPack::with_meta("loose", &[("data/minecraft/stray.json", "{}")]);
         let data = load(&[&pack], &LoadOptions::default());
         assert_eq!(data.findings().len(), 1, "{:?}", data.findings());
     }
 
     #[test]
     fn a_second_namespace_is_loaded_as_its_own() {
-        let pack = MemoryPack::with_meta(
+        let pack = MemPack::with_meta(
             "two",
             &[
                 ("data/minecraft/recipe/a.json", "{}"),
@@ -955,7 +1227,7 @@ mod tests {
 
     #[test]
     fn an_uppercase_file_name_is_an_error_that_explains_itself() {
-        let pack = MemoryPack::with_meta("shouty", &[("data/minecraft/recipe/Stick.json", "{}")]);
+        let pack = MemPack::with_meta("shouty", &[("data/minecraft/recipe/Stick.json", "{}")]);
         let data = load(&[&pack], &LoadOptions::default());
         assert_eq!(data.error_count(), 1, "{:?}", data.findings());
         assert!(
@@ -967,7 +1239,7 @@ mod tests {
 
     #[test]
     fn a_nested_resource_path_keeps_its_directories_in_the_name() {
-        let pack = MemoryPack::with_meta(
+        let pack = MemPack::with_meta(
             "nested",
             &[("data/minecraft/loot_table/blocks/stone.json", "{}")],
         );
@@ -984,13 +1256,13 @@ mod tests {
     fn files_outside_data_are_not_findings() {
         // README, LICENSE and pack.png are in half the packs on the internet.
         // A warning that is always there teaches people to stop reading them.
-        let pack = MemoryPack::with_meta(
+        let pack = MemPack::with_meta(
             "documented",
             &[
                 ("README.md", "hello"),
                 ("pack.png", "not really a png"),
                 ("assets/minecraft/lang/en_us.json", "{}"),
-                ("data/minecraft/recipe/a.json", "{}"),
+                ("data/minecraft/recipe/a.json", typed_recipe()),
             ],
         );
         let data = load(&[&pack], &LoadOptions::default());

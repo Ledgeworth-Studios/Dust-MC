@@ -156,6 +156,19 @@ pub struct Overlay {
     pub formats: FormatRange,
 }
 
+impl Overlay {
+    /// Whether this entry layers itself on when loading for `format`.
+    ///
+    /// The same negotiation as [`PackMeta::is_compatible_with`] — a bare
+    /// number, a two-element list or the inclusive object all land in
+    /// [`FormatRange`] at parse time, so this is a range check and nothing
+    /// more. Kept as a named method because the sentence "an overlay applies
+    /// when its range contains the running format" should be findable.
+    pub fn applies_to(&self, format: u32) -> bool {
+        self.formats.contains(format)
+    }
+}
+
 /// Everything `pack.mcmeta` says.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PackMeta {
@@ -192,10 +205,11 @@ impl PackMeta {
     ///
     /// `None` means the file could not be understood well enough to say what
     /// the pack is; the findings say why. Findings are also produced for things
-    /// that parsed and are **not acted on** — `features`, `filter` and
-    /// `overlays` — because a pack author who wrote a filter and got no
-    /// filtering has to be told, and a loader that quietly ignores a section is
-    /// the silent-no-op again.
+    /// that parsed and are **not acted on** — `features` and `filter` — because
+    /// a pack author who wrote a filter and got no filtering has to be told,
+    /// and a loader that quietly ignores a section is the silent-no-op again.
+    /// Overlays *are* applied — see [`crate::overlay`] — so their entries are
+    /// parsed without a warning of their own.
     pub fn parse(bytes: &[u8], pack: &str, file: &str) -> (Option<Self>, Vec<Finding>) {
         let mut findings = Vec::new();
         let value = match json::parse(bytes, pack, file) {
@@ -431,10 +445,10 @@ fn overlays(
         let Some(directory) = object.get("directory").and_then(Value::as_str) else {
             continue;
         };
-        let formats = match object.get("formats") {
-            Some(Value::Number(_)) => {
-                format_number(object.get("formats")).map(FormatRange::exactly)
-            }
+        let written_formats = object.get("formats");
+        let formats = match written_formats {
+            None => None,
+            Some(Value::Number(_)) => format_number(written_formats).map(FormatRange::exactly),
             Some(Value::Array(items)) if items.len() == 2 => {
                 match (format_number(items.first()), format_number(items.get(1))) {
                     (Some(min), Some(max)) => Some(FormatRange { min, max }),
@@ -450,28 +464,50 @@ fn overlays(
             },
             _ => None,
         };
+        let formats = match formats {
+            Some(range) if range.min <= range.max => range,
+            Some(range) => {
+                findings.push(Finding::error(
+                    pack,
+                    file,
+                    format!(
+                        "has an overlay entry for `{directory}` whose formats run \
+                         backwards ({} down to {}), so it can never apply.",
+                        range.min, range.max
+                    ),
+                ));
+                FormatRange { min: 0, max: 0 }
+            }
+            None => {
+                // Present but unreadable gets a finding; absent is left to
+                // vanilla's reading of it, which is that such an entry never
+                // applies. Both land on "never applies"; only one of them is
+                // allowed to do so quietly.
+                if written_formats.is_some() {
+                    findings.push(Finding::error(
+                        pack,
+                        file,
+                        format!(
+                            "has an overlay entry for `{directory}` whose \
+                             `formats` Dust cannot read. It must be a number, a \
+                             two-element list `[min, max]`, or \
+                             `{{\"min_inclusive\": n, \"max_inclusive\": n}}`."
+                        ),
+                    ));
+                }
+                FormatRange { min: 0, max: 0 }
+            }
+        };
         parsed.push(Overlay {
             directory: directory.to_owned(),
-            formats: formats.unwrap_or(FormatRange { min: 0, max: 0 }),
+            formats,
         });
     }
-    if !parsed.is_empty() {
-        findings.push(Finding::warning(
-            pack,
-            file,
-            format!(
-                "declares {} overlay director{}. Dust does not apply overlays yet, \
-                 so only the pack's own `data/` directory is read and {} ignored.",
-                parsed.len(),
-                if parsed.len() == 1 { "y" } else { "ies" },
-                parsed
-                    .iter()
-                    .map(|o| o.directory.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        ));
-    }
+    // No warning for overlays as a whole: an applicable entry is layered by
+    // the loader (see `crate::overlay`), and an entry for another format is
+    // the ordinary shape of a multi-version pack. Warning here would put a
+    // line on every correctly-built pack, which is how warnings stop being
+    // read.
     parsed
 }
 
@@ -581,13 +617,11 @@ mod tests {
 
     #[test]
     fn a_section_dust_does_not_apply_says_so_rather_than_going_quiet() {
+        // Overlays are applied and so are silent here; `features` and
+        // `filter` are not, and have to say so.
         for (written, expected) in [
             (r#""features":{"enabled":["minecraft:bundle"]}"#, "feature"),
             (r#""filter":{"block":[]}"#, "filter"),
-            (
-                r#""overlays":{"entries":[{"formats":[46,47],"directory":"old"}]}"#,
-                "overlay",
-            ),
         ] {
             let (meta, findings) = parse(&format!(
                 r#"{{"pack":{{"pack_format":48,"description":"d"}},{written}}}"#
@@ -598,6 +632,39 @@ mod tests {
                 "{written}: {findings:?}"
             );
         }
+    }
+
+    #[test]
+    fn overlay_entries_parse_without_a_warning_because_they_are_applied() {
+        let (meta, findings) = parse(
+            r#"{"pack":{"pack_format":48,"description":"d"},
+               "overlays":{"entries":[
+                  {"formats":[46,47],"directory":"old"},
+                  {"formats":48,"directory":"current"}]}}"#,
+        );
+        let meta = meta.expect("parses");
+        assert!(findings.is_empty(), "{findings:?}");
+        assert_eq!(meta.overlays.len(), 2);
+        assert_eq!(meta.overlays[0].directory, "old");
+        assert_eq!(meta.overlays[0].formats, FormatRange { min: 46, max: 47 });
+        // The negotiation is the loader's question, answered in one place.
+        assert!(!meta.overlays[0].applies_to(48));
+        assert!(meta.overlays[1].applies_to(48));
+        assert!(!meta.overlays[1].applies_to(49));
+    }
+
+    #[test]
+    fn an_overlay_with_an_unreadable_formats_field_never_applies() {
+        // The parser falls back to the range that contains no format at all,
+        // rather than to one that matches everything — an entry whose formats
+        // cannot be read must not end up layering itself unconditionally.
+        let (meta, findings) = parse(
+            r#"{"pack":{"pack_format":48,"description":"d"},
+               "overlays":{"entries":[{"directory":"mystery","formats":"soon"}]}}"#,
+        );
+        let meta = meta.expect("parses");
+        assert_eq!(crate::finding::error_count(&findings), 1, "{findings:?}");
+        assert!(!meta.overlays[0].applies_to(48));
     }
 
     #[test]
