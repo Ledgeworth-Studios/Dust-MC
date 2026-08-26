@@ -478,24 +478,25 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
 
     /// Pull bytes from the socket into the decoder. `false` means EOF.
     ///
-    /// This is where the encrypted read path earns its safety. The pull is
-    /// capped at what the current frame still needs; while the length prefix
-    /// is incomplete under encryption that cap is **one byte**. A speculative
-    /// bulk read could pull ciphertext past the frame boundary, and decrypting
-    /// those bytes would advance the cipher through data belonging to a frame
-    /// nobody has sized yet — the exact "bytes encrypted twice" bug described
-    /// in [`crate::crypt`]. The prefix is five bytes at most, so the price of
-    /// correctness is five single-byte reads per frame, paid only while the
-    /// prefix straggles in. See [`Needed`].
+    /// Reads never cross the frame boundary they are serving, in *either*
+    /// mode: the pull is capped at what the current frame still needs, and
+    /// while the length prefix is incomplete that cap is **one byte**, plain
+    /// connection or not. Under encryption this is obviously load-bearing —
+    /// decrypting speculative bytes advances the cipher through frames nobody
+    /// has sized yet, the exact "bytes encrypted twice" bug described in
+    /// [`crate::crypt`] — but the same discipline is what makes the switch
+    /// itself survivable: a peer that pipelines encrypted frames into the
+    /// same segment as its Encryption Response finds them still unread,
+    /// waiting in the socket, when the cipher turns on. A reader that had
+    /// gulped them pre-switch would have committed them as plaintext, and no
+    /// amount of switching afterwards undoes that.
+    ///
+    /// The prefix is five bytes at most, so the price is a handful of
+    /// single-byte reads per frame, paid on the straggling head of the
+    /// stream only. See [`Needed`].
     async fn fill(&mut self) -> Result<bool, ConnError> {
         let wanted = match self.decoder.needed() {
-            Needed::Unknown => {
-                if self.cipher_in.is_enabled() {
-                    1
-                } else {
-                    self.scratch.len()
-                }
-            }
+            Needed::Unknown => 1,
             // Zero means the decoder already holds a verdict — a frame or an
             // error — and reading anything would be reading past it.
             Needed::Exactly(0) => return Ok(true),
