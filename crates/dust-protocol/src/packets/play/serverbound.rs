@@ -8,9 +8,11 @@
 //! which this crate never does.
 
 use crate::packet_group;
+use crate::packets::play::advancements::SeenAdvancementsBody;
 use crate::packets::play::chat::MessageAcknowledgement;
+use crate::packets::play::containers::{ChangedSlot, ClickType};
 use crate::packets::play::Abilities;
-use crate::types::{BoundedString, Identifier, RestOfPacket, VarInt};
+use crate::types::{BoundedString, Identifier, RestOfPacket, Slot, VarInt};
 
 packet_group! {
     state: Play,
@@ -103,5 +105,30 @@ packet_group! {
     /// clientbound twin uses a byte. Same name, different widths.
     "minecraft:set_carried_item" => SetCarriedItem {
         slot: i16,
+    },
+
+    /// The player clicked a slot: what they did, and the container as they
+    /// believe it now stands.
+    ///
+    /// The server replays the click over its own state and pushes back only
+    /// the slots that disagree, which is why this packet carries the client's
+    /// opinion rather than a request. `state_id` ties it to the last full or
+    /// partial sync; see [`ChangedSlot`] and [`ClickType`].
+    "minecraft:container_click" => ClickContainer {
+        window_id: u8,
+        state_id: VarInt,
+        slot: i16,
+        button: i8,
+        mode: ClickType,
+        changed_slots: Vec<ChangedSlot>,
+        cursor_item: Slot,
+    },
+
+    /// The advancement screen opened onto one tab, or closed.
+    ///
+    /// The action picks whether the tab id follows — see
+    /// [`SeenAdvancementsBody`].
+    "minecraft:seen_advancements" => SeenAdvancements {
+        body: SeenAdvancementsBody,
     },
 }

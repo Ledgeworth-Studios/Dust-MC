@@ -139,12 +139,95 @@ impl Encode for SoundId {
         version: ProtocolVersion,
     ) -> Result<(), EncodeError> {
         match self {
-            Self::Id(id) => out.write_var_int(id.0.wrapping_add(1)),
+            Self::Id(id) => {
+                // The wire carries id + 1 so that zero can mark the inline
+                // form. An id of -1 would therefore encode as zero and be
+                // read back as something else entirely — refused instead of
+                // crossing forms.
+                if id.0 < 0 {
+                    return Err(EncodeError::Unsupported {
+                        field: "sound id",
+                        why: "a negative registry id would encode as the inline form's marker",
+                    });
+                }
+                out.write_var_int(id.0.wrapping_add(1));
+                Ok(())
+            }
             Self::Inline { name, fixed_range } => {
                 out.write_var_int(0);
                 name.encode(out, version)?;
-                return fixed_range.encode(out, version);
+                fixed_range.encode(out, version)
             }
+        }
+    }
+}
+
+/// Everything after the packet id: which sound to stop, if any.
+///
+/// One flags byte selects among four layouts — neither half, the category
+/// alone, the name alone, or both. There is no "stop everything" sentinel
+/// beyond the empty layout, and an unknown flag is refused rather than read
+/// as a partial match, because a guessed layout would eat the next packet's
+/// bytes.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct StopSoundBody {
+    /// The mixer category to silence; `None` means every category.
+    pub source: Option<SoundCategory>,
+    /// The specific sound to stop; `None` means every sound in `source`.
+    pub name: Option<Identifier>,
+}
+
+impl StopSoundBody {
+    const HAS_SOURCE: u8 = 0x01;
+    const HAS_NAME: u8 = 0x02;
+}
+
+impl Decode for StopSoundBody {
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        let flags = input.read_u8()?;
+        let known = flags & !(Self::HAS_SOURCE | Self::HAS_NAME) == 0;
+        if !known {
+            return Err(DecodeError::UnknownVariant {
+                name: "StopSoundBody",
+                value: i32::from(flags),
+            });
+        }
+        let source = if flags & Self::HAS_SOURCE != 0 {
+            Some(SoundCategory::decode(input, version)?)
+        } else {
+            None
+        };
+        let name = if flags & Self::HAS_NAME != 0 {
+            Some(Identifier::decode(input, version)?)
+        } else {
+            None
+        };
+        Ok(Self { source, name })
+    }
+}
+
+impl Encode for StopSoundBody {
+    fn encode<W: crate::wire::WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        version: ProtocolVersion,
+    ) -> Result<(), crate::wire::EncodeError> {
+        let mut flags = 0u8;
+        if self.source.is_some() {
+            flags |= Self::HAS_SOURCE;
+        }
+        if self.name.is_some() {
+            flags |= Self::HAS_NAME;
+        }
+        out.write_u8(flags);
+        if let Some(source) = self.source {
+            source.encode(out, version)?;
+        }
+        if let Some(name) = &self.name {
+            name.encode(out, version)?;
         }
         Ok(())
     }

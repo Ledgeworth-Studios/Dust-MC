@@ -465,3 +465,20 @@ wire_struct! {
         value: VarInt,
     }
 }
+
+var_int_enum! {
+    /// Which kind of slot interaction a click reports.
+    ///
+    /// The ids are the protocol's own; the button byte's meaning changes with
+    /// this, which is why the two travel together in one packet rather than
+    /// being interpreted apart.
+    pub enum ClickType {
+        Pickup = 0,
+        QuickMove = 1,
+        Swap = 2,
+        Clone = 3,
+        Throw = 4,
+        QuickCraft = 5,
+        PickupAll = 6,
+    }
+}

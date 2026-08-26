@@ -88,14 +88,18 @@ impl Encode for AdvancementDisplay {
         if self.flags & Self::HAS_BACKGROUND != 0 {
             // A flag promising a background without one would leave the peer
             // reading the coordinates as an identifier — refusing beats that.
-            return match &self.background {
-                Some(background) => background.encode(out, version),
-                None => Err(EncodeError::Unsupported {
-                    field: "advancement display",
-                    why: "the flags promise a background texture and none was given",
-                }),
-            };
+            match &self.background {
+                Some(background) => background.encode(out, version)?,
+                None => {
+                    return Err(EncodeError::Unsupported {
+                        field: "advancement display",
+                        why: "the flags promise a background texture and none was given",
+                    })
+                }
+            }
         }
+        // The grid position follows whether or not there was a background:
+        // the flag gates only the texture, never the coordinates.
         out.write_f32(self.x);
         out.write_f32(self.y);
         Ok(())
@@ -234,5 +238,168 @@ impl Encode for AdvancementProgress {
     ) -> Result<(), EncodeError> {
         self.key.encode(out, version)?;
         self.criteria.encode(out, version)
+    }
+}
+
+/// One key-value row of the advancement sync's two maps.
+///
+/// The wire spells a map as rows of key then value; this is one row. Two
+/// wrappers where one generic would do, because [`Advancement`] and
+/// [`AdvancementProgress`] are different documents about the same tree and
+/// conflating them lets a progress row be written where an advancement
+/// belongs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamedAdvancement {
+    pub key: Identifier,
+    pub value: Advancement,
+}
+
+impl Decode for NamedAdvancement {
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        Ok(Self {
+            key: Identifier::decode(input, version)?,
+            value: Advancement::decode(input, version)?,
+        })
+    }
+}
+
+impl Encode for NamedAdvancement {
+    fn encode<W: WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        self.key.encode(out, version)?;
+        self.value.encode(out, version)
+    }
+}
+
+/// One key-value row of the progress half of the sync.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamedProgress {
+    pub key: Identifier,
+    pub value: AdvancementProgress,
+}
+
+impl Decode for NamedProgress {
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        Ok(Self {
+            key: Identifier::decode(input, version)?,
+            value: AdvancementProgress::decode(input, version)?,
+        })
+    }
+}
+
+impl Encode for NamedProgress {
+    fn encode<W: WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        self.key.encode(out, version)?;
+        self.value.encode(out, version)
+    }
+}
+
+/// Everything after the packet id: the whole advancement state, in one shot.
+///
+/// There is no incremental form. Every sync either replaces what the client
+/// holds (`reset`) or patches it, and both halves travel together because the
+/// client rebuilds its screen from this one message.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdvancementsBody {
+    /// Whether the client discards everything it had before applying this.
+    pub reset: bool,
+    pub added: Vec<NamedAdvancement>,
+    pub removed: Vec<Identifier>,
+    pub progress: Vec<NamedProgress>,
+}
+
+impl Decode for AdvancementsBody {
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        Ok(Self {
+            reset: input.read_bool()?,
+            added: Vec::<NamedAdvancement>::decode(input, version)?,
+            removed: Vec::<Identifier>::decode(input, version)?,
+            progress: Vec::<NamedProgress>::decode(input, version)?,
+        })
+    }
+}
+
+impl Encode for AdvancementsBody {
+    fn encode<W: WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        out.write_bool(self.reset);
+        self.added.encode(out, version)?;
+        self.removed.encode(out, version)?;
+        self.progress.encode(out, version)
+    }
+}
+
+var_int_enum! {
+    /// What the advancement screen just did.
+    ///
+    /// `OpenedTab` carries the tab that opened; `ClosedScreen` carries
+    /// nothing, which is why the body below holds the id as an `Option`.
+    pub enum SeenAdvancementsAction {
+        OpenedTab = 0,
+        ClosedScreen = 1,
+    }
+}
+
+/// Everything after the packet id: the action, and the tab if there is one.
+///
+/// A closed screen has no tab to name, so the pair stays together here — a
+/// tab arriving without the opened-tab action would be a layout the peer did
+/// not send.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeenAdvancementsBody {
+    pub action: SeenAdvancementsAction,
+    pub tab: Option<Identifier>,
+}
+
+impl Decode for SeenAdvancementsBody {
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        let action = SeenAdvancementsAction::decode(input, version)?;
+        let tab = match action {
+            SeenAdvancementsAction::OpenedTab => Some(Identifier::decode(input, version)?),
+            SeenAdvancementsAction::ClosedScreen => None,
+        };
+        Ok(Self { action, tab })
+    }
+}
+
+impl Encode for SeenAdvancementsBody {
+    fn encode<W: WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        self.action.encode(out, version)?;
+        if self.action == SeenAdvancementsAction::OpenedTab {
+            return match &self.tab {
+                Some(tab) => tab.encode(out, version),
+                None => Err(EncodeError::Unsupported {
+                    field: "seen advancements",
+                    why: "the opened-tab action names a tab and none was given",
+                }),
+            };
+        }
+        Ok(())
     }
 }

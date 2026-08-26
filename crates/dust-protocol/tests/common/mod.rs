@@ -508,20 +508,38 @@ pub fn corpus() -> Vec<Frame> {
 
 #[allow(clippy::too_many_lines)]
 fn play_frames(out: &mut Vec<Frame>) {
+    use dust_protocol::packets::play::advancements::{
+        Advancement, AdvancementDisplay, AdvancementProgress, AdvancementsBody, CriterionProgress,
+        FrameType, NamedAdvancement, NamedProgress, SeenAdvancementsAction, SeenAdvancementsBody,
+    };
+    use dust_protocol::packets::play::boss_bar::{
+        BossBarAction, BossBarColor, BossBarDivision, BossBarFlags, BossEventBody,
+    };
     use dust_protocol::packets::play::chat::{
         AcknowledgedMessage, ChatFilter, MessageAcknowledgement, SignatureBytes,
     };
     use dust_protocol::packets::play::chunk::{BlockEntity, ChunkData, LightArray, LightData};
     use dust_protocol::packets::play::clientbound as cb;
+    use dust_protocol::packets::play::commands::{
+        CommandsBody, Node, NodeType, NumericRange, ParserProperties, SuggestionMatch,
+    };
+    use dust_protocol::packets::play::containers::{
+        ChangedSlot, ClickType, CraftingBookCategory, EquipmentEntries, EquipmentEntry,
+        EquipmentSlot, Ingredient, Recipe, RecipeKind, StonecuttingData,
+    };
+    use dust_protocol::packets::play::map_item::{MapDataBody, MapIcon, MapIconKind, MapPatch};
     use dust_protocol::packets::play::metadata::{MetadataEntries, MetadataValue};
+    use dust_protocol::packets::play::particle::ParticleValue;
     use dust_protocol::packets::play::player_info::{
         ChatSession, PlayerInfoActions, PlayerInfoBody, PlayerInfoEntry, ProfileAddition,
     };
     use dust_protocol::packets::play::serverbound as sb;
+    use dust_protocol::packets::play::sound::{SoundCategory, SoundId, StopSoundBody};
     use dust_protocol::packets::play::{
         Abilities, BlockChangeEntry, ChunkSectionPosition, DeathLocation, EntityDelta,
         EntityVelocity, GameModeByte, PreviousGameMode, TeleportFlags,
     };
+    use dust_protocol::types::{ProtocolString, Slot};
 
     let signature: SignatureBytes = core::array::from_fn(|i| (i * 7 + 3) as u8);
 
@@ -971,6 +989,318 @@ fn play_frames(out: &mut Vec<Frame>) {
         Play,
         Serverbound,
         sb::SetCarriedItem { slot: 5 }
+    ));
+
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::BossEvent {
+            body: BossEventBody {
+                uuid: Uuid(0xB055),
+                action: BossBarAction::Add {
+                    title: dust_protocol::text::Component::text("Ender Dragon").colored(
+                        dust_protocol::text::Color::Named(
+                            dust_protocol::text::NamedColor::DarkPurple,
+                        )
+                    ),
+                    health: 0.75,
+                    color: BossBarColor::Purple,
+                    division: BossBarDivision::Notches10,
+                    flags: BossBarFlags(BossBarFlags::DARKEN_SKY | BossBarFlags::DRAGON_BAR),
+                },
+            },
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::Commands {
+            body: CommandsBody {
+                nodes: vec![
+                    Node::literal(NodeType::Root, None),
+                    {
+                        let mut greet = Node::literal(NodeType::Literal, Some("greet"));
+                        greet.executable = true;
+                        greet.children = vec![VarInt(2)];
+                        greet
+                    },
+                    {
+                        let mut speed = Node::literal(NodeType::Argument, Some("speed"));
+                        speed.parser = Some((
+                            3,
+                            Some(ParserProperties::Integer(NumericRange {
+                                min: Some(1),
+                                max: None,
+                            })),
+                        ));
+                        speed.suggestions = Some(id("minecraft:ask_server"));
+                        speed
+                    },
+                ],
+                root_index: VarInt(0),
+            },
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::UpdateAdvancements {
+            body: AdvancementsBody {
+                reset: true,
+                added: vec![NamedAdvancement {
+                    key: id("minecraft:story/root"),
+                    value: Advancement {
+                        parent: None,
+                        display: Some(AdvancementDisplay {
+                            title: dust_protocol::nbt::TextComponent(some_nbt()),
+                            description: dust_protocol::nbt::TextComponent(some_nbt()),
+                            icon: Slot::Present {
+                                count: 1,
+                                item_id: 42,
+                                removed_components: vec![7],
+                            },
+                            frame: FrameType::Task,
+                            flags: AdvancementDisplay::SHOW_TOAST,
+                            background: None,
+                            x: 0.5,
+                            y: -12.25,
+                        }),
+                        criteria: vec![id("minecraft:mine_stone")],
+                        requirements: vec![vec![
+                            ProtocolString::new("minecraft:mined").expect("fits")
+                        ]],
+                        sends_telemetry: false,
+                    },
+                }],
+                removed: vec![id("minecraft:old/path")],
+                progress: vec![NamedProgress {
+                    key: id("minecraft:story/root"),
+                    value: AdvancementProgress {
+                        key: id("minecraft:story/root"),
+                        criteria: vec![CriterionProgress {
+                            identifier: id("minecraft:mine_stone"),
+                            achieved_at: Some(1_700_000_000_000),
+                        }],
+                    },
+                }],
+            },
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::SelectAdvancementsTab {
+            tab: Some(id("minecraft:story/root"))
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::SetEquipment {
+            entity_id: VarInt(17),
+            entries: EquipmentEntries(vec![
+                EquipmentEntry {
+                    slot: EquipmentSlot::MainHand,
+                    item: Slot::Empty,
+                },
+                EquipmentEntry {
+                    slot: EquipmentSlot::Helmet,
+                    item: Slot::Present {
+                        count: 1,
+                        item_id: 9,
+                        removed_components: vec![],
+                    },
+                },
+            ]),
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::LevelParticles {
+            long_distance: true,
+            x: -0.5,
+            y: 64.125,
+            z: 4096.0,
+            offset_x: 0.25,
+            offset_y: 1.0,
+            offset_z: -0.25,
+            max_speed: 0.1,
+            count: 30,
+            particle: ParticleValue::Dust {
+                id: 13,
+                red: 0.8,
+                green: 0.2,
+                blue: 0.1,
+                scale: 1.5,
+            },
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::MapItemData {
+            map_id: VarInt(4),
+            data: MapDataBody {
+                scale: 2,
+                locked: true,
+                icons: Some(vec![MapIcon {
+                    kind: MapIconKind::Mansion,
+                    x: -64,
+                    z: 96,
+                    direction: 8,
+                    display_name: Some(dust_protocol::text::Component::text("woodland mansion")),
+                }]),
+                patch: MapPatch {
+                    columns: 2,
+                    rows: 3,
+                    x: 10,
+                    z: 20,
+                    data: vec![0xA5; 6],
+                },
+            },
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::Sound {
+            sound: SoundId::Id(VarInt(90)),
+            category: SoundCategory::Hostile,
+            position_x: -512,
+            position_y: -32,
+            position_z: 2048,
+            volume: 0.85,
+            pitch: 1.25,
+            seed: 1234567890,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::SoundEntity {
+            sound: SoundId::Inline {
+                name: id("dust:custom_sound"),
+                fixed_range: Some(24.0),
+            },
+            category: SoundCategory::Voice,
+            entity_id: VarInt(-7),
+            volume: 2.0,
+            pitch: 0.5,
+            seed: -987654321,
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::StopSound {
+            body: StopSoundBody {
+                source: Some(SoundCategory::Music),
+                name: Some(id("minecraft:music.game")),
+            },
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::UpdateRecipes {
+            recipes: vec![
+                Recipe {
+                    id: id("minecraft:oak_planks"),
+                    kind: RecipeKind::Stonecutting(StonecuttingData {
+                        group: ProtocolString::new("planks").expect("fits"),
+                        ingredient: Ingredient {
+                            items: vec![Slot::Present {
+                                count: 1,
+                                item_id: 15,
+                                removed_components: vec![],
+                            }],
+                        },
+                        result: Slot::Present {
+                            count: 1,
+                            item_id: 16,
+                            removed_components: vec![],
+                        },
+                    }),
+                },
+                Recipe {
+                    id: id("minecraft:crafting/special/armor_dye"),
+                    kind: RecipeKind::Special {
+                        type_id: 2,
+                        category: CraftingBookCategory::Equipment,
+                    },
+                },
+            ],
+        }
+    ));
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::CommandSuggestions {
+            id: VarInt(9),
+            start: VarInt(2),
+            length: VarInt(4),
+            matches: vec![
+                SuggestionMatch {
+                    text: ProtocolString::new("give").expect("fits"),
+                    tooltip: None,
+                },
+                SuggestionMatch {
+                    text: ProtocolString::new("gamerule").expect("fits"),
+                    tooltip: Some(dust_protocol::text::Component::text("the rules").italic(true)),
+                },
+            ],
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::ClickContainer {
+            window_id: 2,
+            state_id: VarInt(11),
+            slot: 36,
+            button: 40,
+            mode: ClickType::Swap,
+            changed_slots: vec![
+                ChangedSlot {
+                    number: 0,
+                    item: Slot::Empty,
+                },
+                ChangedSlot {
+                    number: 45,
+                    item: Slot::Present {
+                        count: 16,
+                        item_id: 33,
+                        removed_components: vec![1, 2],
+                    },
+                },
+            ],
+            cursor_item: Slot::Empty,
+        }
+    ));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::SeenAdvancements {
+            body: SeenAdvancementsBody {
+                action: SeenAdvancementsAction::OpenedTab,
+                tab: Some(id("minecraft:recipes/root")),
+            },
+        }
     ));
 }
 

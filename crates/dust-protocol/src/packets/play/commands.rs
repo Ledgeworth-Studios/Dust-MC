@@ -28,8 +28,10 @@
 //! note that here even the *vanilla* client behaves identically, which makes
 //! refusing the least surprising thing this module can do.
 
+use crate::text::Component;
 use crate::types::{
-    read_string, write_string, Decode, Encode, Identifier, VarInt, DEFAULT_STRING_LIMIT,
+    read_string, write_string, Decode, Encode, Identifier, ProtocolString, VarInt,
+    DEFAULT_STRING_LIMIT,
 };
 use crate::wire::{DecodeError, EncodeError, WireRead, WireWrite};
 use crate::{var_int_enum, ProtocolVersion};
@@ -840,5 +842,38 @@ mod tests {
             None,
             "an invented mode is refused"
         );
+    }
+}
+
+/// One tab-completion match: the text to insert, and an optional tooltip.
+///
+/// The text travels as a plain bounded string — a completion is inserted
+/// verbatim, so there is nothing for a component to style.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SuggestionMatch {
+    pub text: ProtocolString,
+    pub tooltip: Option<Component>,
+}
+
+impl Decode for SuggestionMatch {
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        Ok(Self {
+            text: ProtocolString::decode(input, version)?,
+            tooltip: Option::<Component>::decode(input, version)?,
+        })
+    }
+}
+
+impl Encode for SuggestionMatch {
+    fn encode<W: WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        self.text.encode(out, version)?;
+        self.tooltip.encode(out, version)
     }
 }

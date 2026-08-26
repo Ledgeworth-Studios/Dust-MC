@@ -10,9 +10,16 @@
 
 use crate::nbt::Nbt;
 use crate::packet_group;
+use crate::packets::play::advancements::AdvancementsBody;
+use crate::packets::play::boss_bar::BossEventBody;
 use crate::packets::play::chunk::{BlockEntity, ChunkData, LightData};
+use crate::packets::play::commands::{CommandsBody, SuggestionMatch};
+use crate::packets::play::containers::{EquipmentEntries, Recipe};
+use crate::packets::play::map_item::MapDataBody;
 use crate::packets::play::metadata::MetadataEntries;
+use crate::packets::play::particle::ParticleValue;
 use crate::packets::play::player_info::PlayerInfoBody;
+use crate::packets::play::sound::{SoundCategory, SoundId, StopSoundBody};
 use crate::packets::play::{chat as chat_fields, TeleportFlags};
 use crate::packets::play::{Abilities, BlockChangeEntry, ChunkSectionPosition, DeathLocation};
 use crate::packets::play::{EntityDelta, EntityVelocity, GameModeByte, PreviousGameMode};
@@ -247,5 +254,124 @@ packet_group! {
     /// The answer to the client's own ping request, payload untouched.
     "minecraft:pong_response" => PongResponse {
         payload: i64,
+    },
+
+    /// One boss bar appears, changes or disappears.
+    ///
+    /// The action picks the layout, which is why the body is one type; see
+    /// [`BossEventBody`]'s module for how to read it.
+    "minecraft:boss_event" => BossEvent {
+        body: BossEventBody,
+    },
+
+    /// Every command the server offers, as a brigadier node graph.
+    ///
+    /// Children and redirects are indices into the packet's own node array,
+    /// and may only point at nodes declared earlier; see [`CommandsBody`]'s
+    /// module for the node format and the parser table.
+    "minecraft:commands" => Commands {
+        body: CommandsBody,
+    },
+
+    /// The advancement tree, its display cards and each player's progress.
+    ///
+    /// There is no incremental form: every sync carries all four sections,
+    /// and `reset` decides whether they replace or patch what the client had.
+    /// See [`AdvancementsBody`].
+    "minecraft:update_advancements" => UpdateAdvancements {
+        body: AdvancementsBody,
+    },
+
+    /// Which tab of the advancement screen the client should show. `None`
+    /// means the screen was closed on the server side.
+    "minecraft:select_advancements_tab" => SelectAdvancementsTab {
+        tab: Option<Identifier>,
+    },
+
+    /// A mob's visible gear changed. Entries continue while a high bit says
+    /// so — see [`EquipmentEntries`].
+    "minecraft:set_equipment" => SetEquipment {
+        entity_id: VarInt,
+        entries: EquipmentEntries,
+    },
+
+    /// A burst of particles at a point in the world.
+    ///
+    /// `count` copies are scattered through the offsets; a count of zero
+    /// places exactly one particle at the position itself, which is how a
+    /// single dramatic effect is spelled.
+    "minecraft:level_particles" => LevelParticles {
+        long_distance: bool,
+        x: f64,
+        y: f64,
+        z: f64,
+        offset_x: f32,
+        offset_y: f32,
+        offset_z: f32,
+        max_speed: f32,
+        count: i32,
+        particle: ParticleValue,
+    },
+
+    /// A map item's icons and colour patch, in one update.
+    ///
+    /// Both halves are optional and value-dependent, so the tail is one type;
+    /// see [`MapDataBody`]'s module.
+    "minecraft:map_item_data" => MapItemData {
+        map_id: VarInt,
+        data: MapDataBody,
+    },
+
+    /// A sound plays from a point in the world.
+    ///
+    /// The position is three ints — block coordinates, not floats — because
+    /// the client snaps fixed sounds to a block anyway. See [`SoundId`] for
+    /// why the sound itself is a tagged union.
+    "minecraft:sound" => Sound {
+        sound: SoundId,
+        category: SoundCategory,
+        position_x: i32,
+        position_y: i32,
+        position_z: i32,
+        volume: f32,
+        pitch: f32,
+        seed: i64,
+    },
+
+    /// A sound plays from an entity, so the client can follow it around.
+    "minecraft:sound_entity" => SoundEntity {
+        sound: SoundId,
+        category: SoundCategory,
+        entity_id: VarInt,
+        volume: f32,
+        pitch: f32,
+        seed: i64,
+    },
+
+    /// Stop one playing sound, a whole category, or everything.
+    ///
+    /// One flags byte selects among four layouts; see [`StopSoundBody`].
+    "minecraft:stop_sound" => StopSound {
+        body: StopSoundBody,
+    },
+
+    /// Every recipe the client may craft, with each recipe's own layout.
+    ///
+    /// The type id leads the data and picks the struct that follows; see
+    /// [`Recipe`]. What the client *may craft* is the separate recipe book
+    /// packet, which carries ids rather than layouts.
+    "minecraft:update_recipes" => UpdateRecipes {
+        recipes: Vec<Recipe>,
+    },
+
+    /// The answer to the client's tab-completion request: what to offer.
+    ///
+    /// `start`/`length` name the span of the input being replaced. Each
+    /// match carries its own optional tooltip; see [`SuggestionMatch`].
+    "minecraft:command_suggestions" => CommandSuggestions {
+        id: VarInt,
+        start: VarInt,
+        length: VarInt,
+        matches: Vec<SuggestionMatch>,
     },
 }

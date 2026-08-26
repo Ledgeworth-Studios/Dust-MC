@@ -427,3 +427,233 @@ proptest! {
         assert_round_trip(&root);
     }
 }
+
+mod wave_two {
+    //! Round-trip properties for the second wave's value-dependent tails.
+    //!
+    //! Each of these types picks its layout from a discriminant, so the
+    //! property is not only "survives the wire" but "the same variant comes
+    //! back" — a swap between two shapes of one width would otherwise be
+    //! invisible.
+
+    use super::*;
+    use dust_protocol::packets::play::advancements::{
+        Advancement, AdvancementDisplay, AdvancementProgress, CriterionProgress, FrameType,
+    };
+    use dust_protocol::packets::play::boss_bar::{
+        BossBarAction, BossBarColor, BossBarDivision, BossBarFlags,
+    };
+    use dust_protocol::packets::play::commands::{NumericRange, ParserProperties};
+    use dust_protocol::packets::play::containers::ClickType;
+    use dust_protocol::packets::play::containers::{
+        EquipmentEntries, EquipmentEntry, EquipmentSlot,
+    };
+    use dust_protocol::packets::play::map_item::{MapIconKind, MapPatch};
+    use dust_protocol::packets::play::particle::{ParticleValue, PositionSource, VibrationPath};
+    use dust_protocol::packets::play::sound::SoundId;
+
+    fn slot(item_id: i32) -> dust_protocol::types::Slot {
+        dust_protocol::types::Slot::Present {
+            count: 1,
+            item_id,
+            removed_components: vec![],
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn numeric_ranges_survive_whichever_ends_they_carry(
+            which in 0u8..4,
+            fmin in any::<f32>(), fmax in any::<f32>(),
+            dmin in any::<f64>(), dmax in any::<f64>(),
+            imin in any::<i32>(), imax in any::<i32>(),
+            lmin in any::<i64>(), lmax in any::<i64>(),
+        ) {
+            // Properties travel only as an argument node's tail — they are
+            // meaningless without their parser id — so each range rides one.
+            let node_with = |id: i32, properties: Option<ParserProperties>| {
+                let mut node = dust_protocol::packets::play::commands::Node::literal(
+                    dust_protocol::packets::play::commands::NodeType::Argument,
+                    Some("value"),
+                );
+                node.parser = Some((id, properties));
+                node
+            };
+            let (has_min, has_max) = (which & 1 != 0, which & 2 != 0);
+            assert_round_trip(&node_with(1, Some(ParserProperties::Float(NumericRange::<f32> {
+                min: if has_min { Some(fmin) } else { None },
+                max: if has_max { Some(fmax) } else { None },
+            }))));
+            assert_round_trip(&node_with(2, Some(ParserProperties::Double(NumericRange::<f64> {
+                min: if has_min { Some(dmin) } else { None },
+                max: if has_max { Some(dmax) } else { None },
+            }))));
+            assert_round_trip(&node_with(3, Some(ParserProperties::Integer(NumericRange::<i32> {
+                min: if has_min { Some(imin) } else { None },
+                max: if has_max { Some(imax) } else { None },
+            }))));
+            assert_round_trip(&node_with(4, Some(ParserProperties::Long(NumericRange::<i64> {
+                min: if has_min { Some(lmin) } else { None },
+                max: if has_max { Some(lmax) } else { None },
+            }))));
+        }
+
+        #[test]
+        fn boss_bar_actions_keep_their_own_layouts(
+            health in any::<f32>(),
+            flags in any::<u8>(),
+            colour in 0i32..7,
+            division in 0i32..5,
+        ) {
+            let action = match colour % 3 {
+                0 => BossBarAction::UpdateHealth(health),
+                1 => BossBarAction::UpdateProperties(BossBarFlags(flags)),
+                _ => BossBarAction::UpdateStyle {
+                    color: BossBarColor::from_discriminant(colour).expect("modelled"),
+                    division: BossBarDivision::from_discriminant(division).expect("modelled"),
+                },
+            };
+            assert_round_trip(&action);
+        }
+
+        #[test]
+        fn sound_ids_travel_as_either_form(
+            raw_id in 0i32..=i32::MAX - 1,
+            range_present in any::<bool>(),
+            fixed_range in any::<f32>(),
+            namespace in "[a-z]{2,8}",
+            path in "[a-z_/]{2,16}",
+        ) {
+            assert_round_trip(&SoundId::Id(VarInt(raw_id)));
+            assert_round_trip(&SoundId::Inline {
+                name: Identifier { namespace, path },
+                fixed_range: range_present.then_some(fixed_range),
+            });
+        }
+
+        #[test]
+        fn particle_values_agree_with_their_ids_across_shapes(
+            block_state in any::<i32>(),
+            roll in any::<f32>(),
+            delay in any::<i32>(),
+            colour in any::<i32>(),
+        ) {
+            assert_round_trip(&ParticleValue::BlockState { id: 1, state: VarInt(block_state) });
+            assert_round_trip(&ParticleValue::SculkCharge { id: 35, roll });
+            assert_round_trip(&ParticleValue::Shriek { id: 99, delay: VarInt(delay) });
+            assert_round_trip(&ParticleValue::EntityEffect { id: 20, color: colour });
+            assert_round_trip(&ParticleValue::Vibration(VibrationPath {
+                source: PositionSource::Block(Position::new(-9, 70, 12)),
+                destination: PositionSource::Entity {
+                    entity_id: VarInt(delay),
+                    eye_height: roll.abs(),
+                },
+                ticks: VarInt(colour),
+            }));
+        }
+
+        #[test]
+        fn map_patches_and_icons_round_trip(
+            columns in 0u8..=3,
+            rows in 0u8..=4,
+            data_len in 0usize..13,
+            icon_kind in 0i32..35,
+        ) {
+            // Columns zero means "icons only": the rest of the patch does not
+            // exist on the wire, so the value is normalised rather than
+            // carried. Only a non-empty patch is representable as-is.
+            let patch = if columns == 0 {
+                MapPatch {
+                    columns: 0,
+                    rows: 0,
+                    x: 0,
+                    z: 0,
+                    data: vec![],
+                }
+            } else {
+                MapPatch {
+                    columns,
+                    rows,
+                    x: 3,
+                    z: 4,
+                    data: vec![0x3C; data_len],
+                }
+            };
+            assert_round_trip(&patch);
+            let kind = MapIconKind::from_discriminant(icon_kind).expect("modelled");
+            prop_assert_eq!(kind.discriminant(), icon_kind);
+        }
+
+        #[test]
+        fn click_types_are_a_closed_set(mode in 0i32..9) {
+            let decoded = ClickType::from_discriminant(mode);
+            prop_assert_eq!(decoded.is_some(), mode <= 6);
+        }
+
+        #[test]
+        fn advancement_documents_survive_their_optionals(
+            with_parent in any::<bool>(),
+            with_display in any::<bool>(),
+            with_background in any::<bool>(),
+            achieved in any::<bool>(),
+            frame in 0i32..3,
+        ) {
+            // The component fields are opaque NBT here; the empty value is
+            // enough to exercise the delimiting, and it is what a server
+            // with nothing to say writes.
+            let title_blob = dust_protocol::nbt::TextComponent(dust_protocol::nbt::Nbt::empty());
+            let description_blob =
+                dust_protocol::nbt::TextComponent(dust_protocol::nbt::Nbt::empty());
+            let display = with_display.then(|| AdvancementDisplay {
+                title: title_blob.clone(),
+                description: description_blob.clone(),
+                icon: slot(30),
+                frame: FrameType::from_discriminant(frame).expect("modelled"),
+                flags: if with_background { AdvancementDisplay::HAS_BACKGROUND } else { 0 },
+                background: with_background
+                    .then(|| Identifier::parse("minecraft:textures/block/stone").expect("valid")),
+                x: 0.25,
+                y: -0.75,
+            });
+            let advancement = Advancement {
+                parent: with_parent.then(|| Identifier::parse("minecraft:parent").expect("valid")),
+                display,
+                criteria: vec![Identifier::parse("minecraft:criterion").expect("valid")],
+                requirements: vec![vec![BoundedString::<32767>::new("criterion").expect("fits")]],
+                sends_telemetry: false,
+            };
+            assert_round_trip(&advancement);
+
+            let progress = AdvancementProgress {
+                key: Identifier::parse("minecraft:key").expect("valid"),
+                criteria: vec![CriterionProgress {
+                    identifier: Identifier::parse("minecraft:criterion").expect("valid"),
+                    achieved_at: achieved.then_some(1_700_000_000_000),
+                }],
+            };
+            assert_round_trip(&progress);
+        }
+
+        #[test]
+        fn equipment_lists_round_trip_through_the_continuation_bit(count in 1usize..=7) {
+            let slots = [
+                EquipmentSlot::MainHand,
+                EquipmentSlot::OffHand,
+                EquipmentSlot::Boots,
+                EquipmentSlot::Leggings,
+                EquipmentSlot::Chestplate,
+                EquipmentSlot::Helmet,
+                EquipmentSlot::Body,
+            ];
+            let entries: Vec<EquipmentEntry> = (0..count)
+                .map(|index| EquipmentEntry {
+                    slot: slots[index],
+                    item: if index % 2 == 0 { slot(index as i32) } else { dust_protocol::types::Slot::Empty },
+                })
+                .collect();
+            assert_round_trip(&EquipmentEntries(entries));
+        }
+    }
+}
