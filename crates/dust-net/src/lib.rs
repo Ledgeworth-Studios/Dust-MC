@@ -79,6 +79,7 @@ pub mod crypt;
 pub mod frame;
 pub mod io;
 pub mod login;
+pub mod metrics;
 pub mod state;
 pub mod testkeys;
 pub mod varint;

@@ -64,6 +64,7 @@ use tokio::task::JoinHandle;
 
 use crate::crypt::{Cipher, SharedSecret, SHARED_SECRET_LEN};
 use crate::frame::{Compress, Frame, FrameDecoder, FrameEncoder, FrameError, Limits, Needed};
+use crate::metrics::{ConnCounters, StatsSnapshot};
 use crate::state::{Connection as StateMachine, HandshakeError, IllegalTransition, Intent, State};
 use crate::varint::MAX_VAR_INT_LEN;
 
@@ -273,6 +274,9 @@ pub struct Conn<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> {
     /// Where the writer records a write failure for the next operation that
     /// cares to look. Shared with the writer task; see `poisoned`.
     failure: Arc<Mutex<Option<ConnError>>>,
+    /// The connection's counters, shared with the writer task so both halves
+    /// of the stream report into the same totals. See [`crate::metrics`].
+    stats: Arc<ConnCounters>,
     /// Kept so a panic in the writer is noticed rather than detached into
     /// silence; nothing joins this handle in the normal path.
     _writer: JoinHandle<()>,
@@ -308,12 +312,14 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
         let limits = config.limits;
         let failure: Arc<Mutex<Option<ConnError>>> = Arc::default();
         let queued: Arc<AtomicUsize> = Arc::default();
+        let stats: Arc<ConnCounters> = Arc::new(ConnCounters::new());
         let handle = tokio::spawn(write_loop(
             writer,
             outbound_rx,
             abort_rx,
             Arc::clone(&failure),
             Arc::clone(&queued),
+            Arc::clone(&stats),
         ));
         Self {
             reader,
@@ -328,6 +334,7 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
             queued,
             abort_flag,
             failure,
+            stats,
             _writer: handle,
             ended: false,
         }
@@ -386,6 +393,28 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
         self.queued.load(Ordering::Relaxed)
     }
 
+    /// A snapshot of this connection's counters: frames and bytes in each
+    /// direction, and terminal failures by kind. See [`crate::metrics`] for
+    /// what each count means and where it is taken.
+    ///
+    /// The numbers are exact at the instants their events happened; the
+    /// snapshot itself may already be behind a connection that kept moving.
+    /// Take another to see later.
+    pub fn stats(&self) -> StatsSnapshot {
+        let c = &*self.stats;
+        StatsSnapshot {
+            frames_in: c.frames_in.load(Ordering::Relaxed),
+            frames_out: c.frames_out.load(Ordering::Relaxed),
+            bytes_in: c.bytes_in.load(Ordering::Relaxed),
+            bytes_out: c.bytes_out.load(Ordering::Relaxed),
+            protocol_errors: c.protocol_errors.load(Ordering::Relaxed),
+            io_errors: c.io_errors.load(Ordering::Relaxed),
+            truncated_frames: c.truncated_frames.load(Ordering::Relaxed),
+            idle_timeouts: c.idle_timeouts.load(Ordering::Relaxed),
+            pre_auth_deadlines: c.pre_auth_deadlines.load(Ordering::Relaxed),
+        }
+    }
+
     /// Whether the transport has ended — cleanly, badly, or by local close.
     /// Afterwards every operation fails with [`ConnError::Closed`].
     pub fn has_ended(&self) -> bool {
@@ -435,10 +464,16 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
             return Err(self.take_failure().unwrap_or(ConnError::Closed));
         }
         self.cipher_in.enable(secret);
-        self.dispatch(Command::EnableEncryption {
-            secret: *secret.as_bytes(),
-        })
-        .await
+        if let Err(error) = self
+            .dispatch(Command::EnableEncryption {
+                secret: *secret.as_bytes(),
+            })
+            .await
+        {
+            self.stats.note_error(&error);
+            return Err(error);
+        }
+        Ok(())
     }
 
     // -- Reading -------------------------------------------------------------
@@ -466,9 +501,17 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
         // after a timeout or a bad frame there is no operation this driver
         // can still perform honestly.
         match self.pull_until_frame().await {
+            Ok(Some(frame)) => {
+                self.stats.frames_in.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(frame))
+            }
             Ok(outcome) => Ok(outcome),
             Err(error) => {
                 self.ended = true;
+                // Counted here, once, at the place the failure became an
+                // error; every later call returns Closed, which is not an
+                // event and is not counted.
+                self.stats.note_error(&error);
                 Err(error)
             }
         }
@@ -543,6 +586,9 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
         if n == 0 {
             return Ok(false);
         }
+        // Counted before the bytes are decrypted or decoded: this is the
+        // wire cost the peer chose to impose, whatever it turns into.
+        self.stats.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
         let arrived = &mut self.scratch[..n];
         self.cipher_in.decrypt(arrived);
         self.decoder.feed(arrived);
@@ -568,6 +614,7 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
         }
         if let Some(failure) = self.take_failure() {
             self.ended = true;
+            self.stats.note_error(&failure);
             return Err(failure);
         }
         // Encoding happens before anything is queued, so an oversized frame
@@ -579,12 +626,15 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
         self.encoder.encode(&frame, &mut wire)?;
         match self.outbound.send(Command::Frame(wire)).await {
             Ok(()) => {
+                self.stats.frames_out.fetch_add(1, Ordering::Relaxed);
                 self.queued.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
             Err(_) => {
                 self.ended = true;
-                Err(self.take_failure().unwrap_or(ConnError::Closed))
+                let error = self.take_failure().unwrap_or(ConnError::Closed);
+                self.stats.note_error(&error);
+                Err(error)
             }
         }
     }
@@ -626,9 +676,15 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
             return Err(self.take_failure().unwrap_or(ConnError::Closed));
         }
         let (done_tx, done_rx) = oneshot::channel();
-        self.dispatch(Command::Finish { done: done_tx }).await?;
+        if let Err(error) = self.dispatch(Command::Finish { done: done_tx }).await {
+            self.stats.note_error(&error);
+            return Err(error);
+        }
         let outcome = done_rx.await.unwrap_or(Err(ConnError::Closed));
         self.ended = true;
+        if let Err(error) = &outcome {
+            self.stats.note_error(error);
+        }
         outcome
     }
 
@@ -688,6 +744,7 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
     mut abort: watch::Receiver<bool>,
     failure: Arc<Mutex<Option<ConnError>>>,
     queued: Arc<AtomicUsize>,
+    stats: Arc<ConnCounters>,
 ) {
     let mut cipher_out = Cipher::disabled();
 
@@ -733,6 +790,12 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
                             record_failure(&failure, Some(ConnError::Io(error)));
                             break;
                         }
+                        // Counted here rather than at accept time so that
+                        // `bytes_out` is what the socket actually took, the
+                        // honest counterpart to `bytes_in`'s wire cost. The
+                        // two counters answer different questions on a
+                        // stalled connection, which is the point.
+                        stats.bytes_out.fetch_add(wire.len() as u64, Ordering::Relaxed);
                     }
                 }
             }
