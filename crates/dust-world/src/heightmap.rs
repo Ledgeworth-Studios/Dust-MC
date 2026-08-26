@@ -23,6 +23,13 @@
 //! lands, the six predicates become six functions in the crate that owns it,
 //! and nothing here changes.
 //!
+//! The same seam runs through the *incremental* path,
+//! [`Heightmap::update_on_set_block`]: a single block edit folds into the
+//! map in place of a column recompute, and the one case it cannot settle on
+//! its own — the surface sinking because its top block stopped counting —
+//! takes the states below as a lazy parameter rather than a back-reference
+//! to a chunk this type deliberately does not hold.
+//!
 //! **What this does not catch:** everything about the predicate. A heightmap
 //! computed with the wrong test is a valid heightmap of the wrong numbers, and
 //! nothing in this module can tell. The only check with teeth is comparing
@@ -267,6 +274,71 @@ impl Heightmap {
         self.storage.set(Self::index(x, z), stored);
     }
 
+    /// Fold one block change into the map instead of recomputing the column.
+    ///
+    /// The arguments are what a block edit already knows: where it happened,
+    /// whether the previous state counted (`was_opaque`) and whether the new
+    /// one does (`is_opaque`). Three cases need work:
+    ///
+    /// * A counting block placed at or above the current surface raises it to
+    ///   `y + 1`, whatever stood there before.
+    /// * A counting block removed from the surface itself — `y` exactly one
+    ///   below the first available position — sinks it, and where it lands
+    ///   depends on what is *under* that block, which a heightmap cannot see.
+    ///   The caller supplies the view: `below` yields `(y, counted)` pairs for
+    ///   the rest of the column, top-down from `y - 1`, and the walk stops at
+    ///   the first counted row. Building that iterator costs the caller
+    ///   almost nothing precisely because it is lazy — in every other case it
+    ///   is never consumed.
+    /// * Everything else — interior edits, air into air, a counted block
+    ///   replaced by another — moves nothing, because some counted block
+    ///   still stands above `y`.
+    ///
+    /// This is exact by construction, not approximately right: the result is
+    /// identical to [`Heightmap::recompute_column`] over the same column,
+    /// which `tests/heightmap_incremental.rs` holds against hundreds of
+    /// random edit schedules.
+    ///
+    /// # Panics
+    ///
+    /// As [`Heightmap::set_first_available`], if a raised surface would land
+    /// past the ceiling — impossible for a block inside this world — or if
+    /// `below` stops descending. A lazy check keeps the contract visible
+    /// without charging the hot path for it.
+    pub fn update_on_set_block<I>(
+        &mut self,
+        x: u32,
+        y: i32,
+        z: u32,
+        was_opaque: bool,
+        is_opaque: bool,
+        below: I,
+    ) where
+        I: IntoIterator<Item = (i32, bool)>,
+    {
+        let first_available = self.first_available(x, z);
+        if is_opaque {
+            if y >= first_available {
+                self.set_first_available(x, z, y + 1);
+            }
+        } else if was_opaque && y == first_available - 1 {
+            let mut sunk_to = self.world.min_y;
+            let mut previous = y;
+            for (below_y, counted) in below {
+                debug_assert!(
+                    below_y < previous,
+                    "the column below the edit must arrive top-down"
+                );
+                previous = below_y;
+                if counted {
+                    sunk_to = below_y + 1;
+                    break;
+                }
+            }
+            self.set_first_available(x, z, sunk_to);
+        }
+    }
+
     /// Recompute one column from the states in it.
     ///
     /// `top_down` yields `(y, state)` from the top of the world downwards, and
@@ -498,6 +570,151 @@ mod tests {
             }
         }
         assert_eq!(read, map);
+    }
+
+    #[test]
+    fn an_incremental_raise_lands_the_surface_above_the_new_block() {
+        let mut map = Heightmap::new(HeightmapKind::WorldSurface, WorldHeight::OVERWORLD);
+        // Placing counted blocks onto an empty column: each raise lands at
+        // y + 1, and the lazy `below` argument is never touched -- which is
+        // what lets callers build it from an iterator they already have.
+        let mut consumed = false;
+        let below = std::iter::from_fn(|| {
+            consumed = true;
+            None::<(i32, bool)>
+        });
+        map.update_on_set_block(3, 5, 4, false, true, below);
+        assert!(!consumed, "a raise has no need of the column beneath");
+        assert_eq!(map.first_available(3, 4), 6);
+        assert_eq!(map.highest_taken(3, 4), Some(5));
+
+        // A second block higher still moves the surface past itself; one
+        // lower than the surface moves nothing.
+        map.update_on_set_block(3, 90, 4, false, true, std::iter::empty());
+        assert_eq!(map.first_available(3, 4), 91);
+        map.update_on_set_block(3, 40, 4, false, true, std::iter::empty());
+        assert_eq!(
+            map.first_available(3, 4),
+            91,
+            "an interior placement does not lower or double-count"
+        );
+    }
+
+    #[test]
+    fn an_incremental_lower_walks_the_column_only_when_the_top_left() {
+        let mut map = Heightmap::new(HeightmapKind::WorldSurface, WorldHeight::new(0, 32));
+        // Column with counted blocks at y = 20 and y = 7: surface at 21.
+        map.set_first_available(1, 2, 21);
+
+        // Removing an interior counted block leaves the surface alone --
+        // something counted still stands above it.
+        map.update_on_set_block(1, 7, 2, true, false, [(6, true)]);
+        assert_eq!(map.first_available(1, 2), 21);
+
+        // Removing the top sinks it to the next counted row below.
+        let mut asked = Vec::new();
+        let below = (0..20i32).rev().map(|row| {
+            let counted = row == 7;
+            asked.push((row, counted));
+            (row, counted)
+        });
+        map.update_on_set_block(1, 20, 2, true, false, below);
+        assert_eq!(map.first_available(1, 2), 8);
+        // The walk stopped at the first counted row; nothing below was read.
+        assert_eq!(asked.len(), 13, "rows 19..=7 were looked at, no further");
+        assert_eq!(asked.last().copied(), Some((7, true)));
+
+        // And removing the last counted block drops the column to the floor.
+        map.update_on_set_block(1, 7, 2, true, false, (0..7).rev().map(|y| (y, false)));
+        assert_eq!(map.first_available(1, 2), 0);
+        assert_eq!(map.highest_taken(1, 2), None);
+    }
+
+    #[test]
+    fn replacing_a_counted_block_with_another_moves_nothing() {
+        let mut map = Heightmap::new(HeightmapKind::WorldSurface, WorldHeight::new(0, 32));
+        map.set_first_available(9, 9, 14);
+        map.update_on_set_block(9, 13, 9, true, true, std::iter::empty());
+        assert_eq!(map.first_available(9, 9), 14);
+        // Placing a counted block above the surface is a different story:
+        // that raises regardless of what the previous state was.
+        map.update_on_set_block(9, 30, 9, false, true, std::iter::empty());
+        assert_eq!(map.first_available(9, 9), 31);
+    }
+
+    #[test]
+    fn raising_and_lowering_across_word_boundaries_leaves_the_neighbours_alone() {
+        // Nine-bit columns pack seven to a long; columns 6 and 7 share a word
+        // boundary, so edits that push their stored values around are exactly
+        // the writes most likely to smear into a neighbour if the packing is
+        // wrong. Both directions, repeatedly, with the padding checked after.
+        for world in [
+            WorldHeight::OVERWORLD,
+            WorldHeight::NETHER,
+            WorldHeight::new(0, 255),
+        ] {
+            let bits = world.heightmap_bits();
+            let per_long = crate::bits::values_per_long(bits);
+            let left_index = per_long - 1;
+            let right_index = per_long;
+            if right_index >= COLUMNS {
+                continue;
+            }
+            let (left_x, left_z) = ((left_index % 16) as u32, (left_index / 16) as u32);
+            let (right_x, right_z) = ((right_index % 16) as u32, (right_index / 16) as u32);
+            let mut map = Heightmap::new(HeightmapKind::MotionBlocking, world);
+            let floor = world.min_y();
+            let ceiling = world.max_y_exclusive();
+
+            for step in 0..12usize {
+                // Interleaved placements at unrelated heights -- one high and
+                // sinking, one low and rising -- so neither column's stored
+                // value sits still while the other is rewritten.
+                let left_y = ceiling - 2 - step as i32;
+                let right_y = ceiling - 40 + step as i32 * 3;
+                map.update_on_set_block(left_x, left_y, left_z, false, true, std::iter::empty());
+                assert_eq!(
+                    map.first_available(left_x, left_z),
+                    left_y + 1,
+                    "{world:?} raise step {step}"
+                );
+                map.update_on_set_block(right_x, right_y, right_z, false, true, std::iter::empty());
+                assert_eq!(
+                    map.first_available(right_x, right_z),
+                    right_y + 1,
+                    "{world:?} raise step {step}"
+                );
+                // And the exact inverse: removing each placed top sinks its
+                // column back to the floor through the lazy walk.
+                map.update_on_set_block(
+                    left_x,
+                    left_y,
+                    left_z,
+                    true,
+                    false,
+                    (floor..left_y).rev().map(|y| (y, false)),
+                );
+                assert_eq!(
+                    map.first_available(left_x, left_z),
+                    floor,
+                    "{world:?} sink step {step}"
+                );
+                map.update_on_set_block(
+                    right_x,
+                    right_y,
+                    right_z,
+                    true,
+                    false,
+                    (floor..right_y).rev().map(|y| (y, false)),
+                );
+                assert_eq!(
+                    map.first_available(right_x, right_z),
+                    floor,
+                    "{world:?} sink step {step}"
+                );
+                assert!(map.storage().padding_is_zero(), "{world:?} step {step}");
+            }
+        }
     }
 
     #[test]

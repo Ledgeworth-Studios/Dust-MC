@@ -33,12 +33,15 @@
 //!
 //! # Decisions this skeleton makes, so nobody has to make them twice
 //!
-//! * **Setting a block does not touch the heightmaps or the light.** Vanilla
-//!   updates both as blocks change; doing that correctly needs the block
-//!   registry (which states count for each map) and a cross-section light
-//!   engine, neither of which lives on this branch. Until then the caller
-//!   recomputes explicitly with [`Chunk::recompute_heightmaps`], and a stale
-//!   heightmap is visible rather than half-maintained.
+//! * **Setting a block leaves the heightmaps to a second door.** The plain
+//!   [`Chunk::set_block`] writes states and nothing else — right when a
+//!   caller is building or rewriting a chunk wholesale, where per-edit
+//!   maintenance would be paid six hundred times over for nothing.
+//!   [`Chunk::set_block_maintaining`] takes the counting predicate as a
+//!   closure — this crate cannot know which states each of the six maps
+//!   counts — and folds every edit into all six incrementally, exactly as a
+//!   recompute would answer it. Neither door half-maintains: a stale map is
+//!   either deliberately unwritten or provably current.
 //! * **Registry sizes ride along.** The chunk stores how many block states
 //!   and biomes its registries hold, because a paletted container cannot
 //!   answer "is this id in range" without that number and this crate does
@@ -478,6 +481,67 @@ impl Chunk {
         self.section_mut(y)
             .states_mut()
             .try_set(Strategy::BLOCK_STATES.index(x, row % 16, z), state)
+    }
+
+    /// Put a block state at world coordinates and fold the change into every
+    /// heightmap whose predicate says it counts.
+    ///
+    /// The predicate is asked per [`HeightmapKind`] whether each of the two
+    /// states — the one that was there and the one that is now — is one that
+    /// map counts; its outcomes are exactly what
+    /// [`Heightmap::update_on_set_block`] folds in. The walk down a column,
+    /// needed only when an edit sinks a surface, is built from this chunk's
+    /// own sections through the same predicate and consumed lazily, so edits
+    /// that raise or land interior cost nothing beyond the write itself.
+    ///
+    /// This is the incremental counterpart to
+    /// [`Chunk::recompute_heightmaps`]: same answers, no full-column rescans.
+    /// `tests/heightmap_incremental.rs` holds the two together across random
+    /// edit schedules.
+    ///
+    /// # Panics
+    ///
+    /// If the coordinates are outside the chunk, or `state` is outside the
+    /// block registry — as [`Chunk::set_block`].
+    pub fn set_block_maintaining<F>(&mut self, x: u32, y: i32, z: u32, state: u32, mut counts: F)
+    where
+        F: FnMut(HeightmapKind, u32) -> bool,
+    {
+        let previous = self
+            .try_set_block(x, y, z, state)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let min_y = self.world.min_y();
+        for kind in HeightmapKind::ALL {
+            let was = counts(kind, previous);
+            let is = counts(kind, state);
+            if !was && !is {
+                continue;
+            }
+            // The rest of this column below the edited block, top-down, with
+            // the predicate's verdict attached. Built per kind because the
+            // kinds disagree about what counts; read at most until the first
+            // counted row, and often never. The walk starts at the top of
+            // the world, so the rows down to the edit are skipped, not taken:
+            // stopping at the first row *over* the edit would hand the fold
+            // an empty column and drop every sunk surface to the floor.
+            let below = self
+                .sections
+                .iter()
+                .enumerate()
+                .rev()
+                .flat_map(|(index, section)| {
+                    let base = min_y + (index * 16) as i32;
+                    (0..16u32)
+                        .rev()
+                        .map(move |row| (base + row as i32, section.states().get_at(x, row, z)))
+                })
+                .skip_while(|(below_y, _)| *below_y >= y)
+                .map(|(below_y, below_state)| (below_y, counts(kind, below_state)));
+            self.heightmaps
+                .get_mut(kind)
+                .update_on_set_block(x, y, z, was, is, below);
+        }
     }
 
     /// The biome governing world coordinates.
@@ -933,6 +997,74 @@ mod tests {
                 .first_available(3, 4),
             0,
             "kinds whose predicate counts nothing stay at the floor"
+        );
+    }
+
+    #[test]
+    fn setting_a_block_maintains_each_map_that_counts_it_and_none_other() {
+        let mut chunk = empty_chunk();
+        let counts = |kind: HeightmapKind, state: u32| match kind {
+            HeightmapKind::WorldSurface | HeightmapKind::MotionBlocking => state != 0,
+            _ => false,
+        };
+
+        // Raise: a counted block lands on an empty column.
+        chunk.set_block_maintaining(3, 7, 4, 100, counts);
+        assert_eq!(
+            chunk
+                .heightmaps()
+                .get(HeightmapKind::WorldSurface)
+                .first_available(3, 4),
+            8
+        );
+        assert_eq!(
+            chunk
+                .heightmaps()
+                .get(HeightmapKind::OceanFloor)
+                .first_available(3, 4),
+            0,
+            "kinds whose predicate counts nothing stay at the floor"
+        );
+
+        // Sink: removing exactly that block walks back down to the floor --
+        // across sections, since the column is empty below.
+        chunk.set_block_maintaining(3, 7, 4, 0, counts);
+        assert_eq!(
+            chunk
+                .heightmaps()
+                .get(HeightmapKind::WorldSurface)
+                .first_available(3, 4),
+            0
+        );
+
+        // A stack crossing the section border at y = 16, then the lower half
+        // removed out from under the top.
+        chunk.set_block_maintaining(5, 15, 6, 101, counts);
+        chunk.set_block_maintaining(5, 16, 6, 102, counts);
+        assert_eq!(
+            chunk
+                .heightmaps()
+                .get(HeightmapKind::MotionBlocking)
+                .first_available(5, 6),
+            17
+        );
+        chunk.set_block_maintaining(5, 15, 6, 0, counts);
+        assert_eq!(
+            chunk
+                .heightmaps()
+                .get(HeightmapKind::MotionBlocking)
+                .first_available(5, 6),
+            17,
+            "the top still stands"
+        );
+        chunk.set_block_maintaining(5, 16, 6, 0, counts);
+        assert_eq!(
+            chunk
+                .heightmaps()
+                .get(HeightmapKind::MotionBlocking)
+                .first_available(5, 6),
+            0,
+            "and now the column is empty again"
         );
     }
 
