@@ -28,6 +28,7 @@ dust-registry = { path = "crates/dust-registry" }
 dust-sim = { path = "crates/dust-sim" }
 dust-world = { path = "crates/dust-world" }
 
+ctrlc = "3"
 proc-macro2 = "1"
 quote = "1"
 serde = { version = "1", features = ["derive"] }

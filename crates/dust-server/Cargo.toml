@@ -7,7 +7,13 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+# The operator-facing program will be `dust`, not `dust-server`: subcommands
+# read as `dust server …`. The [[bin]] stanza arrives with src/main.rs and the
+# cli module; declaring it first broke every workspace build for nothing.
+
 [dependencies]
+ctrlc.workspace = true
+dust-config.workspace = true
 
 [lints]
 workspace = true
