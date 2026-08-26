@@ -101,6 +101,7 @@
 
 pub mod bits;
 pub mod chunk;
+pub mod column_light;
 pub mod container;
 pub mod coords;
 pub mod heightmap;

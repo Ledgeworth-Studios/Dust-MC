@@ -25,6 +25,7 @@ use dust_registry::Block;
 use dust_world::chunk::Chunk;
 use dust_world::coords::ChunkPos;
 use dust_world::heightmap::{HeightmapKind, WorldHeight};
+use dust_world::propagation::DefaultOpacity as OpacityModel;
 
 /// The block states one flat world is built from, resolved once.
 #[derive(Debug, Clone, Copy)]
@@ -76,6 +77,14 @@ impl std::fmt::Display for MissingBlock {
 
 impl std::error::Error for MissingBlock {}
 
+/// How much work one column's sky-light walk may do.
+///
+/// Counted in edge examinations. A column is 16x16x384 cells with six edges
+/// each, so a full rewrite of every one is under a million; four is generous
+/// enough that no honest column reaches it and finite enough that a walk which
+/// somehow cannot converge stops instead of holding a thread.
+const LIGHT_BUDGET: u64 = 4_000_000;
+
 /// The y of the topmost solid row. One block of grass at the world's floor
 /// plus four, which is where a vanilla superflat puts it.
 pub const SURFACE_Y: i32 = -60;
@@ -90,9 +99,13 @@ pub const SURFACE_Y: i32 = -60;
 pub const SPAWN: (f64, f64, f64) = (0.5, SURFACE_Y as f64 + 1.0, 0.5);
 
 /// One flat world.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct FlatWorld {
     palette: Palette,
+    /// What passes light. Air only, which is exactly right for a world made of
+    /// bedrock, dirt and grass — and the model the engine takes, so the day
+    /// this world has glass in it there is a place to say so.
+    opacity: OpacityModel,
     height: WorldHeight,
     biome: u32,
     block_registry_size: u32,
@@ -106,6 +119,7 @@ impl FlatWorld {
     /// second ordering here would name a different biome.
     pub fn new(palette: Palette, biome: u32, biome_registry_size: u32) -> Self {
         Self {
+            opacity: OpacityModel::transparent_only([palette.air]),
             palette,
             height: WorldHeight::OVERWORLD,
             biome,
@@ -152,6 +166,21 @@ impl FlatWorld {
         // diverge where those exist. The predicate still takes the kind, so
         // the day this world grows one, the divergence has somewhere to go.
         chunk.recompute_heightmaps(|_kind, state| state != air);
+
+        // Sky light, from the real propagation engine rather than a constant.
+        // A flat world's answer happens to be simple — fifteen above the
+        // grass, nothing below it — and computing it anyway is the point: the
+        // day the terrain is not flat, the light follows without this line
+        // changing.
+        //
+        // A budget failure here would leave the column under-lit rather than
+        // corrupt, and the budget is far above what a column can need, so it
+        // is reported to the caller rather than swallowed.
+        let _ = dust_world::column_light::ColumnSkyLight::seed(
+            &mut chunk,
+            &self.opacity,
+            dust_world::propagation::Budget::new(LIGHT_BUDGET),
+        );
         chunk
     }
 

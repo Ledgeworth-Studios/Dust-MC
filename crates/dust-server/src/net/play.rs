@@ -26,17 +26,22 @@
 //!
 //! # Light
 //!
-//! Every section is sent fully lit — sky light 15 everywhere, block light zero.
-//! That is a lie, and it is a *stated* lie rather than an omission: sending no
-//! light at all leaves a flat world rendered pitch black, which reads as a
-//! broken chunk packet rather than as an unimplemented light engine.
-//! `dust-world` has a real propagation engine (`propagation.rs`) and wiring it
-//! in is the next thing to do here; until it is, a uniformly lit world is the
-//! honest placeholder, because it is obviously not what a real world looks like.
+//! Sky light comes from `dust-world`'s propagation engine, computed per column
+//! against the terrain's own heightmaps. It is not fifteen everywhere: under
+//! the grass it is dark, which is what a cave will need and what a constant
+//! could never give.
+//!
+//! Two things it is not. Light does **not cross a chunk boundary** — each
+//! column is lit alone, so a terrain step at an edge leaves a seam — and there
+//! is **no block light at all**, because nothing in this world emits any. Both
+//! are stated in `dust_world::column_light`, and neither is the kind of gap
+//! that renders as a broken packet.
 
 use dust_protocol::nbt::Nbt;
 use dust_protocol::packets::play;
-use dust_protocol::packets::play::chunk::{ChunkData, LightArray, Section as WireSection};
+use dust_protocol::packets::play::chunk::{
+    ChunkData, LightArray, Section as WireSection, LIGHT_SECTION_BYTES,
+};
 use dust_protocol::packets::play::{GameModeByte, Gamemode, PreviousGameMode, TeleportFlags};
 use dust_protocol::types::{BitSet, Identifier, PrefixedBytes, VarInt};
 use dust_protocol::wire::Writer;
@@ -54,9 +59,7 @@ use super::world::FlatWorld;
 /// reading this file could check.
 pub const LEVEL_CHUNKS_LOAD_START: u8 = 13;
 
-/// Sky light with every nibble at full.
-///
-/// See the module note: a deliberate placeholder, not an omission.
+/// A light byte holding two nibbles at full: the value for a cell in open sky.
 const FULL_BRIGHT: u8 = 0xff;
 
 /// Build the join packet for a player entering `world`.
@@ -144,7 +147,7 @@ pub fn chunk_packet(
         data: ChunkData(PrefixedBytes(data.into_bytes())),
         // No chests, no signs, no spawners in a flat world.
         block_entities: Vec::new(),
-        light: full_bright_light(section_count),
+        light: column_light(chunk, section_count),
     })
 }
 
@@ -196,39 +199,46 @@ fn network_name(kind: HeightmapKind) -> &'static str {
     }
 }
 
-/// Light for a column, entirely sky-lit.
+/// The light packet for a column, from the column's own arrays.
 ///
-/// The masks cover the sections *plus one above and one below* — the client
+/// The masks cover the sections **plus one above and one below**. The client
 /// lights the boundary between a chunk and the void from those, and a mask
-/// sized to the sections alone leaves a dark seam at the world's floor.
-fn full_bright_light(section_count: usize) -> play::chunk::LightData {
-    let entries = section_count + 2;
+/// sized to the sections alone leaves a dark seam at the world's floor and
+/// another at its ceiling. The two extra arrays are the world's outside: the
+/// one below is dark, the one above is open sky.
+fn column_light(chunk: &Chunk, section_count: usize) -> play::chunk::LightData {
     let mut sky_mask = BitSet(Vec::new());
-    for index in 0..entries {
-        sky_mask.set(index, true);
+    let mut sky_arrays = Vec::with_capacity(section_count + 2);
+
+    // Below the world: no sky reaches under bedrock.
+    sky_mask.set(0, true);
+    sky_arrays.push(LightArray(vec![0; LIGHT_SECTION_BYTES]));
+
+    for (index, section) in chunk.sections().iter().enumerate() {
+        sky_mask.set(index + 1, true);
+        sky_arrays.push(LightArray(section.sky_light().as_bytes().to_vec()));
     }
+
+    // Above the world: open sky, so the top of a column is not shadowed by the
+    // absence of anything.
+    sky_mask.set(section_count + 1, true);
+    sky_arrays.push(LightArray(vec![FULL_BRIGHT; LIGHT_SECTION_BYTES]));
+
     let mut empty_block_mask = BitSet(Vec::new());
-    for index in 0..entries {
+    for index in 0..section_count + 2 {
         empty_block_mask.set(index, true);
     }
 
     play::chunk::LightData {
         sky_mask,
-        // Nothing emits light, so no block-light array is sent and every
-        // section is named in the empty mask. Absent and "present but zero"
-        // mean the same thing to a renderer; absent is fewer bytes and is what
-        // vanilla sends for a chunk with no torches in it.
+        // Nothing in this world emits light, so no block-light array is sent
+        // and every section is named in the empty mask. Absent and
+        // "present but zero" mean the same thing to a renderer; absent is
+        // fewer bytes and is what vanilla sends for a chunk with no torches.
         block_mask: BitSet(Vec::new()),
         empty_sky_mask: BitSet(Vec::new()),
         empty_block_mask,
-        sky_arrays: (0..entries)
-            .map(|_| {
-                LightArray(vec![
-                    FULL_BRIGHT;
-                    dust_protocol::packets::play::chunk::LIGHT_SECTION_BYTES
-                ])
-            })
-            .collect(),
+        sky_arrays,
         block_arrays: Vec::new(),
     }
 }
