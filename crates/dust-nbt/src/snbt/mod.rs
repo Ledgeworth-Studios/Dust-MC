@@ -73,5 +73,5 @@
 mod parse;
 mod print;
 
-pub use parse::{parse, parse_compound, ParseError};
+pub use parse::{parse, parse_compound, Expected, ParseError};
 pub use print::{to_string, to_string_named};
