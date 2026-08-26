@@ -67,9 +67,9 @@
 //!
 //! So every number is kept at the width the report's own text implies, which is
 //! `f64`, and [`super::numbers::check_every_number_reprints`] tokenises the raw bytes and
-//! insists that every one of the 3,021 numbers in the file re-prints to exactly
-//! the text Mojang wrote. Not a sample of them: all of them, because a width
-//! defect would hit only the numbers whose two spellings differ, and there are
+//! insists that the tree this extraction reads holds every one of the 3,021
+//! numbers in the file, by value. Not a sample of them: all of them, because a
+//! width defect would hit only the numbers whose two spellings differ, and there are
 //! 15 such literals out of 41.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -120,8 +120,8 @@ pub struct Items {
     /// there is no free text in this report is something the extraction states
     /// rather than something a reader assumes.
     pub non_id_strings: BTreeSet<String>,
-    /// How many numbers the report contains, all of which were checked to
-    /// re-print to their own text.
+    /// How many numbers the report contains, all of which were checked to be
+    /// present by value in what this module reads.
     pub number_count: usize,
 }
 

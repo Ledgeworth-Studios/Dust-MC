@@ -94,16 +94,34 @@ pub enum Kind {
 /// instead of being dropped.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Properties {
-    Integer { min: Option<i32>, max: Option<i32> },
-    Float { min: Option<f32>, max: Option<f32> },
-    Double { min: Option<f64>, max: Option<f64> },
+    Integer {
+        min: Option<i32>,
+        max: Option<i32>,
+    },
+    Float {
+        min: Option<f32>,
+        max: Option<f32>,
+    },
+    Double {
+        min: Option<f64>,
+        max: Option<f64>,
+    },
     /// `word`, `phrase` or `greedy`.
     StringKind(String),
-    Entity { single: bool, players_only: bool },
-    ScoreHolder { single: bool },
+    Entity {
+        single: bool,
+        players_only: bool,
+    },
+    ScoreHolder {
+        single: bool,
+    },
     /// The registry the argument names something in.
-    Resource { registry: String },
-    Time { min: i32 },
+    Resource {
+        registry: String,
+    },
+    Time {
+        min: i32,
+    },
 }
 
 /// A node, flattened out of the tree and given an index.
@@ -142,17 +160,22 @@ pub struct Commands {
     /// Registries named by `resource`-family parsers that are not in the
     /// registry report, because they come from the data pack instead.
     pub unchecked_registries: BTreeSet<String>,
+    /// The report as it was read, kept so the golden sample can be taken from
+    /// its own tree rather than from anything [`flatten`] derived. Same rule as
+    /// `Blocks::reported`: the rows have to be able to disagree with the table
+    /// for them to be worth asserting.
+    pub reported: ReportedNode,
 }
 
 pub fn parse(json: &[u8], registries: &Registries) -> Result<Commands, String> {
-    let root: ReportedNode =
+    let reported: ReportedNode =
         serde_json::from_slice(json).map_err(|e| format!("could not read commands.json: {e}"))?;
     let number_count = check_every_number_reprints(json, "commands.json")?;
-    check_child_order_is_name_order(&root, "")?;
+    check_child_order_is_name_order(&reported, "")?;
 
     let mut nodes = Vec::new();
     let mut by_path = BTreeMap::new();
-    flatten(&root, String::new(), &mut nodes, &mut by_path)?;
+    flatten(&reported, String::new(), &mut nodes, &mut by_path)?;
 
     // Redirects are resolved after every node has an index, which is the whole
     // reason the table is flat: a redirect from inside `execute` back to
@@ -218,14 +241,54 @@ pub fn parse(json: &[u8], registries: &Registries) -> Result<Commands, String> {
         executable_count,
         number_count,
         unchecked_registries: BTreeSet::new(),
+        reported,
         nodes,
     };
     check_kinds_and_parsers(&commands)?;
+    check_parsers_are_argument_types(&commands, registries)?;
     let unchecked = check_named_registries_exist(&commands, registries)?;
     Ok(Commands {
         unchecked_registries: unchecked,
         ..commands
     })
+}
+
+/// Every parser an argument uses is an entry of the `command_argument_type`
+/// registry.
+///
+/// Two reports agreeing again, and the check earns its place the way the others
+/// do: brigadier spells the parser exactly as the registry names it today, and
+/// if that ever stops being true — a new parser shipping before its registry
+/// entry, or a rename reaching one file and not the other — the extraction has
+/// to stop while the disagreement is still a puzzle somebody can look at,
+/// rather than generate a table whose parser strings decode against nothing.
+///
+/// The reverse is reported rather than required: three registered argument
+/// types are never used as a parser in vanilla's graph (`brigadier:long`,
+/// `minecraft:float_range`, `minecraft:uuid`). They exist for map makers and
+/// are left alone.
+fn check_parsers_are_argument_types(
+    commands: &Commands,
+    registries: &Registries,
+) -> Result<(), String> {
+    let registry = registries
+        .registries
+        .iter()
+        .find(|r| r.name == "minecraft:command_argument_type")
+        .ok_or("the registry report has no minecraft:command_argument_type")?;
+    for node in &commands.nodes {
+        let Some(parser) = &node.parser else {
+            continue;
+        };
+        if !registry.entries.iter().any(|e| &e.name == parser) {
+            return Err(format!(
+                "{} uses the parser {parser}, which is not an entry of the \
+                 command_argument_type registry",
+                node.path
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A node on its way out of the tree, still holding the redirect as a path.
@@ -244,7 +307,11 @@ fn flatten(
         "root" => Kind::Root,
         "literal" => Kind::Literal,
         "argument" => Kind::Argument,
-        other => return Err(format!("{path} has type {other:?}, which is not a node type")),
+        other => {
+            return Err(format!(
+                "{path} has type {other:?}, which is not a node type"
+            ))
+        }
     };
     let name = path.rsplit('/').next().unwrap_or_default().to_owned();
     let properties = match (&reported.parser, &reported.properties) {

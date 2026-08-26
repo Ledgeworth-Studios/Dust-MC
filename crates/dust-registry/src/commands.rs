@@ -1,276 +1,247 @@
-//! The vanilla command graph: brigadier's nodes, as data.
+//! The brigadier command graph, and how to walk it without falling in.
 //!
-//! 1,763 nodes — one root, 816 literals, 946 arguments — 83 commands at the
-//! top, 13 levels at the deepest. Phase 1 sends this to the client as
-//! `declare_commands`, which is what gives a vanilla client tab completion and
-//! client-side syntax colouring for commands the server has not implemented
-//! yet, and Phase 3 needs it again.
+//! `cargo xtask extract` reads Minecraft's own command report and commits this
+//! table: every literal and argument the vanilla client is told about, as
+//! [`CommandDef`] nodes addressed by index, with children and redirects as
+//! indices into the same array.
 //!
-//! # This is the graph and not a dispatcher, deliberately
+//! # Why a flat array and not a tree
 //!
-//! Nothing here parses user input, checks a permission, or runs anything. There
-//! is no `Command::execute`, no argument parsing behind
-//! [`ParserProperties::Integer`], and no suggestion provider. Phase 3 owns
-//! that, and a half-built dispatcher would be worse than none: it would be
-//! reached for, would work for `/say`, and would be discovered to be a
-//! pretence somewhere around `/execute if score`. What this crate offers is the
-//! shape of the graph, exactly as Minecraft's own generator described it.
+//! The report looks like a tree — every node written inside its parent — but
+//! carries a `redirect` field naming a path back into it. Following those turns
+//! the shape into a graph with cycles: on 1.21.1 there are 108 redirects and
+//! 103 of them point at `execute`, most from inside `execute` itself. An owned
+//! tree cannot hold a child that is also an ancestor; an index can. Nothing in
+//! the table resolves a cycle, and nothing here does either — that is what
+//! [`CommandGraph::walk`] carrying a visited set is for.
 //!
-//! # It is a graph, not a tree, and the difference is `/execute`
+//! A depth limit would have been the other option, and it was not taken: a
+//! limit is a number somebody guessed, and the graph stays cyclic underneath
+//! whatever number is picked. A visited set terminates on any shape the data
+//! can actually have.
 //!
-//! 108 nodes redirect. 103 of them point at `execute` and every one is a
-//! descendant of `execute`, which makes one strongly connected component of 268
-//! nodes and cycles from three to eight edges long. The other five are aliases:
-//! `tell` and `w` to `msg`, `tm` to `teammsg`, `tp` to `teleport`, `xp` to
-//! `experience`.
+//! # What a redirect means
 //!
-//! So the table is flat and a redirect is an index like any other — cycles are
-//! representable by construction, rather than being something the shape has to
-//! survive. Every walker here carries a visited set: [`Node::reachable`] will
-//! not loop, and [`Node::resolve`] will not loop on a redirect chain. Neither
-//! has a depth limit, because a depth limit is a number somebody guessed and
-//! the graph is still cyclic underneath it.
+//! `/tp` is not a command of its own; its node redirects to `teleport`. Five of
+//! the 108 are those aliases (`tell`/`w` to `msg`, `tm` to `teammsg`, `tp` to
+//! `teleport`, `xp` to `experience`). The rest are the `execute` recursion. At
+//! dispatch time a redirect means "this node has no meaning of its own; keep
+//! walking from there".
 //!
-//! # `execute run` and `return run` are dead in the report
+//! # Two dead nodes, named rather than fixed
 //!
-//! Both are a literal with no children, not executable, no redirect — a node
-//! that can neither end a command nor continue one. In the game they redirect
-//! to the *root*, which is what makes `/execute run <anything>` work, and the
-//! report cannot say so because a redirect is a path and the root's path is
-//! empty.
+//! `execute/run` and `return/run` are `{"type": "literal"}` and nothing else:
+//! no children, not executable, no redirect. As written they can neither end a
+//! command nor continue one, which makes them unreachable by construction. In
+//! the game they redirect to the *root* — `/execute run <anything>` is the
+//! entire point of `/execute` — but the report cannot say so, because a
+//! redirect is a path and the root's path is empty.
 //!
-//! The extractor does not invent the edge, because the value of this table is
-//! that it came from the report. It names them instead: [`UNREACHABLE`] holds
-//! them, and a test in `tests/commands.rs` asserts there are exactly two and
-//! that both are called `run`. Whoever builds `declare_commands` will meet this
-//! deliberately rather than discovering it from a client that will not run
+//! This extraction does not invent the edge. Inventing it would put knowledge
+//! from outside the report into a table whose whole value is that it came from
+//! the report. The two nodes are listed in [`generated::commands::UNREACHABLE`]
+//! instead, and whoever builds `declare_commands` meets them deliberately,
+//! with this paragraph beside them, rather than from a client that will not run
 //! `/execute run`.
+//!
+//! # What this table is not
+//!
+//! It is the graph's shape, not its semantics: no argument parsing, no suggestion
+//! providers (the report does not carry them), no permission checks, and no
+//! execution. Phase 3's dispatcher reads this for tab completion and syntax;
+//! what an argument *accepts* is that phase's problem.
 
-use crate::generated::commands::{NODES, UNREACHABLE};
+use crate::generated::commands::{NODES, NODE_COUNT, UNREACHABLE};
 
-/// What kind of node this is.
+/// Which of the three node shapes this is.
+///
+/// Hand-written rather than generated because it is the protocol's fixed
+/// vocabulary — brigadier has exactly these three — and a fourth would be a
+/// change to think about rather than absorb. The extractor holds the same three
+/// and refuses anything else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Kind {
-    /// The one node everything hangs off. Not a command.
+pub enum NodeKind {
+    /// The unnamed node every path starts from.
     Root,
-    /// A word typed literally: the `if` in `/execute if`.
+    /// A fixed word: `give`, `execute`, `as`.
     Literal,
-    /// A value read by a parser: the `targets` in `/execute as <targets>`.
+    /// A value read with a parser: `minecraft:entity`, `brigadier:integer`.
     Argument,
 }
 
-/// How much of the input a `brigadier:string` argument takes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum StringKind {
-    /// One unquoted word.
-    Word,
-    /// One word, or several inside quotes.
-    Phrase,
-    /// The rest of the line, quotes and all.
-    Greedy,
+impl NodeKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Root => "root",
+            Self::Literal => "literal",
+            Self::Argument => "argument",
+        }
+    }
 }
 
-/// The properties an argument's parser was configured with.
+/// The properties an argument's parser constrains itself with, typed.
 ///
-/// Typed, unlike the item components in [`crate::items`], and for the reason
-/// that decided those: type what the data can check. Eleven of the 51 parsers
-/// carry properties, between them in these shapes, and every field of every
-/// shape appears in the report — so this is a description of data rather than a
-/// guess at it. A twelfth parser with properties, or a new key on one of these,
-/// stops `cargo xtask extract` rather than being dropped on the way in.
+/// Eleven parsers carry properties, in these eight shapes, and every field of
+/// every shape appears in the 1.21.1 report — so this is a description of data
+/// rather than a guess at it. The extractor refuses an unrecognised key or a
+/// twelfth shape rather than dropping either.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ParserProperties {
-    /// `brigadier:integer`. Absent bounds are brigadier's own, which are the
-    /// full range of the type.
+pub enum ArgumentProperties {
     Integer {
         min: Option<i32>,
         max: Option<i32>,
     },
-    /// `brigadier:float`. `f32` because that is the width the wire sends these
-    /// bounds at, and the extractor checks every one is exactly representable
-    /// as one before narrowing it.
     Float {
         min: Option<f32>,
         max: Option<f32>,
     },
-    /// `brigadier:double`.
     Double {
         min: Option<f64>,
         max: Option<f64>,
     },
-    /// `brigadier:string`.
-    Str(StringKind),
-    /// `minecraft:entity`: how many, and whether only players.
-    Entity { single: bool, players_only: bool },
-    /// `minecraft:score_holder`: how many.
-    ScoreHolder { single: bool },
-    /// `minecraft:resource` and its three relatives: which registry the
-    /// argument names something in.
-    ///
-    /// Six of the ten registries named this way are data pack registries —
-    /// `minecraft:enchantment`, `minecraft:worldgen/biome` and friends — which
-    /// are not in the registry report and so are not among [`crate::Registry`].
-    /// The extractor says which on every run rather than leaving "unchecked"
-    /// looking like "checked".
-    Resource { registry: &'static str },
-    /// `minecraft:time`, whose minimum is in ticks.
-    Time { min: i32 },
+    /// How much of the input one read takes: `word`, `phrase` or `greedy`.
+    StringKind(&'static str),
+    Entity {
+        single: bool,
+        players_only: bool,
+    },
+    ScoreHolder {
+        single: bool,
+    },
+    /// The registry the argument names something in, e.g. `minecraft:function`.
+    Resource {
+        registry: &'static str,
+    },
+    Time {
+        min: i32,
+    },
 }
 
-/// One node, as the generated table holds it.
+/// One node of the command graph, as the generated table holds it.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CommandNode {
-    pub kind: Kind,
-    /// The literal word, or the argument's name. Empty for the root.
+pub struct CommandDef {
+    /// The word or argument name; empty only for the root.
     pub name: &'static str,
-    /// Indices into the node table, sorted by the child's name.
+    pub kind: NodeKind,
+    /// Indices into [`NODES`], sorted by name — which is what makes
+    /// [`CommandGraph::resolve`] a chain of binary searches rather than scans.
     pub children: &'static [u16],
-    /// Whether a command may end here.
+    /// Whether reaching this node ends a runnable command.
     pub executable: bool,
-    /// Where parsing continues instead of at this node's children.
+    /// Where control continues when this node is reached as an alias or an
+    /// `execute` clause. Backward indices are normal: most point into
+    /// `execute`.
     pub redirect: Option<u16>,
-    /// The parser id for an argument, e.g. `minecraft:entity`.
+    /// The parser an argument reads its input with; every value here is an
+    /// entry of the `command_argument_type` registry, checked at extraction.
     pub parser: Option<&'static str>,
-    pub properties: Option<ParserProperties>,
+    pub properties: Option<ArgumentProperties>,
 }
 
-/// A node in the command graph.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Node(u16);
+/// The whole command graph, and the ways it is safe to move through it.
+///
+/// A node is an index into [`NODES`]; everything here hands out indices rather
+/// than references-with-lifetimes so callers can store them freely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandGraph;
 
-impl Node {
-    /// The root. Every command hangs off it and it is not one itself.
-    pub const fn root() -> Self {
-        Self(0)
+impl CommandGraph {
+    /// The index of the root, where every path starts.
+    pub const ROOT: usize = 0;
+
+    /// How many nodes the graph holds.
+    pub fn len() -> usize {
+        NODE_COUNT
     }
 
-    /// The node at an index in the generated table, or `None` if there is none.
-    pub fn at(index: u16) -> Option<Self> {
-        ((index as usize) < NODES.len()).then_some(Self(index))
+    pub fn is_empty() -> bool {
+        false
     }
 
-    /// This node's index, which is what a redirect holds and what
-    /// `declare_commands` will send.
-    pub fn index(self) -> u16 {
-        self.0
-    }
-
-    pub fn kind(self) -> Kind {
-        self.def().kind
-    }
-
-    pub fn name(self) -> &'static str {
-        self.def().name
-    }
-
-    pub fn is_executable(self) -> bool {
-        self.def().executable
-    }
-
-    pub fn parser(self) -> Option<&'static str> {
-        self.def().parser
-    }
-
-    pub fn properties(self) -> Option<ParserProperties> {
-        self.def().properties
-    }
-
-    /// Where parsing continues instead of at this node's children.
-    pub fn redirect(self) -> Option<Self> {
-        self.def().redirect.map(Self)
-    }
-
-    /// This node's children, in name order.
-    pub fn children(self) -> impl Iterator<Item = Self> {
-        self.def().children.iter().copied().map(Self)
-    }
-
-    /// The child with this name.
+    /// The node at an index, or `None` past the end.
     ///
-    /// A binary search, which is sound because the extractor stores children in
-    /// name order and refuses a report whose own order disagrees.
-    pub fn child(self, name: &str) -> Option<Self> {
-        let children = self.def().children;
-        let position = children
-            .binary_search_by(|index| Self(*index).name().cmp(name))
-            .ok()?;
-        Some(Self(children[position]))
+    /// Indices arrive from children and redirect arrays that were checked
+    /// against this length at generation time, but they also arrive from
+    /// callers, and a caller's index is exactly the kind of number to check.
+    pub fn def(index: usize) -> Option<&'static CommandDef> {
+        NODES.get(index)
     }
 
-    /// Walk a path of node names from here, following redirects.
+    /// Resolve a slash-joined path from the root, e.g. `execute/if/block`.
     ///
-    /// `Node::root().resolve(&["execute", "as"])` is the `as` of `/execute as`.
-    /// A redirect is followed when this node has no child of the wanted name
-    /// and does redirect — which is what makes
-    /// `["execute", "as", "targets", "at"]` resolve at all, since `targets`
-    /// redirects to `execute` and `at` is one of `execute`'s children.
-    ///
-    /// Termination comes from a visited set and not from a depth limit: 103
-    /// nodes redirect into `execute`, so a redirect chain could be made to loop
-    /// and a guessed limit would be both arbitrary and wrong somewhere.
-    ///
-    /// This resolves *names*. It is not a parser: it does not read arguments,
-    /// does not check that a value fits a parser's properties, and does not
-    /// know what a command does.
-    pub fn resolve(self, path: &[&str]) -> Option<Self> {
-        let mut node = self;
-        for segment in path {
-            let mut hops = Vec::new();
-            loop {
-                if let Some(child) = node.child(segment) {
-                    node = child;
-                    break;
-                }
-                let Some(next) = node.redirect() else {
-                    return None;
-                };
-                if hops.contains(&next) {
-                    // A redirect cycle with no matching child anywhere in it.
-                    return None;
-                }
-                hops.push(next);
-                node = next;
-            }
+    /// Each step binary-searches the current node's children, so a miss stops
+    /// early. Redirects are *not* followed: the path names the node the report
+    /// filed it under, and `xp` resolving to the `xp` node rather than to
+    /// `experience` is the difference between the two spellings.
+    pub fn resolve(path: &str) -> Option<usize> {
+        let mut current = Self::ROOT;
+        for part in path.split('/').filter(|p| !p.is_empty()) {
+            let def = Self::def(current)?;
+            let position = def
+                .children
+                .binary_search_by(|&child| NODES[child as usize].name.cmp(part))
+                .ok()?;
+            current = def.children[position] as usize;
         }
-        Some(node)
+        Some(current)
     }
 
-    /// Every node reachable from here, breadth-first, including this one.
+    /// Every node reachable from the root, once each, depth-first.
     ///
-    /// A `Vec` and not an iterator because reachability needs a visited set to
-    /// terminate, and a lazy iterator that owns one is a worse thing to read
-    /// than a list. `Node::root().reachable()` is 1,763 nodes and takes
-    /// microseconds.
-    pub fn reachable(self) -> Vec<Self> {
-        let mut seen = vec![false; NODES.len()];
-        let mut queue = std::collections::VecDeque::from([self]);
-        let mut out = Vec::new();
-        seen[self.0 as usize] = true;
-        while let Some(node) = queue.pop_front() {
-            out.push(node);
-            for next in node.children().chain(node.redirect()) {
-                if !std::mem::replace(&mut seen[next.0 as usize], true) {
-                    queue.push_back(next);
-                }
+    /// Cycles are followed around, not into: a visited set ends the walk
+    /// wherever the graph loops, which is why this iterator terminates on
+    /// `execute` while a naive recursive walk would not terminate at all.
+    pub fn walk() -> impl Iterator<Item = usize> {
+        let mut seen = vec![false; NODE_COUNT];
+        let mut stack = vec![Self::ROOT];
+        std::iter::from_fn(move || loop {
+            let index = stack.pop()?;
+            if seen[index] {
+                continue;
             }
+            seen[index] = true;
+            // Pushed in reverse so the pop order visits children by name.
+            stack.extend(NODES[index].children.iter().rev().map(|&c| c as usize));
+            if let Some(redirect) = NODES[index].redirect {
+                stack.push(redirect as usize);
+            }
+            return Some(index);
+        })
+    }
+
+    /// The nodes that can neither end a command nor continue one.
+    ///
+    /// Two on 1.21.1 — `execute/run` and `return/run`. See the module header
+    /// before deciding this list is a bug.
+    pub fn unreachable_nodes() -> impl Iterator<Item = usize> {
+        UNREACHABLE.iter().map(|&i| i as usize)
+    }
+
+    /// Follow redirects from a node until it reaches one with no redirect, or
+    /// one already seen on this chain.
+    ///
+    /// Returns every node along the way, starting with `start`. The visited
+    /// check is per call: `execute` redirects to itself, so "follow to the end"
+    /// needs a stopping rule that comes from the walk and not from a guess
+    /// about the data.
+    pub fn redirect_chain(start: usize) -> Vec<usize> {
+        let mut chain = vec![start];
+        let mut current = start;
+        while let Some(def) = Self::def(current) {
+            let Some(next) = def.redirect else {
+                break;
+            };
+            let next = next as usize;
+            if chain.contains(&next) {
+                break;
+            }
+            chain.push(next);
+            current = next;
         }
-        out
-    }
-
-    /// Every node in the table, in the order it is stored: the root, then each
-    /// command's subtree in turn.
-    pub fn all() -> impl Iterator<Item = Self> {
-        (0..NODES.len() as u16).map(Self)
-    }
-
-    /// The nodes the report describes as unable to end a command or continue
-    /// one — `execute/run` and `return/run` on 1.21.1. See this module's
-    /// documentation for why they are like that and why nothing here fixes it.
-    pub fn unreachable() -> impl Iterator<Item = Self> {
-        UNREACHABLE.iter().copied().map(Self)
-    }
-
-    fn def(self) -> &'static CommandNode {
-        &NODES[self.0 as usize]
+        chain
     }
 }
+
+/// Re-exported for the tests that quote them, and for callers that want the
+/// raw golden rows rather than going through [`CommandGraph`].
+pub use crate::generated::commands::{EXECUTABLE_COUNT, MAX_DEPTH};

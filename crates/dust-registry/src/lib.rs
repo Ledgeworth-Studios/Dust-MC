@@ -28,11 +28,13 @@
 //! `xtask/src/extract/blocks.rs`, where four blocks on 1.21.1 turn out to
 //! disagree with the obvious reading of the report.
 
+pub mod commands;
 pub mod flat;
 pub mod generated;
 pub mod items;
 pub mod registry;
 
+pub use commands::{ArgumentProperties, CommandDef, CommandGraph, NodeKind};
 pub use flat::{EntityType, Fluid, Item};
 pub use generated::blocks::{DATA_VERSION, STATE_COUNT, STATE_SAMPLES};
 pub use generated::items::COMPONENT_SAMPLES;

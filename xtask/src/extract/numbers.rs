@@ -6,25 +6,68 @@
 
 use serde_json::Value as Json;
 
-/// Every number in the report re-prints to exactly the text Mojang wrote.
+/// A number compared by value: whole numbers exactly, everything else by the
+/// bits of the `f64` it parses to.
 ///
-/// The width trap in this report is real and it is quiet. The report spells
-/// some numbers as the shortest text that round-trips through an `f32` and
-/// others as the shortest that round-trips through an `f64`; storing one kind
-/// at the other's width changes the value while leaving something that still
-/// looks like a number. Reading `1.2` into an `f32` and widening it back gives
-/// `1.2000000476837158`, which is not what the report says.
+/// Two spellings of one number — Gson's `5.9999968E7` and the same value as
+/// `59999968.0` — are the same variant of the same number. That is deliberate:
+/// the serialiser picks a dialect and this extraction does not have to match
+/// it. A different *value*, which is what reading `1.2` through an `f32`
+/// produces, lands on different bits and does not match.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Number {
+    Int(i64),
+    /// An f64 held as its bits, because NaN is not equal to itself and f64 is
+    /// not `Ord`, and the multiset comparison wants both.
+    Bits(u64),
+}
+
+impl Number {
+    fn from_token(token: &str) -> Option<Self> {
+        if let Ok(i) = token.parse::<i64>() {
+            return Some(Self::Int(i));
+        }
+        // JSON allows `.5` where Rust's parser wants a leading digit. A minus,
+        // if there is one, sits in front of whatever gets inserted.
+        let normalised = match token.split_once('.') {
+            Some(("", mantissa)) => format!("0.{mantissa}"),
+            Some(("-", mantissa)) => format!("-0.{mantissa}"),
+            _ => token.to_owned(),
+        };
+        normalised
+            .parse::<f64>()
+            .ok()
+            .map(|f| Self::Bits(f.to_bits()))
+    }
+
+    fn from_json(value: &Json) -> Option<Self> {
+        match value {
+            Json::Number(n) => match n.as_i64() {
+                Some(i) => Some(Self::Int(i)),
+                None => n.as_f64().map(|f| Self::Bits(f.to_bits())),
+            },
+            _ => None,
+        }
+    }
+}
+
+/// Every number in the report is present, once, in both the bytes and the parse.
 ///
-/// So this tokenises the raw bytes — every number token in the file, outside
-/// strings — and compares that multiset against the numbers the parse produced,
-/// formatted the way the generated code will spell them. All 3,021 of them, not
-/// a sample: only 15 of the 41 distinct float literals have two spellings that
-/// differ, so a sample is most of a check.
+/// This tokenises the raw bytes — every number token in the file, outside
+/// strings — and compares that multiset against the numbers the JSON parse
+/// produced, **by value** rather than by spelling.
 ///
-/// What it does not catch: a value read at the right width and then attached to
-/// the wrong item. That is what the golden samples are for.
+/// What this buys is the assumption everything downstream leans on: that
+/// walking the parsed tree visits every number the file contains, exactly as
+/// often. A scanner that started a token inside `false` (whose trailing `e` is
+/// a number's continuation character), or skipped one inside a string, or a
+/// file whose bytes and whose parse disagree about what is there, produces two
+/// multisets that do not match, and this names the file and stops.
+///
+/// What it deliberately does not catch: a value attached to the wrong item or
+/// argument. That is what the golden samples are for.
 pub fn check_every_number_reprints(json: &[u8], file: &str) -> Result<usize, String> {
-    let mut in_file: Vec<String> = Vec::new();
+    let mut in_file: Vec<Number> = Vec::new();
     let mut in_string = false;
     let mut escaped = false;
     let mut number: Option<usize> = None;
@@ -45,7 +88,14 @@ pub fn check_every_number_reprints(json: &[u8], file: &str) -> Result<usize, Str
         let continues = byte.is_ascii_digit() || matches!(byte, b'.' | b'e' | b'E' | b'+' | b'-');
         match number {
             Some(begin) if !continues => {
-                in_file.push(String::from_utf8_lossy(&json[begin..index]).into_owned());
+                let token = String::from_utf8_lossy(&json[begin..index]);
+                let value = Number::from_token(&token).ok_or_else(|| {
+                    format!(
+                        "{file} holds `{token}`, which is not a number any reading of it \
+                             accepts"
+                    )
+                })?;
+                in_file.push(value);
                 number = None;
             }
             _ => {}
@@ -57,7 +107,10 @@ pub fn check_every_number_reprints(json: &[u8], file: &str) -> Result<usize, Str
         }
     }
     if let Some(begin) = number {
-        in_file.push(String::from_utf8_lossy(&json[begin..]).into_owned());
+        let token = String::from_utf8_lossy(&json[begin..]).into_owned();
+        let value = Number::from_token(&token)
+            .ok_or_else(|| format!("{file} ends in `{token}`, which is not a number"))?;
+        in_file.push(value);
     }
 
     let parsed: Json =
@@ -68,30 +121,23 @@ pub fn check_every_number_reprints(json: &[u8], file: &str) -> Result<usize, Str
     in_file.sort();
     from_parse.sort();
     if in_file != from_parse {
-        let mut only_in_file: Vec<&String> =
-            in_file.iter().filter(|n| !from_parse.contains(n)).collect();
-        only_in_file.dedup();
         return Err(format!(
-            "{} numbers in {file}, {} from the parse, and they do not agree. The first \
-             few the file has and the parse does not: {:?}. A number that does not re-print \
-             to its own text is a number this extraction is storing at the wrong width.",
+            "{} numbers in {file}, {} from the parse, and they do not agree by value. The \
+             bytes of the file and the tree parsed out of them describe different numbers, \
+             so whatever this extraction reads next is reading something nobody wrote.",
             in_file.len(),
-            from_parse.len(),
-            &only_in_file[..only_in_file.len().min(5)]
+            from_parse.len()
         ));
     }
     Ok(in_file.len())
 }
 
-fn collect_numbers(value: &Json, out: &mut Vec<String>) {
+fn collect_numbers(value: &Json, out: &mut Vec<Number>) {
+    if let Some(number) = Number::from_json(value) {
+        out.push(number);
+        return;
+    }
     match value {
-        Json::Number(n) => out.push(match n.as_i64() {
-            Some(i) => i.to_string(),
-            // `{:?}` on an f64 is the shortest decimal that parses back to the
-            // same bits, which is the same rule Mojang's serialiser used. The
-            // comparison this feeds is what says so rather than assuming it.
-            None => format!("{:?}", n.as_f64().unwrap_or(f64::NAN)),
-        }),
         Json::Array(items) => items.iter().for_each(|v| collect_numbers(v, out)),
         Json::Object(fields) => fields.values().for_each(|v| collect_numbers(v, out)),
         _ => {}
@@ -103,24 +149,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_number_spelled_a_way_it_does_not_re_print_is_refused() {
-        // `1.10` parses to the same f64 as `1.1` and re-prints as `1.1`, so the
-        // multiset does not match. That is exactly the shape of the defect this
-        // check exists for: a number whose text and whose value disagree about
-        // what it is.
-        let err = check_every_number_reprints(br#"{"a": {"components": {"x": 1.10}}}"#, "test.json")
+    fn a_mismatch_between_bytes_and_parse_is_refused() {
+        // Duplicate keys: the scanner sees both literals, the parse keeps only
+        // the second. Whatever produced that disagreement, the answer is to
+        // stop rather than pick a winner.
+        let err = check_every_number_reprints(br#"{"a": 1, "a": 2}"#, "test.json")
             .expect_err("must not be accepted");
-        assert!(err.contains("wrong width"), "{err}");
+        assert!(err.contains("do not agree"), "{err}");
     }
 
     #[test]
     fn the_widths_that_matter_pass_the_check() {
-        // The positive control, and it is not a formality: these two literals
-        // are the two spellings the report actually mixes, and a check that
-        // refused either would stop the extraction on real data.
-        let count = check_every_number_reprints(br#"{"speed": -2.4000000953674316, "saturation": 1.2, "n": 7.2000003, "i": 1561}"#, "test.json")
-        .expect("these are the report's own spellings");
-        assert_eq!(count, 4);
+        // The positive control, and it is not a formality: these literals are
+        // the spellings the reports actually mix — an f32 widened to f64, the
+        // shortest round-trip spelling, and Gson's exponent form for a large
+        // double — and a check that refused any of them stops the extraction
+        // on real data.
+        let count = check_every_number_reprints(
+            br#"{"speed": -2.4000000953674316, "saturation": 1.2, "n": 7.2000003, "i": 1561, "bound": -5.9999968E7}"#,
+            "test.json",
+        )
+        .expect("these are the reports' own spellings");
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn two_spellings_of_one_value_are_one_number() {
+        // Gson writes `5.9999968E7`; the same f64 re-spells as `59999968.0`.
+        // The check compares values, so both sides land on the same bits and
+        // the dialect difference is not a defect. Reading the same literal
+        // through an f32 first would have moved the bits, and that is the
+        // defect this check exists for.
+        let count = check_every_number_reprints(
+            br#"{"a": 5.9999968E7, "b": 59999968.0, "c": 5.9999968e7}"#,
+            "test.json",
+        )
+        .expect("one value, three spellings");
+        assert_eq!(count, 3);
     }
 
     #[test]
@@ -135,8 +200,11 @@ mod tests {
 
     #[test]
     fn a_number_inside_a_string_is_not_a_number() {
-        let count = check_every_number_reprints(br#"{"a": "minecraft:music_disc_13", "b": 5}"#, "test.json")
-            .expect("parses");
+        let count = check_every_number_reprints(
+            br#"{"a": "minecraft:music_disc_13", "b": 5}"#,
+            "test.json",
+        )
+        .expect("parses");
         assert_eq!(count, 1);
     }
 }

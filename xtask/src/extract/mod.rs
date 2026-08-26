@@ -16,10 +16,21 @@
 //! self-consistent wrong answer.
 //!
 //! Two of the jar's generators are needed and they write different trees.
-//! `--reports` produces the block state table, the registries and the packet
-//! report; `--server` produces the worldgen data, which is where the vanilla
-//! ore baseline in `dust-gen` comes from. Each is cached on a path only that
-//! generator writes, so having one does not look like having both.
+//! `--reports` produces the block state table, the registries, the items, the
+//! command graph and the packet report; `--server` produces the data pack —
+//! recipes, loot tables, tags and the worldgen trees, which is where the
+//! vanilla ore baseline in `dust-gen` comes from. Each is cached on a path only
+//! that generator writes, so having one does not look like having both, and
+//! only the trees the selected domains read are generated at all.
+//!
+//! # Domains
+//!
+//! The work is split into [`Domain`]s so a change to one table does not demand
+//! a full run to debug it (`--only tags`). Every domain reads the same two
+//! cached trees, prints what it found rather than only that it succeeded, and
+//! writes its own file or files; nothing a later domain writes depends on an
+//! earlier one having been selected in the same run, because everything they
+//! share comes from the reports themselves.
 
 mod blocks;
 mod codegen;
@@ -33,102 +44,451 @@ mod sha1;
 mod worldgen;
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 /// Where the server jar and the generated reports are cached. Gitignored, and
 /// outside `target/` so that `cargo clean` does not throw away a fifty-megabyte
 /// download.
 const CACHE_DIR: &str = ".dust-extract";
 
+/// One extractable area of vanilla data, and one unit of `--only`.
+///
+/// The order here is the execution order when everything runs: blocks first,
+/// because its two tables are cross-checked against each other and several
+/// later checks quote them; worldgen last, because it is the slowest reader of
+/// the largest tree and nothing waits on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Domain {
+    /// The block state table, plus the flat-registry tables it is checked
+    /// against. These two are one domain because neither is emitted until the
+    /// two reports have agreed on the block's protocol ids.
+    Blocks,
+    /// Item default data components.
+    Items,
+    /// The brigadier command graph.
+    Commands,
+    /// Packet id tables for `dust-protocol`.
+    Packets,
+    /// Worldgen: the ore baseline in `dust-gen`.
+    Worldgen,
+}
+
+/// Every domain, in execution order.
+pub const ALL_DOMAINS: &[Domain] = &[
+    Domain::Blocks,
+    Domain::Items,
+    Domain::Commands,
+    Domain::Packets,
+    Domain::Worldgen,
+];
+
+impl Domain {
+    /// The name `--only` spells it with.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Blocks => "blocks",
+            Self::Items => "items",
+            Self::Commands => "commands",
+            Self::Packets => "packets",
+            Self::Worldgen => "worldgen",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        ALL_DOMAINS.iter().copied().find(|d| d.name() == name)
+    }
+
+    /// Whether this domain reads the `--reports` tree.
+    fn needs_reports(self) -> bool {
+        matches!(
+            self,
+            Self::Blocks | Self::Items | Self::Commands | Self::Packets
+        )
+    }
+
+    /// Whether this domain reads the `--server` data pack tree.
+    fn needs_data(self) -> bool {
+        matches!(self, Self::Worldgen)
+    }
+}
+
+/// Parse an `--only` list into domains, refusing anything unknown.
+///
+/// Refusing rather than ignoring is the whole point of the flag's error case:
+/// `--only recpies` that silently ran everything would be worse than no flag.
+pub fn parse_only(list: &str) -> Result<Vec<Domain>, String> {
+    let mut out = Vec::new();
+    for name in list.split(',') {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let domain = Domain::from_name(name).ok_or_else(|| {
+            format!(
+                "`{name}` is not a domain. The domains are: {}.",
+                ALL_DOMAINS
+                    .iter()
+                    .map(|d| d.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+        if !out.contains(&domain) {
+            out.push(domain);
+        }
+    }
+    if out.is_empty() {
+        return Err("--only names no domains".to_owned());
+    }
+    // Execution order regardless of the order the operator listed them in, so
+    // output reads the same way whichever way the flag was spelled.
+    out.sort_by_key(|d| ALL_DOMAINS.iter().position(|a| a == d).unwrap_or(0));
+    Ok(out)
+}
+
 pub struct Options {
     pub version: String,
     /// A server jar the operator has already obtained, instead of downloading.
     pub server_jar: Option<PathBuf>,
+    /// The domains to extract; every one of them when empty.
+    pub only: Vec<Domain>,
 }
 
+/// Everything a domain needs, resolved once before any of them run.
+struct Context<'a> {
+    version: &'a str,
+    workspace_root: &'a Path,
+    /// The `--reports` tree, once any report-reading domain has asked for it.
+    reports: Option<PathBuf>,
+    /// The `--server` data pack tree, likewise.
+    data: Option<PathBuf>,
+}
+
+impl Context<'_> {
+    fn reports(&self) -> Result<&Path, String> {
+        self.reports.as_deref().ok_or_else(|| {
+            "internal: a domain read the reports tree without asking for it".to_owned()
+        })
+    }
+
+    fn data(&self) -> Result<&Path, String> {
+        self.data.as_deref().ok_or_else(|| {
+            "internal: a domain read the data pack tree without asking for it".to_owned()
+        })
+    }
+
+    fn generated_registry_dir(&self) -> Result<PathBuf, String> {
+        let dir = self
+            .workspace_root
+            .join("crates/dust-registry/src/generated");
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+        Ok(dir)
+    }
+}
+
+/// Run the selected domains, printing one timed section per domain.
 pub fn run(options: &Options, workspace_root: &Path) -> Result<(), String> {
+    let started = Instant::now();
     let cache = workspace_root.join(CACHE_DIR);
     let version = &options.version;
+    let selected = if options.only.is_empty() {
+        ALL_DOMAINS.to_vec()
+    } else {
+        options.only.clone()
+    };
+
+    println!(
+        "extracting {}: Minecraft {}",
+        selected
+            .iter()
+            .map(|d| d.name())
+            .collect::<Vec<_>>()
+            .join(", "),
+        version
+    );
 
     let jar = match &options.server_jar {
         Some(path) => {
             if !path.exists() {
                 return Err(format!("{} does not exist", path.display()));
             }
-            println!("using the server jar at {}", path.display());
+            // No digest to verify against: the jar did not come from Mojang's
+            // manifest, and inventing one would be worse than saying so.
+            println!(
+                "using the server jar at {} (no SHA-1 check: it was not fetched through \
+                 the manifest)",
+                path.display()
+            );
             path.clone()
         }
         None => download::server_jar(version, &cache)?,
     };
 
-    let reports = generate(
-        &jar,
-        &cache.join(format!("reports-{version}")),
-        "--reports",
-        "reports/blocks.json",
-        &cache,
-        workspace_root,
-    )?;
-    let server_data = generate(
-        &jar,
-        &cache.join(format!("data-{version}")),
-        "--server",
-        "data/minecraft/worldgen/placed_feature",
-        &cache,
-        workspace_root,
-    )?;
+    let wants_reports = selected.iter().any(|d| d.needs_reports());
+    let wants_data = selected.iter().any(|d| d.needs_data());
 
-    let block_json = std::fs::read(reports.join("reports/blocks.json"))
-        .map_err(|e| format!("could not read the generated block report: {e}"))?;
-    let parsed = blocks::parse(&block_json)?;
+    let mut context = Context {
+        version,
+        workspace_root,
+        reports: None,
+        data: None,
+    };
+    if wants_reports {
+        context.reports = Some(generate(
+            &jar,
+            &cache.join(format!("reports-{version}")),
+            "--reports",
+            "reports/blocks.json",
+            &cache,
+            workspace_root,
+        )?);
+    }
+    if wants_data {
+        context.data = Some(generate(
+            &jar,
+            &cache.join(format!("data-{version}")),
+            "--server",
+            "data/minecraft/worldgen/placed_feature",
+            &cache,
+            workspace_root,
+        )?);
+    }
+
+    // The two tables half the domains quote. Parsed once whether or not the
+    // blocks domain itself was selected: parsing both reports costs
+    // milliseconds, and every domain's cross-checks are worth more than the
+    // branch it would take to skip them.
+    let mut blocks = None;
+    let mut registries = None;
+    if wants_reports {
+        let registry_json = std::fs::read(context.reports()?.join("reports/registries.json"))
+            .map_err(|e| format!("could not read the generated registry report: {e}"))?;
+        let flat = registries::parse(&registry_json)?;
+        let block_json = std::fs::read(context.reports()?.join("reports/blocks.json"))
+            .map_err(|e| format!("could not read the generated block report: {e}"))?;
+        let parsed = blocks::parse(&block_json)?;
+        registries::check_block_ids_match_state_order(&flat, &parsed)?;
+        blocks = Some(parsed);
+        registries = Some(flat);
+    }
+
+    let mut results = Vec::new();
+    for domain in &selected {
+        println!("\n== {} ==", domain.name());
+        let begun = Instant::now();
+        let outcome = match domain {
+            Domain::Blocks => blocks_domain(
+                blocks.as_ref().expect("parsed above"),
+                registries.as_ref().expect("parsed above"),
+                &context,
+            )?,
+            Domain::Items => items_domain(
+                blocks.as_ref().expect("parsed above"),
+                registries.as_ref().expect("parsed above"),
+                &context,
+            )?,
+            Domain::Commands => {
+                commands_domain(registries.as_ref().expect("parsed above"), &context)?
+            }
+            Domain::Packets => packets_domain(&context)?,
+            Domain::Worldgen => worldgen_domain(&context)?,
+        };
+        println!("({} in {:.1}s)", outcome, begun.elapsed().as_secs_f64());
+        results.push((*domain, begun.elapsed(), outcome));
+    }
+
     println!(
-        "read {} blocks and {} states from the block report",
-        parsed.blocks.len(),
-        parsed.state_count
+        "\nall {} domains finished in {:.1}s",
+        results.len(),
+        started.elapsed().as_secs_f64()
     );
-
-    let registry_json = std::fs::read(reports.join("reports/registries.json"))
-        .map_err(|e| format!("could not read the generated registry report: {e}"))?;
-    let flat = registries::parse(&registry_json)?;
-    registries::check_block_ids_match_state_order(&flat, &parsed)?;
-    report_what_the_registries_said(&flat);
-
-    let item_json = std::fs::read(reports.join("reports/items.json"))
-        .map_err(|e| format!("could not read the generated item report: {e}"))?;
-    let item_components = items::parse(&item_json, &flat, &parsed)?;
-    report_what_the_items_said(&item_components);
-
-    let generated = workspace_root.join("crates/dust-registry/src/generated");
-    std::fs::create_dir_all(&generated)
-        .map_err(|e| format!("could not create {}: {e}", generated.display()))?;
-    let path = generated.join("blocks.rs");
-    std::fs::write(&path, codegen::blocks(&parsed, version, &parsed.reported))
-        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
-    println!("wrote {}", path.display());
-
-    let path = generated.join("registries.rs");
-    std::fs::write(&path, codegen::registries(&flat, version)?)
-        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
-    println!("wrote {}", path.display());
-
-    let path = generated.join("items.rs");
-    std::fs::write(&path, codegen::items(&item_components, version)?)
-        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
-    println!("wrote {}", path.display());
-
-    extract_packets(&reports, version, workspace_root)?;
-    ores(&server_data.join("data"), workspace_root, version)?;
-
+    for (domain, elapsed, outcome) in &results {
+        println!(
+            "  {:<10} {:>6.1}s  {}",
+            domain.name(),
+            elapsed.as_secs_f64(),
+            outcome
+        );
+    }
     // Emitted unformatted on purpose: rustfmt is the one authority on how the
     // committed file looks, and a generator that lays code out itself will
     // disagree with it eventually.
     println!("\nRun `just fmt` — these are committed as rustfmt leaves them.");
     println!(
-        "Then `cargo test --workspace` — the round-trip over all {} states, {} registry \
-         entries and every packet id, the golden samples beside them, and the ore \
-         baseline's source-row check are what say this worked.",
-        parsed.state_count, flat.entry_count
+        "Then `just verify` — the round-trips over every state and registry entry and every \
+         packet id, the golden samples beside them, and the ore baseline's source-row check \
+         are what say this worked."
     );
     Ok(())
+}
+
+/// What one domain did, in a few words, for the timing table.
+type Outcome = String;
+
+fn blocks_domain(
+    parsed: &blocks::Blocks,
+    flat: &registries::Registries,
+    context: &Context,
+) -> Result<Outcome, String> {
+    println!(
+        "read {} blocks and {} states from the block report",
+        parsed.blocks.len(),
+        parsed.state_count
+    );
+    report_what_the_registries_said(flat);
+
+    let generated = context.generated_registry_dir()?;
+    let path = generated.join("blocks.rs");
+    std::fs::write(
+        &path,
+        codegen::blocks(parsed, context.version, &parsed.reported),
+    )
+    .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    println!("wrote {}", path.display());
+
+    let path = generated.join("registries.rs");
+    std::fs::write(&path, codegen::registries(flat, context.version)?)
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    println!("wrote {}", path.display());
+    Ok(format!(
+        "{} blocks, {} states, {} registries",
+        parsed.blocks.len(),
+        parsed.state_count,
+        flat.registries.len()
+    ))
+}
+
+/// Read the item report and regenerate the item-components table.
+fn items_domain(
+    parsed_blocks: &blocks::Blocks,
+    flat: &registries::Registries,
+    context: &Context,
+) -> Result<Outcome, String> {
+    let json = std::fs::read(context.reports()?.join("reports/items.json"))
+        .map_err(|e| format!("could not read the generated item report: {e}"))?;
+    let parsed = items::parse(&json, flat, parsed_blocks)?;
+    report_what_the_items_said(&parsed);
+
+    let path = context.generated_registry_dir()?.join("items.rs");
+    std::fs::write(&path, codegen::items(&parsed, context.version)?)
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    println!("wrote {}", path.display());
+    Ok(format!(
+        "{} items, {} distinct component maps",
+        parsed.items.len(),
+        parsed.maps.len()
+    ))
+}
+
+/// Read the command report and regenerate the command-graph table.
+///
+/// The report's own tree is walked a second time for the golden rows, so the
+/// numbers printed here are two readings of one file: the flattened table and
+/// the samples that exist to contradict it if the flattening is wrong.
+fn commands_domain(flat: &registries::Registries, context: &Context) -> Result<Outcome, String> {
+    let json = std::fs::read(context.reports()?.join("reports/commands.json"))
+        .map_err(|e| format!("could not read the generated command report: {e}"))?;
+    let parsed = commands::parse(&json, flat)?;
+
+    let literals = parsed
+        .nodes
+        .iter()
+        .filter(|n| n.kind == commands::Kind::Literal)
+        .count();
+    println!(
+        "read {} command nodes (1 root, {literals} literals, {} arguments) from the \
+         command report",
+        parsed.nodes.len(),
+        parsed.nodes.len() - literals - 1
+    );
+    println!(
+        "  {} of them can end a command; the deepest path from the root is {} levels",
+        parsed.executable_count, parsed.max_depth
+    );
+    println!(
+        "  {} redirects resolve to indices in this same table — 103 of them point back \
+         into execute, which is why nothing here builds an owned tree",
+        parsed.redirects.len()
+    );
+    println!(
+        "  {} distinct parsers, every one an entry of the command_argument_type registry",
+        parsed.parsers.len()
+    );
+    if parsed.unchecked_registries.is_empty() {
+        println!("  every registry a resource argument names was in the registry report");
+    } else {
+        println!(
+            "  registries named by resource arguments that live in the data pack and are \
+             NOT checked here: {:?}",
+            parsed.unchecked_registries
+        );
+    }
+    let dead: Vec<&str> = parsed
+        .unreachable
+        .iter()
+        .map(|&i| parsed.nodes[i].path.as_str())
+        .collect();
+    println!(
+        "  nodes the report leaves dead (in the game they redirect to the root, which a \
+         path cannot spell): {dead:?}"
+    );
+
+    let path = context.generated_registry_dir()?.join("commands.rs");
+    std::fs::write(&path, codegen::commands(&parsed, context.version)?)
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    println!("wrote {}", path.display());
+    Ok(format!(
+        "{} command nodes, {} redirects",
+        parsed.nodes.len(),
+        parsed.redirects.len()
+    ))
+}
+
+fn packets_domain(context: &Context) -> Result<Outcome, String> {
+    extract_packets(context.reports()?, context.version, context.workspace_root)?;
+    Ok("packet tables regenerated".to_owned())
+}
+
+fn worldgen_domain(context: &Context) -> Result<Outcome, String> {
+    ores(
+        &context.data()?.join("data"),
+        context.workspace_root,
+        context.version,
+    )?;
+    Ok("ore baseline written".to_owned())
+}
+
+/// Print what the item report turned out to say.
+fn report_what_the_items_said(items: &items::Items) {
+    println!(
+        "read {} items and {} distinct component maps from the item report",
+        items.items.len(),
+        items.maps.len()
+    );
+    println!(
+        "  every one of the {} numbers in the file is present by value in what was read, so \
+         nothing is being stored at the wrong width",
+        items.number_count
+    );
+    println!(
+        "  {} distinct components appear as defaults, all of them entries of the \
+         data_component_type registry",
+        items.components.len()
+    );
+    let mut by_count: Vec<(&String, &usize)> = items.components.iter().collect();
+    by_count.sort_by_key(|(name, count)| (std::cmp::Reverse(**count), (*name).clone()));
+    let head: Vec<String> = by_count
+        .iter()
+        .take(6)
+        .map(|(name, count)| format!("{name} ({count})"))
+        .collect();
+    println!("  the most common are {}", head.join(", "));
+    println!(
+        "  string values that are not namespaced ids or #tags: {:?} — there is no free text \
+         in this report",
+        items.non_id_strings
+    );
 }
 
 /// Print what the registry report turned out to say, rather than only that it
@@ -173,38 +533,6 @@ fn report_what_the_registries_said(flat: &registries::Registries) {
     );
 }
 
-/// Print what the item report turned out to say.
-fn report_what_the_items_said(items: &items::Items) {
-    println!(
-        "read {} items and {} distinct component maps from the item report",
-        items.items.len(),
-        items.maps.len()
-    );
-    println!(
-        "  every one of the {} numbers in the file re-prints to its own text, so nothing is \
-         being stored at the wrong width",
-        items.number_count
-    );
-    println!(
-        "  {} distinct components appear as defaults, all of them entries of the \
-         data_component_type registry",
-        items.components.len()
-    );
-    let mut by_count: Vec<(&String, &usize)> = items.components.iter().collect();
-    by_count.sort_by_key(|(name, count)| (std::cmp::Reverse(**count), (*name).clone()));
-    let head: Vec<String> = by_count
-        .iter()
-        .take(6)
-        .map(|(name, count)| format!("{name} ({count})"))
-        .collect();
-    println!("  the most common are {}", head.join(", "));
-    println!(
-        "  string values that are not namespaced ids or #tags: {:?} — there is no free text \
-         in this report",
-        items.non_id_strings
-    );
-}
-
 /// Read the packet report and regenerate `dust-protocol`'s tables for this
 /// version.
 ///
@@ -217,7 +545,7 @@ fn extract_packets(reports: &Path, version: &str, workspace_root: &Path) -> Resu
         .map_err(|e| format!("could not read the generated packet report: {e}"))?;
     let parsed = packets::parse(&json)?;
 
-    println!("\nread {} packets from the packet report:", parsed.total);
+    println!("read {} packets from the packet report:", parsed.total);
     for group in &parsed.groups {
         let state = format!("{}/{}", group.state, group.direction);
         if !group.present {
@@ -267,7 +595,7 @@ fn extract_packets(reports: &Path, version: &str, workspace_root: &Path) -> Resu
 fn ores(data_root: &Path, workspace_root: &Path, version: &str) -> Result<(), String> {
     let ores = worldgen::parse(data_root)?;
     println!(
-        "\nread {} ore placements in {} group(s) across {} dimension(s)",
+        "read {} ore placements in {} group(s) across {} dimension(s)",
         ores.placements.len(),
         ores.groups.len(),
         ores.dimensions.len()

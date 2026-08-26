@@ -17,11 +17,13 @@ cargo xtask <command>
                    it does not, rather than rewriting it.
   licenses         Audit every dependency's licence for GPL-3.0 compatibility.
 
-  extract --version <v> [--server-jar <path>]
+  extract --version <v> [--server-jar <path>] [--only <domain,domain>]
                    Download the Minecraft server jar for <v>, run its own data
                    generators, and regenerate the tables in dust-registry and
-                   dust-protocol from the reports. Needs a network and a JDK 21 or newer. Not part
-                   of `just verify`, and not something CI runs.
+                   dust-protocol from the reports. Needs a network and a JDK 21
+                   or newer. Not part of `just verify`, and not something CI
+                   runs. With --only, extract just the named domains (blocks,
+                   items, packets, worldgen) instead of all of them.
 ";
 
 fn main() -> ExitCode {
@@ -83,6 +85,7 @@ fn docs(check: bool) -> Result<(), String> {
 fn extract_data(args: &[String]) -> Result<(), String> {
     let mut version = None;
     let mut server_jar = None;
+    let mut only = Vec::new();
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -98,6 +101,10 @@ fn extract_data(args: &[String]) -> Result<(), String> {
                     rest.next().ok_or("--server-jar needs a path")?,
                 ))
             }
+            "--only" => {
+                let list = rest.next().ok_or("--only needs a comma-separated list")?;
+                only = extract::parse_only(list)?;
+            }
             other => return Err(format!("unknown option `{other}`\n\n{USAGE}")),
         }
     }
@@ -108,6 +115,7 @@ fn extract_data(args: &[String]) -> Result<(), String> {
         &extract::Options {
             version,
             server_jar,
+            only,
         },
         &workspace_root(),
     )
