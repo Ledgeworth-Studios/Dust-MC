@@ -230,8 +230,23 @@ async fn a_cancelled_wait_leaves_the_gate_untouched() {
     waiter_a.abort();
     waiter_b.abort();
 
+    // Joined, not slept on. `abort` *requests* cancellation; the task is not
+    // finished when it returns, and a waiter that had already been polled can
+    // still take the permit the drop below frees and then give it back as it
+    // unwinds. A fixed sleep is a guess about how long that takes, and it was
+    // long enough here and not on a CI runner — where this failed with
+    // `available() == 0`, which is the window itself.
+    //
+    // Awaiting an aborted task returns a cancellation error and guarantees the
+    // task is done and its guard dropped, which is the thing being asserted.
     drop(_held);
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    for waiter in [waiter_a, waiter_b] {
+        let outcome = waiter.await;
+        assert!(
+            outcome.is_err(),
+            "an aborted waiter must not report having been admitted"
+        );
+    }
     assert_eq!(gate.available(), 1, "cancelled acquisitions leaked nothing");
 }
 
