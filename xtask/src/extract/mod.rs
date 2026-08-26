@@ -36,6 +36,7 @@ mod blocks;
 mod codegen;
 mod commands;
 mod download;
+mod entities;
 mod fluids;
 mod items;
 mod numbers;
@@ -66,6 +67,8 @@ pub enum Domain {
     Blocks,
     /// Item default data components.
     Items,
+    /// Entity types: the registry's own facts, and its golden rows.
+    Entities,
     /// Fluids and their block and bucket relationships.
     Fluids,
     /// The brigadier command graph.
@@ -80,6 +83,7 @@ pub enum Domain {
 pub const ALL_DOMAINS: &[Domain] = &[
     Domain::Blocks,
     Domain::Items,
+    Domain::Entities,
     Domain::Fluids,
     Domain::Commands,
     Domain::Packets,
@@ -92,6 +96,7 @@ impl Domain {
         match self {
             Self::Blocks => "blocks",
             Self::Items => "items",
+            Self::Entities => "entities",
             Self::Fluids => "fluids",
             Self::Commands => "commands",
             Self::Packets => "packets",
@@ -107,7 +112,12 @@ impl Domain {
     fn needs_reports(self) -> bool {
         matches!(
             self,
-            Self::Blocks | Self::Items | Self::Fluids | Self::Commands | Self::Packets
+            Self::Blocks
+                | Self::Items
+                | Self::Entities
+                | Self::Fluids
+                | Self::Commands
+                | Self::Packets
         )
     }
 
@@ -293,6 +303,9 @@ pub fn run(options: &Options, workspace_root: &Path) -> Result<(), String> {
                 registries.as_ref().expect("parsed above"),
                 &context,
             )?,
+            Domain::Entities => {
+                entities_domain(registries.as_ref().expect("parsed above"), &context)?
+            }
             Domain::Fluids => fluids_domain(
                 blocks.as_ref().expect("parsed above"),
                 registries.as_ref().expect("parsed above"),
@@ -498,6 +511,31 @@ fn fluids_domain(
     Ok(format!(
         "{} fluids joined against blocks and items",
         parsed.fluids.len()
+    ))
+}
+
+/// Read the entity-type slice of the registry report and regenerate its
+/// golden rows.
+fn entities_domain(flat: &registries::Registries, context: &Context) -> Result<Outcome, String> {
+    let parsed = entities::parse(flat)?;
+    println!(
+        "read {} entity types from the registry report; the default is {}",
+        parsed.reported.len(),
+        parsed.default.as_deref().unwrap_or("(none)")
+    );
+    println!(
+        "  no per-entity facts exist in this version's generator output — bounding boxes, \
+         spawn categories and friends are compiled into the game, so nothing here invents \
+         them"
+    );
+
+    let path = context.generated_registry_dir()?.join("entity_types.rs");
+    std::fs::write(&path, codegen::entities(&parsed, context.version))
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    println!("wrote {}", path.display());
+    Ok(format!(
+        "{} entity types, all sampled",
+        parsed.reported.len()
     ))
 }
 
