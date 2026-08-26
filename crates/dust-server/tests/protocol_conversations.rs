@@ -401,6 +401,23 @@ impl Joined {
         }
     }
 
+    /// Read until `done` is satisfied, or give up and say so.
+    ///
+    /// The bounded form of draining. A plain drain stops at the first quiet
+    /// moment, which is a claim about the socket and not about the server; a
+    /// `wait_for` cannot be used when the packet in question may already have
+    /// been read by an earlier drain. This waits for a *condition on what has
+    /// been seen*, which is the thing the caller actually means.
+    fn drain_until(&mut self, stream: &mut TcpStream, done: impl Fn(&Self) -> bool) -> bool {
+        for _ in 0..40 {
+            if done(self) {
+                return true;
+            }
+            self.drain(stream);
+        }
+        done(self)
+    }
+
     fn drain_until_quiet(&mut self, stream: &mut TcpStream) {
         self.read_for(stream, Duration::from_millis(750));
     }
@@ -1085,6 +1102,149 @@ fn chat_and_the_join_and_leave_lines_reach_everybody() {
 
     drop(first_stream);
     running.finish();
+}
+
+/// Decision 0005's standing guard, as the architecture states it: **turning
+/// the JVM off must leave a fully working server, minus plugins.**
+///
+/// A test already checked that `jvm.enabled = false` keeps the placeholder out
+/// of the participant list. That was all a server with no players could check.
+/// This is the guard the decision record actually asks for — a player joins,
+/// receives a world, changes it, is told about the change, and talks — with no
+/// JVM in the process at all.
+///
+/// If game logic ever leaks across the Java boundary, this is what goes red,
+/// and it goes red on the feature that leaked rather than on a count.
+#[test]
+fn everything_still_works_with_the_jvm_switched_off() {
+    let running = start("[jvm]\nenabled = false\n");
+    let addr = running.addr;
+
+    let mut stream = connect(addr);
+    let mut client = join_as(&mut stream, addr, "NoJvm");
+    assert!(client.chunks >= 25, "the world arrived");
+    assert!(
+        client.spawned_at.is_some(),
+        "and the player was put somewhere in it"
+    );
+
+    // Breaking a block, which is world state changing.
+    let (x, y, z) = (2i64, -60i64, 2i64);
+    let packed = ((x & 0x3ff_ffff) << 38) | ((z & 0x3ff_ffff) << 12) | (y & 0xfff);
+    let mut body = packed.to_be_bytes().to_vec();
+    body.insert(0, 0);
+    body.push(1);
+    write_var_int(1, &mut body);
+    send_compressed_frame(&mut stream, 36, &body);
+    client
+        .wait_for(&mut stream, 5)
+        .expect("the dig is acknowledged with no JVM in the process");
+
+    // And chat, which is the server speaking.
+    let mut said = Vec::new();
+    write_string("still here", &mut said);
+    said.extend_from_slice(&0i64.to_be_bytes());
+    said.extend_from_slice(&0i64.to_be_bytes());
+    said.push(0);
+    write_var_int(0, &mut said);
+    said.extend_from_slice(&[0u8; 3]);
+    send_compressed_frame(&mut stream, 6, &said);
+    let line = client
+        .wait_for(&mut stream, 108)
+        .expect("chat still travels");
+    assert!(String::from_utf8_lossy(&line).contains("still here"));
+
+    let report = running.finish();
+    assert!(
+        !report.participants.contains(&"jvm-placeholder".to_owned()),
+        "the JVM really was off: {:?}",
+        report.participants
+    );
+}
+
+/// Phase 3's exit criterion, in one test, as the build plan words it: connect,
+/// walk a thousand blocks across streaming chunks, chat, disconnect, and
+/// reconnect to the same position.
+///
+/// The pieces are each checked on their own elsewhere. This is the one that
+/// says the milestone is met, so it does the whole thing in order and against
+/// two server lifetimes — because "reconnect to the same position" is only
+/// worth anything if the server was stopped in between.
+///
+/// What the plan asks for and this does not do: run for ten minutes, and run
+/// as a headless bot client rather than a hand-written one. Both are the
+/// difference between this and the standing suite the plan wants from Phase 3
+/// onward, and neither is a thing to claim by leaving it unsaid.
+#[test]
+fn phase_three_walk_chat_disconnect_and_come_back() {
+    let world_dir = std::env::temp_dir().join(format!(
+        "dust-phase3-{}-{}",
+        std::process::id(),
+        ICON_SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+
+    let mut x = 0.5f64;
+    {
+        let running = start_in(&world_dir, "");
+        let addr = running.addr;
+        let mut stream = connect(addr);
+        let mut client = join_as(&mut stream, addr, "Walker");
+
+        // A thousand blocks east, one at a time, reading as we go.
+        for step in 0..1000 {
+            x += 1.0;
+            let mut walk = Vec::new();
+            walk.extend_from_slice(&x.to_be_bytes());
+            walk.extend_from_slice(&(-59.0f64).to_be_bytes());
+            walk.extend_from_slice(&0.5f64.to_be_bytes());
+            walk.push(1);
+            send_compressed_frame(&mut stream, 26, &walk);
+            if step % 16 == 0 {
+                client.drain(&mut stream);
+            }
+        }
+        // Drained to a count rather than waiting for one more recentre: the
+        // drains inside the loop above have already consumed most of them, so
+        // there may be none left to wait for.
+        assert!(
+            client.drain_until(&mut stream, |c| c.centres >= 63),
+            "the walk produced {} recentres, not the sixty-two boundaries plus \
+             the join",
+            client.centres
+        );
+        assert_eq!(client.centres, 63, "and no more than that");
+
+        // Chat.
+        let mut said = Vec::new();
+        write_string("made it", &mut said);
+        said.extend_from_slice(&0i64.to_be_bytes());
+        said.extend_from_slice(&0i64.to_be_bytes());
+        said.push(0);
+        write_var_int(0, &mut said);
+        said.extend_from_slice(&[0u8; 3]);
+        send_compressed_frame(&mut stream, 6, &said);
+        let line = client.wait_for(&mut stream, 108).expect("the message");
+        assert!(String::from_utf8_lossy(&line).contains("made it"));
+
+        // Disconnect.
+        drop(stream);
+        running.finish();
+    }
+
+    {
+        let running = start_in(&world_dir, "");
+        let addr = running.addr;
+        let mut stream = connect(addr);
+        let client = join_as(&mut stream, addr, "Walker");
+        let (back_x, _, back_z) = client.spawned_at.expect("a position on rejoining");
+        assert_eq!(back_x, x, "a thousand blocks east, where they stopped");
+        assert_eq!(back_z, 0.5);
+        assert!(client.chunks >= 25, "with the world around them");
+        drop(stream);
+        running.finish();
+    }
+
+    let _ = std::fs::remove_dir_all(&world_dir);
 }
 
 #[test]
