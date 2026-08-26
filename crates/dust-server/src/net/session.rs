@@ -114,6 +114,11 @@ pub struct SessionContext {
     /// For the one thing this layer has to say that is not a packet: a session
     /// that fell behind on block changes.
     pub logger: crate::logging::Logger,
+    /// Everybody currently connected, and the channel their comings and
+    /// goings travel on.
+    pub roster: super::players::SharedRoster,
+    /// `minecraft:player`'s id in the entity-type registry, resolved at boot.
+    pub player_entity_type: i32,
     /// Where each player was when they last left, by profile id.
     ///
     /// Read on join and written on leave, so a reconnecting player lands where
@@ -358,6 +363,7 @@ where
         }
     };
     let profile_id = authenticated.profile_id;
+    let username = authenticated.username.clone();
 
     // Login Acknowledged has been received, so the connection is in
     // configuration. Every disconnect from here carries an NBT component, not
@@ -392,7 +398,7 @@ where
 
     // Configuration finished, so both ends are in Play.
     conn.transition(State::Play)?;
-    serve_play(&mut conn, ctx, profile_id).await?;
+    serve_play(&mut conn, ctx, profile_id, &username).await?;
     conn.disconnect();
     finish(conn, outcome).await
 }
@@ -405,6 +411,7 @@ async fn serve_play<W>(
     conn: &mut Conn<W>,
     ctx: &SessionContext,
     profile_id: [u8; 16],
+    username: &str,
 ) -> Result<(), SessionError>
 where
     W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -476,12 +483,47 @@ where
     )
     .await?;
 
+    // Join the roster *after* the world is on screen. The order matters the
+    // same way the position does: an entity announced before the client has
+    // the column it stands in is an entity the client files against nothing.
+    //
+    // The roster hands back the players already here and a subscription that
+    // begins before this player was added, both taken under one lock — so
+    // nobody who joins in between falls between the two.
+    let joined = ctx.roster.join(profile_id, username.to_owned(), start);
+    let me = joined.player.clone();
+    let mut roster_changes = joined.listener;
+
+    // Everybody already here, both halves each: the tab-list row and the body.
+    for other in &joined.existing {
+        send_play(conn, play_mod::player_info_add(other)?, version).await?;
+        send_play(
+            conn,
+            play_mod::spawn_player(other, ctx.player_entity_type),
+            version,
+        )
+        .await?;
+    }
+
     // The loop updates `position` as the player moves. Read after it ends
     // however it ended — a clean disconnect, a timeout, a decode error —
     // because a position recorded only on a graceful exit is one that is right
     // exactly when nobody needed it.
     let mut position = start;
-    let result = play_loop(conn, ctx, view, &mut edits, &mut position).await;
+    let result = play_loop(
+        conn,
+        ctx,
+        view,
+        &mut edits,
+        &mut roster_changes,
+        &me,
+        &mut position,
+    )
+    .await;
+
+    // Left however the loop ended, so a session that failed does not leave a
+    // body standing in the world forever.
+    ctx.roster.leave(me.entity_id);
     ctx.positions
         .lock()
         .expect("the position map is never poisoned")
@@ -547,6 +589,8 @@ async fn play_loop<W>(
     ctx: &SessionContext,
     mut view: View,
     edits: &mut tokio::sync::broadcast::Receiver<Edit>,
+    roster: &mut tokio::sync::broadcast::Receiver<super::players::RosterChange>,
+    me: &super::players::Player,
     position: &mut (f64, f64, f64),
 ) -> Result<(), SessionError>
 where
@@ -611,6 +655,73 @@ where
                     }
                 }
             }
+            change = roster.recv() => {
+                use super::players::RosterChange;
+                match change {
+                    // A session hears about its own join and its own movement,
+                    // because its subscription starts before either. Filtered
+                    // here rather than by the roster, because a channel that
+                    // knew who each receiver was would be a channel per
+                    // receiver — and showing a player their own body standing
+                    // where they are is the one entity that must not exist.
+                    Ok(RosterChange::Joined(player)) if player.entity_id != me.entity_id => {
+                        send_play(conn, play_mod::player_info_add(&player)?, ctx.version).await?;
+                        send_play(
+                            conn,
+                            play_mod::spawn_player(&player, ctx.player_entity_type),
+                            ctx.version,
+                        )
+                        .await?;
+                    }
+                    Ok(RosterChange::Left { entity_id, uuid }) if entity_id != me.entity_id => {
+                        // Both halves, again: the entity id takes the body away
+                        // and the uuid takes the tab-list row.
+                        send_play(conn, play_mod::despawn(entity_id), ctx.version).await?;
+                        send_play(conn, play_mod::player_info_remove(uuid), ctx.version).await?;
+                    }
+                    Ok(RosterChange::Moved {
+                        entity_id,
+                        x,
+                        y,
+                        z,
+                        yaw,
+                        pitch,
+                    }) if entity_id != me.entity_id => {
+                        send_play(
+                            conn,
+                            play_mod::move_player(entity_id, x, y, z, yaw, pitch),
+                            ctx.version,
+                        )
+                        .await?;
+                        send_play(conn, play_mod::turn_head(entity_id, yaw), ctx.version).await?;
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                    // Behind on the roster means showing players who left and
+                    // missing players who arrived. Rebuilt from the current
+                    // roster rather than patched, for the same reason as the
+                    // edits: what was missed is what is not known.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        ctx.logger.warn(
+                            "dust::net",
+                            format!("a session missed {missed} roster change(s); resending it"),
+                        );
+                        for other in ctx.roster.snapshot() {
+                            if other.entity_id == me.entity_id {
+                                continue;
+                            }
+                            send_play(conn, play_mod::player_info_add(&other)?, ctx.version)
+                                .await?;
+                            send_play(
+                                conn,
+                                play_mod::spawn_player(&other, ctx.player_entity_type),
+                                ctx.version,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
             frame = conn.next_frame() => {
                 let Some(frame) = frame? else { return Ok(()) };
                 let mut reader = Reader::new(&frame.body);
@@ -623,11 +734,28 @@ where
                     // the spot has not changed which columns they can see.
                     Ok(play::serverbound::Packet::MovePlayerPos(m)) => {
                         *position = (m.x, m.y, m.z);
+                        ctx.roster
+                            .moved(me.entity_id, m.x, m.y, m.z, me.yaw, me.pitch);
                         moved(conn, ctx, &mut view, m.x, m.z).await?;
                     }
                     Ok(play::serverbound::Packet::MovePlayerPosRot(m)) => {
                         *position = (m.x, m.y, m.z);
+                        ctx.roster
+                            .moved(me.entity_id, m.x, m.y, m.z, m.yaw, m.pitch);
                         moved(conn, ctx, &mut view, m.x, m.z).await?;
+                    }
+                    // Turning on the spot. It changes no column, so it does not
+                    // stream — but it is what everybody else sees, so it does
+                    // reach the roster.
+                    Ok(play::serverbound::Packet::MovePlayerRot(m)) => {
+                        ctx.roster.moved(
+                            me.entity_id,
+                            position.0,
+                            position.1,
+                            position.2,
+                            m.yaw,
+                            m.pitch,
+                        );
                     }
                     // Digging. Only the finish counts: the start and the
                     // cancel are a client telling the server what its

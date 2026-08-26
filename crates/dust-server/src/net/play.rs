@@ -268,3 +268,138 @@ pub fn columns_around(centre: ChunkPos, radius: i32) -> Vec<ChunkPos> {
     });
     columns
 }
+
+// ---------------------------------------------------------------------------
+// Other players
+// ---------------------------------------------------------------------------
+
+use dust_protocol::packets::play::player_info::{
+    PlayerInfoActions, PlayerInfoBody, PlayerInfoEntry, ProfileAddition,
+};
+use dust_protocol::types::{Angle, BoundedString, Uuid};
+
+use super::players::Player;
+
+/// The tab-list entry that says a player exists.
+///
+/// Sent alongside the entity and never instead of it: a client shown the
+/// entity without an entry renders a body with no name plate and no skin,
+/// because the skin is looked up from the profile this carries.
+///
+/// `ADD_PLAYER | UPDATE_LISTED`, and no more. The actions byte selects which
+/// fields each entry carries, so a bit set here is a field the encoder must
+/// write and a bit unset is one it must not — there is no way to send a field
+/// "just in case", and a mismatched bit desynchronises every entry after it.
+pub fn player_info_add(
+    player: &Player,
+) -> Result<play::clientbound::PlayerInfoUpdate, dust_protocol::wire::EncodeError> {
+    Ok(play::clientbound::PlayerInfoUpdate {
+        body: PlayerInfoBody {
+            actions: PlayerInfoActions(
+                PlayerInfoActions::ADD_PLAYER | PlayerInfoActions::UPDATE_LISTED,
+            ),
+            entries: vec![PlayerInfoEntry {
+                uuid: Uuid(u128::from_be_bytes(player.uuid)),
+                profile: Some(ProfileAddition {
+                    name: BoundedString::new(player.name.clone())?,
+                    // Empty in offline mode: the signed skin lives in the
+                    // profile Mojang returns, and offline mode never asks. An
+                    // online-mode server puts the real properties here and the
+                    // player has their own face.
+                    properties: Vec::new(),
+                }),
+                chat_session: None,
+                game_mode: None,
+                listed: Some(true),
+                latency: None,
+                display_name: None,
+            }],
+        },
+    })
+}
+
+/// The tab-list removal. Keyed by uuid, where the entity removal is keyed by
+/// entity id — two namespaces for one player, and sending one without the
+/// other leaves either a ghost body or a ghost name.
+pub fn player_info_remove(uuid: [u8; 16]) -> play::clientbound::PlayerInfoRemove {
+    play::clientbound::PlayerInfoRemove {
+        uuids: vec![Uuid(u128::from_be_bytes(uuid))],
+    }
+}
+
+/// The entity that gives a player a body.
+pub fn spawn_player(player: &Player, player_type: i32) -> play::clientbound::AddEntity {
+    play::clientbound::AddEntity {
+        entity_id: VarInt(player.entity_id),
+        uuid: Uuid(u128::from_be_bytes(player.uuid)),
+        kind: VarInt(player_type),
+        x: player.x,
+        y: player.y,
+        z: player.z,
+        pitch: Angle::from_degrees(player.pitch),
+        yaw: Angle::from_degrees(player.yaw),
+        // The head is sent at the body's yaw on spawn. They diverge as soon as
+        // the player turns, and `rotate_head` carries that — but a spawn with
+        // a head at zero while the body faces west renders as a player looking
+        // over their own shoulder.
+        head_yaw: Angle::from_degrees(player.yaw),
+        data: VarInt(0),
+        velocity: play::EntityVelocity { x: 0, y: 0, z: 0 },
+    }
+}
+
+/// Move an entity that already exists.
+///
+/// A teleport rather than a delta. The delta packets carry position as
+/// 1/4096-block shorts, which is smaller and only legal for moves under eight
+/// blocks — so using them means tracking each viewer's idea of where each
+/// entity is and falling back when it drifts too far. That bookkeeping is
+/// worth having and is not free, and doing it wrong sends a delta that the
+/// client applies to the wrong origin, which is a player sliding away into the
+/// distance. Absolute coordinates cannot be wrong about where somebody is.
+pub fn move_player(
+    entity_id: i32,
+    x: f64,
+    y: f64,
+    z: f64,
+    yaw: f32,
+    pitch: f32,
+) -> play::clientbound::TeleportEntity {
+    play::clientbound::TeleportEntity {
+        entity_id: VarInt(entity_id),
+        x,
+        y,
+        z,
+        yaw: Angle::from_degrees(yaw),
+        pitch: Angle::from_degrees(pitch),
+        on_ground: true,
+    }
+}
+
+/// The head's yaw, which the body's does not imply.
+///
+/// Living entities carry both: the head leads a turn and the body follows, and
+/// a client sent only the body's yaw renders a player whose head never moves.
+pub fn turn_head(entity_id: i32, yaw: f32) -> play::clientbound::RotateHead {
+    play::clientbound::RotateHead {
+        entity_id: VarInt(entity_id),
+        head_yaw: Angle::from_degrees(yaw),
+    }
+}
+
+/// Take a player's body away.
+pub fn despawn(entity_id: i32) -> play::clientbound::RemoveEntities {
+    play::clientbound::RemoveEntities {
+        entity_ids: vec![VarInt(entity_id)],
+    }
+}
+
+/// `minecraft:player`'s id in the entity-type registry.
+///
+/// Resolved from the generated table rather than written down: it is a
+/// position in a list that is regenerated per version, and a constant would be
+/// right until a bump and then spawn something else entirely.
+pub fn player_entity_type() -> Option<i32> {
+    dust_registry::EntityType::from_name("minecraft:player")
+        .and_then(|t| i32::try_from(t.protocol_id()).ok())
+}

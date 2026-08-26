@@ -866,6 +866,10 @@ impl Server {
             },
             logger: self.options.logger.clone(),
             positions: std::sync::Arc::clone(&positions),
+            roster: std::sync::Arc::default(),
+            player_entity_type: crate::net::play::player_entity_type().ok_or_else(|| {
+                fail("the generated entity table has no minecraft:player".to_owned())
+            })?,
             counters: std::sync::Arc::clone(&counters),
         });
 

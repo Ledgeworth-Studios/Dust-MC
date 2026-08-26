@@ -330,6 +330,10 @@ struct Joined {
     chunks: usize,
     forgets: usize,
     centres: usize,
+    /// Bodies this client has been told to render.
+    spawned_entities: usize,
+    /// Tab-list rows it has been given.
+    player_infos: usize,
     /// Where the server teleported the player on arrival. Captured during the
     /// join rather than waited for afterwards, because the join has already
     /// read past it by the time it returns — a later `wait_for` would block
@@ -365,6 +369,8 @@ impl Joined {
                 39 => self.chunks += 1,
                 33 => self.forgets += 1,
                 84 => self.centres += 1,
+                1 => self.spawned_entities += 1,
+                62 => self.player_infos += 1,
                 38 => send_compressed_frame(stream, 24, &body),
                 29 => panic!("the server disconnected while waiting for {id}"),
                 _ => {}
@@ -386,6 +392,8 @@ impl Joined {
                 39 => self.chunks += 1,
                 33 => self.forgets += 1,
                 84 => self.centres += 1,
+                1 => self.spawned_entities += 1,
+                62 => self.player_infos += 1,
                 // A keep-alive is answered so the connection stays up through
                 // a walk that outlasts the ten-second period.
                 38 => send_compressed_frame(stream, 24, &body),
@@ -425,6 +433,8 @@ fn join_as(stream: &mut TcpStream, addr: SocketAddr, name: &str) -> Joined {
         chunks: 0,
         forgets: 0,
         centres: 0,
+        spawned_entities: 0,
+        player_infos: 0,
         spawned_at: None,
     };
     loop {
@@ -445,6 +455,8 @@ fn join_as(stream: &mut TcpStream, addr: SocketAddr, name: &str) -> Joined {
             39 => counted.chunks += 1,
             33 => counted.forgets += 1,
             84 => counted.centres += 1,
+            1 => counted.spawned_entities += 1,
+            62 => counted.player_infos += 1,
             64 => {
                 counted.spawned_at = Some((
                     f64::from_be_bytes(body[0..8].try_into().expect("eight bytes")),
@@ -902,6 +914,74 @@ fn a_broken_block_and_a_walked_to_position_both_survive_a_restart() {
     assert!(saved.contains("\"y\": -60"), "{saved}");
 
     let _ = std::fs::remove_dir_all(&world_dir);
+}
+
+/// Two players in one world can see each other.
+///
+/// The whole point of a server, and the thing every other test here would pass
+/// without. A player has to arrive as *both* halves — a tab-list entry and an
+/// entity — because a client shown one without the other renders either a name
+/// with no body or a body with no name, and neither looks like a bug in the
+/// half that is missing.
+#[test]
+fn two_players_see_each_other_arrive_move_and_leave() {
+    let running = start("");
+    let addr = running.addr;
+
+    let mut first_stream = connect(addr);
+    let mut first = join_as(&mut first_stream, addr, "First");
+    // Nobody else is here yet, so the first player is told about nobody.
+    first.drain(&mut first_stream);
+    assert_eq!(first.spawned_entities, 0, "an empty server has no bodies");
+
+    let mut second_stream = connect(addr);
+    let mut second = join_as(&mut second_stream, addr, "Second");
+    // The roster goes out *after* the loading-screen event, deliberately — an
+    // entity announced before the client holds the column it stands in is one
+    // the client files against nothing — so `join_as` has already returned by
+    // the time it arrives.
+    second.drain_until_quiet(&mut second_stream);
+
+    // The second player is told about the first, on arrival, from the roster
+    // snapshot rather than from the broadcast.
+    assert_eq!(second.player_infos, 1, "the first player's tab-list row");
+    assert_eq!(second.spawned_entities, 1, "and the first player's body");
+
+    // And the first is told about the second, through the broadcast.
+    first
+        .wait_for(&mut first_stream, 1)
+        .expect("the first player is told the second arrived");
+    assert_eq!(
+        first.player_infos, 1,
+        "the tab-list row came with the body, not instead of it"
+    );
+
+    // The second walks; the first is told where to.
+    let mut walk = Vec::new();
+    walk.extend_from_slice(&64.5f64.to_be_bytes());
+    walk.extend_from_slice(&(-59.0f64).to_be_bytes());
+    walk.extend_from_slice(&8.5f64.to_be_bytes());
+    walk.push(1);
+    send_compressed_frame(&mut second_stream, 26, &walk);
+
+    let teleport = first
+        .wait_for(&mut first_stream, 112)
+        .expect("the first player is told the second moved");
+    let (_, rest) = read_var_int_from(&teleport);
+    let x = f64::from_be_bytes(rest[0..8].try_into().expect("eight bytes"));
+    assert_eq!(x, 64.5, "to where they actually went");
+
+    // The second leaves; the first is told to forget them, both halves.
+    drop(second_stream);
+    first
+        .wait_for(&mut first_stream, 66)
+        .expect("the body is removed");
+    first
+        .wait_for(&mut first_stream, 61)
+        .expect("and so is the tab-list row");
+
+    drop(first_stream);
+    running.finish();
 }
 
 #[test]
