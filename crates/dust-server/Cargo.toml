@@ -7,9 +7,12 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-# The operator-facing program will be `dust`, not `dust-server`: subcommands
-# read as `dust server …`. The [[bin]] stanza arrives with src/main.rs and the
-# cli module; declaring it first broke every workspace build for nothing.
+# The operator-facing program is `dust`, not `dust-server`: subcommands read
+# as `dust server …`, matching the grammar in `cli`. The library stays the
+# thing other crates build on; the binary is a thin shell over it.
+[[bin]]
+name = "dust"
+path = "src/main.rs"
 
 [dependencies]
 ctrlc.workspace = true

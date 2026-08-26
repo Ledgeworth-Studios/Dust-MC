@@ -81,7 +81,10 @@ impl Default for ParticipantSet {
 impl ParticipantSet {
     /// An empty set.
     pub fn new() -> Self {
-        Self { entries: Vec::new(), next_order: 0 }
+        Self {
+            entries: Vec::new(),
+            next_order: 0,
+        }
     }
 
     /// Register a participant. Later calls with an equal priority run after
@@ -98,11 +101,8 @@ impl ParticipantSet {
         self.entries.push(entry);
         // Stable sort: equal (priority) keys preserve insertion order via the
         // explicit `order` tiebreaker, making the ordering total regardless.
-        self.entries.sort_by(|a, b| {
-            a.priority
-                .cmp(&b.priority)
-                .then(a.order.cmp(&b.order))
-        });
+        self.entries
+            .sort_by(|a, b| a.priority.cmp(&b.priority).then(a.order.cmp(&b.order)));
     }
 
     /// How many participants are registered.
@@ -117,14 +117,14 @@ impl ParticipantSet {
 
     /// Names in execution order, for logs and reports.
     pub fn names(&self) -> Vec<String> {
-        self.entries.iter().map(|e| e.participant.name().to_owned()).collect()
+        self.entries
+            .iter()
+            .map(|e| e.participant.name().to_owned())
+            .collect()
     }
 
     /// Walk every participant in execution order.
-    pub(crate) fn for_each(
-        &mut self,
-        mut f: impl FnMut(&mut dyn TickParticipant),
-    ) {
+    pub(crate) fn for_each(&mut self, mut f: impl FnMut(&mut dyn TickParticipant)) {
         for entry in &mut self.entries {
             f(entry.participant.as_mut());
         }
@@ -162,11 +162,13 @@ mod tests {
 
     fn set_with(log: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>) -> ParticipantSet {
         let mut set = ParticipantSet::new();
-        let mk = |name, priority| Box::new(Recorder {
-            name,
-            priority,
-            log: std::sync::Arc::clone(&log),
-        }) as Box<dyn TickParticipant>;
+        let mk = |name, priority| {
+            Box::new(Recorder {
+                name,
+                priority,
+                log: std::sync::Arc::clone(&log),
+            }) as Box<dyn TickParticipant>
+        };
         // Registered deliberately out of order: the set must sort them.
         set.insert(mk("flusher", 100));
         set.insert(mk("world", 0));
@@ -199,7 +201,10 @@ mod tests {
     #[test]
     fn names_report_execution_order_not_registration_order() {
         let set = set_with(std::sync::Arc::default());
-        assert_eq!(set.names(), vec!["listener", "world", "second-world", "flusher"]);
+        assert_eq!(
+            set.names(),
+            vec!["listener", "world", "second-world", "flusher"]
+        );
     }
 
     #[test]

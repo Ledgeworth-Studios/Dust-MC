@@ -52,6 +52,15 @@ pub enum WorkCharger {
 }
 
 impl WorkCharger {
+    /// The charger a server run should use: virtual when the run was given a
+    /// manual clock to charge against (tests), real-world otherwise.
+    pub(crate) fn from_option(clock: Option<std::sync::Arc<ManualClock>>) -> Self {
+        match clock {
+            Some(clock) => Self::Virtual(clock),
+            None => Self::RealWorld,
+        }
+    }
+
     fn charge(&self, ns: u64) {
         if let Self::Virtual(clock) = self {
             clock.advance_ns(ns);
@@ -64,10 +73,7 @@ impl WorkCharger {
 /// This function is the wiring diagram made code: read it to see which
 /// setting gates which participant. It is deliberately infallible — a
 /// configuration that reached here has already passed validation.
-pub fn registry_from_config(
-    config: &DustConfig,
-    charger: &WorkCharger,
-) -> ParticipantSet {
+pub fn registry_from_config(config: &DustConfig, charger: &WorkCharger) -> ParticipantSet {
     let mut set = ParticipantSet::new();
 
     // `[server]`: identity and capacity reach the runtime verbatim.
@@ -94,6 +100,7 @@ pub fn registry_from_config(
 /// operator compares against `server.max_players` and `server.motd` in the
 /// file they wrote. Twenty ticks is one vanilla second, chosen so a minute
 /// of logs is three lines rather than twelve hundred.
+#[derive(Debug)]
 pub struct StatusProbe {
     max_players: u32,
     motd: String,
@@ -129,10 +136,8 @@ impl TickParticipant for StatusProbe {
 
     fn tick(&mut self, ctx: &TickContext) {
         if ctx.tick_index % 20 == 0 {
-            ctx.logger.info(
-                TARGET_STATUS,
-                format!("heartbeat: 0/{self} players"),
-            );
+            ctx.logger
+                .info(TARGET_STATUS, format!("heartbeat: 0/{self} players"));
         }
     }
 }
@@ -149,6 +154,7 @@ impl std::fmt::Display for StatusProbe {
 /// then go quiet. The announcement matters more than silence: in a log
 /// transcript, "jvm-placeholder announced" versus "absent from the
 /// participant list" is the observable difference the enable flag makes.
+#[derive(Debug)]
 pub struct JvmPlaceholder {
     announced: bool,
 }
@@ -182,7 +188,8 @@ impl TickParticipant for JvmPlaceholder {
     fn tick(&mut self, ctx: &TickContext) {
         if !self.announced {
             self.announced = true;
-            ctx.logger.info(TARGET_JVM, "plugin bridge would mount here");
+            ctx.logger
+                .info(TARGET_JVM, "plugin bridge would mount here");
         }
     }
 }
@@ -196,6 +203,7 @@ impl TickParticipant for JvmPlaceholder {
 /// disabled by override, its resolution falls back through the same
 /// precedence `dust-gen` will honour later, which is precisely the point:
 /// there is one resolver, and everyone borrows it.
+#[derive(Debug)]
 pub struct OreWorkload {
     frequency: f64,
     work_units: u32,
@@ -207,6 +215,7 @@ impl OreWorkload {
     pub fn new(config: &DustConfig, charger: &WorkCharger) -> Self {
         let group = VANILLA_ORE_GROUPS
             .first()
+            .copied()
             .map(dust_config::ore::OreGroup::new)
             .expect("the vanilla ore group table is non-empty");
         let settings = config.worldgen.ores.resolve_group(&group);

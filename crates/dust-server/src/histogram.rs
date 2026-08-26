@@ -49,7 +49,10 @@ impl TimingHistogram {
     /// An empty histogram with a specific window size, for tests that want a
     /// window small enough to watch samples fall off the end.
     pub fn with_window(size: usize) -> Self {
-        assert!(size > 0, "a zero-length timing window can never hold a sample");
+        assert!(
+            size > 0,
+            "a zero-length timing window can never hold a sample"
+        );
         Self {
             window: vec![0; size],
             next: 0,
@@ -134,7 +137,9 @@ fn percentile_rank(len: usize, p: f64) -> usize {
     // Rank is 1-based, hence the -1 for the index. At p=0.99 the smallest
     // window this can be asked about is length 1, where ceil(0.99) == 1 == the
     // only element, so no clamping is needed below.
-    ((p * len as f64).ceil() as usize).saturating_sub(1).min(len - 1)
+    ((p * len as f64).ceil() as usize)
+        .saturating_sub(1)
+        .min(len - 1)
 }
 
 #[cfg(test)]
@@ -189,7 +194,8 @@ mod tests {
         assert_eq!(stats.total_recorded, 5, "eviction is not forgetting");
         assert_eq!(stats.max, Some(999), "the newest sample is still in");
         assert_eq!(
-            stats.min, Some(20),
+            stats.min,
+            Some(20),
             "10 fell off the front when 999 arrived"
         );
     }

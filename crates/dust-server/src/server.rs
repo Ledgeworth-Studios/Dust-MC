@@ -43,20 +43,21 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::path::{PathBuf, Path};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use dust_config::model::LogLevel;
 use dust_config::{ConfigError, DustConfig};
 
 use crate::clock::{Clock, ManualClock, MonotonicClock};
 use crate::engine::TickEngine;
 use crate::histogram::TimingStats;
 use crate::logging::{Level, Logger};
-use crate::participant::ParticipantSet;
+use crate::participant::{ParticipantSet, TickParticipant};
 use crate::stop::{
-    watch_dog, CondvarParker, Parker, StopHandle, StopState, ThreadTracker,
-    WatchdogHarness, WatchdogPolicy,
+    watch_dog, CondvarParker, Parker, StopHandle, StopState, ThreadTracker, WatchdogHarness,
+    WatchdogPolicy,
 };
 use crate::tasks;
 
@@ -67,9 +68,41 @@ pub const DEFAULT_CONFIG_PATH: &str = "dust.toml";
 /// Placeholder until the schema gains a level-name setting; the constant
 /// exists so there is exactly one place to change.
 pub const DEFAULT_WORLD_DIR: &str = "world";
-/// Default watchdog grace after a stop request: ten seconds against whatever
-/// clock the server runs on (real seconds under the production clock).
-pub const DEFAULT_SHUTDOWN_GRACE_NS: u64 = 10_000_000_000;
+
+/// The runtime settings phases 4 and 5 consume, extracted from the loaded
+/// configuration in one place.
+///
+/// Phase 1 loads the file; everything downstream reads these numbers instead
+/// of reaching back into the config tree. One extraction point means the
+/// mapping from setting to behaviour is written once and testable alone.
+#[derive(Debug, Clone, Copy)]
+struct RuntimeSettings {
+    /// `[server].max_catchup_ticks`, verbatim.
+    catchup_cap: u32,
+    /// `[server].shutdown_timeout_secs`, converted to nanoseconds on whatever
+    /// clock the run uses.
+    shutdown_grace_ns: u64,
+}
+
+impl RuntimeSettings {
+    fn from_config(config: &DustConfig) -> Self {
+        Self {
+            catchup_cap: config.server.max_catchup_ticks,
+            shutdown_grace_ns: u64::from(config.server.shutdown_timeout_secs) * 1_000_000_000,
+        }
+    }
+}
+
+/// Map a configured log level onto the logger's severity scale.
+fn log_level_of(level: LogLevel) -> Level {
+    match level {
+        LogLevel::Error => Level::Error,
+        LogLevel::Warn => Level::Warn,
+        LogLevel::Info => Level::Info,
+        LogLevel::Debug => Level::Debug,
+        LogLevel::Trace => Level::Trace,
+    }
+}
 
 /// One named stage of the boot sequence, in execution order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -147,30 +180,72 @@ impl fmt::Display for TranscriptEntry {
 }
 
 /// Everything that can end a boot badly.
+///
+/// The phase failures carry the transcript as it stood when they fired, so a
+/// caller can show (or a test can assert) exactly which phases ran and were
+/// unwound. Configuration failure carries none because configuration is the
+/// first phase: nothing has started, so nothing can have been unwound.
 #[derive(Debug)]
 pub enum ServerError {
     /// The configuration failed to load or validate.
     Config(ConfigError),
     /// The world directories could not be created.
-    WorldDirs { path: PathBuf, source: std::io::Error },
+    WorldDirs {
+        path: PathBuf,
+        source: std::io::Error,
+        transcript: Vec<TranscriptEntry>,
+    },
     /// `[server] bind` did not describe a usable address.
-    NetworkBind { bind: String, message: String },
+    NetworkBind {
+        bind: String,
+        message: String,
+        transcript: Vec<TranscriptEntry>,
+    },
     /// A tracked thread died during shutdown.
     ThreadPanic(Vec<String>),
+}
+
+impl ServerError {
+    /// The boot transcript at the moment of failure: every phase that had
+    /// started, plus the stop entries written while unwinding it.
+    pub fn transcript(&self) -> &[TranscriptEntry] {
+        match self {
+            Self::Config(_) | Self::ThreadPanic(_) => &[],
+            Self::WorldDirs { transcript, .. } | Self::NetworkBind { transcript, .. } => transcript,
+        }
+    }
+
+    /// Attach the boot transcript to a phase failure. Called by [`Server::run`]
+    /// *after* unwinding, so the error carries the stops as well as the starts.
+    fn attach(&mut self, transcript: Vec<TranscriptEntry>) {
+        match self {
+            Self::Config(_) | Self::ThreadPanic(_) => {}
+            Self::WorldDirs {
+                transcript: slot, ..
+            }
+            | Self::NetworkBind {
+                transcript: slot, ..
+            } => *slot = transcript,
+        }
+    }
 }
 
 impl fmt::Display for ServerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Config(e) => write!(f, "{e}"),
-            Self::WorldDirs { path, source } => {
+            Self::WorldDirs { path, source, .. } => {
                 write!(f, "could not prepare world directory {path:?}: {source}")
             }
-            Self::NetworkBind { bind, message } => {
+            Self::NetworkBind { bind, message, .. } => {
                 write!(f, "[server] bind = {bind:?}: {message}")
             }
             Self::ThreadPanic(names) => {
-                write!(f, "thread(s) panicked during shutdown: {}", names.join(", "))
+                write!(
+                    f,
+                    "thread(s) panicked during shutdown: {}",
+                    names.join(", ")
+                )
             }
         }
     }
@@ -216,12 +291,31 @@ impl fmt::Debug for LiveMetrics {
 pub type ParkerFactory =
     Arc<dyn Fn(Arc<StopState>, Arc<dyn Clock>) -> Box<dyn Parker> + Send + Sync>;
 
+/// What the watchdog thread should be, per run.
+///
+/// The default is [`WatchdogSetting::FromConfig`]: the grace period is
+/// `[server].shutdown_timeout_secs` from the loaded file, which is how that
+/// setting reaches a thread that starts after configuration has been read.
+/// Tests and embedded hosts either name an explicit policy or switch the
+/// watchdog off entirely.
+#[derive(Clone, Debug, Default)]
+pub enum WatchdogSetting {
+    /// Build the policy from the loaded configuration's timeout.
+    #[default]
+    FromConfig,
+    /// No watchdog. Nothing enforces the shutdown deadline; only do this when
+    /// something else owns it.
+    Disabled,
+    /// An explicit policy, overriding whatever the file says.
+    Custom(WatchdogPolicy),
+}
+
 /// Everything configurable about a server run.
 ///
 /// Defaults describe a normal production boot: monotonic clock, condvar
-/// parking, a process-exiting watchdog with [`DEFAULT_SHUTDOWN_GRACE_NS`] of
-/// grace, info-level logs on stdout. Tests override pieces individually and
-/// leave the rest honest.
+/// parking, a config-driven process-exiting watchdog, info-level logs on
+/// stdout until the file says otherwise. Tests override pieces individually
+/// and leave the rest honest.
 pub struct ServerOptions {
     pub config_path: PathBuf,
     pub world_dir: PathBuf,
@@ -230,9 +324,8 @@ pub struct ServerOptions {
     pub loop_parker: ParkerFactory,
     /// Builds the parker the watchdog thread owns.
     pub watchdog_parker: ParkerFactory,
-    /// `None` disables the watchdog entirely (tests that need fully
-    /// deterministic single-stepping do this).
-    pub watchdog: Option<WatchdogPolicy>,
+    /// What watchdog to run across the tick loop and teardown.
+    pub watchdog: WatchdogSetting,
     pub logger: Logger,
     /// Participants registered on top of the ones built from configuration.
     pub extra_tasks: Vec<Box<dyn TickParticipant>>,
@@ -248,7 +341,14 @@ impl fmt::Debug for ServerOptions {
         f.debug_struct("ServerOptions")
             .field("config_path", &self.config_path)
             .field("world_dir", &self.world_dir)
-            .field("watchdog", &self.watchdog.is_some())
+            .field(
+                "watchdog",
+                match &self.watchdog {
+                    WatchdogSetting::Disabled => &"disabled",
+                    WatchdogSetting::FromConfig => &"from-config",
+                    WatchdogSetting::Custom(_) => &"custom",
+                },
+            )
             .field("extra_tasks", &self.extra_tasks.len())
             .finish_non_exhaustive()
     }
@@ -257,7 +357,9 @@ impl fmt::Debug for ServerOptions {
 impl Default for ServerOptions {
     fn default() -> Self {
         let clock: Arc<dyn Clock> = Arc::new(MonotonicClock::new());
-        let logger = Logger::to_stdout(Level::Info, Arc::clone(&clock));
+        // Anchored once, here: the monotonic clock reads from process start,
+        // and log lines should show the calendar, not the uptime.
+        let logger = Logger::to_stdout(Level::Info, Arc::clone(&clock)).anchored_to_unix_now();
         let loop_parker: ParkerFactory =
             Arc::new(|state, clock| Box::new(CondvarParker::new(state, clock)));
         Self {
@@ -265,7 +367,7 @@ impl Default for ServerOptions {
             world_dir: PathBuf::from(DEFAULT_WORLD_DIR),
             loop_parker: Arc::clone(&loop_parker),
             watchdog_parker: loop_parker,
-            watchdog: Some(WatchdogPolicy::exit_process(DEFAULT_SHUTDOWN_GRACE_NS)),
+            watchdog: WatchdogSetting::default(),
             logger,
             extra_tasks: Vec::new(),
             virtual_work_clock: None,
@@ -366,28 +468,47 @@ impl Server {
             Err(e) => return Err(e), // nothing has started yet; nothing to undo
         }
         completed.push(Phase::ConfigLoad);
+
+        // Configuration is in; everything downstream takes its numbers from
+        // it. The log filter applies from here on — phases 2 and later speak
+        // at the loudness the file asked for.
+        let staged = self.config.as_ref().expect("config staged by phase 1");
+        let runtime = RuntimeSettings::from_config(staged);
+        self.options.logger = self
+            .options
+            .logger
+            .with_filter(log_level_of(staged.server.log_level));
         if self.shared.stop.is_stopped() {
-            return Ok(self.abort_startup(completed, &mut transcript, started_at));
+            let transcript = std::mem::take(&mut transcript);
+            return Ok(self.abort_startup(completed, transcript, started_at));
         }
 
         // ---- Phase 2: world directories --------------------------------
-        if let Err(e) = self.start_world_dirs(&mut transcript) {
+        if let Err(mut e) = self.start_world_dirs(&mut transcript) {
             self.teardown(completed, &mut transcript, 0);
+            e.attach(std::mem::take(&mut transcript));
             return Err(e);
         }
         completed.push(Phase::WorldDirs);
         if self.shared.stop.is_stopped() {
-            return Ok(self.abort_startup(completed, &mut transcript, started_at));
+            {
+                let transcript = std::mem::take(&mut transcript);
+                return Ok(self.abort_startup(completed, transcript, started_at));
+            }
         }
 
         // ---- Phase 3: network placeholder ------------------------------
-        if let Err(e) = self.start_network_placeholder(&mut transcript) {
+        if let Err(mut e) = self.start_network_placeholder(&mut transcript) {
             self.teardown(completed, &mut transcript, 0);
+            e.attach(std::mem::take(&mut transcript));
             return Err(e);
         }
         completed.push(Phase::NetworkBind);
         if self.shared.stop.is_stopped() {
-            return Ok(self.abort_startup(completed, &mut transcript, started_at));
+            {
+                let transcript = std::mem::take(&mut transcript);
+                return Ok(self.abort_startup(completed, transcript, started_at));
+            }
         }
 
         // ---- Phase 4: the tick loop ------------------------------------
@@ -407,8 +528,16 @@ impl Server {
         });
 
         // From here on the watchdog watches: armed by the stop request, it
-        // enforces the deadline across the loop and the whole teardown.
-        let policy = self.options.watchdog.take();
+        // enforces the deadline across the loop and the whole teardown. The
+        // grace period comes from configuration unless the run was given an
+        // explicit policy or told to go without.
+        let policy = match &self.options.watchdog {
+            WatchdogSetting::Disabled => None,
+            WatchdogSetting::Custom(policy) => Some(policy.clone()),
+            WatchdogSetting::FromConfig => {
+                Some(WatchdogPolicy::exit_process(runtime.shutdown_grace_ns))
+            }
+        };
         if let Some(policy) = &policy {
             let harness = WatchdogHarness {
                 stop: Arc::clone(&self.shared.stop),
@@ -426,15 +555,19 @@ impl Server {
             tracker.spawn("dust-watchdog", move || watch_dog(harness));
         }
 
-        let summary = self.run_tick_loop(&mut participants);
+        let summary = self.run_tick_loop(&mut participants, runtime.catchup_cap);
         completed.push(Phase::TickLoop);
 
         // ---- Shutdown: exact reverse of everything completed ------------
         self.teardown(completed, &mut transcript, summary.ticks_run);
 
         // Release the watchdog first so a not-yet-fired one retires quietly;
-        // one that already fired has already done its worst.
+        // one that already fired has already done its worst. The extra wake
+        // matters under virtual time: nothing else moves the clock after the
+        // loop exits, so without this the watcher would sleep out its whole
+        // grace period on a clock that will never reach it.
         self.shared.complete.store(true, Ordering::SeqCst);
+        self.shared.stop.broadcast_stop();
         let (joined, panicked) = self.tracker.join_all();
 
         Ok(ShutdownReport {
@@ -447,6 +580,7 @@ impl Server {
             participants: participant_names,
             transcript,
             watchdog_fired: self.shared.watchdog_fired.load(Ordering::SeqCst),
+            shutdown_grace_ns: policy.map(|_| runtime.shutdown_grace_ns),
             threads_joined: joined.len(),
             thread_panics: panicked,
         })
@@ -466,12 +600,18 @@ impl Server {
                     .filter(|f| f.severity == dust_config::Severity::Warning)
                     .count();
                 let origin = self.options.config_path.display();
+                let server = &config.server;
                 transcript.push(TranscriptEntry {
                     phase: Phase::ConfigLoad,
                     direction: Direction::Start,
                     detail: format!(
                         "loaded {origin} ({warnings} warning(s)); defaults applied \
-                         for anything unset"
+                         for anything unset; catch-up capped at {} tick(s), \
+                         shutdown grace {}s, logs at {}, bind {}",
+                        server.max_catchup_ticks,
+                        server.shutdown_timeout_secs,
+                        server.log_level,
+                        server.bind,
                     ),
                 });
                 self.config = Some(config);
@@ -484,10 +624,7 @@ impl Server {
         }
     }
 
-    fn start_world_dirs(
-        &self,
-        transcript: &mut Vec<TranscriptEntry>,
-    ) -> Result<(), ServerError> {
+    fn start_world_dirs(&self, transcript: &mut Vec<TranscriptEntry>) -> Result<(), ServerError> {
         let dir = self.options.world_dir.clone();
         match std::fs::create_dir_all(&dir) {
             Ok(()) => {
@@ -503,7 +640,11 @@ impl Server {
                     "dust::server",
                     format!("world directory {} failed: {source}", dir.display()),
                 );
-                Err(ServerError::WorldDirs { path: dir, source })
+                Err(ServerError::WorldDirs {
+                    path: dir,
+                    source,
+                    transcript: Vec::new(),
+                })
             }
         }
     }
@@ -533,7 +674,11 @@ impl Server {
                 Ok(())
             }
             Err(message) => {
-                let err = ServerError::NetworkBind { bind: bind.clone(), message };
+                let err = ServerError::NetworkBind {
+                    bind: bind.clone(),
+                    message,
+                    transcript: Vec::new(),
+                };
                 self.options.logger.error("dust::server", format!("{err}"));
                 Err(err)
             }
@@ -542,15 +687,22 @@ impl Server {
 
     /// The hot loop. Checks stop **between** passes; a batch in flight always
     /// finishes whole.
-    fn run_tick_loop(&self, participants: &mut ParticipantSet) -> EngineSummary {
+    ///
+    /// `catchup_cap` is the per-burst repayment allowance, from
+    /// `[server].max_catchup_ticks`; it is an argument rather than a field so
+    /// the loop cannot run without the configuration phase having supplied it.
+    fn run_tick_loop(&self, participants: &mut ParticipantSet, catchup_cap: u32) -> EngineSummary {
         let parker = (self.options.loop_parker)(
             Arc::clone(&self.shared.stop),
             Arc::clone(&self.options.clock),
         );
-        let mut engine = TickEngine::new(Arc::clone(&self.options.clock));
+        let mut engine =
+            TickEngine::new(Arc::clone(&self.options.clock)).with_catchup_cap(catchup_cap);
         while !self.shared.stop.is_stopped() {
             engine.advance(participants, &self.options.logger);
-            self.shared.ticks_observed.store(engine.ticks_run(), Ordering::SeqCst);
+            self.shared
+                .ticks_observed
+                .store(engine.ticks_run(), Ordering::SeqCst);
             if self.shared.stop.is_stopped() {
                 break;
             }
@@ -565,9 +717,7 @@ impl Server {
             participant_timing: engine
                 .accounted_participants()
                 .into_iter()
-                .filter_map(|name| {
-                    engine.participant_timing(&name).map(|stats| (name, stats))
-                })
+                .filter_map(|name| engine.participant_timing(&name).map(|stats| (name, stats)))
                 .collect(),
         }
     }
@@ -599,12 +749,12 @@ impl Server {
     fn abort_startup(
         self,
         completed: Vec<Phase>,
-        transcript: &mut Vec<TranscriptEntry>,
+        mut transcript: Vec<TranscriptEntry>,
         started_at: u64,
     ) -> ShutdownReport {
         // No helper threads exist on this path: the watchdog spawns only
         // once the tick loop begins.
-        self.teardown(completed, transcript, 0);
+        self.teardown(completed, &mut transcript, 0);
         ShutdownReport {
             interrupted: true,
             ticks_run: 0,
@@ -615,6 +765,7 @@ impl Server {
             participants: Vec::new(),
             transcript,
             watchdog_fired: false,
+            shutdown_grace_ns: None,
             threads_joined: 0,
             thread_panics: Vec::new(),
         }
@@ -634,8 +785,9 @@ pub fn resolve_bind(bind: &str) -> Result<SocketAddr, String> {
     let (host, port) = bind
         .rsplit_once(':')
         .ok_or_else(|| format!("expected host:port, got {bind:?} with no port"))?;
-    let port: u16 =
-        port.parse().map_err(|_| format!("port {port:?} is not a u16"))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| format!("port {port:?} is not a u16"))?;
     (host, port)
         .to_socket_addrs()
         .map_err(|e| format!("could not resolve host {host:?}: {e}"))?
@@ -671,6 +823,10 @@ pub struct ShutdownReport {
     pub participants: Vec<String>,
     pub transcript: Vec<TranscriptEntry>,
     pub watchdog_fired: bool,
+    /// The grace period the watchdog ran with, in nanoseconds — `None` when
+    /// the run went without one. Recorded because "the timeout came from the
+    /// file" is a claim a report can carry and a reader can check.
+    pub shutdown_grace_ns: Option<u64>,
     pub threads_joined: usize,
     pub thread_panics: Vec<String>,
 }
@@ -688,5 +844,246 @@ impl ShutdownReport {
             .iter()
             .map(|e| (e.phase, e.direction))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::TICK_NS;
+    use crate::stop::StepParker;
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    /// A unique temp file per call: tests run in parallel in one process, and
+    /// two of them sharing a config path would share a fate.
+    fn write_config(text: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "dust-server-test-{}-{}.toml",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst),
+        ));
+        std::fs::write(&path, text).expect("write the temp config");
+        path
+    }
+
+    /// Bytes collected from the logger, shareable with the test thread.
+    #[derive(Clone, Default)]
+    struct SinkBytes(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SinkBytes {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A parker factory whose parks advance virtual time by `step_ns`, so a
+    /// full lifecycle costs no real time.
+    fn stepping(clock: Arc<ManualClock>, step_ns: u64) -> ParkerFactory {
+        Arc::new(move |_state, _clock| {
+            Box::new(StepParker::new(clock.clone(), step_ns)) as Box<dyn Parker>
+        })
+    }
+
+    /// A server wired for virtual time around one config file, plus the
+    /// handles a test needs to watch and stop it.
+    struct Run {
+        metrics: LiveMetrics,
+        stop: StopHandle,
+        sink: Arc<Mutex<Vec<u8>>>,
+        config_path: PathBuf,
+    }
+
+    /// Build (but do not start) a virtual-time run of `dust server`.
+    fn boot(config_text: &str, configure: impl FnOnce(&mut ServerOptions)) -> (Run, Server) {
+        let clock = Arc::new(ManualClock::new());
+        let sink = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let logger = Logger::new(
+            Arc::new(Mutex::new(SinkBytes(Arc::clone(&sink)))),
+            Level::Info,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+        );
+        let config_path = write_config(config_text);
+        let mut options = ServerOptions {
+            config_path: config_path.clone(),
+            clock: Arc::clone(&clock) as Arc<dyn Clock>,
+            // The tick loop parks by advancing virtual time; the watchdog
+            // deliberately keeps the default condvar park. A stepper would
+            // let the watcher manufacture its own grace expiry faster than
+            // the other threads could report completion — the watchdog may
+            // observe time, never fabricate it.
+            loop_parker: stepping(Arc::clone(&clock), TICK_NS),
+            logger,
+            ..ServerOptions::default()
+        };
+        configure(&mut options);
+        let server = Server::new(options);
+        let run = Run {
+            metrics: server.metrics(),
+            stop: server.stop_handle(),
+            sink,
+            config_path,
+        };
+        (run, server)
+    }
+
+    /// Wait for progress without sleeping: bounded cooperative spinning,
+    /// panicking loudly if the server never gets there.
+    fn wait_until_ticks(metrics: &LiveMetrics, minimum: u64) {
+        for _ in 0..10_000_000 {
+            if metrics.ticks_observed() >= minimum {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        panic!(
+            "the server never reached {minimum} tick(s); stuck at {}",
+            metrics.ticks_observed()
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_bind_unwinds_the_completed_phases_in_reverse() {
+        let (_run, server) = boot("[server]\nbind = \"no port here\"\n", |_| {});
+        let err = server.run().expect_err("a bad bind stops the boot");
+        assert!(matches!(err, ServerError::NetworkBind { .. }), "{err}");
+        assert!(err.to_string().contains("no port here"), "{err}");
+        // Config and world started and were both released; network never
+        // started, so it never appears — not even as a failure line.
+        assert_eq!(
+            err.transcript()
+                .iter()
+                .map(|e| (e.phase, e.direction))
+                .collect::<Vec<_>>(),
+            vec![
+                (Phase::ConfigLoad, Direction::Start),
+                (Phase::WorldDirs, Direction::Start),
+                (Phase::WorldDirs, Direction::Stop),
+                (Phase::ConfigLoad, Direction::Stop),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_invalid_config_stops_the_boot_before_anything_started() {
+        let (_run, server) = boot("[server]\nmotdd = \"typo\"\n", |_| {});
+        let err = server.run().expect_err("an unknown key is refused");
+        assert!(matches!(err, ServerError::Config(_)), "{err}");
+        assert!(err.transcript().is_empty(), "{:?}", err.transcript());
+    }
+
+    #[test]
+    fn the_watchdog_thread_is_spawned_once_and_joined_once() {
+        // This is the lifecycle-level half of the no-leaked-threads
+        // guarantee; the tracker's own books are checked in `stop`'s tests.
+        // What the run adds: the one thread spawned during phase 4 retires
+        // through the same books instead of being detached, and a graceful
+        // shutdown always beats it to completion.
+        let (run, server) = boot("[server]\nshutdown_timeout_secs = 600\n", |options| {
+            options.watchdog =
+                WatchdogSetting::Custom(WatchdogPolicy::custom(600_000_000_000, |_| {}));
+        });
+        let worker = std::thread::spawn(move || server.run());
+        wait_until_ticks(&run.metrics, 2);
+        assert!(run.stop.request_stop());
+        let report = worker.join().expect("run finishes").expect("clean");
+        assert_eq!(report.thread_panics, Vec::<String>::new());
+        assert_eq!(report.threads_joined, 1, "the watchdog thread retires");
+        assert!(!report.watchdog_fired);
+    }
+
+    #[test]
+    fn the_configured_shutdown_timeout_reaches_the_watchdog() {
+        let (run, server) = boot("[server]\nshutdown_timeout_secs = 600\n", |_| {});
+        let worker = std::thread::spawn(move || server.run());
+        wait_until_ticks(&run.metrics, 3);
+        assert!(run.stop.request_stop());
+        let report = worker.join().expect("run finishes").expect("clean");
+        assert_eq!(report.shutdown_grace_ns, Some(600_000_000_000));
+        assert!(!report.watchdog_fired, "graceful shutdown wins the race");
+        assert_eq!(report.thread_panics, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_stop_before_boot_aborts_with_a_symmetric_transcript_and_no_ticks() {
+        let (run, server) = boot("", |_| {});
+        run.stop.request_stop();
+        let report = server.run().expect("an early stop is not an error");
+        assert!(report.interrupted);
+        assert_eq!(report.ticks_run, 0);
+        assert_eq!(
+            report.transcript_pairs(),
+            vec![
+                (Phase::ConfigLoad, Direction::Start),
+                (Phase::ConfigLoad, Direction::Stop),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_configured_log_level_silences_the_heartbeat() {
+        // At warn, the info-level heartbeat never reaches the sink...
+        let (run, server) = boot("[server]\nlog_level = \"warn\"\n", |_| {});
+        let worker = std::thread::spawn(move || server.run());
+        wait_until_ticks(&run.metrics, 2);
+        run.stop.request_stop();
+        let report = worker.join().expect("finishes").expect("clean");
+        assert!(report.is_clean());
+        let text = String::from_utf8(run.sink.lock().unwrap().clone()).expect("utf8");
+        assert!(!text.contains("heartbeat"), "{text}");
+
+        // ...and at the default it does, proving silence was the setting and
+        // not a broken sink.
+        let (run, server) = boot("", |_| {});
+        let worker = std::thread::spawn(move || server.run());
+        wait_until_ticks(&run.metrics, 2);
+        run.stop.request_stop();
+        worker.join().expect("finishes").expect("clean");
+        let text = String::from_utf8(run.sink.lock().unwrap().clone()).expect("utf8");
+        assert!(text.contains("heartbeat"), "{text}");
+    }
+
+    #[test]
+    fn jvm_disabled_keeps_its_placeholder_out_of_the_participant_list() {
+        let (run, server) = boot("[jvm]\nenabled = false\n", |_| {});
+        let worker = std::thread::spawn(move || server.run());
+        wait_until_ticks(&run.metrics, 1);
+        run.stop.request_stop();
+        let report = worker.join().expect("finishes").expect("clean");
+        assert!(
+            !report.participants.contains(&"jvm-placeholder".to_owned()),
+            "{:?}",
+            report.participants
+        );
+        assert!(report.participants.contains(&"status-probe".to_owned()));
+    }
+
+    #[test]
+    fn an_environment_override_reaches_the_runtime_knobs() {
+        // The env layer sits between file and types; these are the settings
+        // this crate consumes, arriving exactly as a container would set
+        // them. Pure function, no process environment touched.
+        let config = DustConfig::from_toml_and_env(
+            "",
+            "test",
+            [
+                ("DUST__SERVER__MAX_CATCHUP_TICKS".to_owned(), "7".to_owned()),
+                (
+                    "DUST__SERVER__SHUTDOWN_TIMEOUT_SECS".to_owned(),
+                    "9".to_owned(),
+                ),
+                ("DUST__SERVER__LOG_LEVEL".to_owned(), "debug".to_owned()),
+            ],
+        )
+        .expect("valid");
+        let runtime = RuntimeSettings::from_config(&config);
+        assert_eq!(runtime.catchup_cap, 7);
+        assert_eq!(runtime.shutdown_grace_ns, 9_000_000_000);
+        assert_eq!(log_level_of(config.server.log_level), Level::Debug);
     }
 }

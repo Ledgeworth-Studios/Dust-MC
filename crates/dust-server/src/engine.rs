@@ -39,10 +39,13 @@ pub const TICK_NS: u64 = 50_000_000;
 
 /// The most simulated time one burst may try to repay, in ticks.
 ///
-/// See the module docs for why this limit exists. If you raise it, you are
-/// deciding the server should try harder to hide long stalls; if you lower
-/// it, you are deciding it should give up sooner and stay responsive. Either
-/// is a defensible answer; having no answer is not.
+/// This constant is the engine's *default* allowance, not its law: each engine
+/// carries its own cap ([`TickEngine::with_catchup_cap`]), and the server sets
+/// that from `[server].max_catchup_ticks` in `dust.toml`. See the module docs
+/// for why the limit exists at all. If you raise it, you are deciding the
+/// server should try harder to hide long stalls; if you lower it, you are
+/// deciding it should give up sooner and stay responsive. Either is a
+/// defensible answer; having no answer is not.
 pub const MAX_CATCHUP_TICKS: u32 = 20;
 
 /// What one call to [`TickEngine::advance`] did.
@@ -65,6 +68,8 @@ pub struct TickEngine {
     next_tick_at: Option<u64>,
     ticks_run: u64,
     paused: bool,
+    /// This engine's allowance per burst; [`MAX_CATCHUP_TICKS`] unless set.
+    catchup_cap: u32,
     surrendered_batches: u64,
     overall: TimingHistogram,
     per_participant: BTreeMap<String, TimingHistogram>,
@@ -82,7 +87,7 @@ impl std::fmt::Debug for TickEngine {
 }
 
 impl TickEngine {
-    /// An idle engine reading time from `clock`.
+    /// An idle engine reading time from `clock`, with the default allowance.
     pub fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
             clock,
@@ -91,18 +96,25 @@ impl TickEngine {
             next_tick_at: None,
             ticks_run: 0,
             paused: false,
+            catchup_cap: MAX_CATCHUP_TICKS,
             surrendered_batches: 0,
             overall: TimingHistogram::new(),
             per_participant: BTreeMap::new(),
         }
     }
 
+    /// Set how many ticks one burst may repay before surrendering, replacing
+    /// [`MAX_CATCHUP_TICKS`]. This is where `[server].max_catchup_ticks`
+    /// lands; a cap of 0 is accepted but means every burst surrenders
+    /// immediately, which configuration validation refuses before an engine
+    /// is ever built.
+    pub fn with_catchup_cap(mut self, cap: u32) -> Self {
+        self.catchup_cap = cap;
+        self
+    }
+
     /// Advance to the clock's current reading and run whatever is due.
-    pub fn advance(
-        &mut self,
-        participants: &mut ParticipantSet,
-        logger: &Logger,
-    ) -> AdvanceReport {
+    pub fn advance(&mut self, participants: &mut ParticipantSet, logger: &Logger) -> AdvanceReport {
         self.advance_at(self.clock.now_ns(), participants, logger)
     }
 
@@ -116,8 +128,8 @@ impl TickEngine {
     /// 2. While paused, nothing runs and any accumulated debt is forgiven, so
     ///    resuming never unleashes a burst to pay for time nobody observed.
     /// 3. Otherwise, due ticks run one at a time until either the schedule
-    ///    catches up with `now` or [`MAX_CATCHUP_TICKS`] have run in this
-    ///    single burst, at which point the rest of the debt is dropped and
+    ///    catches up with `now` or this burst has repaid its allowance (the
+    ///    catch-up cap), at which point the rest of the debt is dropped and
     ///    the schedule resynchronises to now.
     pub fn advance_at(
         &mut self,
@@ -125,12 +137,14 @@ impl TickEngine {
         participants: &mut ParticipantSet,
         logger: &Logger,
     ) -> AdvanceReport {
-        let Some(last) = self.last_now.replace(now_ns) else {
+        // The previous reading is deliberately unused: elapsed time is derived
+        // from the tick schedule rather than from the wall delta, because the
+        // schedule is what the loop owes against.
+        if self.last_now.replace(now_ns).is_none() {
             // First observation: arm from here, owe nothing for the past.
             self.next_tick_at = Some(now_ns.saturating_add(TICK_NS));
             return AdvanceReport::default();
-        };
-        let _ = last; // elapsed is derived from the schedule, not the delta
+        }
 
         if self.paused {
             // Pause forgives: the alternative (banking the gap) would punish
@@ -145,14 +159,14 @@ impl TickEngine {
             if now_ns < deadline {
                 break;
             }
-            if report.ticks_executed >= u64::from(MAX_CATCHUP_TICKS) {
+            if report.ticks_executed >= u64::from(self.catchup_cap) {
                 report.surrendered = true;
                 self.surrendered_batches += 1;
                 logger.warn(
                     "dust::engine",
                     format!(
-                        "tick loop fell {} tick(s) behind; skipping ahead to stay live",
-                        MAX_CATCHUP_TICKS
+                        "tick loop fell more than {} tick(s) behind; skipping ahead to stay live",
+                        self.catchup_cap
                     ),
                 );
                 self.next_tick_at = Some(now_ns.saturating_add(TICK_NS));
@@ -213,8 +227,14 @@ impl TickEngine {
         self.paused = false;
     }
 
+    /// Whether ticks are currently held back by a pause.
     pub fn is_paused(&self) -> bool {
         self.paused
+    }
+
+    /// This engine's per-burst allowance.
+    pub fn catchup_cap(&self) -> u32 {
+        self.catchup_cap
     }
 
     /// How many bursts have hit the catch-up cap.
@@ -229,7 +249,9 @@ impl TickEngine {
 
     /// Per-participant timing, keyed by participant name.
     pub fn participant_timing(&self, name: &str) -> Option<TimingStats> {
-        self.per_participant.get(name).map(TimingHistogram::snapshot)
+        self.per_participant
+            .get(name)
+            .map(TimingHistogram::snapshot)
     }
 
     /// Every participant that has been accounted, in name order.
@@ -242,6 +264,8 @@ impl TickEngine {
 mod tests {
     use super::*;
     use crate::clock::ManualClock;
+    use crate::logging::Level;
+    use crate::participant::TickParticipant;
 
     /// A participant that charges `charge_ns` of virtual time per tick by
     /// advancing the very clock the engine measures with, so the accounting
@@ -285,18 +309,23 @@ mod tests {
         fn with(setup: impl FnOnce(&Arc<ManualClock>, &mut ParticipantSet)) -> Self {
             let clock = Arc::new(ManualClock::new());
             let sink = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-            let logger =
-                Logger::new(sink, Level::Error, Arc::clone(&clock) as Arc<dyn Clock>);
+            let logger = Logger::new(sink, Level::Error, Arc::clone(&clock) as Arc<dyn Clock>);
             let mut set = ParticipantSet::new();
             setup(&clock, &mut set);
             let engine = TickEngine::new(Arc::clone(&clock) as Arc<dyn Clock>);
-            Self { clock, engine, set, logger }
+            Self {
+                clock,
+                engine,
+                set,
+                logger,
+            }
         }
 
         /// Arm the schedule, then move virtual time forward by whole ticks.
         fn run_ticks(&mut self, count: usize) -> AdvanceReport {
             self.engine.advance_at(0, &mut self.set, &self.logger);
-            self.clock.advance_ns(u64::try_from(count).unwrap() * TICK_NS);
+            self.clock
+                .advance_ns(u64::try_from(count).unwrap() * TICK_NS);
             self.engine.advance(&mut self.set, &self.logger)
         }
     }
@@ -373,6 +402,26 @@ mod tests {
     }
 
     #[test]
+    fn a_configured_cap_replaces_the_default_one() {
+        // The catch-up allowance is a setting, not a constant of nature: an
+        // operator who writes max_catchup_ticks = 1 gets an engine that pays
+        // exactly one tick of any debt before resynchronising.
+        let mut h = Harness::new();
+        h.engine = TickEngine::new(Arc::clone(&h.clock) as Arc<dyn Clock>).with_catchup_cap(1);
+        assert_eq!(h.engine.catchup_cap(), 1);
+        h.engine.advance_at(0, &mut h.set, &h.logger);
+        h.clock.advance_ns(5 * TICK_NS);
+        let report = h.engine.advance(&mut h.set, &h.logger);
+        assert!(report.surrendered);
+        assert_eq!(report.ticks_executed, 1, "one tick repaid, four dropped");
+        assert_eq!(
+            h.engine.next_deadline(),
+            Some(5 * TICK_NS + TICK_NS),
+            "the schedule anchors to now, not to the debt"
+        );
+    }
+
+    #[test]
     fn pause_runs_nothing_and_resume_does_not_repay_the_gap() {
         let mut h = Harness::new();
         h.run_ticks(2);
@@ -430,7 +479,11 @@ mod tests {
         assert_eq!(quick.avg, Some(0), "a free participant is measured as free");
         assert_eq!(slow.avg, Some(1_500), "charged time lands on the right row");
         let overall = h.engine.overall_timing();
-        assert_eq!(overall.avg, Some(1_500), "the whole tick pays for its parts");
+        assert_eq!(
+            overall.avg,
+            Some(1_500),
+            "the whole tick pays for its parts"
+        );
         assert_eq!(
             h.engine.accounted_participants(),
             vec!["quick", "slow"],

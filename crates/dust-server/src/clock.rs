@@ -53,7 +53,9 @@ impl Default for MonotonicClock {
 impl MonotonicClock {
     /// Start measuring from now.
     pub fn new() -> Self {
-        Self { start: Instant::now() }
+        Self {
+            start: Instant::now(),
+        }
     }
 }
 

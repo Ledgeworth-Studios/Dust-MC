@@ -19,6 +19,7 @@
 //! virtual-time reason everything else does: production parks on a condvar,
 //! tests park by advancing a manual clock, and neither knows about the other.
 
+use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -27,8 +28,13 @@ use std::time::Duration;
 use crate::clock::Clock;
 
 /// Shared stop state: one atomic bit plus a condvar so sleepers wake early.
+///
+/// Opaque by design — outside callers hold it only to hand it back: a
+/// [`StopHandle`] is the polite front door for requesting a stop, and parker
+/// constructors take this state because two threads must agree on the same
+/// condvar. Nothing here is worth calling directly.
 #[derive(Debug, Default)]
-pub(crate) struct StopState {
+pub struct StopState {
     stopped: AtomicBool,
     sleeper: Mutex<()>,
     wake: Condvar,
@@ -123,10 +129,15 @@ pub trait Parker: Send {
 /// which is also why it degrades gracefully under a manual clock in tests:
 /// a frozen manual clock makes the computed wait long, but any stop request
 /// still wakes it immediately.
-#[derive(Debug)]
 pub struct CondvarParker {
     state: Arc<StopState>,
     clock: Arc<dyn Clock>,
+}
+
+impl fmt::Debug for CondvarParker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CondvarParker").finish_non_exhaustive()
+    }
 }
 
 impl CondvarParker {
@@ -137,7 +148,8 @@ impl CondvarParker {
 
 impl Parker for CondvarParker {
     fn park_until(&self, deadline_ns: u64) {
-        self.state.park_until_stopped_or(deadline_ns, self.clock.as_ref());
+        self.state
+            .park_until_stopped_or(deadline_ns, self.clock.as_ref());
     }
 }
 
@@ -156,11 +168,11 @@ pub struct StepParker {
 
 impl StepParker {
     /// Advance the shared manual clock by `step_ns` each time the loop parks.
-    pub fn new(
-        clock: std::sync::Arc<crate::clock::ManualClock>,
-        step_ns: u64,
-    ) -> Self {
-        assert!(step_ns > 0, "a zero-step parker would spin without progressing");
+    pub fn new(clock: std::sync::Arc<crate::clock::ManualClock>, step_ns: u64) -> Self {
+        assert!(
+            step_ns > 0,
+            "a zero-step parker would spin without progressing"
+        );
         Self { clock, step_ns }
     }
 }
@@ -226,7 +238,10 @@ impl WatchdogPolicy {
     /// Run an arbitrary action instead of exiting. For tests and embedded
     /// hosts that want to decide for themselves.
     pub fn custom(grace_ns: u64, action: impl Fn(WatchdogFiring) + Send + Sync + 'static) -> Self {
-        Self { grace_ns, action: Arc::new(action) }
+        Self {
+            grace_ns,
+            action: Arc::new(action),
+        }
     }
 }
 
@@ -251,15 +266,8 @@ impl ThreadTracker {
     /// Spawn a thread and remember it. Panicking spawns are recorded too —
     /// `std::thread::Builder::spawn` fails before a handle exists, and a
     /// spawn that never started needs no joining.
-    pub(crate) fn spawn(
-        self: &Arc<Self>,
-        name: &str,
-        f: impl FnOnce() + Send + 'static,
-    ) {
-        match thread::Builder::new()
-            .name(name.to_owned())
-            .spawn(f)
-        {
+    pub(crate) fn spawn(self: &Arc<Self>, name: &str, f: impl FnOnce() + Send + 'static) {
+        match thread::Builder::new().name(name.to_owned()).spawn(f) {
             Ok(handle) => self.threads.lock().unwrap().push(Tracked {
                 name: name.to_owned(),
                 handle: Some(handle),
@@ -293,7 +301,12 @@ impl ThreadTracker {
     /// precisely the assertion tests make.
     #[cfg(test)]
     pub(crate) fn outstanding(self: &Arc<Self>) -> usize {
-        self.threads.lock().unwrap().iter().filter(|t| t.handle.is_some()).count()
+        self.threads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.handle.is_some())
+            .count()
     }
 }
 
@@ -462,7 +475,9 @@ mod tests {
 
         // Completion still retires the watcher cleanly after a firing.
         complete.store(true, Ordering::SeqCst);
-        worker.join().expect("watcher thread exits after completion");
+        worker
+            .join()
+            .expect("watcher thread exits after completion");
     }
 
     #[test]

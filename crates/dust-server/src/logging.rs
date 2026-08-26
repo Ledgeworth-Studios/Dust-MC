@@ -68,11 +68,21 @@ type Sink = Arc<Mutex<dyn Write + Send>>;
 /// It is cheap to clone by arc and safe to share across threads; the mutex is
 /// only ever held for one line's worth of writing so interleaving cannot tear
 /// a line in half.
+///
+/// Timestamps are `[Clock] reading + epoch anchor`. The anchor exists because
+/// the production clock counts nanoseconds since process start — the right
+/// thing for deadlines, the wrong thing for a calendar — so [`to_stdout`]
+/// anchors once to the wall at construction and every line shows true UTC
+/// from there on. Virtual-time setups leave the anchor at zero, where the
+/// epoch *is* time zero and tests can assert on exact output. The anchor is
+/// never re-read: a log line that jumps backwards when NTP corrects the host
+/// is worse than one that drifts by milliseconds over a month.
 #[derive(Clone)]
 pub struct Logger {
     sink: Sink,
     filter: Level,
     clock: Arc<dyn Clock>,
+    epoch_ns: u64,
 }
 
 impl fmt::Debug for Logger {
@@ -85,14 +95,62 @@ impl fmt::Debug for Logger {
 
 impl Logger {
     /// A logger writing to `sink`, showing levels at or above `filter`
-    /// severity, stamping lines from `clock`.
+    /// severity, stamping lines from `clock` with no epoch anchor: a zero
+    /// reading formats as 1970, which is exactly what virtual time wants.
     pub fn new(sink: Sink, filter: Level, clock: Arc<dyn Clock>) -> Self {
-        Self { sink, filter, clock }
+        Self {
+            sink,
+            filter,
+            clock,
+            epoch_ns: 0,
+        }
     }
 
     /// A logger writing to standard output.
     pub fn to_stdout(filter: Level, clock: Arc<dyn Clock>) -> Self {
         Self::new(Arc::new(Mutex::new(std::io::stdout())), filter, clock)
+    }
+
+    /// Anchor the timestamps to the wall: a zero clock reading now formats as
+    /// the moment this was called, and everything after is real UTC.
+    ///
+    /// Production runs this once, at construction. The anchor is deliberately
+    /// never re-read — a log that jumps when NTP corrects the host is harder
+    /// to grep than one that drifts by milliseconds over a month — and
+    /// virtual-time tests leave it at zero so they can assert exact output.
+    pub fn anchored_to_unix_now(self) -> Self {
+        Self {
+            epoch_ns: Self::unix_epoch_ns_now(),
+            ..self
+        }
+    }
+
+    /// The same anchoring with the epoch named explicitly, which is what
+    /// tests use: an assertion on rendered output must not depend on when the
+    /// test ran.
+    pub fn anchored_to_unix_now_at(self, epoch_ns: u64) -> Self {
+        Self { epoch_ns, ..self }
+    }
+
+    /// Nanoseconds since the Unix epoch, read once.
+    pub fn unix_epoch_ns_now() -> u64 {
+        let since_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        u64::try_from(since_epoch.as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    /// The same logger, showing levels at or above `filter` instead.
+    ///
+    /// This is how configuration reaches the sink: the server builds its
+    /// logger before it has read any configuration, then re-filters once the
+    /// file says how loud to be. Sinks and clocks are shared, so lines already
+    /// written stay where they are and only the gate moves.
+    pub fn with_filter(&self, filter: Level) -> Self {
+        Self {
+            filter,
+            ..self.clone()
+        }
     }
 
     /// Whether `level` passes the current filter.
@@ -107,7 +165,7 @@ impl Logger {
         }
         let line = format!(
             "{} [{}] [{}] {message}\n",
-            iso8601_utc(self.clock.now_ns()),
+            iso8601_utc(self.epoch_ns.saturating_add(self.clock.now_ns())),
             level.label(),
             target,
         );
@@ -165,7 +223,11 @@ fn iso8601_utc(ns_since_epoch: u64) -> String {
     let mp = (5 * doy + 2) / 153;
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { yoe + era * 400 + 1 } else { yoe + era * 400 };
+    let year = if month <= 2 {
+        yoe + era * 400 + 1
+    } else {
+        yoe + era * 400
+    };
 
     format!(
         "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
@@ -187,8 +249,8 @@ mod tests {
     }
 
     impl Buffer {
-        fn text(self) -> String {
-            String::from_utf8(self.bytes).expect("tests write UTF-8")
+        fn text(&self) -> String {
+            String::from_utf8(self.bytes.clone()).expect("tests write UTF-8")
         }
     }
 
@@ -206,7 +268,11 @@ mod tests {
         let buffer: Arc<Mutex<Buffer>> = Arc::default();
         let clock = Arc::new(ManualClock::new());
         let sink: Sink = Arc::clone(&buffer) as Sink;
-        (Logger::new(sink, filter, Arc::clone(&clock) as Arc<dyn Clock>), clock, buffer)
+        (
+            Logger::new(sink, filter, Arc::clone(&clock) as Arc<dyn Clock>),
+            clock,
+            buffer,
+        )
     }
 
     #[test]
@@ -238,7 +304,40 @@ mod tests {
         let (logger, clock, buffer) = logger_at(Level::Trace);
         clock.set_ns(0);
         logger.info("t", "epoch");
-        assert!(buffer.lock().unwrap().text().starts_with("1970-01-01T00:00:00.000Z"));
+        assert!(buffer
+            .lock()
+            .unwrap()
+            .text()
+            .starts_with("1970-01-01T00:00:00.000Z"));
+    }
+
+    #[test]
+    fn an_anchored_logger_shows_wall_time_offset_by_the_virtual_reading() {
+        let (unanchored, clock, buffer) = logger_at(Level::Info);
+        // The production shape: a clock reading from an arbitrary origin,
+        // anchored once so a zero reading displays as the moment of anchor.
+        let anchor_ns = 1_787_661_296_789_000_000;
+        let logger = unanchored.anchored_to_unix_now_at(anchor_ns);
+        clock.set_ns(0);
+        logger.info("t", "anchor moment");
+        assert_eq!(
+            buffer.lock().unwrap().text(),
+            "2026-08-25T12:34:56.789Z [INFO ] [t] anchor moment\n",
+            "a zero reading displays as the anchor, not as the epoch"
+        );
+        // Half a second later on the injected clock is half a second later in
+        // the rendered world: the anchor moves with the readings.
+        clock.advance_ns(500_000_000);
+        logger.info("t", "half past");
+        assert!(
+            buffer
+                .lock()
+                .unwrap()
+                .text()
+                .contains("2026-08-25T12:34:57.289Z"),
+            "{}",
+            buffer.lock().unwrap().text()
+        );
     }
 
     #[test]
@@ -260,7 +359,10 @@ mod tests {
         struct Closed;
         impl Write for Closed {
             fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed"))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed",
+                ))
             }
             fn flush(&mut self) -> std::io::Result<()> {
                 Ok(())
