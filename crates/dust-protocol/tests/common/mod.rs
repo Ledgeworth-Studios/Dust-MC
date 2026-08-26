@@ -1376,7 +1376,12 @@ fn play_frames(out: &mut Vec<Frame>) {
             text: s::<32_500>("gamerule keepInv"),
         }
     ));
-    out.push(frame!(sb, Play, Serverbound, sb::AcknowledgeConfiguration {}));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::AcknowledgeConfiguration {}
+    ));
     out.push(frame!(
         sb,
         Play,
@@ -1386,7 +1391,12 @@ fn play_frames(out: &mut Vec<Frame>) {
             button_id: VarInt(1),
         }
     ));
-    out.push(frame!(sb, Play, Serverbound, sb::CloseContainer { window_id: 0 }));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::CloseContainer { window_id: 0 }
+    ));
     out.push(frame!(
         sb,
         Play,
@@ -1472,7 +1482,12 @@ fn play_frames(out: &mut Vec<Frame>) {
             right_paddle: false,
         }
     ));
-    out.push(frame!(sb, Play, Serverbound, sb::PickItem { slot: VarInt(4) }));
+    out.push(frame!(
+        sb,
+        Play,
+        Serverbound,
+        sb::PickItem { slot: VarInt(4) }
+    ));
     out.push(frame!(
         sb,
         Play,
@@ -1557,7 +1572,9 @@ fn play_frames(out: &mut Vec<Frame>) {
         sb,
         Play,
         Serverbound,
-        sb::SelectTrade { selected_slot: VarInt(2) }
+        sb::SelectTrade {
+            selected_slot: VarInt(2)
+        }
     ));
     out.push(frame!(
         sb,
@@ -1635,7 +1652,8 @@ fn play_frames(out: &mut Vec<Frame>) {
             size_y: 20,
             size_z: 15,
             mirror: dust_protocol::packets::play::serverbound::StructureBlockMirror::FrontBack,
-            rotation: dust_protocol::packets::play::serverbound::StructureBlockRotation::Clockwise90,
+            rotation:
+                dust_protocol::packets::play::serverbound::StructureBlockRotation::Clockwise90,
             metadata: s::<32_767>(""),
             integrity: 0.5,
             seed: dust_protocol::types::VarLong(-4_242_424_242),
@@ -1669,7 +1687,9 @@ fn play_frames(out: &mut Vec<Frame>) {
         sb,
         Play,
         Serverbound,
-        sb::SpectateTeleport { target: Uuid(0xFEED) }
+        sb::SpectateTeleport {
+            target: Uuid(0xFEED)
+        }
     ));
     out.push(frame!(
         sb,

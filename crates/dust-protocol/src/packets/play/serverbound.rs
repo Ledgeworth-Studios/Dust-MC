@@ -7,13 +7,13 @@
 //! id *is* the tag, and collapsing them would put the id back inside a body,
 //! which this crate never does.
 
-use crate::{packet_group, var_int_enum};
 use crate::packets::play::advancements::SeenAdvancementsBody;
 use crate::packets::play::chat::MessageAcknowledgement;
 use crate::packets::play::containers::{ChangedSlot, ClickType, RecipeBookType};
 use crate::packets::play::map_item::BookPage;
 use crate::packets::play::{Abilities, DifficultyByte, Hand};
 use crate::types::{BoundedString, Identifier, RestOfPacket, Slot, VarInt};
+use crate::{packet_group, var_int_enum};
 
 packet_group! {
     state: Play,

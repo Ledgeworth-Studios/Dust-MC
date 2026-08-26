@@ -560,11 +560,19 @@ fn the_unclaimed_worklist_is_exactly_the_blocked_set() {
             Direction::Clientbound,
             "minecraft:container_set_content",
         ),
-        (State::Play, Direction::Clientbound, "minecraft:container_set_slot"),
+        (
+            State::Play,
+            Direction::Clientbound,
+            "minecraft:container_set_slot",
+        ),
         // The chat-signing wall: offline-first means no session keys, and
         // these packets exist to carry them. See `play::chat`.
         (State::Play, Direction::Clientbound, "minecraft:delete_chat"),
-        (State::Play, Direction::Serverbound, "minecraft:chat_command"),
+        (
+            State::Play,
+            Direction::Serverbound,
+            "minecraft:chat_command",
+        ),
         (
             State::Play,
             Direction::Serverbound,
@@ -576,7 +584,11 @@ fn the_unclaimed_worklist_is_exactly_the_blocked_set() {
             "minecraft:chat_session_update",
         ),
         // Development-only pair; neither half means anything alone.
-        (State::Play, Direction::Clientbound, "minecraft:debug_sample"),
+        (
+            State::Play,
+            Direction::Clientbound,
+            "minecraft:debug_sample",
+        ),
         (
             State::Play,
             Direction::Serverbound,
@@ -595,6 +607,9 @@ fn the_unclaimed_worklist_is_exactly_the_blocked_set() {
         "the worklist moved: {actual:#?} — update this test deliberately"
     );
     for (got, want) in actual.iter().zip(expected.iter()) {
-        assert_eq!(got, want, "the worklist moved — update this test deliberately");
+        assert_eq!(
+            got, want,
+            "the worklist moved — update this test deliberately"
+        );
     }
 }
