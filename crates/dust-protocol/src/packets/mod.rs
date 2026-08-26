@@ -34,7 +34,7 @@
 //! Three things connect them here, and they are the reason this is a
 //! declarative macro rather than forty hand-rolled `impl` blocks:
 //!
-//! 1. **A definition never writes an id.** [`packet_group!`] takes the packet's
+//! 1. **A definition never writes an id.** [`crate::packet_group!`] takes the packet's
 //!    namespaced *name* and looks the number up in the generated table at
 //!    dispatch time, per version. A release that renumbers every packet in the
 //!    protocol needs no edit here at all — which is most of what a version bump

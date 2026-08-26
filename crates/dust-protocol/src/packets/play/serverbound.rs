@@ -18,7 +18,7 @@ packet_group! {
     versions: ["1.21.1"],
 
     /// "The teleport you sent me happened." Carries back the id from
-    /// [`clientbound::PlayerPosition`]; until this arrives the server treats
+    /// the clientbound `player_position`; until this arrives the server treats
     /// the client's position as provisional.
     "minecraft:accept_teleportation" => TeleportConfirm {
         teleport_id: VarInt,

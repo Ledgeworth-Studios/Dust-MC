@@ -9,7 +9,7 @@
 //! closed Rust enum over an **open** wire format, and the seam between those
 //! two is the whole design.
 //!
-//! The rule is [`MetadataValue::from_discriminant`]: a serializer this crate
+//! The rule is [`MetadataValue::read`]: a serializer this crate
 //! models decodes into a variant; a serializer it does not returns
 //! [`DecodeError::Unsupported`] naming the id. It does not guess. A
 //! serializer's value has **no length**, so stepping past an unknown one

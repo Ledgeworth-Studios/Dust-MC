@@ -41,7 +41,7 @@
 //! ```
 //!
 //! The runner takes plain function pointers rather than a generic over the
-//! [`WireRead`](crate::wire::WireRead) trait on purpose: `dust-net`'s reader
+//! [`WireRead`] trait on purpose: `dust-net`'s reader
 //! will have its own error type and its own lifetimes, and a conformance check
 //! that made it implement this crate's traits first would be a check it could
 //! not run until after the merge it exists to make safe.
