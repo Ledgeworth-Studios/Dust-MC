@@ -65,6 +65,15 @@ pub enum DecodeError {
     UnknownVariant { name: &'static str, value: i32 },
     /// A namespaced id was not one.
     BadIdentifier { value: String },
+    /// A structured value carried a key this crate does not model.
+    ///
+    /// The key is owned because it came off the wire. Refusing rather than
+    /// skipping is the point: a skipped key renders a different message than
+    /// was sent, and nothing downstream would ever know.
+    UnknownField {
+        container: &'static str,
+        key: String,
+    },
     /// A packet id that this state and direction has no packet for.
     UnknownPacket {
         state: &'static str,
@@ -108,6 +117,9 @@ impl fmt::Display for DecodeError {
                 write!(f, "{value} is not a {name}")
             }
             Self::BadIdentifier { value } => write!(f, "`{value}` is not a namespaced id"),
+            Self::UnknownField { container, key } => {
+                write!(f, "{container} carries the key `{key}`, which is not modelled")
+            }
             Self::UnknownPacket {
                 state,
                 direction,

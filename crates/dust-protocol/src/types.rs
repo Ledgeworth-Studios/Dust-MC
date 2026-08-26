@@ -79,6 +79,33 @@ fixed_width! {
     f64 => read_f64 / write_f64,
 }
 
+/// A byte sequence of a length both sides know in advance.
+///
+/// Distinct from [`PrefixedBytes`], which carries a VarInt count. The chat
+/// signature is the reason this exists: it is *always* 256 bytes and is
+/// **not** length-prefixed, so wrapping it in a prefixed type writes four
+/// bytes vanilla never sends and desynchronises every field after it. The
+/// length lives in the type, where a reader cannot get it wrong.
+impl<const N: usize> Decode for [u8; N] {
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        _version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        input.read_array()
+    }
+}
+
+impl<const N: usize> Encode for [u8; N] {
+    fn encode<W: WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        _version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        out.write_slice(self);
+        Ok(())
+    }
+}
+
 /// An `i32` in the protocol's variable-length encoding.
 ///
 /// A distinct type from `i32` on purpose. Both appear in packet bodies and

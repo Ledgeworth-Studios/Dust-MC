@@ -1,10 +1,13 @@
-//! The 41 packet bodies a connection uses before it reaches Play.
+//! The packet bodies, state by state and direction by direction.
 //!
 //! # Scope
 //!
-//! Handshake, status, login and configuration, both directions. That is what a
-//! client has to get through before it is in the world, and it is the whole of
-//! what accepting a connection needs. Play's 182 packets are not here.
+//! Handshake, status, login and configuration are complete: that is what a
+//! client has to get through before it reaches Play, and every packet those
+//! four states can carry is defined. Play is defined family by family — join
+//! and movement first, then the world and entity families, then chat — and is
+//! deliberately not finished; [`unclaimed_for`] is the worklist of what is
+//! left.
 //!
 //! Do not confuse this module with [`crate::generated::packets`], which is the
 //! id table. This one is bodies; that one is names and numbers.
@@ -50,23 +53,26 @@
 //! Point 3 is the one that answers D3. A definition that is right for 1.21.1
 //! and silently wrong for 1.21.4 is exactly the failure D3 exists to prevent,
 //! and the guard against it is a version list on every definition plus a test
-//! that no packet in a version's table is unclaimed. The guard is tested with a
-//! version that does not exist, so that it is known to bite rather than assumed
+//! that no packet in a version's table is unclaimed. The forward half of the
+//! guard applies per pair — see [`COMPLETE_PAIRS`] for why Play is held to it
+//! only once its last packet is written. The guard is tested with a version
+//! that does not exist, so that it is known to bite rather than assumed
 //! to — see the tests at the bottom of this file.
 //!
 //! # What the definitions do not prove
 //!
 //! That a layout is right. A hand-written field list can be wrong in a way
 //! every test in this crate agrees with, because every test in this crate reads
-//! the same list. The check that a layout is right is the live vanilla server
-//! in `tests/vanilla_conformance.rs`, which decodes what a real 1.21.1 server
-//! actually sends and insists that every packet ends exactly where the
-//! definition says it does.
+//! the same list. The check that a layout is right is a live vanilla server:
+//! decoding what a real 1.21.1 server actually sends and insisting that every
+//! packet ends exactly where the definition says it does. Nothing here can do
+//! that job from inside the crate.
 
 pub mod common;
 pub mod configuration;
 pub mod handshake;
 pub mod login;
+pub mod play;
 pub mod status;
 
 use crate::{ConnectionState, Direction, ProtocolVersion};
@@ -99,20 +105,34 @@ pub trait PacketBody: crate::types::Encode + crate::types::Decode {
     }
 }
 
-/// The states this crate implements bodies for.
-pub const IMPLEMENTED_STATES: [ConnectionState; 4] = [
-    ConnectionState::Handshake,
-    ConnectionState::Status,
-    ConnectionState::Login,
-    ConnectionState::Configuration,
+/// The (state, direction) pairs whose definitions are **complete**: every
+/// packet the version table lists for the pair is defined here, and the
+/// coverage check refuses to let that drift.
+///
+/// Play is absent on purpose and is not a promise about the future. Its
+/// definitions grow family by family — movement, then entities, then chat —
+/// and a half-covered pair held to the complete-pair rule would turn the suite
+/// red for months while providing no information beyond what this constant
+/// already states. The pair graduates to this list the day its last packet is
+/// written, and [`undefined_for`] turns into its guard from that moment. A
+/// test in `tests/packet_bodies.rs` pins the fact that Play is *not* here, so
+/// nobody mistakes a growing definition list for a finished state.
+pub static COMPLETE_PAIRS: &[(ConnectionState, Direction)] = &[
+    (ConnectionState::Handshake, Direction::Serverbound),
+    (ConnectionState::Status, Direction::Clientbound),
+    (ConnectionState::Status, Direction::Serverbound),
+    (ConnectionState::Login, Direction::Clientbound),
+    (ConnectionState::Login, Direction::Serverbound),
+    (ConnectionState::Configuration, Direction::Clientbound),
+    (ConnectionState::Configuration, Direction::Serverbound),
 ];
 
 /// Every group of definitions.
 ///
 /// One row per (state, direction) that has packets. A group left out of this
 /// list would leave its packets looking undefined, which [`undefined_in`]
-/// reports — so forgetting to add a group here fails the same test that
-/// forgetting to write one does.
+/// reports for complete pairs and which the duplicate-name test catches for
+/// all of them — so forgetting to add a group here fails either way.
 pub static GROUPS: &[&[PacketMeta]] = &[
     handshake::serverbound::DEFINED,
     status::clientbound::DEFINED,
@@ -121,6 +141,8 @@ pub static GROUPS: &[&[PacketMeta]] = &[
     login::serverbound::DEFINED,
     configuration::clientbound::DEFINED,
     configuration::serverbound::DEFINED,
+    play::clientbound::DEFINED,
+    play::serverbound::DEFINED,
 ];
 
 /// What is wrong with the coverage of `version_name` by `groups`, given the
@@ -136,16 +158,36 @@ pub static GROUPS: &[&[PacketMeta]] = &[
 /// obvious failure; a definition naming a packet the table does not have is
 /// the one that catches a typo in a name, which would otherwise sit there
 /// decoding nothing forever.
+///
+/// The forward check runs only for pairs in `complete_pairs`. A pair still
+/// being written gets its definitions checked against the table — a name is
+/// either right or reported — but is not required to have every packet yet,
+/// because "not finished" must be representable without lying about it.
 pub fn undefined_in(
     version_name: &str,
     table: &[(ConnectionState, Direction, &str)],
     groups: &[&[PacketMeta]],
 ) -> Vec<String> {
+    undefined_in_partial(version_name, table, groups, COMPLETE_PAIRS)
+}
+
+/// [`undefined_in`] with the complete pairs supplied by the caller.
+///
+/// The split exists so the guard's sensitivity stays provable: tests pass
+/// their own pair lists, including ones that make Play look complete, and can
+/// then assert exactly what bites. A guard whose inputs cannot vary is a guard
+/// whose behaviour on new input is folklore.
+pub fn undefined_in_partial(
+    version_name: &str,
+    table: &[(ConnectionState, Direction, &str)],
+    groups: &[&[PacketMeta]],
+    complete_pairs: &[(ConnectionState, Direction)],
+) -> Vec<String> {
     let mut problems = Vec::new();
     let defined: Vec<&PacketMeta> = groups.iter().flat_map(|group| group.iter()).collect();
 
     for (state, direction, name) in table {
-        if !IMPLEMENTED_STATES.contains(state) {
+        if !complete_pairs.contains(&(*state, *direction)) {
             continue;
         }
         let found = defined.iter().find(|meta| {
@@ -196,6 +238,36 @@ pub fn undefined_for(version: ProtocolVersion) -> Vec<String> {
         }
     }
     undefined_in(version.name(), &table, GROUPS)
+}
+
+/// The packets a version's table lists for pairs **outside**
+/// [`COMPLETE_PAIRS`] that no definition claims, as
+/// `(state, direction, name)`.
+///
+/// The forward half of the coverage check deliberately does not look at these —
+/// that is what makes an unfinished state representable. What keeps the
+/// unfinishedness honest is this function: it is the worklist, in the table's
+/// own order, and the tests read it rather than trusting the list to shrink by
+/// itself.
+pub fn unclaimed_for(version: ProtocolVersion) -> Vec<(ConnectionState, Direction, &'static str)> {
+    let defined: Vec<&PacketMeta> = GROUPS.iter().flat_map(|group| group.iter()).collect();
+    let mut unclaimed = Vec::new();
+    for state in ConnectionState::ALL {
+        for direction in Direction::ALL {
+            if COMPLETE_PAIRS.contains(&(state, direction)) {
+                continue;
+            }
+            for (_, name) in version.table(state, direction).packets() {
+                let claimed = defined.iter().any(|meta| {
+                    meta.state == state && meta.direction == direction && meta.name == name
+                });
+                if !claimed {
+                    unclaimed.push((state, direction, name));
+                }
+            }
+        }
+    }
+    unclaimed
 }
 
 /// Define a group of packets: one (state, direction) pair's bodies, the enum
@@ -419,14 +491,26 @@ mod tests {
     fn a_version_no_definition_claims_is_reported_packet_by_packet() {
         let version = ProtocolVersion::from_name("1.21.1").expect("the table exists");
         let mut table = Vec::new();
-        for state in IMPLEMENTED_STATES {
+        for state in ConnectionState::ALL {
             for direction in Direction::ALL {
                 for (_, name) in version.table(state, direction).packets() {
                     table.push((state, direction, name));
                 }
             }
         }
-        let problems = undefined_in("1.21.4", &table, GROUPS);
+        // Every pair is held complete here, including Play, which is how the
+        // day 1.21.4's table lands will actually look.
+        let problems = undefined_in_partial("1.21.4", &table, GROUPS, &[
+            (ConnectionState::Handshake, Direction::Serverbound),
+            (ConnectionState::Status, Direction::Clientbound),
+            (ConnectionState::Status, Direction::Serverbound),
+            (ConnectionState::Login, Direction::Clientbound),
+            (ConnectionState::Login, Direction::Serverbound),
+            (ConnectionState::Configuration, Direction::Clientbound),
+            (ConnectionState::Configuration, Direction::Serverbound),
+            (ConnectionState::Play, Direction::Clientbound),
+            (ConnectionState::Play, Direction::Serverbound),
+        ]);
         assert_eq!(
             problems.len(),
             table.len(),
@@ -436,6 +520,80 @@ mod tests {
             problems.iter().all(|p| p.contains("1.21.4")),
             "{problems:#?}"
         );
+    }
+
+    #[test]
+    fn an_incomplete_pair_is_not_held_to_the_forward_check() {
+        // The mechanism the growing Play definitions rely on: a pair outside
+        // the complete list gets its definitions validated but is not required
+        // to cover its table yet.
+        let table = [(
+            ConnectionState::Play,
+            Direction::Clientbound,
+            "minecraft:explode",
+        )];
+        static CLAIMED: &[PacketMeta] = &[PacketMeta {
+            name: "minecraft:login",
+            state: ConnectionState::Play,
+            direction: Direction::Clientbound,
+            versions: &["1.21.1"],
+        }];
+        let all_complete: Vec<(ConnectionState, Direction)> = ConnectionState::ALL
+            .iter()
+            .flat_map(|&s| Direction::ALL.map(move |d| (s, d)))
+            .collect();
+        let problems = undefined_in("1.21.1", &table, &[CLAIMED]);
+        assert!(!problems.is_empty(), "`minecraft:explode` is undefined");
+        let problems =
+            undefined_in_partial("1.21.1", &table, &[CLAIMED], &all_complete);
+        assert!(
+            !problems.is_empty(),
+            "holding every pair complete must report the gap"
+        );
+        let problems = undefined_in_partial("1.21.1", &table, &[CLAIMED], &[]);
+        assert!(problems.is_empty(), "{problems:#?}");
+    }
+
+    #[test]
+    fn a_pair_graduating_to_complete_is_guarded_from_that_moment() {
+        // What happens when Play/clientbound is added to COMPLETE_PAIRS while
+        // packets are still missing: one complaint per missing packet. This is
+        // the check that makes graduation irreversible without finishing.
+        let mut table = Vec::new();
+        for (_, name) in ProtocolVersion::from_name("1.21.1")
+            .expect("the table exists")
+            .table(ConnectionState::Play, Direction::Clientbound)
+            .packets()
+        {
+            table.push((ConnectionState::Play, Direction::Clientbound, name));
+        }
+        let problems = undefined_in_partial(
+            "1.21.1",
+            &table,
+            GROUPS,
+            &[(ConnectionState::Play, Direction::Clientbound)],
+        );
+        assert_eq!(
+            problems.len(),
+            unclaimed_for(ProtocolVersion::from_name("1.21.1").unwrap())
+                .iter()
+                .filter(|(s, d, _)| (*s, *d) == (ConnectionState::Play, Direction::Clientbound))
+                .count(),
+            "every unclaimed packet of a graduated pair is a complaint"
+        );
+    }
+
+    #[test]
+    fn no_two_groups_define_the_same_packet() {
+        // The dispatch `match` would silently prefer the first arm over a
+        // duplicate, so a copy-pasted definition would compile and decode as
+        // whichever group came first. The coverage check cannot see it — both
+        // rows claim the same name — so it is caught here instead.
+        let mut defined: Vec<&PacketMeta> = GROUPS.iter().flat_map(|g| g.iter()).collect();
+        defined.sort_by_key(|meta| (meta.state, meta.direction, meta.name));
+        let unique = defined.len();
+        defined.dedup_by_key(|meta| (meta.state, meta.direction, meta.name));
+        assert_eq!(unique, defined.len(), "a packet is defined twice");
     }
 
     #[test]

@@ -1,54 +1,31 @@
-//! The offline half of Phase 1's check: vectors, coverage, and a round trip of
-//! every packet before Play.
+//! The offline half of Phase 1's check: vectors, coverage, and round trips of
+//! every defined packet.
 //!
 //! Needs no network and no JVM. The other half — whether these layouts are
-//! what a real 1.21.1 server actually speaks — is in `vanilla_conformance.rs`,
-//! and neither of these files can do the other's job. This one proves the code
-//! is self-consistent and agrees with tables computed elsewhere; that one
+//! what a real 1.21.1 server actually speaks — needs a live server, and
+//! neither half can do the other's job. This file proves the code is
+//! self-consistent and agrees with tables computed elsewhere; a live client
 //! proves it agrees with Minecraft.
+//!
+//! The per-packet round trips themselves live in [`common::corpus`], because
+//! the mutation loop and the coverage checks need the same frames this file
+//! used to build privately. What stays here is what is about single field
+//! types and about the suite's own guardrails.
 
+mod common;
+
+use common::{corpus, id, s, some_nbt, v};
 use dust_protocol::conformance::{
     check_field_types, check_nbt, check_wire, in_crate_nbt, in_crate_wire,
 };
-use dust_protocol::nbt::{self, JsonTextComponent, Nbt, TextComponent};
-use dust_protocol::packets::common::{
-    BuiltInLinkLabel, KnownPack, ProfileProperty, RegistryEntry, ReportDetail, ServerLink,
-    ServerLinkLabel, Tag, TagRegistry,
-};
-use dust_protocol::packets::{
-    configuration, handshake, login, status, undefined_for, IMPLEMENTED_STATES,
-};
+use dust_protocol::nbt::{self, TextComponent};
+use dust_protocol::packets::{undefined_for, unclaimed_for, COMPLETE_PAIRS};
 use dust_protocol::types::{
     Angle, BitSet, BoundedString, ChatVisibility, Decode, Encode, FixedBitSet, Identifier,
-    MainHand, NextState, Position, PrefixedBytes, ResourcePackResult, RestOfPacket, Slot, Uuid,
-    VarInt,
+    MainHand, NextState, Position, PrefixedBytes, Slot, Uuid, VarInt,
 };
 use dust_protocol::wire::{DecodeError, EncodeError, Reader, WireRead, WireWrite, Writer};
 use dust_protocol::{version, ConnectionState, Direction, ProtocolVersion};
-
-fn v() -> ProtocolVersion {
-    version::V1_21_1
-}
-
-fn s<const N: usize>(text: &str) -> BoundedString<N> {
-    BoundedString::new(text).expect("fits")
-}
-
-fn id(text: &str) -> Identifier {
-    Identifier::parse(text).expect("valid")
-}
-
-/// An NBT compound, so a text component field carries something with structure
-/// rather than the one-byte empty value that every scanner gets right.
-fn some_nbt() -> Nbt {
-    Nbt(vec![
-        0x0a, 0x08, 0x00, 0x04, b't', b'e', b'x', b't', 0x00, 0x04, b'D', b'u', b's', b't', 0x00,
-    ])
-}
-
-// ---------------------------------------------------------------------------
-// The vector tables
-// ---------------------------------------------------------------------------
 
 #[test]
 fn the_wire_primitives_agree_with_the_vectors() {
@@ -208,10 +185,7 @@ fn an_unknown_enum_discriminant_is_a_named_error_and_never_a_default() {
         Err(DecodeError::UnknownVariant { value: -1, .. })
     ));
     for state in NextState::ALL {
-        assert_eq!(
-            NextState::from_discriminant(state.discriminant()),
-            Some(*state)
-        );
+        assert_eq!(NextState::from_discriminant(state.discriminant()), Some(*state));
     }
 }
 
@@ -286,14 +260,7 @@ fn an_identifier_is_validated_and_a_bare_path_takes_the_default_namespace() {
     assert_eq!(id("minecraft:stone").to_string(), "minecraft:stone");
     assert_eq!(id("stone").namespace, "minecraft");
     assert_eq!(id("dust:some/path.thing-1").path, "some/path.thing-1");
-    for bad in [
-        "",
-        ":",
-        "Minecraft:stone",
-        "minecraft:",
-        "a b:c",
-        "mine/craft:x",
-    ] {
+    for bad in ["", ":", "Minecraft:stone", "minecraft:", "a b:c", "mine/craft:x"] {
         assert!(
             Identifier::parse(bad).is_err(),
             "`{bad}` should not be an identifier"
@@ -357,7 +324,7 @@ fn nbt_nesting_is_bounded_rather_than_overflowing_the_stack() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn every_packet_before_play_has_a_definition_and_every_definition_is_a_packet() {
+fn every_complete_pair_has_a_definition_and_every_definition_is_a_packet() {
     // This is the test that makes hand-written definitions defensible. The ids
     // are generated; the bodies are not; this is the only thing that connects
     // them, and it runs on every pull request forever.
@@ -368,419 +335,131 @@ fn every_packet_before_play_has_a_definition_and_every_definition_is_a_packet() 
 }
 
 #[test]
-fn the_definitions_cover_exactly_the_forty_one_packets_before_play() {
+fn the_complete_pairs_cover_exactly_the_forty_one_packets_before_play() {
     let mut counted = 0;
-    for state in IMPLEMENTED_STATES {
+    for state in ConnectionState::ALL {
         for direction in Direction::ALL {
+            if !COMPLETE_PAIRS.contains(&(state, direction)) {
+                continue;
+            }
             counted += v().table(state, direction).len();
         }
     }
     assert_eq!(counted, 41, "the four states before Play have 41 packets");
-    let defined: usize = dust_protocol::packets::GROUPS
-        .iter()
-        .map(|group| group.len())
-        .sum();
-    assert_eq!(defined, 41);
 }
 
 #[test]
-fn play_is_deliberately_not_covered() {
-    // Scope, asserted rather than assumed. If somebody adds Play definitions
-    // without widening IMPLEMENTED_STATES, the coverage check would not look at
-    // them; if they widen it without adding them, this crate's own coverage
-    // test goes red. Either way it is visible.
-    assert!(!IMPLEMENTED_STATES.contains(&ConnectionState::Play));
+fn play_is_partially_defined_and_marked_incomplete() {
+    // Scope, asserted rather than assumed. Play grows family by family, and
+    // while it grows its pairs stay outside COMPLETE_PAIRS — so nothing can
+    // quietly mistake a long definition list for a finished state. When the
+    // last packet lands, the pair graduates and `every_complete_pair...`
+    // above becomes its guard from that moment.
+    let incomplete: Vec<(ConnectionState, Direction)> =
+        [(ConnectionState::Play, Direction::Clientbound), (ConnectionState::Play, Direction::Serverbound)]
+            .iter()
+            .copied()
+            .filter(|pair| !COMPLETE_PAIRS.contains(pair))
+            .collect();
     assert_eq!(
-        v().table(ConnectionState::Play, Direction::Clientbound)
-            .len(),
-        124
+        incomplete.len(),
+        2,
+        "both Play pairs are still being written"
     );
-}
 
-// ---------------------------------------------------------------------------
-// Every packet, both ways
-// ---------------------------------------------------------------------------
-
-/// One value of every packet before Play.
-///
-/// Written out rather than derived, because a `Default` would fill every field
-/// with a zero and a round trip over zeros is a weaker test than one over
-/// values that differ from each other — a swapped pair of fields of the same
-/// type is invisible when both are zero.
-#[allow(clippy::too_many_lines)]
-fn one_of_every_packet() -> Vec<(&'static str, Vec<u8>)> {
-    let mut out = Vec::new();
-    let mut push = |name: &'static str, bytes: Vec<u8>| out.push((name, bytes));
-
-    macro_rules! round_trip {
-        ($group:path, $value:expr) => {{
-            use $group as g;
-            let packet: g::Packet = ($value).into();
-            let name = packet.name();
-            let mut writer = Writer::new();
-            let protocol_id = packet.encode(&mut writer, v()).expect("encodes");
-            let bytes = writer.into_bytes();
-            let back = g::Packet::decode(&mut Reader::new(&bytes), v())
-                .unwrap_or_else(|e| panic!("{name} (id {protocol_id}) did not decode: {e}"));
-            assert_eq!(back, packet, "{name} changed on the way round");
-            push(name, bytes);
-        }};
+    // Every definition that does exist claims a version whose table really has
+    // the packet — the typo direction of the guard, applied to the unfinished
+    // pair too.
+    let claimed: Vec<&str> = dust_protocol::packets::GROUPS
+        .iter()
+        .flat_map(|group| group.iter())
+        .filter(|meta| meta.state == ConnectionState::Play)
+        .map(|meta| meta.name)
+        .collect();
+    let tabled: Vec<&str> = [
+        (ConnectionState::Play, Direction::Clientbound),
+        (ConnectionState::Play, Direction::Serverbound),
+    ]
+    .iter()
+    .flat_map(|&(state, direction)| {
+        v().table(state, direction).packets().map(|(_, name)| name)
+    })
+    .collect();
+    for name in &claimed {
+        assert!(
+            tabled.contains(name),
+            "{name} is defined but {:#?} has no such packet",
+            incomplete
+        );
     }
+    assert!(!claimed.is_empty());
 
-    round_trip!(
-        handshake::serverbound,
-        handshake::serverbound::Intention {
-            protocol_version: VarInt(767),
-            server_address: s("dust.example"),
-            server_port: 25565,
-            next_state: NextState::Login,
-        }
-    );
-
-    round_trip!(
-        status::clientbound,
-        status::clientbound::StatusResponse {
-            json: s(r#"{"description":"x"}"#),
-        }
-    );
-    round_trip!(
-        status::clientbound,
-        status::clientbound::PongResponse { payload: -9 }
-    );
-    round_trip!(status::serverbound, status::serverbound::StatusRequest {});
-    round_trip!(
-        status::serverbound,
-        status::serverbound::PingRequest {
-            payload: 81985529216486895
-        }
-    );
-
-    round_trip!(
-        login::clientbound,
-        login::clientbound::LoginDisconnect {
-            reason: JsonTextComponent(s(r#"{"text":"no"}"#)),
-        }
-    );
-    round_trip!(
-        login::clientbound,
-        login::clientbound::Hello {
-            server_id: s(""),
-            public_key: PrefixedBytes(vec![1, 2, 3]),
-            verify_token: PrefixedBytes(vec![4, 5, 6, 7]),
-            should_authenticate: true,
-        }
-    );
-    round_trip!(
-        login::clientbound,
-        login::clientbound::GameProfile {
-            uuid: Uuid(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef),
-            username: s("Notch"),
-            properties: vec![
-                ProfileProperty {
-                    name: s("textures"),
-                    value: s("base64"),
-                    signature: Some(s("sig")),
-                },
-                ProfileProperty {
-                    name: s("unsigned"),
-                    value: s("value"),
-                    signature: None,
-                },
-            ],
-            strict_error_handling: true,
-        }
-    );
-    round_trip!(
-        login::clientbound,
-        login::clientbound::LoginCompression {
-            threshold: VarInt(256)
-        }
-    );
-    round_trip!(
-        login::clientbound,
-        login::clientbound::CustomQuery {
-            message_id: VarInt(7),
-            channel: id("fabric:hello"),
-            data: RestOfPacket(vec![9, 9, 9]),
-        }
-    );
-    round_trip!(
-        login::clientbound,
-        login::clientbound::CookieRequest {
-            key: id("dust:session")
-        }
-    );
-
-    round_trip!(
-        login::serverbound,
-        login::serverbound::Hello {
-            name: s("Notch"),
-            profile_id: Uuid(1),
-        }
-    );
-    round_trip!(
-        login::serverbound,
-        login::serverbound::Key {
-            shared_secret: PrefixedBytes(vec![1; 16]),
-            verify_token: PrefixedBytes(vec![2; 4]),
-        }
-    );
-    round_trip!(
-        login::serverbound,
-        login::serverbound::CustomQueryAnswer {
-            message_id: VarInt(7),
-            data: Some(RestOfPacket(vec![1, 2])),
-        }
-    );
-    round_trip!(
-        login::serverbound,
-        login::serverbound::CustomQueryAnswer {
-            message_id: VarInt(8),
-            data: None,
-        }
-    );
-    round_trip!(login::serverbound, login::serverbound::LoginAcknowledged {});
-    round_trip!(
-        login::serverbound,
-        login::serverbound::CookieResponse {
-            key: id("dust:session"),
-            payload: Some(PrefixedBytes(vec![3, 3, 3])),
-        }
-    );
-
-    round_trip!(
-        configuration::clientbound,
-        configuration::clientbound::CookieRequest { key: id("dust:c") }
-    );
-    round_trip!(
-        configuration::clientbound,
-        configuration::clientbound::CustomPayload {
-            channel: id("minecraft:brand"),
-            data: RestOfPacket(b"\x04Dust".to_vec()),
-        }
-    );
-    round_trip!(
-        configuration::clientbound,
-        configuration::clientbound::Disconnect {
-            reason: TextComponent(some_nbt()),
-        }
-    );
-    round_trip!(
-        configuration::clientbound,
-        configuration::clientbound::FinishConfiguration {}
-    );
-    round_trip!(
-        configuration::clientbound,
-        configuration::clientbound::KeepAlive { id: -1 }
-    );
-    round_trip!(
-        configuration::clientbound,
-        configuration::clientbound::Ping { id: -2 }
-    );
-    round_trip!(
-        configuration::clientbound,
-        configuration::clientbound::ResetChat {}
-    );
-    round_trip!(
-        configuration::clientbound,
-        configuration::clientbound::RegistryData {
-            registry_id: id("minecraft:dimension_type"),
-            entries: vec![
-                RegistryEntry {
-                    entry_id: id("minecraft:overworld"),
-                    data: Some(some_nbt()),
-                },
-                RegistryEntry {
-                    entry_id: id("minecraft:the_nether"),
-                    data: None,
-                },
-            ],
-        }
-    );
-    round_trip!(
-        configuration::clientbound,
-        configuration::clientbound::ResourcePackPop {
-            uuid: Some(Uuid(5))
-        }
-    );
-    round_trip!(
-        configuration::clientbound,
-        configuration::clientbound::ResourcePackPush {
-            uuid: Uuid(6),
-            url: s("https://example.invalid/p.zip"),
-            hash: s("0123456789012345678901234567890123456789"),
-            forced: true,
-            prompt_message: Some(TextComponent(some_nbt())),
-        }
-    );
-    round_trip!(
-        configuration::clientbound,
-        configuration::clientbound::StoreCookie {
-            key: id("dust:c"),
-            payload: PrefixedBytes(vec![1, 2, 3]),
-        }
-    );
-    round_trip!(
-        configuration::clientbound,
-        configuration::clientbound::Transfer {
-            host: s("elsewhere.example"),
-            port: VarInt(25565),
-        }
-    );
-    round_trip!(
-        configuration::clientbound,
-        configuration::clientbound::UpdateEnabledFeatures {
-            features: vec![id("minecraft:vanilla")],
-        }
-    );
-    round_trip!(
-        configuration::clientbound,
-        configuration::clientbound::UpdateTags {
-            registries: vec![TagRegistry {
-                registry: id("minecraft:block"),
-                tags: vec![Tag {
-                    name: id("minecraft:logs"),
-                    entries: vec![VarInt(1), VarInt(2), VarInt(3)],
-                }],
-            }],
-        }
-    );
-    round_trip!(
-        configuration::clientbound,
-        configuration::clientbound::SelectKnownPacks {
-            packs: vec![KnownPack {
-                namespace: s("minecraft"),
-                id: s("core"),
-                version: s("1.21.1"),
-            }],
-        }
-    );
-    round_trip!(
-        configuration::clientbound,
-        configuration::clientbound::CustomReportDetails {
-            details: vec![ReportDetail {
-                title: s("server"),
-                description: s("Dust"),
-            }],
-        }
-    );
-    round_trip!(
-        configuration::clientbound,
-        configuration::clientbound::ServerLinks {
-            links: vec![
-                ServerLink {
-                    label: ServerLinkLabel::BuiltIn(BuiltInLinkLabel::BugReport),
-                    url: s("https://example.invalid/bugs"),
-                },
-                ServerLink {
-                    label: ServerLinkLabel::Custom(TextComponent(some_nbt())),
-                    url: s("https://example.invalid/other"),
-                },
-            ],
-        }
-    );
-
-    round_trip!(
-        configuration::serverbound,
-        configuration::serverbound::ClientInformation {
-            locale: s("en_GB"),
-            view_distance: 12,
-            chat_mode: ChatVisibility::System,
-            chat_colors: true,
-            displayed_skin_parts: 0b0111_1111,
-            main_hand: MainHand::Left,
-            text_filtering_enabled: false,
-            allow_server_listings: true,
-        }
-    );
-    round_trip!(
-        configuration::serverbound,
-        configuration::serverbound::CookieResponse {
-            key: id("dust:c"),
-            payload: None,
-        }
-    );
-    round_trip!(
-        configuration::serverbound,
-        configuration::serverbound::CustomPayload {
-            channel: id("minecraft:brand"),
-            data: RestOfPacket(b"\x06vanilla".to_vec()),
-        }
-    );
-    round_trip!(
-        configuration::serverbound,
-        configuration::serverbound::FinishConfiguration {}
-    );
-    round_trip!(
-        configuration::serverbound,
-        configuration::serverbound::KeepAlive { id: 42 }
-    );
-    round_trip!(
-        configuration::serverbound,
-        configuration::serverbound::Pong { id: 43 }
-    );
-    round_trip!(
-        configuration::serverbound,
-        configuration::serverbound::ResourcePack {
-            uuid: Uuid(6),
-            result: ResourcePackResult::Declined,
-        }
-    );
-    round_trip!(
-        configuration::serverbound,
-        configuration::serverbound::SelectKnownPacks { packs: vec![] }
-    );
-
-    out
+    // And the worklist is real: packets remain unclaimed, which is exactly
+    // what an honest partial state looks like.
+    let remaining = unclaimed_for(v());
+    assert!(!remaining.is_empty(), "play still has packets to write");
+    assert!(remaining.len() < 124 + 58, "and not all of them");
 }
 
 #[test]
-fn every_packet_before_play_round_trips_through_its_body() {
-    let encoded = one_of_every_packet();
+fn the_corpus_covers_every_definition_exactly_once_per_name() {
+    let frames = corpus();
 
-    // Every packet name in the table appears at least once above. A round-trip
-    // suite that quietly stopped covering a packet would stay green while that
-    // packet's layout went unchecked — the failure mode where a guard degrades
+    // Every defined packet appears at least once. A corpus that quietly
+    // stopped covering a definition would keep every other test green while
+    // that layout went unchecked — the failure mode where a guard degrades
     // instead of breaking.
-    let mut covered: Vec<&str> = encoded.iter().map(|(name, _)| *name).collect();
-    covered.sort_unstable();
-    covered.dedup();
-    let mut missing = Vec::new();
-    for state in IMPLEMENTED_STATES {
-        for direction in Direction::ALL {
-            for (_, name) in v().table(state, direction).packets() {
-                if !covered.contains(&name) {
-                    missing.push(format!("{}/{} {name}", state.name(), direction.name()));
-                }
-            }
-        }
-    }
+    let defined: Vec<&str> = dust_protocol::packets::GROUPS
+        .iter()
+        .flat_map(|group| group.iter())
+        .map(|meta| meta.name)
+        .collect();
+    let covered: Vec<&str> = frames.iter().map(|frame| frame.name).collect();
+    let mut missing: Vec<&str> = defined
+        .iter()
+        .filter(|name| !covered.contains(name))
+        .copied()
+        .collect();
+    missing.sort_unstable();
     assert!(
         missing.is_empty(),
-        "packets with no round-trip: {missing:#?}"
+        "definitions with no frame in the corpus: {missing:#?}"
+    );
+    assert_eq!(
+        defined.len(),
+        covered.len(),
+        "one frame per definition keeps the count honest"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Frame-level decode policy
+// ---------------------------------------------------------------------------
 
 #[test]
 fn a_body_that_ends_early_or_late_is_an_error_rather_than_a_shrug() {
-    // Trailing bytes mean the layout this crate believes is not the layout that
-    // was sent. Accepting them would mean the next packet on a shared buffer
-    // starts in the wrong place, which is a much harder bug to find than this.
-    let packet =
-        status::serverbound::Packet::PingRequest(status::serverbound::PingRequest { payload: 1 });
-    let mut writer = Writer::new();
-    packet.encode(&mut writer, v()).expect("encodes");
-    let mut bytes = writer.into_bytes();
+    // Trailing bytes mean the layout this crate believes is not the layout
+    // that was sent. Accepting them would mean the next packet on a shared
+    // buffer starts in the wrong place, which is a much harder bug to find
+    // than this.
+    let frame = corpus()
+        .into_iter()
+        .find(|frame| frame.name == "minecraft:ping_request" && frame.state == ConnectionState::Status)
+        .expect("the status ping is in the corpus");
 
+    let mut bytes = frame.bytes.clone();
     bytes.push(0xff);
     assert_eq!(
-        status::serverbound::Packet::decode(&mut Reader::new(&bytes), v()),
+        dust_protocol::packets::status::serverbound::Packet::decode(
+            &mut Reader::new(&bytes),
+            v()
+        ),
         Err(DecodeError::TrailingBytes { left: 1 })
     );
 
     bytes.truncate(bytes.len() - 3);
     assert!(matches!(
-        status::serverbound::Packet::decode(&mut Reader::new(&bytes), v()),
+        dust_protocol::packets::status::serverbound::Packet::decode(&mut Reader::new(&bytes), v()),
         Err(DecodeError::UnexpectedEnd { .. })
     ));
 }
@@ -789,13 +468,26 @@ fn a_body_that_ends_early_or_late_is_an_error_rather_than_a_shrug() {
 fn an_id_this_state_has_no_packet_for_is_a_named_error() {
     let bytes = [0x7f];
     assert_eq!(
-        status::serverbound::Packet::decode(&mut Reader::new(&bytes), v()),
+        dust_protocol::packets::status::serverbound::Packet::decode(&mut Reader::new(&bytes), v()),
         Err(DecodeError::UnknownPacket {
             state: "status",
             direction: "serverbound",
             protocol_id: 127
         })
     );
+
+    // And in Play, where the same rule matters more: an id past the end of a
+    // 124-packet table is refused by naming the id, the state and the
+    // direction, which is everything a log line needs.
+    let bytes = [0xff, 0x01];
+    assert!(matches!(
+        dust_protocol::packets::play::clientbound::Packet::decode(&mut Reader::new(&bytes), v()),
+        Err(DecodeError::UnknownPacket {
+            state: "play",
+            protocol_id: 255,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -805,28 +497,30 @@ fn a_packet_takes_its_id_from_the_generated_table_and_not_from_a_constant() {
     // protocol changes nothing here.
     use dust_protocol::packets::PacketBody;
     assert_eq!(
-        login::serverbound::LoginAcknowledged::protocol_id(v()),
-        v().protocol_id(
-            ConnectionState::Login,
-            Direction::Serverbound,
-            "minecraft:login_acknowledged"
-        )
-    );
-    assert_eq!(
-        login::serverbound::LoginAcknowledged::protocol_id(v()),
+        dust_protocol::packets::login::serverbound::LoginAcknowledged::protocol_id(v()),
         Some(3)
     );
+    assert_eq!(
+        dust_protocol::packets::play::clientbound::Login::protocol_id(v()),
+        v().protocol_id(ConnectionState::Play, Direction::Clientbound, "minecraft:login")
+    );
 
-    // And the refusal when a version has no such packet, rather than a wrong
-    // number.
-    let packet = status::serverbound::Packet::StatusRequest(status::serverbound::StatusRequest {});
+    // Every definition resolves through its version's table, both directions
+    // of the lookup agreeing.
+    for meta in dust_protocol::packets::GROUPS.iter().copied().flatten() {
+        let id = v()
+            .protocol_id(meta.state, meta.direction, meta.name)
+            .unwrap_or_else(|| panic!("{} does not resolve", meta.name));
+        assert_eq!(
+            v().packet_name(meta.state, meta.direction, id),
+            Some(meta.name),
+            "{meta:?} does not resolve back"
+        );
+    }
+
+    let packet = dust_protocol::packets::status::serverbound::Packet::StatusRequest(
+        dust_protocol::packets::status::serverbound::StatusRequest {},
+    );
     let mut writer = Writer::new();
     assert!(packet.encode(&mut writer, v()).is_ok());
-    assert!(matches!(
-        BoundedString::<1>::new("too long"),
-        Err(EncodeError::StringTooLong {
-            limit: 1,
-            actual: 8
-        })
-    ));
 }

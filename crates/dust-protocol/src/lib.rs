@@ -9,10 +9,12 @@
 //! client in play. [`generated::packets`] holds the table that turns the pair
 //! and the number into a name and back.
 //!
-//! [`packets`] holds the **bodies** for the 41 packets of handshake, status,
+//! [`packets`] holds the **bodies** for every packet of handshake, status,
 //! login and configuration — everything a connection uses before it reaches
-//! Play. Play's 182 are not here. [`types`] holds the field types those bodies
-//! are built from.
+//! Play — plus the core of Play itself: join and movement, the world and
+//! entity families, chat and the tab list. What is missing from Play is a
+//! list, not a secret: see [`packets::unclaimed_for`]. [`types`] holds the
+//! field types those bodies are built from.
 //!
 //! What is *not* here, and is not missing:
 //!
@@ -23,8 +25,9 @@
 //!   interpret it; see [`nbt`].
 //! - **Registry contents.** `dust-registry` owns those. The configuration state
 //!   carries registry sync, and this crate carries the entry ids and the blobs;
-//!   see [`packets::common::RegistryEntry`].
-//! - **Play.** Bodies for it, and the field types only it uses, are Phase 2.
+//!   see [`packets::common::RegistryEntry`]. The same holds inside Play: chunk
+//!   sections are a blob plus a trait, and the world crate fills both in —
+//!   see [`packets::play`].
 //!
 //! Those first three are **seams**, not gaps. Each one is a trait or an opaque
 //! type that another crate will implement or replace, and each one has a
@@ -70,6 +73,7 @@ pub mod conformance;
 pub mod generated;
 pub mod nbt;
 pub mod packets;
+pub mod text;
 pub mod types;
 pub mod wire;
 
