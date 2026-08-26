@@ -10,8 +10,9 @@
 mod support;
 
 use dust_data::registry::RegistryId;
+use dust_data::zip::ZipError;
 use dust_data::{load, LoadOptions, PackError, PackSource, ResourceLocation, Severity, ZipPack};
-use support::PackBuilder;
+use support::{write_layouted_zip, PackBuilder, RawZipEntry, ZipEntryLayout};
 
 fn location(text: &str) -> ResourceLocation {
     ResourceLocation::parse(text).expect("valid")
@@ -148,6 +149,258 @@ fn a_declared_size_past_the_cap_is_refused_before_decompressing() {
         .read("data/minecraft/recipe/x.json")
         .expect_err("declared size past the cap");
     assert!(matches!(error, PackError::Zip { .. }), "{error}");
+}
+
+#[test]
+fn local_headers_that_disagree_with_the_directory_are_refused_at_read() {
+    // Every field both records carry is checked in its own case below. The
+    // point of doing all four: a partial writer that fixed one field but not
+    // another must not slip through whichever check happens to be missing.
+    let body = br#"{"type":"minecraft:crafting_shaped"}"#;
+    let base = RawZipEntry {
+        name: b"data/minecraft/recipe/x.json".to_vec(),
+        flags: 0,
+        method: 0,
+        crc: dust_data::zip::crc32(body),
+        compressed_size: body.len() as u32,
+        uncompressed_size: body.len() as u32,
+        body: body.to_vec(),
+    };
+
+    let patch_u16 = |bytes: &mut [u8], at: usize, value: u16| {
+        bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    };
+    let patch_u32 = |bytes: &mut [u8], at: usize, value: u32| {
+        bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    };
+
+    /// One field edit against one entry's records, applied after the writer
+    /// has laid the archive out.
+    type Patch = Box<dyn Fn(&mut Vec<u8>, &ZipEntryLayout)>;
+
+    struct Case {
+        label: &'static str,
+        edit: Patch,
+    }
+
+    let cases = vec![
+        Case {
+            label: "a different name",
+            edit: Box::new(|bytes, entry| {
+                bytes[entry.local_header + 30] = b'X';
+            }),
+        },
+        Case {
+            label: "a different method",
+            edit: Box::new(move |bytes, entry| {
+                patch_u16(bytes, entry.local_header + 8, 8);
+            }),
+        },
+        Case {
+            label: "different sizes",
+            edit: Box::new(move |bytes, entry| {
+                patch_u32(bytes, entry.local_header + 18, 999);
+            }),
+        },
+        Case {
+            label: "a different checksum",
+            edit: Box::new(move |bytes, entry| {
+                patch_u32(bytes, entry.local_header + 14, 0xdead_beef);
+            }),
+        },
+    ];
+
+    for case in cases {
+        let entry = base.clone();
+        let (mut bytes, layout) = write_layouted_zip(&[entry]);
+        (case.edit)(&mut bytes, &layout.entries[0]);
+        let pack =
+            ZipPack::from_bytes(bytes, "disagree", "<zip>").expect("the archive still opens");
+        let error = pack
+            .read("data/minecraft/recipe/x.json")
+            .expect_err(case.label);
+        let label = case.label;
+        assert!(error.to_string().contains("disagree"), "{label}: {error}");
+    }
+}
+
+#[test]
+fn the_streaming_flag_excuses_local_fields_that_were_never_filled_in() {
+    // Bit 3 means "sizes and checksum arrive after the data" — the local
+    // copies are legitimately unfilled, so refusing them would refuse every
+    // archive written by a streaming tool. Name and method are known up
+    // front and are still checked.
+    let body = b"{}";
+    let raw = RawZipEntry {
+        name: b"data/minecraft/recipe/streamed.json".to_vec(),
+        flags: 1 << 3,
+        method: 0,
+        crc: dust_data::zip::crc32(body),
+        compressed_size: body.len() as u32,
+        uncompressed_size: body.len() as u32,
+        body: body.to_vec(),
+    };
+    let (mut bytes, layout) = write_layouted_zip(&[raw]);
+    // The local copies of checksum and both sizes are zeroed, as a streaming
+    // writer would have left them. The name, method and lengths stay put.
+    let local = layout.entries[0].local_header;
+    bytes[local + 14..local + 26].copy_from_slice(&[0u8; 12]);
+
+    let pack = ZipPack::from_bytes(bytes, "stream", "<zip>").expect("opens");
+    let read = pack
+        .read("data/minecraft/recipe/streamed.json")
+        .expect("reads")
+        .expect("present");
+    assert_eq!(read, body);
+}
+
+#[test]
+fn the_unicode_flag_makes_a_non_utf8_name_a_refusal() {
+    // The flag promises UTF-8. Bytes that break that promise are corruption,
+    // and silently replacing them would invent a resource path no pack wrote.
+    let raw = RawZipEntry {
+        name: vec![b'd', b'a', b't', b'a', b'/', 0xff],
+        flags: 1 << 11,
+        method: 0,
+        crc: 0,
+        compressed_size: 0,
+        uncompressed_size: 0,
+        body: Vec::new(),
+    };
+    let (bytes, _) = write_layouted_zip(&[raw]);
+    let error = ZipPack::from_bytes(bytes, "badname", "<zip>").expect_err("refused");
+    assert!(
+        matches!(
+            error,
+            PackError::Zip {
+                source: ZipError::NameNotUtf8 { .. },
+                ..
+            }
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn unicode_names_survive_both_compression_methods() {
+    // A non-ASCII name under the flag, once stored and once deflated through
+    // the fixed-Huffman encoder in support. Both copies must come back with
+    // the name exactly as written and the payload intact.
+    let payload = br#"{"values":["minecraft:stone"]}"#;
+    for method in [0u16, 8u16] {
+        let name: Vec<u8> = "data/minecraft/tags/block/for\u{ea}ges.json"
+            .to_string()
+            .into_bytes();
+        let body = if method == 8 {
+            support::write_deflate_fixed(payload)
+        } else {
+            payload.to_vec()
+        };
+        let raw = RawZipEntry {
+            name,
+            flags: 1 << 11,
+            method,
+            crc: dust_data::zip::crc32(payload),
+            compressed_size: body.len() as u32,
+            uncompressed_size: payload.len() as u32,
+            body,
+        };
+        let (bytes, _) = write_layouted_zip(&[raw]);
+        let pack = ZipPack::from_bytes(bytes, "unicode", "<zip>").expect("opens");
+        let listed = pack.list().expect("lists");
+        assert_eq!(
+            listed,
+            vec![format!("data/minecraft/tags/block/for\u{ea}ges.json")]
+        );
+        let read = pack
+            .read("data/minecraft/tags/block/for\u{ea}ges.json")
+            .expect("reads")
+            .expect("present");
+        assert_eq!(read, payload);
+    }
+}
+
+#[test]
+fn zip64_sentinels_are_refused_wherever_they_sit() {
+    let body = b"{}".to_vec();
+    let make = || RawZipEntry {
+        name: b"data/minecraft/recipe/z.json".to_vec(),
+        flags: 0,
+        method: 0,
+        crc: dust_data::zip::crc32(&body),
+        compressed_size: body.len() as u32,
+        uncompressed_size: body.len() as u32,
+        body: body.clone(),
+    };
+
+    // The count sentinel in the end-of-directory record.
+    let (mut bytes, layout) = write_layouted_zip(&[make()]);
+    bytes[layout.eocd + 10..layout.eocd + 12].copy_from_slice(&0xffff_u16.to_le_bytes());
+    assert!(matches!(
+        ZipPack::from_bytes(bytes, "z64", "<z>").unwrap_err(),
+        PackError::Zip {
+            source: ZipError::Zip64,
+            ..
+        }
+    ));
+
+    // The size sentinel in one entry's directory record.
+    let (mut bytes, layout) = write_layouted_zip(&[make()]);
+    let at = layout.entries[0].central_directory + 24;
+    bytes[at..at + 4].copy_from_slice(&0xffff_ffff_u32.to_le_bytes());
+    assert!(matches!(
+        ZipPack::from_bytes(bytes, "z64", "<z>").unwrap_err(),
+        PackError::Zip {
+            source: ZipError::Zip64,
+            ..
+        }
+    ));
+
+    // The offset sentinel, also in the directory record.
+    let (mut bytes, layout) = write_layouted_zip(&[make()]);
+    let at = layout.entries[0].central_directory + 42;
+    bytes[at..at + 4].copy_from_slice(&0xffff_ffff_u32.to_le_bytes());
+    assert!(matches!(
+        ZipPack::from_bytes(bytes, "z64", "<z>").unwrap_err(),
+        PackError::Zip {
+            source: ZipError::Zip64,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_zip64_record_that_is_not_needed_does_not_stop_the_archive() {
+    // Some writers always emit the zip64 end-of-directory locator even when
+    // every value fits the ordinary fields. Only the *sentinels* mean zip64
+    // is required; an archive whose ordinary fields are truthful opens fine.
+    const LOCATOR: u32 = 0x0706_4b50;
+    let body = b"{}";
+    let raw = RawZipEntry {
+        name: b"data/minecraft/recipe/plain.json".to_vec(),
+        flags: 0,
+        method: 0,
+        crc: dust_data::zip::crc32(body),
+        compressed_size: body.len() as u32,
+        uncompressed_size: body.len() as u32,
+        body: body.to_vec(),
+    };
+    let (mut bytes, layout) = write_layouted_zip(&[raw]);
+    // Splice the 20-byte locator in directly before the EOCD.
+    let insert_at = layout.eocd;
+    let mut locator = LOCATOR.to_le_bytes().to_vec();
+    locator.extend_from_slice(&0_u32.to_le_bytes()); // disk
+    locator.extend_from_slice(&0_u64.to_le_bytes()); // zip64 eocd offset
+    locator.extend_from_slice(&1_u32.to_le_bytes()); // total disks
+    bytes.splice(insert_at..insert_at, locator);
+
+    let pack = ZipPack::from_bytes(bytes, "harmless", "<z>").expect("opens");
+    assert_eq!(
+        pack.read("data/minecraft/recipe/plain.json")
+            .unwrap()
+            .unwrap(),
+        body
+    );
 }
 
 #[test]

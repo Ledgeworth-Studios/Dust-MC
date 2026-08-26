@@ -630,6 +630,11 @@ struct PackTally {
     /// the one that registry holds. Counted per registry, with the expected
     /// extension kept beside the count so the warning can name it.
     wrong_extension: BTreeMap<String, (usize, &'static str)>,
+    /// Paths inside the pack that are themselves zip archives. A pack inside
+    /// a pack is never read — not by Minecraft, not by here — and it is
+    /// almost always an accident of zipping one directory too high, so it is
+    /// named rather than treated as inert junk.
+    nested_archives: Vec<String>,
     /// Files seen under each namespace. Read counts are kept separately so a
     /// namespace that held files but contributed nothing is visible as such.
     namespace_files: BTreeMap<String, usize>,
@@ -721,6 +726,17 @@ fn load_pack(source: &dyn PackSource, options: &LoadOptions, data: &mut LoadedDa
     }
 
     let mut tally = PackTally::default();
+
+    // Nested archives are spotted on the raw listing rather than during the
+    // per-file walk: a `.zip` beside `pack.mcmeta` never reaches a registry
+    // match, so the walk would stay silent about exactly the case that most
+    // needs saying. The raw listing rather than the layered view, because an
+    // archive under an inert overlay is still being carried.
+    for path in &listing {
+        if path.ends_with(".zip") || path.ends_with(".ZIP") {
+            tally.nested_archives.push(path.clone());
+        }
+    }
 
     if plan.applied.is_empty() {
         for path in &listing {
@@ -1247,6 +1263,31 @@ fn report_tally(id: &str, tally: &PackTally, options: &LoadOptions, data: &mut L
             ),
         ));
     }
+    if !tally.nested_archives.is_empty() {
+        let (named, more) = match tally.nested_archives.len() {
+            0..=5 => (tally.nested_archives.join(", "), 0),
+            n => (
+                format!("{} …", tally.nested_archives[..5].join(", ")),
+                n - 5,
+            ),
+        };
+        let and_more = if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        };
+        data.findings.push(Finding::warning(
+            id,
+            &tally.nested_archives[0],
+            format!(
+                "is a zip archive carried inside this pack, as {}{and_more}. \
+                 Nothing inside a zip inside a pack is read — Minecraft would \
+                 not read it either — so if that archive was meant to be part \
+                 of the pack, its files have to be unpacked into it.",
+                named
+            ),
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -1480,6 +1521,55 @@ mod tests {
         assert_eq!(tick.file.command_count(), 2);
         assert_eq!(tick.file.lines[1].command, r#"tellraw @a "bye""#);
         assert_eq!(tick.pack, "functions");
+    }
+
+    #[test]
+    fn a_nested_zip_inside_a_pack_is_named_rather_than_ignored() {
+        // The classic accident: the whole `datapacks/` folder zipped instead
+        // of one pack. The inner archives are inert here and in Minecraft,
+        // and an operator deserves to be told that in those words.
+        let pack = MemPack::with_meta(
+            "wrapped",
+            &[
+                ("inner_pack.zip", "not really a zip, but named like one"),
+                ("data/minecraft/recipe/stick.json", typed_recipe()),
+            ],
+        );
+        let data = load(&[&pack], &LoadOptions::default());
+        assert!(data
+            .get(&RegistryId::new("recipe"), &location("minecraft:stick"))
+            .is_some());
+        let finding = data
+            .findings()
+            .iter()
+            .find(|f| f.message.contains("nested archive") || f.file == "inner_pack.zip")
+            .expect("the nested archive is named");
+        assert!(finding.message.contains("unpacked into it"), "{}", finding);
+    }
+
+    #[test]
+    fn a_nested_zip_is_one_finding_even_when_there_are_several() {
+        let files: Vec<(String, &str)> = (0..7)
+            .map(|index| (format!("bundle{index}.zip"), "junk"))
+            .collect();
+        let owned: Vec<(&str, &str)> = files.iter().map(|(p, b)| (p.as_str(), *b)).collect();
+        let pack = MemPack::with_meta("many", &owned);
+        let data = load(&[&pack], &LoadOptions::default());
+        assert_eq!(
+            data.findings()
+                .iter()
+                .filter(|f| f.message.contains("zip"))
+                .count(),
+            1,
+            "{:?}",
+            data.findings()
+        );
+        // Five are named; the rest are counted rather than listed.
+        assert!(
+            data.findings()[0].message.contains("and 2 more"),
+            "{}",
+            data.findings()[0]
+        );
     }
 
     #[test]

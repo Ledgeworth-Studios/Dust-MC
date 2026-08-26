@@ -25,6 +25,21 @@
 //!   [`crate::inflate`]: the number was computed by whatever compressor wrote
 //!   the archive, so it cannot agree with a decompressor bug the way a
 //!   round-trip against our own encoder would.
+//! * **The local header is checked against the directory.** A zip records
+//!   every entry twice — once in the streaming local header next to the
+//!   bytes, once in the central directory at the end — and writers may fill
+//!   the local copy in late (the data-descriptor convention), but when both
+//!   copies *are* filled in they must agree. Where they disagree the archive
+//!   has been edited by something that did not finish the job, and every
+//!   field that disagrees is named rather than silently resolved in
+//!   whichever direction happened to be read second.
+//! * **The Unicode-name flag is honoured.** Bit 11 of the general-purpose
+//!   flags promises the entry name is UTF-8; a name that fails to decode
+//!   under that promise is corruption and is refused, because silently
+//!   substituting U+FFFD would produce resource paths no pack could have
+//!   meant. Without the flag the name decodes lossily — nominally CP437,
+//!   in practice usually UTF-8 a writer declined to promise — and ASCII
+//!   paths, which is what a datapack uses, come through either way.
 //!
 //! # What this does not support, and therefore refuses
 //!
@@ -62,6 +77,15 @@ const METHOD_STORED: u16 = 0;
 const METHOD_DEFLATE: u16 = 8;
 /// General-purpose bit 0: the entry is encrypted.
 const FLAG_ENCRYPTED: u16 = 1 << 0;
+/// General-purpose bit 3: sizes and checksum live in a data descriptor after
+/// the entry, because the writer was streaming and did not know them yet.
+///
+/// Under this flag the local header's copies of those fields are legitimately
+/// zero or garbage, so the disagreement check compares the name and method
+/// only — those are known before compression starts and are always filled in.
+const FLAG_DATA_DESCRIPTOR: u16 = 1 << 3;
+/// General-purpose bit 11: the entry name is UTF-8 rather than CP437.
+const FLAG_UTF8: u16 = 1 << 11;
 
 /// Why an archive could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +131,17 @@ pub enum ZipError {
         name: String,
         expected: usize,
         actual: usize,
+    },
+    /// The streaming local header and the central directory disagree about a
+    /// field both have filled in. `detail` names the field.
+    LocalHeaderMismatch {
+        name: String,
+        detail: &'static str,
+    },
+    /// The entry declares the Unicode-name flag, and its name is not UTF-8.
+    NameNotUtf8 {
+        name: String,
+        at: usize,
     },
 }
 
@@ -164,6 +199,20 @@ impl std::fmt::Display for ZipError {
                 "has `{name}` decompressing to {actual} bytes where the archive \
                  records {expected}"
             ),
+            Self::LocalHeaderMismatch { name, detail } => write!(
+                f,
+                "has `{name}`, whose local file header {detail}. A zip writes \
+                 every entry twice — beside the bytes and in the directory at \
+                 the end — and the two copies disagree, so the archive was \
+                 edited by something that did not finish the job"
+            ),
+            Self::NameNotUtf8 { name, at } => write!(
+                f,
+                "names an entry `{name}` whose bytes are not UTF-8 (they stop \
+                 being decodable at byte {at}) while carrying the Unicode-name \
+                 flag promising they are. The name cannot be read as written, \
+                 so the entry has been refused rather than silently renamed"
+            ),
         }
     }
 }
@@ -179,6 +228,10 @@ pub struct ZipEntry {
     compressed_size: usize,
     uncompressed_size: usize,
     local_header_offset: usize,
+    /// General-purpose bit 11 as the directory records it. Kept because a
+    /// diagnostic about an oddly-named entry wants to know whether the
+    /// archive promised the name was UTF-8.
+    utf8_flagged: bool,
 }
 
 impl ZipEntry {
@@ -188,6 +241,11 @@ impl ZipEntry {
     /// the convention every writer uses.
     pub fn is_directory(&self) -> bool {
         self.name.ends_with('/')
+    }
+
+    /// Whether the archive's Unicode-name flag promises this name is UTF-8.
+    pub fn is_utf8_flagged(&self) -> bool {
+        self.utf8_flagged
     }
 }
 
@@ -237,7 +295,7 @@ impl ZipArchive {
             let comment_length = read_u16(&data, at + 32)? as usize;
             let local_header_offset = read_u32(&data, at + 42)? as usize;
 
-            let name = read_name(&data, at + 46, name_length)?;
+            let name = read_name(&data, at + 46, name_length, flags & FLAG_UTF8 != 0)?;
             if compressed_size == 0xffff_ffff
                 || uncompressed_size == 0xffff_ffff
                 || local_header_offset == 0xffff_ffff
@@ -261,6 +319,7 @@ impl ZipArchive {
                 compressed_size,
                 uncompressed_size,
                 local_header_offset,
+                utf8_flagged: flags & FLAG_UTF8 != 0,
             });
             at += 46 + name_length + extra_length + comment_length;
         }
@@ -273,17 +332,47 @@ impl ZipArchive {
     }
 
     /// Decompress one entry and check it against the archive's own checksum.
+    ///
+    /// The entry is read through its **local** header, which is checked
+    /// against the central directory's copy first: a zip records every entry
+    /// twice and the two records agreeing is part of what "this archive is
+    /// intact" means. See the module documentation.
     pub fn read(&self, entry: &ZipEntry) -> Result<Vec<u8>, ZipError> {
         let header = entry.local_header_offset;
         if read_u32(&self.data, header)? != LOCAL_SIGNATURE {
             return Err(ZipError::CorruptRecord { at: header });
         }
+        let local_flags = read_u16(&self.data, header + 6)?;
+        let local_method = read_u16(&self.data, header + 8)?;
+        let local_crc = read_u32(&self.data, header + 14)?;
+        let local_compressed = read_u32(&self.data, header + 18)? as usize;
+        let local_uncompressed = read_u32(&self.data, header + 22)? as usize;
         // The local header's name and extra lengths are read rather than the
-        // central directory's: writers are allowed to differ, and taking the
+        // central directory's: writers are allowed to differ there — an extra
+        // field can be padded differently in the two places — and taking the
         // central copy puts the read a few bytes into the wrong place with no
         // signature left to notice it.
         let name_length = read_u16(&self.data, header + 26)? as usize;
         let extra_length = read_u16(&self.data, header + 28)? as usize;
+
+        check_local_agreement(
+            entry,
+            LocalHeaderFields {
+                flags: local_flags,
+                method: local_method,
+                crc32: local_crc,
+                compressed_size: local_compressed,
+                uncompressed_size: local_uncompressed,
+            },
+        )?;
+        let local_name = self.read_local_name(header + 30, name_length)?;
+        if local_name != entry.name {
+            return Err(ZipError::LocalHeaderMismatch {
+                name: entry.name.clone(),
+                detail: "names the entry differently than the central directory does",
+            });
+        }
+
         let start = header + 30 + name_length + extra_length;
         let end = start
             .checked_add(entry.compressed_size)
@@ -327,6 +416,60 @@ impl ZipArchive {
         }
         Ok(bytes)
     }
+
+    /// The local header's own copy of the name, for the agreement check.
+    fn read_local_name(&self, at: usize, length: usize) -> Result<String, ZipError> {
+        let bytes = self
+            .data
+            .get(at..at + length)
+            .ok_or(ZipError::Truncated { at })?;
+        Ok(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+/// The local header's own copies of the fields both records carry.
+struct LocalHeaderFields {
+    flags: u16,
+    method: u16,
+    crc32: u32,
+    compressed_size: usize,
+    uncompressed_size: usize,
+}
+
+/// Compare the local header against the central directory, refusing where
+/// they disagree about something the local copy has actually filled in.
+///
+/// The data-descriptor flag is what makes this check honest: a streaming
+/// writer genuinely does not know sizes or checksum until after the bytes are
+/// out, so under that flag those fields are expected to be unfilled and are
+/// not compared. The name and the method *are* known up front — every writer
+/// fills them in — so they are compared regardless.
+fn check_local_agreement(entry: &ZipEntry, local: LocalHeaderFields) -> Result<(), ZipError> {
+    if local.method != entry.method {
+        return Err(ZipError::LocalHeaderMismatch {
+            name: entry.name.clone(),
+            detail: "records a different compression method than the central \
+                     directory does",
+        });
+    }
+    if local.flags & FLAG_DATA_DESCRIPTOR != 0 {
+        return Ok(());
+    }
+    if local.compressed_size != entry.compressed_size
+        || local.uncompressed_size != entry.uncompressed_size
+    {
+        return Err(ZipError::LocalHeaderMismatch {
+            name: entry.name.clone(),
+            detail: "records different entry sizes than the central directory does",
+        });
+    }
+    if local.crc32 != entry.crc32 {
+        return Err(ZipError::LocalHeaderMismatch {
+            name: entry.name.clone(),
+            detail: "records a different checksum than the central directory does",
+        });
+    }
+    Ok(())
 }
 
 /// Scan backwards for the end-of-central-directory signature.
@@ -357,15 +500,32 @@ fn read_u32(data: &[u8], at: usize) -> Result<u32, ZipError> {
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
-fn read_name(data: &[u8], at: usize, length: usize) -> Result<String, ZipError> {
+/// Read an entry name, honouring the Unicode-name flag.
+///
+/// With the flag set the name is *promised* UTF-8, so a failed decode is
+/// corruption and is refused — replacing bytes with U+FFFD would hand back a
+/// resource path no pack could have written. Without the flag the name is
+/// nominally CP437; it decodes lossily, which is exact for ASCII (every
+/// datapack path) and honest about everything else in a log line, because
+/// refusing whole archives over a code-page nobody meant would cost more than
+/// it saved.
+fn read_name(
+    data: &[u8],
+    at: usize,
+    length: usize,
+    require_utf8: bool,
+) -> Result<String, ZipError> {
     let bytes = data
         .get(at..at + length)
         .ok_or(ZipError::Truncated { at: data.len() })?;
-    // Zip names are CP437 unless the UTF-8 flag is set. Every writer this
-    // millennium sets it, and a datapack path is ASCII anyway, so a name that
-    // is not UTF-8 is reported rather than transcoded from a code page nobody
-    // meant.
-    Ok(String::from_utf8_lossy(bytes).into_owned())
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Ok(text.to_owned()),
+        Err(error) if require_utf8 => Err(ZipError::NameNotUtf8 {
+            name: String::from_utf8_lossy(bytes).into_owned(),
+            at: error.valid_up_to(),
+        }),
+        Err(_) => Ok(String::from_utf8_lossy(bytes).into_owned()),
+    }
 }
 
 /// Why a name is not one Dust will accept, or `None`.
