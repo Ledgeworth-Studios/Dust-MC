@@ -142,6 +142,11 @@ async fn shake_hands(
 async fn send_login_start(client: &mut Conn<tokio::net::TcpStream>, name: &str) {
     let mut start = Vec::new();
     put_string(&mut start, name);
+    // The profile id: sixteen raw bytes, mandatory since 1.20.5, no presence
+    // flag. Its value is ignored by the server — offline mode derives its own
+    // and online mode takes Mojang's — but its *length* is checked, because a
+    // body of the wrong length is a client that cannot be talked to.
+    start.extend_from_slice(&[0x11; 16]);
     client.send(Frame::new(0x00, start)).await.expect("send");
 }
 

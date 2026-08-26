@@ -39,5 +39,5 @@ pub mod status;
 
 pub use favicon::{Favicon, FaviconError};
 pub use listen::{Listener, ListenerHandle};
-pub use session::{Served, SessionContext, SessionError};
+pub use session::{Authority, Served, SessionContext, SessionError};
 pub use status::StatusPolicy;

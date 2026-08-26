@@ -135,7 +135,8 @@ impl Listener {
 pub struct Counters {
     accepted: AtomicU64,
     status_served: AtomicU64,
-    logins_refused: AtomicU64,
+    logins: AtomicU64,
+    logins_failed: AtomicU64,
     failed: AtomicU64,
 }
 
@@ -144,7 +145,8 @@ pub struct Counters {
 pub struct NetStats {
     pub accepted: u64,
     pub status_served: u64,
-    pub logins_refused: u64,
+    pub logins: u64,
+    pub logins_failed: u64,
     pub failed: u64,
 }
 
@@ -199,12 +201,27 @@ async fn accept_loop(
                         format!("{peer}: server list ping (measured: {pinged})"),
                     );
                 }
-                Ok(Served::LoginRefused) => {
-                    counters.logins_refused.fetch_add(1, Ordering::Relaxed);
+                Ok(Served::LoggedIn {
+                    username,
+                    profile_id,
+                }) => {
+                    counters.logins.fetch_add(1, Ordering::Relaxed);
                     logger.info(
                         "dust::net",
-                        format!("{peer}: asked to log in; this server cannot host players yet"),
+                        format!(
+                            "{peer}: {username} ({}) logged in; disconnected because \
+                             there is no world to join yet",
+                            hyphenated(&profile_id)
+                        ),
                     );
+                }
+                Ok(Served::LoginFailed { reason }) => {
+                    counters.logins_failed.fetch_add(1, Ordering::Relaxed);
+                    // Info rather than warn: a refused login is usually a
+                    // player typing a name wrong or a client on the wrong
+                    // version, and an operator reading warnings should be
+                    // reading about the server.
+                    logger.info("dust::net", format!("{peer}: login refused: {reason}"));
                 }
                 Ok(Served::NothingAsked) => {
                     logger.trace("dust::net", format!("{peer}: connected and said nothing"));
@@ -219,6 +236,23 @@ async fn accept_loop(
             }
         });
     }
+}
+
+/// A profile id in the spelling everything else in this ecosystem uses.
+///
+/// The wire carries sixteen raw bytes; every log, command and web API carries
+/// 8-4-4-4-12 hyphenated hex. Printing the raw form would give an operator a
+/// number they cannot paste anywhere.
+fn hyphenated(id: &[u8; 16]) -> String {
+    let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// A running listener. Dropping this stops it.
@@ -242,7 +276,8 @@ impl ListenerHandle {
         NetStats {
             accepted: self.counters.accepted.load(Ordering::Relaxed),
             status_served: self.counters.status_served.load(Ordering::Relaxed),
-            logins_refused: self.counters.logins_refused.load(Ordering::Relaxed),
+            logins: self.counters.logins.load(Ordering::Relaxed),
+            logins_failed: self.counters.logins_failed.load(Ordering::Relaxed),
             failed: self.counters.failed.load(Ordering::Relaxed),
         }
     }

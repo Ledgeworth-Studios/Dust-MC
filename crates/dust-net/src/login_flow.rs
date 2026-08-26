@@ -73,6 +73,11 @@ use crate::varint::{read_var_int, write_var_int};
 /// Serverbound Login Start, in the login state. See the seam note in the
 /// module docs for why these ids live here.
 pub const LOGIN_START_ID: i32 = 0x00;
+/// The profile id a client appends to its name in Login Start, in bytes.
+///
+/// A UUID, unprefixed and mandatory since 1.20.5. See [`LoginHandler`]'s
+/// `expect_start` for what it used to be and why that mattered.
+pub const PROFILE_ID_BYTES: usize = 16;
 /// Serverbound Encryption Response.
 pub const ENCRYPTION_RESPONSE_ID: i32 = 0x01;
 /// Serverbound Login Acknowledged, added in 1.20.2.
@@ -276,14 +281,36 @@ pub fn canonical_username(raw: &str) -> Result<Username, BadUsername> {
 }
 
 /// Derive the offline-mode profile id: UUID version 3 over
-/// `"OfflinePlayer:" + key`, MD5-based, exactly as vanilla's
+/// `"OfflinePlayer:" + name`, MD5-based, exactly as vanilla's
 /// `nameUUIDFromBytes` computes it. The version and variant nibbles are set
 /// per RFC 4122 because Java's method sets them, not because anything here
 /// reads them back.
-pub fn offline_profile_id(key: &str) -> [u8; 16] {
+///
+/// # The name is the **display** form, and this took a real server to notice
+///
+/// Vanilla hashes the name as the client typed it. Case matters:
+/// `OfflinePlayer:Tester` and `OfflinePlayer:tester` are different strings and
+/// therefore different players, with different inventories and different
+/// entries in every permission system keyed on a uuid.
+///
+/// This function used to take a `&str` and its one caller passed
+/// [`Username::as_key`] — the *lowercase* comparison form — because that is the
+/// form the type steers callers towards, deliberately, for matching. So every
+/// offline player on Dust got a different id from the one they have on every
+/// other offline server, and nothing in either crate could tell:
+///
+/// ```text
+/// vanilla 1.21.1, name "Tester"  ->  f3d28cb0-7225-3cb1-baeb-2dadd2be89ae
+/// dust before this fix           ->  dd823a0c-b94a-369f-acd6-ddd287e3180e   (= "tester")
+/// ```
+///
+/// It takes a [`Username`] now rather than a string, so the caller cannot pick
+/// a form at all. A guard against a mistake somebody already made, placed where
+/// the mistake was available.
+pub fn offline_profile_id(username: &Username) -> [u8; 16] {
     let mut hasher = Md5::new();
     hasher.update(b"OfflinePlayer:");
-    hasher.update(key.as_bytes());
+    hasher.update(username.as_str().as_bytes());
     let mut digest: [u8; 16] = hasher.finalize().into();
     digest[6] = (digest[6] & 0x0F) | 0x30; // version 3
     digest[8] = (digest[8] & 0x3F) | 0x80; // IETF variant
@@ -390,7 +417,7 @@ where
         };
         let outcome = match self.config.mode {
             AuthMode::Offline => {
-                let profile_id = offline_profile_id(start.username.as_key());
+                let profile_id = offline_profile_id(&start.username);
                 self.finish_offline(&start, profile_id).await
             }
             AuthMode::Online => self.finish_online(&start).await,
@@ -420,33 +447,39 @@ where
         let (name_raw, used) =
             read_wire_string(&frame.body).ok_or_else(|| bad_body(LOGIN_START_ID, "name"))?;
 
-        // Since 1.20.5 the client may append a nullable profile id: a boolean
-        // and, when present, sixteen bytes. Both shapes are legal; anything
-        // else is a malformed body, not a longer one. The claim is never
-        // trusted — Mojang's answer decides identity — so it is checked for
-        // shape and dropped.
-        match frame.body.len() - used {
-            0 => {}
-            17 => match frame.body[used] {
-                0 | 1 => {}
-                other => {
-                    return Err(LoginError::UnexpectedFrame {
-                        reason: format!(
-                            "Login Start's optional profile-id flag read {other}, which is \
-                             neither absent nor present"
-                        ),
-                    })
-                }
-            },
-            _ => {
-                return Err(LoginError::UnexpectedFrame {
-                    reason: format!(
-                        "Login Start carries {} trailing byte(s), which is neither empty nor an \
-                         optional profile id",
-                        frame.body.len() - used
-                    ),
-                })
-            }
+        // The name is followed by a profile id: sixteen raw bytes, mandatory,
+        // with no presence flag in front of them.
+        //
+        // This code used to accept a boolean-then-sixteen-bytes shape, and to
+        // accept a bare name, and to refuse the sixteen raw bytes — which is
+        // every case exactly inverted. That shape was real, in 1.20.2 through
+        // 1.20.4; 1.20.5 made the id mandatory and unprefixed, and 1.21.1 is
+        // on the far side of that change. `dust-protocol`'s definition of this
+        // packet had it right the whole time and says so in a comment beside
+        // the field; nothing tied the two together, so they disagreed in
+        // silence.
+        //
+        // Confirmed against a running 1.21.1 server, all three shapes:
+        //
+        // ```text
+        // name + 16 raw bytes      -> accepted, Set Compression follows
+        // name + bool + 16 bytes   -> refused: "1 bytes extra"
+        // name alone               -> refused: "Failed to decode packet"
+        // ```
+        //
+        // The claimed id is never trusted — offline mode derives its own from
+        // the name and online mode takes Mojang's — so it is checked for
+        // length and dropped. Checked anyway, because a body that is the wrong
+        // length is a client this server cannot talk to, and saying so now
+        // beats desynchronising every packet after it.
+        let trailing = frame.body.len() - used;
+        if trailing != PROFILE_ID_BYTES {
+            return Err(LoginError::UnexpectedFrame {
+                reason: format!(
+                    "Login Start carries {trailing} byte(s) after the name; since 1.20.5 it \
+                     carries a {PROFILE_ID_BYTES}-byte profile id there, with no presence flag"
+                ),
+            });
         }
 
         let username = canonical_username(name_raw).map_err(LoginError::BadUsername)?;
@@ -811,28 +844,58 @@ mod tests {
         // not with this function — so a wrong MD5, a missing version nibble
         // or a swapped variant all fail here. Vanilla parity means matching
         // Java's `nameUUIDFromBytes`, whose rules these are.
+        let name = |raw: &str| canonical_username(raw).expect("legal");
         assert_eq!(
-            offline_profile_id("notch"),
+            offline_profile_id(&name("notch")),
             [
                 0x42, 0x65, 0x30, 0x81, 0xa9, 0x0e, 0x34, 0x75, 0xb3, 0xd6, 0x35, 0x50, 0xcd, 0xb4,
                 0x3f, 0x8e
             ]
         );
         assert_eq!(
-            offline_profile_id("steve"),
+            offline_profile_id(&name("steve")),
             [
                 0x53, 0x90, 0x99, 0x32, 0xf7, 0x94, 0x33, 0xc0, 0x93, 0x29, 0x94, 0x80, 0x45, 0xa4,
                 0xc1, 0xce
             ]
         );
-        // The derivation consumes the comparison form, so display case
-        // cannot fork identities offline — provided callers pass the key,
-        // which the only production call site does.
-        let steve = canonical_username("Steve").expect("legal");
+    }
+
+    #[test]
+    fn display_case_forks_the_offline_identity_because_it_does_in_vanilla() {
+        // The test that used to sit here asserted the opposite — that the
+        // comparison form is hashed, so `Steve` and `steve` are one player.
+        // That is a reasonable thing to want and it is not what Minecraft
+        // does, which makes it the wrong thing to implement: an offline player
+        // whose id differs from every other server's has a different
+        // inventory, a different position and a different row in every
+        // permission plugin.
+        //
+        // The vector below was read off the wire of a running 1.21.1 server in
+        // offline mode, logging in as "Tester" — not computed here, and not
+        // computed by the same code being tested.
+        let tester = canonical_username("Tester").expect("legal");
         assert_eq!(
-            offline_profile_id(steve.as_key()),
-            offline_profile_id("steve")
+            offline_profile_id(&tester),
+            [
+                0xf3, 0xd2, 0x8c, 0xb0, 0x72, 0x25, 0x3c, 0xb1, 0xba, 0xeb, 0x2d, 0xad, 0xd2, 0xbe,
+                0x89, 0xae
+            ],
+            "the id vanilla issues for the name \"Tester\""
         );
+
+        let lower = canonical_username("tester").expect("legal");
+        assert_ne!(
+            offline_profile_id(&tester),
+            offline_profile_id(&lower),
+            "case is part of the name vanilla hashes, so it is part of the identity"
+        );
+
+        // Leading and trailing whitespace is still not: canonicalisation trims
+        // before anything reaches the digest, so a name pasted with a space is
+        // the same player rather than a new one.
+        let padded = canonical_username("  Tester ").expect("legal");
+        assert_eq!(offline_profile_id(&tester), offline_profile_id(&padded));
     }
 
     #[test]

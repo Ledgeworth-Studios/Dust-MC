@@ -31,9 +31,15 @@ use std::time::Duration;
 
 use dust_net::frame::Frame;
 use dust_net::io::{Conn, ConnConfig, ConnError};
+use dust_net::login::ServerKey;
+use dust_net::login_flow::{LoginConfig, LoginHandler};
+use dust_net::session::{
+    HttpSessionServer, JoinRequest, Profile, SessionError as NetSessionError, SessionServer,
+    TlsTransport,
+};
 use dust_net::state::{Intent, State};
-use dust_protocol::nbt::JsonTextComponent;
-use dust_protocol::packets::{handshake, login, status};
+use dust_protocol::packets::{configuration, handshake, status};
+use dust_protocol::text::{Color, Component, NamedColor};
 use dust_protocol::types::ProtocolString;
 use dust_protocol::wire::{Reader, Writer};
 use dust_protocol::ProtocolVersion;
@@ -52,8 +58,17 @@ pub enum Served {
     /// round-trip measurement is recorded, because a scanner asks for the JSON
     /// and hangs up while a real client always pings.
     Status { pinged: bool },
-    /// The client asked to log in, and this server has nowhere to put it yet.
-    LoginRefused,
+    /// A player logged in successfully and was then told the world is not
+    /// ready. The identity is carried out because it is the thing the login
+    /// existed to establish, and a log line that omitted it would leave an
+    /// operator unable to tell one attempt from another.
+    LoggedIn {
+        username: String,
+        profile_id: [u8; 16],
+    },
+    /// A login attempt that did not produce an identity. The reason is the one
+    /// the client was given, so the log and the player's screen agree.
+    LoginFailed { reason: String },
     /// The peer disconnected before saying what it wanted.
     NothingAsked,
 }
@@ -67,6 +82,40 @@ pub struct SessionContext {
     pub version: ProtocolVersion,
     pub status: StatusPolicy,
     pub conn: ConnConfig,
+    pub auth: Authority,
+}
+
+/// How this server decides who a joining player is.
+///
+/// The two arms hold different things because they need different things, and
+/// that is the point of the enum over a bool beside two options: an online-mode
+/// server without a key or without a session server is not a configuration, it
+/// is a bug, and this type makes it one that cannot be built. `[server]
+/// online_mode = true` with no way to reach Mojang would otherwise become a
+/// server that quietly admitted anybody under any name — the failure the
+/// setting exists to prevent.
+pub enum Authority {
+    /// Verify nothing. Anyone may claim any name, and the profile id is
+    /// derived from it.
+    Offline,
+    /// Verify against Mojang. The key is generated once at boot, because RSA
+    /// key generation has no upper bound on its running time and does not
+    /// belong on a login path.
+    Online {
+        session: Arc<HttpSessionServer<TlsTransport>>,
+        key: Arc<ServerKey>,
+    },
+}
+
+impl std::fmt::Debug for Authority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Neither the key nor the trust store belongs in a log line, and the
+        // only thing a reader wants here is which regime is running.
+        f.write_str(match self {
+            Self::Offline => "Offline",
+            Self::Online { .. } => "Online",
+        })
+    }
 }
 
 /// Errors this layer adds on top of `dust-net`'s.
@@ -226,54 +275,126 @@ where
             // here would make this look like version enforcement when the real
             // enforcement does not exist yet.
             let _ = intention.protocol_version;
-            serve_login_refusal(conn, &ctx).await
+            serve_login(conn, &ctx).await
         }
     }
 }
 
-/// Read the login request, then refuse it in words.
+/// Log a player in, then tell them the world is not ready.
 ///
-/// # Why the request is read before it is refused
+/// # How far this goes
 ///
-/// The obvious shortcut — send the refusal the instant the intent is known,
-/// without waiting for Login Start — leaves the client's bytes sitting unread
-/// in this end's receive buffer when the socket closes. A TCP stack that closes
-/// with unread data sends **RST rather than FIN**, and an RST is entitled to
-/// discard whatever is still in the peer's receive buffer: on a bad day that is
-/// the refusal itself, and the player sees "connection reset" — precisely the
-/// message this packet exists to replace. It reproduced on the first run here,
-/// as a reset where the test expected a clean end of stream.
+/// All the way through login — Login Start, the encryption exchange and
+/// Mojang's verdict in online mode, Set Compression, Login Success, Login
+/// Acknowledged — and then one step into configuration, where it stops. The
+/// player's identity is established and the connection is in the state where a
+/// server would send its registries; Dust has no registries to send yet, so it
+/// says so and disconnects.
 ///
-/// So the request is consumed first. That is also what a server ought to do on
-/// its own terms: a refusal is an answer to something, and answering before
-/// being asked is how a protocol implementation ends up depending on timing.
-async fn serve_login_refusal<W>(
-    mut conn: Conn<W>,
-    ctx: &SessionContext,
-) -> Result<Served, SessionError>
+/// That is worth doing rather than skipping, because the half that exists is
+/// the half with the cryptography in it. A login that is never exercised end to
+/// end against a real client is a login nobody has tested.
+///
+/// # Why the request is read even when the answer is no
+///
+/// The obvious shortcut — refuse the instant the intent is known, without
+/// waiting for Login Start — leaves the client's bytes unread in this end's
+/// receive buffer when the socket closes. A TCP stack that closes with unread
+/// data sends **RST rather than FIN**, and an RST is entitled to discard
+/// whatever is still in the peer's receive buffer: on a bad day that is the
+/// refusal itself, and the player sees "connection reset" — precisely the
+/// message the packet existed to replace. It reproduced here on the first run,
+/// as a reset where the test expected a clean end of stream. `LoginHandler`
+/// reads the request before answering, which is one more reason to go through
+/// it rather than around it.
+async fn serve_login<W>(mut conn: Conn<W>, ctx: &SessionContext) -> Result<Served, SessionError>
 where
     W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    // One frame, not a loop. The client's next packet after the handshake is
-    // Login Start; anything else is a client this server was never going to
-    // serve, and it is refused with the same words either way. Whether it
-    // arrives at all is optional — a client that hangs up first is not owed an
-    // explanation.
-    let _ = conn.next_frame().await?;
+    let authenticated = match &ctx.auth {
+        Authority::Offline => {
+            LoginHandler::new(&mut conn, LoginConfig::offline(), &NoSessionServer, None)
+                .authenticate()
+                .await
+        }
+        Authority::Online { session, key } => {
+            LoginHandler::new(
+                &mut conn,
+                LoginConfig::online(),
+                session.as_ref(),
+                Some(key.as_ref()),
+            )
+            .authenticate()
+            .await
+        }
+    };
 
-    // Still JSON here, not NBT: login_disconnect predates the 1.20.3 change to
-    // NBT components and kept the old encoding, which is why the field's type
-    // is JsonTextComponent while the play-state disconnect's is not.
-    let reason = ProtocolString::new(
-        r#"{"text":"This Dust server cannot host players yet.","color":"red"}"#,
-    )?;
-    let packet = login::clientbound::Packet::from(login::clientbound::LoginDisconnect {
-        reason: JsonTextComponent(reason),
-    });
+    let authenticated = match authenticated {
+        Ok(authenticated) => authenticated,
+        Err(error) => {
+            // `LoginHandler` has already put the reason on the wire for every
+            // failure that had a wire to put it on; what is left here is to
+            // flush it and say what happened. Returning the error instead
+            // would abort the connection and take the explanation with it.
+            let reason = error.to_string();
+            let _ = finish(
+                conn,
+                Served::LoginFailed {
+                    reason: reason.clone(),
+                },
+            )
+            .await;
+            return Ok(Served::LoginFailed { reason });
+        }
+    };
+
+    // Login Acknowledged has been received, so the connection is in
+    // configuration. The disconnect below is therefore a *configuration*
+    // disconnect and carries an NBT component — not the JSON one login uses.
+    // The two states spell the same idea differently, which is exactly the
+    // sort of thing that is invisible until a client renders nothing.
+    let reason = Component::text("Dust cannot serve a world yet.")
+        .colored(Color::Named(NamedColor::Red))
+        .to_nbt(ctx.version)?;
+    let packet =
+        configuration::clientbound::Packet::from(configuration::clientbound::Disconnect { reason });
     let frame = to_frame!(packet, ctx.version);
     conn.send(frame).await?;
     conn.disconnect();
-    finish(conn, Served::LoginRefused).await
+
+    let outcome = Served::LoggedIn {
+        username: authenticated.username,
+        profile_id: authenticated.profile_id,
+    };
+    finish(conn, outcome).await
+}
+
+/// The session server for offline mode: there isn't one.
+///
+/// `LoginHandler` takes a session server unconditionally because the type it
+/// needs is decided at compile time, and offline mode never calls either
+/// method. Both bodies are unreachable rather than unimplemented, and they say
+/// so by failing loudly instead of returning something plausible — a stub that
+/// answered "yes, that player is who they say" would turn a wiring mistake into
+/// an authentication bypass.
+struct NoSessionServer;
+
+impl SessionServer for NoSessionServer {
+    async fn join(&self, _request: JoinRequest<'_>) -> Result<(), NetSessionError> {
+        Err(NetSessionError::Transport {
+            reason: "offline mode never contacts the session server".to_owned(),
+        })
+    }
+
+    async fn has_joined(
+        &self,
+        _username: &str,
+        _server_id_hash: &str,
+    ) -> Result<Option<Profile>, NetSessionError> {
+        Err(NetSessionError::Transport {
+            reason: "offline mode never contacts the session server".to_owned(),
+        })
+    }
 }
 
 /// The two round trips of a server-list ping.

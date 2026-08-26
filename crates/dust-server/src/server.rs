@@ -708,6 +708,7 @@ impl Server {
         let motd = config.server.motd.clone();
         let max_players = config.server.max_players;
         let favicon_path = config.server.favicon.clone();
+        let online_mode = config.server.online_mode;
 
         let fail = |message: String| -> ServerError {
             ServerError::NetworkBind {
@@ -733,6 +734,34 @@ impl Server {
         // of being spread through the code that assumed one.
         let version = dust_protocol::version::V1_21_1;
 
+        // Both of these are done *before* the socket exists, because both can
+        // fail and a failure after the bind leaves a port taken by a server
+        // that is about to stop. Key generation in particular is slow and
+        // unbounded — RSA prime search has no worst case — which is exactly
+        // why it happens once here and never on a login.
+        let authority = if online_mode {
+            let transport = dust_net::session::TlsTransport::mojang().map_err(|e| {
+                fail(format!(
+                    "online mode needs to reach Mojang's session server and could not: {e}. \
+                     Set [server] online_mode = false to run without verification, knowing \
+                     that anyone may then join under any name"
+                ))
+            })?;
+            let key = dust_net::login::ServerKey::generate()
+                .map_err(|e| fail(format!("online mode needs a server key pair: {e}")))?;
+            crate::net::Authority::Online {
+                session: std::sync::Arc::new(dust_net::session::HttpSessionServer::new(transport)),
+                key: std::sync::Arc::new(key),
+            }
+        } else {
+            self.options.logger.warn(
+                "dust::server",
+                "[server] online_mode = false: nobody is verified and anyone may join \
+                 under any name. Safe only behind a proxy that checks for you.",
+            );
+            crate::net::Authority::Offline
+        };
+
         let listener = crate::net::Listener::bind(addr).map_err(|e| fail(e.to_string()))?;
         let bound = listener.addr();
 
@@ -740,6 +769,7 @@ impl Server {
             version,
             status: crate::net::StatusPolicy::new(version, motd, max_players, favicon),
             conn: dust_net::io::ConnConfig::default(),
+            auth: authority,
         });
 
         let handle = listener
@@ -750,9 +780,10 @@ impl Server {
             phase: Phase::NetworkBind,
             direction: Direction::Start,
             detail: format!(
-                "listening on {bound} for protocol {} ({})",
+                "listening on {bound} for protocol {} ({}), {} mode",
                 version.number(),
-                version.name()
+                version.name(),
+                if online_mode { "online" } else { "offline" }
             ),
         });
         // Published only after the handle exists, so an observer that sees an
@@ -825,8 +856,12 @@ impl Server {
                         handle.shutdown();
                         format!(
                             "released {addr} after {} connection(s): {} ping(s), \
-                             {} login(s) refused, {} failed",
-                            stats.accepted, stats.status_served, stats.logins_refused, stats.failed
+                             {} login(s), {} login(s) refused, {} failed",
+                            stats.accepted,
+                            stats.status_served,
+                            stats.logins,
+                            stats.logins_failed,
+                            stats.failed
                         )
                     }
                     // The bind failed, so the phase never completed and this

@@ -17,7 +17,11 @@ path = "src/main.rs"
 [dependencies]
 ctrlc.workspace = true
 dust-config.workspace = true
-dust-net.workspace = true
+# The `tls` feature is on because online mode needs it: verifying a player
+# against Mojang means a real HTTPS request, and a server that silently ran
+# offline because the feature was off would let anybody join as anybody. See
+# the online-mode handling in `net::session`.
+dust-net = { workspace = true, features = ["tls"] }
 dust-protocol.workspace = true
 
 # The network runtime. dust-net picked tokio and explains why in its own

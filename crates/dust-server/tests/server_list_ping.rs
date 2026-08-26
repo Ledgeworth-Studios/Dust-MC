@@ -100,6 +100,55 @@ fn recv_frame(stream: &mut TcpStream) -> (i32, Vec<u8>) {
     (id, payload[cursor..].to_vec())
 }
 
+/// Read a VarInt out of a slice, returning it and the rest.
+fn read_var_int_from(bytes: &[u8]) -> (i32, &[u8]) {
+    let mut result: i32 = 0;
+    for (shift, i) in (0..5).enumerate() {
+        let byte = bytes[i];
+        result |= i32::from(byte & 0x7f) << (shift * 7);
+        if byte & 0x80 == 0 {
+            return (result, &bytes[i + 1..]);
+        }
+    }
+    panic!("a VarInt longer than five bytes is not one");
+}
+
+/// Receive a frame after Set Compression.
+///
+/// The compressed format inserts one field: an uncompressed-length VarInt after
+/// the frame length. Zero means "the rest is not compressed", which is what a
+/// server sends for anything under the threshold — and every packet this test
+/// receives after the switch is under 256 bytes, so the zero case is the one
+/// exercised. That is not a gap being papered over: it is the case a real
+/// client meets for keepalives and acknowledgements, and getting it wrong is
+/// how a server appears to work until somebody sends a chunk.
+fn recv_compressed_frame(stream: &mut TcpStream) -> (i32, Vec<u8>) {
+    let len = read_var_int(stream);
+    assert!(len > 0, "a frame is at least its uncompressed-length field");
+    let mut payload = vec![0u8; len as usize];
+    stream.read_exact(&mut payload).expect("the frame body");
+    let (uncompressed_len, rest) = read_var_int_from(&payload);
+    assert_eq!(
+        uncompressed_len, 0,
+        "this test only exchanges packets below the threshold; a non-zero \
+         length here means the server compressed something it should not have"
+    );
+    let (id, body) = read_var_int_from(rest);
+    (id, body.to_vec())
+}
+
+/// Send a frame after Set Compression, below the threshold.
+fn send_compressed_frame(stream: &mut TcpStream, id: i32, body: &[u8]) {
+    let mut payload = Vec::new();
+    write_var_int(0, &mut payload); // uncompressed: this packet is small
+    write_var_int(id, &mut payload);
+    payload.extend_from_slice(body);
+    let mut frame = Vec::new();
+    write_var_int(payload.len() as i32, &mut frame);
+    frame.extend_from_slice(&payload);
+    stream.write_all(&frame).expect("write a frame");
+}
+
 /// The handshake, addressed to `addr`, asking for `next_state`.
 fn handshake(stream: &mut TcpStream, protocol: i32, addr: SocketAddr, next_state: i32) {
     let mut body = Vec::new();
@@ -183,7 +232,7 @@ fn stepping(clock: Arc<ManualClock>, step: u64) -> dust_server::server::ParkerFa
 /// becomes the flaky one.
 fn start(extra_config: &str) -> Running {
     let clock = Arc::new(ManualClock::new());
-    let config = format!("[server]\nbind = \"127.0.0.1:0\"\n{extra_config}");
+    let config = format!("[server]\nbind = \"127.0.0.1:0\"\nonline_mode = false\n{extra_config}");
 
     let options = ServerOptions {
         config_path: write_config(&config),
@@ -274,40 +323,65 @@ fn a_client_speaking_raw_protocol_gets_the_server_list_entry() {
 }
 
 #[test]
-fn a_client_that_asks_to_log_in_is_told_why_rather_than_dropped() {
+fn an_offline_login_completes_and_then_says_the_world_is_not_ready() {
     let running = start("");
     let addr = running.addr;
     let mut stream = connect(addr);
     handshake(&mut stream, 767, addr, 2);
 
-    // Login Start: a name and a UUID.
+    // Login Start: a name and the client's guess at its own profile id.
     let mut body = Vec::new();
     write_string("Tester", &mut body);
     body.extend_from_slice(&[0u8; 16]);
     send_frame(&mut stream, 0x00, &body);
 
-    // The refusal is a packet, not a closed socket. A player dropped without a
-    // word sees "connection reset", which is indistinguishable from a network
-    // fault; the one useful thing this server can say, it says.
+    // Set Compression comes first, at vanilla's threshold. From here on the
+    // client's frames carry an uncompressed-length prefix, which is why this
+    // test reads its last frames through the compressed reader below — the
+    // switch is part of the protocol, not an optimisation to skip in a test.
     let (id, body) = recv_frame(&mut stream);
-    assert_eq!(id, 0x00, "login_disconnect is id 0 clientbound in login");
-    let reason = read_string(&body);
-    assert!(reason.contains("cannot host players yet"), "{reason}");
-    // Still JSON in the login state — login_disconnect predates the 1.20.3
-    // change to NBT components and kept the old encoding. A test that accepted
-    // either would not notice the day this is encoded the new way and every
-    // client stops rendering it.
-    assert!(
-        reason.starts_with('{') && reason.contains(r#""text""#),
-        "{reason}"
+    assert_eq!(id, 0x03, "set_compression is id 3 clientbound in login");
+    assert_eq!(read_var_int_from(&body).0, 256, "vanilla's threshold");
+
+    // Login Success. Offline mode derives the profile id from the name, so it
+    // is emphatically not the sixteen zero bytes the client sent.
+    let (id, body) = recv_compressed_frame(&mut stream);
+    assert_eq!(id, 0x02, "login_finished is id 2 clientbound in login");
+    assert_ne!(
+        &body[..16],
+        &[0u8; 16],
+        "an offline id is derived, not echoed"
     );
+    let (name_len, rest) = read_var_int_from(&body[16..]);
+    let name = String::from_utf8(rest[..name_len as usize].to_vec()).expect("UTF-8");
+    assert_eq!(name, "Tester");
 
-    // And then the socket closes, so the client is not left waiting.
+    // Login Acknowledged moves both ends into configuration.
+    send_compressed_frame(&mut stream, 0x03, &[]);
+
+    // And configuration is where this server runs out of things to say. The
+    // disconnect here is the *configuration* one, which carries an NBT
+    // component rather than login's JSON — two spellings of one idea, and a
+    // server that used the wrong one renders nothing at all.
+    let (id, body) = recv_compressed_frame(&mut stream);
+    assert_eq!(id, 0x02, "disconnect is id 2 clientbound in configuration");
+    assert_eq!(body[0], 0x0a, "an NBT component starts with TAG_Compound");
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("cannot serve a world yet"), "{text:?}");
+
     let mut buffer = [0u8; 64];
-    let read = stream.read(&mut buffer).expect("read after the refusal");
-    assert_eq!(read, 0, "the server must close after saying why");
+    let read = stream.read(&mut buffer).expect("read after the disconnect");
+    assert_eq!(read, 0, "the server closes after saying why");
 
-    running.finish();
+    let report = running.finish();
+    assert!(
+        report
+            .transcript
+            .iter()
+            .any(|e| e.detail.contains("1 login(s)")),
+        "the teardown must account for the login: {:?}",
+        report.transcript
+    );
 }
 
 #[test]
@@ -385,7 +459,7 @@ fn tiny_png(width: u32, height: u32) -> Vec<u8> {
 /// Run a boot that is expected to fail in phase 3, and return the error.
 fn boot_expecting_failure(extra_config: &str) -> dust_server::ServerError {
     let clock = Arc::new(ManualClock::new());
-    let config = format!("[server]\nbind = \"127.0.0.1:0\"\n{extra_config}");
+    let config = format!("[server]\nbind = \"127.0.0.1:0\"\nonline_mode = false\n{extra_config}");
     let options = ServerOptions {
         config_path: write_config(&config),
         clock: Arc::clone(&clock) as Arc<dyn Clock>,

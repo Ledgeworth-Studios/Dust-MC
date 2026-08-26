@@ -31,7 +31,9 @@ use dust_net::crypt::{SharedSecret, SHARED_SECRET_LEN};
 use dust_net::frame::{Compress, Frame};
 use dust_net::io::{Conn, ConnConfig, Timeouts};
 use dust_net::login::ServerKey;
-use dust_net::login_flow::{offline_profile_id, LoginConfig, LoginError, LoginHandler};
+use dust_net::login_flow::{
+    canonical_username, offline_profile_id, LoginConfig, LoginError, LoginHandler, PROFILE_ID_BYTES,
+};
 use dust_net::session::{
     JoinRequest, Profile, ProfileId, ProfileProperty, SessionError, SessionServer,
 };
@@ -215,9 +217,26 @@ async fn shake_hands(
     assert_eq!(server.state(), State::Login);
 }
 
+/// Login Start as a 1.21.1 client sends it: the name, then sixteen raw bytes
+/// of profile id with no presence flag in front of them.
+///
+/// Every test in this file built it without the id until the shape was checked
+/// against a running 1.21.1 server, which refuses that with "Failed to decode
+/// packet". The tests and the parser shared one misreading of the format, so
+/// the suite was green and no real client could have logged in — which is what
+/// a test written from the same understanding as the code is worth.
 async fn send_login_start(client: &mut Conn<tokio::io::DuplexStream>, name: &str) {
+    send_login_start_with_id(client, name, [0x11; PROFILE_ID_BYTES]).await;
+}
+
+async fn send_login_start_with_id(
+    client: &mut Conn<tokio::io::DuplexStream>,
+    name: &str,
+    profile_id: [u8; PROFILE_ID_BYTES],
+) {
     let mut start = Vec::new();
     put_string(&mut start, name);
+    start.extend_from_slice(&profile_id);
     client.send(Frame::new(0x00, start)).await.expect("send");
 }
 
@@ -307,11 +326,14 @@ async fn an_offline_login_walks_compression_success_acknowledged_in_order() {
 
         let success = client.next_frame().await.expect("read").expect("success");
         assert_eq!(success.id, 0x02);
-        let expected_id = offline_profile_id("steve");
+        // The name as the client sent it, not its lowercase comparison form:
+        // vanilla hashes what was typed, so `Steve` and `steve` are two
+        // players offline.
+        let expected_id = offline_profile_id(&canonical_username("Steve").expect("legal"));
         assert_eq!(
             &success.body[..16],
             &expected_id[..],
-            "the id is MD5 over OfflinePlayer:steve"
+            "the id is MD5 over OfflinePlayer:Steve"
         );
         let (name, used) = get_string(&success.body[16..]);
         assert_eq!(name, "Steve", "display case survives");
@@ -364,8 +386,8 @@ async fn a_name_arriving_with_surrounding_whitespace_is_canonicalised_once() {
         assert_eq!(name, "Steve", "trimmed once, at the boundary");
         assert_eq!(
             &success.body[..16],
-            &offline_profile_id("steve")[..],
-            "and the id derives from the comparison form"
+            &offline_profile_id(&canonical_username("Steve").expect("legal"))[..],
+            "the id derives from the trimmed display form, case and all"
         );
 
         client

@@ -274,6 +274,28 @@ fn is_bare_string(component: &Component) -> bool {
         && component.extra.is_empty()
 }
 
+impl Component {
+    /// Render into the opaque NBT form the packet fields carry.
+    ///
+    /// The two component types have two jobs — [`nbt::TextComponent`] for a
+    /// field this crate merely forwards, [`Component`] for one it authors —
+    /// and a server that authors a message has to hand it to a field of the
+    /// first kind. Doing that is an encode into a buffer and a wrap, and it
+    /// lives here rather than at every call site because a caller that got the
+    /// encoding wrong would produce a component that travels and does not
+    /// render, with nothing on either end to say so.
+    /// The version is taken even though this encoder ignores it, because the
+    /// NBT spelling of a component is a thing that has changed once already —
+    /// it was JSON before 1.20.3 — and a conversion that could not be told
+    /// which version it was for would be the place that silently kept being
+    /// wrong after the next change.
+    pub fn to_nbt(&self, version: ProtocolVersion) -> Result<nbt::TextComponent, EncodeError> {
+        let mut out = crate::wire::Writer::default();
+        self.encode(&mut out, version)?;
+        Ok(nbt::TextComponent(nbt::Nbt(out.into_bytes())))
+    }
+}
+
 impl Encode for Component {
     fn encode<W: WireWrite + ?Sized>(
         &self,
