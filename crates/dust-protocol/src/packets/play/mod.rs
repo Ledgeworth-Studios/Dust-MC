@@ -39,18 +39,25 @@
 //! arrives, verification plugs in where those bytes are interpreted, and no
 //! layout changes. See [`chat`].
 
+pub mod advancements;
+pub mod boss_bar;
 pub mod chat;
 pub mod chunk;
 pub mod clientbound;
+pub mod commands;
+pub mod containers;
+pub mod map_item;
 pub mod metadata;
+pub mod particle;
 pub mod player_info;
 pub mod serverbound;
+pub mod sound;
 
 use crate::types::{Decode, Encode, Identifier, Position};
 use crate::wire::{DecodeError, EncodeError, WireRead, WireWrite};
-use crate::{wire_struct, ProtocolVersion};
+use crate::{var_int_enum, wire_struct, ProtocolVersion};
 
-crate::var_int_enum! {
+var_int_enum! {
     /// How a player may interact with the world.
     ///
     /// The ids are the registry's own and appear in more than one encoding:
@@ -63,6 +70,54 @@ crate::var_int_enum! {
         Creative = 1,
         Adventure = 2,
         Spectator = 3,
+    }
+}
+
+var_int_enum! {
+    /// How much the world fights back.
+    ///
+    /// Travels as a bare byte in both directions of the difficulty packets,
+    /// never as a VarInt — see [`DifficultyByte`] for the spelling the wire
+    /// uses.
+    pub enum Difficulty {
+        Peaceful = 0,
+        Easy = 1,
+        Normal = 2,
+        Hard = 3,
+    }
+}
+
+/// The difficulty packets' spelling of [`Difficulty`]: one unsigned byte.
+///
+/// The same wrapper [`GameModeByte`] is for gamemodes: the value travels
+/// narrower than a VarInt, so the enum's VarInt codec cannot be reused and a
+/// bare `u8` would lose the closed set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DifficultyByte(pub Difficulty);
+
+impl Decode for DifficultyByte {
+    fn decode<R: WireRead + ?Sized>(
+        input: &mut R,
+        _version: ProtocolVersion,
+    ) -> Result<Self, DecodeError> {
+        let raw = input.read_u8()?;
+        let difficulty =
+            Difficulty::from_discriminant(i32::from(raw)).ok_or(DecodeError::UnknownVariant {
+                name: "Difficulty",
+                value: i32::from(raw),
+            })?;
+        Ok(Self(difficulty))
+    }
+}
+
+impl Encode for DifficultyByte {
+    fn encode<W: WireWrite + ?Sized>(
+        &self,
+        out: &mut W,
+        _version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        out.write_u8(self.0.discriminant() as u8);
+        Ok(())
     }
 }
 
@@ -161,6 +216,31 @@ wire_struct! {
         x: i16,
         y: i16,
         z: i16,
+    }
+}
+
+wire_struct! {
+    /// One block destroyed by an explosion, relative to the explosion's centre.
+    ///
+    /// Three *signed* bytes, one per axis. The offsets are small — an explosion
+    /// reaches a few blocks, not a few hundred — which is why they are bytes at
+    /// all; a `Position` here would be eight bytes of mostly sign bits.
+    pub struct ExplosionRecord {
+        x: i8,
+        y: i8,
+        z: i8,
+    }
+}
+
+var_int_enum! {
+    /// Which hand holds the item an animation or use refers to.
+    ///
+    /// A VarInt enum rather than a bool because the wire spells it as one, and a
+    /// third value arriving from a future version should be refused by name rather
+    /// than read as "off hand".
+    pub enum Hand {
+        Main = 0,
+        Off = 1,
     }
 }
 
