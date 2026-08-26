@@ -8,13 +8,38 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+flate2.workspace = true
+
+[dev-dependencies]
+# The same crate the library uses. The tests need it directly because the
+# external corpus lives inside the server jar, and reading a jar means
+# inflating deflate streams — see `tests/support/mod.rs`.
+flate2.workspace = true
+
+# The generated-document suites: round-trips through both binary dialects and
+# the SNBT printer/parser differential. The strategies live with the rest of
+# the test plumbing in `tests/support/mod.rs`.
+#
+# Default features are off because the defaults include process-forking test
+# isolation (`rusty-fork`), whose dependency tree declares its licences in the
+# legacy slash form — `MIT/Apache-2.0` — that is not valid SPDX and that our
+# licence gate rightly refuses to parse by guessing. Nothing here forks;
+# `std` and `bit-set` are everything the strategies use.
+proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }
+
+# A stopwatch and nothing else; see the note at the top of the bench.
+[[bench]]
+name = "synthetic"
+harness = false
 
 [lints.rust]
-# On the unsafe allow-list; see docs/decisions/0005-implementation-language.md.
-# The workspace denies unsafe, and this crate cannot do its job without it, so
-# it opts out here rather than sprinkling `#[allow]` at each use site — the
-# exception is then visible in one place per crate instead of many.
-unsafe_code = "warn"
+# The stub of this crate opted out of the workspace `unsafe_code = "deny"` in
+# anticipation of a zero-copy reader that would need it. The implementation
+# turned out not to: see the `Tag::String` note in `src/tag.rs` for why nothing
+# in NBT can be borrowed from the input in the general case, which removed the
+# reason for the exception. The deny is back, so the exception is not sitting
+# open for a later change to walk through.
+unsafe_code = "deny"
 missing_debug_implementations = "warn"
 
 [lints.clippy]
