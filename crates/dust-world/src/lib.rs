@@ -14,12 +14,16 @@
 //! * [`heightmap`] — the six heightmaps, stored and accessed, plus the
 //!   recompute helpers that fill them from a chunk's sections.
 //! * [`light::LightArray`] — a section's sky or block light: 4096 four-bit
-//!   levels in the 2048 bytes the format stores. Storage only; see its module
-//!   documentation for where the light engine will take over.
+//!   levels in the 2048 bytes the format stores.
+//! * [`propagation`] — the light engine's walks over that storage: raise
+//!   and darken breadth-first passes, sky-light column seeding, a budget
+//!   with typed overflow errors, and the [`propagation::LightGraph`] seam
+//!   they run through.
 //! * [`chunk::Chunk`] — one chunk column assembled from all of the above:
 //!   sections of block states and biomes, per-section light, the heightmaps,
-//!   and block-entity handles. Its serialised form crosses the region layer
-//!   through the [`chunk::NbtWriter`] and [`chunk::NbtReader`] traits.
+//!   and block-entity handles in a generational slab. Its serialised form
+//!   crosses the region layer through the [`chunk::NbtWriter`] and
+//!   [`chunk::NbtReader`] traits.
 //! * [`coords`] — chunk, region and block positions, and the shifts between
 //!   them.
 //!
@@ -41,7 +45,7 @@
 //! itself, which is why every error in [`region::RegionError`] can name the
 //! chunk it is about and say what did not add up.
 //!
-//! The same seam appears twice more, for the same reason:
+//! The same seam appears three more times, for the same reason:
 //!
 //! * [`container::PalettedContainer`] indexes *a* registry and is told how many
 //!   ids it has. It never asks what a block is, so it does not depend on the
@@ -50,6 +54,11 @@
 //!   parameter. There are six heightmaps and they differ only in that
 //!   predicate, all six need the block registry to answer it, and none of them
 //!   need it to store 256 numbers.
+//! * [`propagation::LightGraph`] is the light engine's version of the same
+//!   line: levels and opacity are asked, never interpreted. Which block
+//!   states let light through is registry work, and the default answer —
+//!   everything opaque except an explicit transparent set — lives beside the
+//!   walks as [`propagation::DefaultOpacity`] until that lands.
 //!
 //! # What the guards in this crate do not catch
 //!
@@ -67,8 +76,11 @@
 //!   of wrong numbers, and this crate cannot know: it does not have the
 //!   registry that would let it disagree.
 //! * **Light values that were never propagated.** [`light::LightArray`] pins
-//!   the encoding; whether fifteen is the right answer for a cell is the
-//!   future engine's problem, and nothing here can ask it.
+//!   the encoding and [`propagation`] walks levels across a graph, but
+//!   nothing yet connects a chunk's blocks to its light: whether fifteen is
+//!   the right answer for a cell needs the registry-backed
+//!   [`propagation::LightGraph`] implementation, and until that lands a
+//!   section can read bright while its blocks say dark.
 //! * **Ids that mean the wrong thing.** The container checks that an id is *in
 //!   range* for the registry size it was given, and nothing checks that the
 //!   range is the right registry.
@@ -83,6 +95,7 @@ pub mod coords;
 pub mod heightmap;
 pub mod light;
 pub mod palette;
+pub mod propagation;
 pub mod region;
 pub mod slab;
 
@@ -93,5 +106,6 @@ pub use coords::{BlockPos, ChunkPos, RegionPos};
 pub use heightmap::{Heightmap, HeightmapKind, HeightmapSet, WorldHeight};
 pub use light::{LightArray, LightArrayError};
 pub use palette::{Palette, PaletteKind};
+pub use propagation::{Budget, DefaultOpacity, LightGraph, PropagationError};
 pub use region::{ChunkPayload, Compression, RegionError, RegionFile};
 pub use slab::{Slab, SlabError, SlabKey};
