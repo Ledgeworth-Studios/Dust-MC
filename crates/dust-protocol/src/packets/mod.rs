@@ -368,6 +368,27 @@ macro_rules! packet_group {
                 version: $crate::ProtocolVersion,
             ) -> ::core::result::Result<Self, $crate::wire::DecodeError> {
                 let protocol_id = input.read_var_int()?;
+                Self::decode_body(protocol_id, input, version)
+            }
+
+            /// Read a body whose id has already been taken off the front.
+            ///
+            /// This is the half a framed transport needs. `dust-net` decodes
+            /// the id itself — it sits at a fixed offset and something has to
+            /// strip it before the body starts — and hands on a
+            /// `Frame { id, body }` whose two halves are no longer adjacent in
+            /// memory. Re-joining them just so [`Packet::decode`] can split
+            /// them again would be a copy per inbound packet to undo work that
+            /// was already done correctly.
+            ///
+            /// `protocol_id` is signed because that is what a VarInt is. A
+            /// negative id is malformed rather than impossible, and refusing it
+            /// needs a type that can hold it; see the `NegativeLength` arm.
+            pub fn decode_body<R: $crate::wire::WireRead + ?Sized>(
+                protocol_id: i32,
+                input: &mut R,
+                version: $crate::ProtocolVersion,
+            ) -> ::core::result::Result<Self, $crate::wire::DecodeError> {
                 let protocol_id = u32::try_from(protocol_id).map_err(|_| {
                     $crate::wire::DecodeError::NegativeLength {
                         field: "packet id",
@@ -406,19 +427,47 @@ macro_rules! packet_group {
                 out: &mut W,
                 version: $crate::ProtocolVersion,
             ) -> ::core::result::Result<u32, $crate::wire::EncodeError> {
+                let protocol_id = self.protocol_id(version)?;
+                out.write_var_int(protocol_id as i32);
+                self.encode_body(out, version)?;
+                ::core::result::Result::Ok(protocol_id)
+            }
+
+            /// This packet's id in `version`, without writing anything.
+            ///
+            /// Separated from the body so a framed transport can learn the id
+            /// and the bytes independently; see [`Packet::encode_body`].
+            pub fn protocol_id(
+                &self,
+                version: $crate::ProtocolVersion,
+            ) -> ::core::result::Result<u32, $crate::wire::EncodeError> {
                 let name = self.name();
-                let protocol_id = version
+                version
                     .protocol_id(Self::STATE, Self::DIRECTION, name)
                     .ok_or($crate::wire::EncodeError::NotInVersion {
                         name,
                         version: version.name(),
-                    })?;
-                out.write_var_int(protocol_id as i32);
+                    })
+            }
+
+            /// Write the body alone, with no id in front of it.
+            ///
+            /// The mirror of [`Packet::decode_body`], and there for the same
+            /// reason: `dust-net`'s `Frame` keeps the id as a number and the
+            /// body as bytes, so writing the id into the body buffer only to
+            /// have the framer parse it back out is work with a wrong answer
+            /// available — the framer would then have two ids and no rule
+            /// about which wins.
+            pub fn encode_body<W: $crate::wire::WireWrite + ?Sized>(
+                &self,
+                out: &mut W,
+                version: $crate::ProtocolVersion,
+            ) -> ::core::result::Result<(), $crate::wire::EncodeError> {
                 match self {
                     $(Self::$packet(body) =>
                         <$packet as $crate::types::Encode>::encode(body, out, version)?,)*
                 }
-                ::core::result::Result::Ok(protocol_id)
+                ::core::result::Result::Ok(())
             }
         }
 
