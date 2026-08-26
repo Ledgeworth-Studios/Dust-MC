@@ -713,7 +713,7 @@ fn bit_flips_next_to_length_prefixes_stay_answer_only() {
         SEED,
         "bit-flip-near-prefix",
         Laid::specimen,
-        |rng, document| flip_bit_near(rng, document),
+        flip_bit_near,
     );
 }
 
@@ -726,7 +726,7 @@ fn length_prefixes_that_lie_upward_and_downward_are_answered_safely() {
         SEED,
         "length-lie",
         Laid::specimen,
-        |rng, document| lie_about_length(rng, document),
+        lie_about_length,
     );
 }
 
@@ -739,7 +739,7 @@ fn tag_ids_swapped_to_the_rare_array_types_stay_answer_only() {
         SEED,
         "rare-tag-swap",
         Laid::specimen,
-        |rng, document| swap_to_rare_tag(rng, document),
+        swap_to_rare_tag,
     );
 }
 
@@ -752,6 +752,6 @@ fn an_array_header_spliced_into_a_list_is_answered_not_fatal() {
         SEED,
         "array-splice",
         Laid::specimen,
-        |rng, document| splice_array_into_list(rng, document),
+        splice_array_into_list,
     );
 }
