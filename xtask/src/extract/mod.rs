@@ -140,6 +140,13 @@ impl Domain {
         )
     }
 
+    /// Whether this domain reads the `--reports` tree even when
+    /// [`Self::needs_reports`] said no — worldgen does, because the
+    /// biome-parameter report lives beside blocks.json and friends.
+    fn needs_reports_too(self) -> bool {
+        matches!(self, Self::Worldgen)
+    }
+
     /// Whether this domain reads the `--server` data pack tree.
     fn needs_data(self) -> bool {
         matches!(
@@ -262,7 +269,8 @@ pub fn run(options: &Options, workspace_root: &Path) -> Result<(), String> {
         None => download::server_jar(version, &cache)?,
     };
 
-    let wants_reports = selected.iter().any(|d| d.needs_reports());
+    let wants_reports = selected.iter().any(|d| d.needs_reports())
+        || selected.iter().any(|d| d.needs_reports_too());
     let wants_data = selected.iter().any(|d| d.needs_data());
 
     let mut context = Context {
@@ -346,7 +354,9 @@ pub fn run(options: &Options, workspace_root: &Path) -> Result<(), String> {
                 &context,
             )?,
             Domain::Packets => packets_domain(&context)?,
-            Domain::Worldgen => worldgen_domain(&context)?,
+            Domain::Worldgen => {
+                worldgen_domain(registries.as_ref().expect("parsed above"), &context)?
+            }
         };
         println!("({} in {:.1}s)", outcome, begun.elapsed().as_secs_f64());
         results.push((*domain, begun.elapsed(), outcome));
@@ -719,13 +729,56 @@ fn packets_domain(context: &Context) -> Result<Outcome, String> {
     Ok("packet tables regenerated".to_owned())
 }
 
-fn worldgen_domain(context: &Context) -> Result<Outcome, String> {
+fn worldgen_domain(flat: &registries::Registries, context: &Context) -> Result<Outcome, String> {
     ores(
         &context.data()?.join("data"),
         context.workspace_root,
         context.version,
     )?;
-    Ok("ore baseline written".to_owned())
+
+    let parsed = worldgen::vocabulary(
+        &context.data()?.join("data/minecraft"),
+        &context.reports()?.join("reports"),
+        flat,
+    )?;
+    println!(
+        "read the Phase 6 vocabulary: {} density-function type(s) in use, {} noise-router \
+         slots identical across every noise setting, biome parameters for {} \
+         dimension(s)",
+        parsed.density_function_types.len(),
+        parsed.noise_router_slots.len(),
+        parsed.dimensions.len()
+    );
+    for dimension in &parsed.dimensions {
+        println!(
+            "  {}: {} entries over {} biomes, {} range-shaped",
+            dimension.dimension,
+            dimension.entries,
+            dimension.distinct_biomes,
+            dimension.ranged_entries
+        );
+    }
+    println!(
+        "  the overworld's parameter expansion stays out on purpose — it is world data a \
+         server reads from its packs, not a constant to freeze"
+    );
+
+    let path = context
+        .workspace_root
+        .join("crates/dust-gen/src/generated")
+        .join("worldgen.rs");
+    std::fs::create_dir_all(path.parent().expect("has a parent"))
+        .map_err(|e| format!("could not create {}: {e}", path.display()))?;
+    std::fs::write(
+        &path,
+        codegen::worldgen_vocabulary(&parsed, context.version),
+    )
+    .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    println!("wrote {}", path.display());
+    Ok(format!(
+        "ore baseline + vocabulary over {} density-function types",
+        parsed.density_function_types.len()
+    ))
 }
 
 /// Print what the item report turned out to say.

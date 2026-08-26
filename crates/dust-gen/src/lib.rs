@@ -7,6 +7,10 @@
 //! the engine underneath it is written — and [`vanilla_ores`], the extracted
 //! baseline it is arithmetic *over*.
 //!
+//! The newest piece is [`worldgen`], the vocabulary Phase 6's terrain engine
+//! starts from: which density functions exist, what a noise router wires, and
+//! what shape a biome-parameter entry takes.
+//!
 //! The two are separate on purpose. `ore_density` never reaches for a vanilla
 //! constant, so it is right on a modded world as well as a vanilla one;
 //! `vanilla_ores` is one caller that happens to supply vanilla's numbers.
@@ -14,3 +18,4 @@
 pub mod generated;
 pub mod ore_density;
 pub mod vanilla_ores;
+pub mod worldgen;

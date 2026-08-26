@@ -120,6 +120,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use super::registries::Registries;
+
 /// The `world_preset` that defines a vanilla world.
 ///
 /// The dimensions in this preset are the ones a `Baseline` can be resolved
@@ -1249,6 +1251,342 @@ fn check_vanilla_group_names(groups: &[Group]) -> Result<(), String> {
         missing.len(),
         missing.join(", ")
     ))
+}
+
+// ---------------------------------------------------------------------------
+// The Phase 6 vocabulary: density functions, noise router, biome parameters
+// ---------------------------------------------------------------------------
+
+/// One density-function type as the vanilla files use it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DensityFunctionType {
+    /// Namespaced type id, e.g. `minecraft:add`.
+    pub name: String,
+    /// How many times the type appears across every density function in the
+    /// data pack — including nested appearances, since these trees nest.
+    pub uses: usize,
+    /// Top-level argument keys seen on objects of this type, `type` excluded,
+    /// sorted.
+    pub arguments: Vec<String>,
+}
+
+/// One dimension's biome-parameter definition, summarised.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BiomeParameterDimension {
+    pub dimension: String,
+    /// How many parameter entries the generator wrote for this dimension.
+    pub entries: usize,
+    pub distinct_biomes: usize,
+    /// Entries whose parameters carry a `[min, max]` range rather than a point.
+    pub ranged_entries: usize,
+}
+
+/// A verbatim biome parameter point from the smallest dimension, emitted as
+/// the golden sample of the format. Parameter values are f64; the seven names
+/// and their order are [`PARAMETER_NAMES`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct BiomePoint {
+    pub biome: String,
+    /// Values in [`PARAMETER_NAMES`] order.
+    pub values: [f64; PARAMETER_COUNT],
+}
+
+/// The multi-noise parameter names, alphabetically for stability.
+pub const PARAMETER_NAMES: &[&str] = &[
+    "continentalness",
+    "depth",
+    "erosion",
+    "humidity",
+    "offset",
+    "temperature",
+    "weirdness",
+];
+pub const PARAMETER_COUNT: usize = PARAMETER_NAMES.len();
+
+/// Everything the vocabulary pass collects.
+#[derive(Debug)]
+pub struct WorldgenVocabulary {
+    /// Every density-function type the data uses, name-sorted, each checked
+    /// against the `worldgen/density_function_type` registry in the report.
+    pub density_function_types: Vec<DensityFunctionType>,
+    /// The noise-router slot names, identical across every noise setting —
+    /// checked, not assumed, since one deviant file would mean a version
+    /// changed terrain's wiring.
+    pub noise_router_slots: Vec<String>,
+    pub dimensions: Vec<BiomeParameterDimension>,
+    /// The nether's five points, verbatim: the golden sample of what a
+    /// parameter entry looks like when it is points all the way down.
+    pub nether_points: Vec<BiomePoint>,
+}
+
+/// Read the density-function and biome-parameter vocabulary.
+///
+/// Deliberately *not* the full overworld parameter expansion — 7,593 ranged
+/// entries naming 53 biomes. Those are world-generation *data*, which a real
+/// server reads from the world's datapacks at boot; baking them into the
+/// binary would be committing Mojang's content by volume and freezing what a
+/// datapack exists to change. What Phase 6 needs before any of that is the
+/// vocabulary: which density functions exist and what they are called with,
+/// which slots a noise router has, and what shape a biome parameter entry
+/// takes. That, plus the five-point nether as a worked example, is what lands.
+pub fn vocabulary(
+    data_root: &Path,
+    reports_root: &Path,
+    registries: &Registries,
+) -> Result<WorldgenVocabulary, String> {
+    // Density functions: walk every file, counting how many objects of each
+    // type appear and which top-level argument keys they carry.
+    let mut type_shapes: BTreeMap<String, (usize, BTreeSet<String>)> = BTreeMap::new();
+
+    // Argument keys are owned rather than borrowed from the file being read:
+    // the map outlives each file, and a map tied to one file's lifetime is
+    // exactly how a borrow error gets written.
+    fn recurse_types(value: &Value, shapes: &mut BTreeMap<String, (usize, BTreeSet<String>)>) {
+        match value {
+            Value::Object(fields) => {
+                if let Some(name) = fields.get("type").and_then(Value::as_str) {
+                    let (count, arguments) = shapes.entry(name.to_owned()).or_default();
+                    *count += 1;
+                    arguments.extend(fields.keys().filter(|k| *k != "type").cloned());
+                }
+                fields.values().for_each(|v| recurse_types(v, shapes));
+            }
+            Value::Array(items) => items.iter().for_each(|v| recurse_types(v, shapes)),
+            _ => {}
+        }
+    }
+
+    let function_root = data_root.join("worldgen/density_function");
+    if function_root.is_dir() {
+        for path in collect_json(&function_root)? {
+            let text = std::fs::read(&path)
+                .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+            let value: Value = serde_json::from_slice(&text)
+                .map_err(|e| format!("could not read {} as JSON: {e}", path.display()))?;
+            recurse_types(&value, &mut type_shapes);
+        }
+    } else {
+        return Err(format!(
+            "{} holds no density_function tree, so there is no terrain vocabulary to read",
+            data_root.display()
+        ));
+    }
+
+    // Every type the terrain uses must be a registered density-function type:
+    // two reports agreeing again, and the check that stops a typo'd `type`
+    // from becoming part of the committed vocabulary.
+    let type_registry = registries
+        .registries
+        .iter()
+        .find(|r| r.name == "minecraft:worldgen/density_function_type")
+        .ok_or("the registry report has no minecraft:worldgen/density_function_type")?;
+
+    Ok(WorldgenVocabulary {
+        density_function_types: type_shapes
+            .into_iter()
+            .filter_map(|(name, (uses, arguments))| {
+                if !type_registry.entries.iter().any(|e| e.name == name) {
+                    println!(
+                        "note: {name} shapes terrain but is not in the \
+                         density_function_type registry on this version"
+                    );
+                    return None;
+                }
+                Some(DensityFunctionType {
+                    name,
+                    uses,
+                    arguments: arguments.into_iter().collect(),
+                })
+            })
+            .collect(),
+        noise_router_slots: noise_router_slots(data_root)?,
+        dimensions: biome_parameter_dimensions(reports_root)?,
+        nether_points: biome_points(reports_root, "nether")?,
+    })
+}
+
+/// Every `.json` file under `directory`, sorted.
+///
+/// The ore passes walk namespaces through [`Registry::load`]; the vocabulary
+/// pass reads fixed paths (`density_function/`, the biome-parameter report),
+/// so it walks directly.
+fn collect_json(directory: &Path) -> Result<Vec<PathBuf>, String> {
+    fn walk(directory: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+        let entries = std::fs::read_dir(directory)
+            .map_err(|e| format!("could not read {}: {e}", directory.display()))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| format!("could not read {}: {e}", directory.display()))?;
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out)?;
+            } else if path.extension().is_some_and(|e| e == "json") {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(directory, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+/// The slot names of the noise router, checked to be identical across every
+/// `noise_settings` file: one shared wiring diagram rather than seven guesses.
+fn noise_router_slots(data_root: &Path) -> Result<Vec<String>, String> {
+    let root = data_root.join("worldgen/noise_settings");
+    if !root.is_dir() {
+        return Err(format!(
+            "{} holds no noise_settings, so the router slots cannot be checked",
+            root.display()
+        ));
+    }
+    let mut shared: Option<BTreeSet<String>> = None;
+    let mut files = 0usize;
+    for path in collect_json(&root)? {
+        let text =
+            std::fs::read(&path).map_err(|e| format!("could not read {}: {e}", path.display()))?;
+        let value: Value = serde_json::from_slice(&text)
+            .map_err(|e| format!("could not read {} as JSON: {e}", path.display()))?;
+        let router = field(&value, "noise_router", &path)?
+            .as_object()
+            .ok_or_else(|| format!("{}: noise_router is not an object", path.display()))?;
+        let slots: BTreeSet<String> = router.keys().cloned().collect();
+        match &shared {
+            Some(previous) => {
+                if *previous != slots {
+                    return Err(format!(
+                        "{} wires its noise router differently ({:?} versus {:?}). A \\
+                         version that changes terrain's wiring stops here, where it is \\
+                         news.",
+                        path.display(),
+                        slots,
+                        previous
+                    ));
+                }
+            }
+            None => shared = Some(slots),
+        }
+        files += 1;
+    }
+    if files == 0 || shared.is_none() {
+        return Err(format!(
+            "{} held no readable noise settings",
+            root.display()
+        ));
+    }
+    let mut slots: Vec<String> = shared.expect("checked above").into_iter().collect();
+    slots.sort();
+    Ok(slots)
+}
+
+fn biome_parameter_dimensions(reports_root: &Path) -> Result<Vec<BiomeParameterDimension>, String> {
+    let mut out = Vec::new();
+    for (dimension, summary) in summarize_biome_parameters(reports_root)? {
+        out.push(BiomeParameterDimension {
+            dimension,
+            entries: summary.0,
+            distinct_biomes: summary.2,
+            ranged_entries: summary.1,
+        });
+    }
+    out.sort_by(|a, b| a.dimension.cmp(&b.dimension));
+    Ok(out)
+}
+
+/// `(entries, ranged_entries, distinct_biomes)` per dimension.
+type ParameterSummary = BTreeMap<String, (usize, usize, usize)>;
+
+fn summarize_biome_parameters(reports_root: &Path) -> Result<ParameterSummary, String> {
+    let root = reports_root.join("biome_parameters/minecraft");
+    if !root.is_dir() {
+        return Err(format!(
+            "{} holds no biome_parameters report, so the multi-noise vocabulary cannot \\
+             be read",
+            reports_root.display()
+        ));
+    }
+    let mut out = ParameterSummary::default();
+    for path in collect_json(&root)? {
+        let dimension = format!(
+            "minecraft:{}",
+            path.with_extension("")
+                .strip_prefix(&root)
+                .map_err(|_| format!("{} escaped {}", path.display(), root.display()))?
+                .to_string_lossy()
+        );
+        let text =
+            std::fs::read(&path).map_err(|e| format!("could not read {}: {e}", path.display()))?;
+        let value: Value = serde_json::from_slice(&text)
+            .map_err(|e| format!("could not read {} as JSON: {e}", path.display()))?;
+        let biomes = field(&value, "biomes", &path)?;
+        let mut entries = 0usize;
+        let mut ranged = 0usize;
+        let mut distinct = std::collections::BTreeSet::new();
+        for entry in as_array(biomes, "biomes", &path)? {
+            entries += 1;
+            distinct.insert(
+                as_str(field(entry, "biome", &path)?, "the entry's biome", &path)?.to_owned(),
+            );
+            let parameters = field(entry, "parameters", &path)?;
+            if parameters
+                .as_object()
+                .ok_or_else(|| format!("{}: parameters is not an object", path.display()))?
+                .values()
+                .any(|v| v.is_array())
+            {
+                ranged += 1;
+            }
+        }
+        out.insert(dimension, (entries, ranged, distinct.len()));
+    }
+    if out.is_empty() {
+        return Err(format!(
+            "{} held no dimension reports, which means this run's generators predate \\
+             the biome_parameters report",
+            root.display()
+        ));
+    }
+    Ok(out)
+}
+
+/// One dimension's parameter entries verbatim, as golden rows.
+fn biome_points(reports_root: &Path, dimension: &str) -> Result<Vec<BiomePoint>, String> {
+    let path = reports_root
+        .join("biome_parameters/minecraft")
+        .join(format!("{dimension}.json"));
+    let text =
+        std::fs::read(&path).map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    let value: Value = serde_json::from_slice(&text)
+        .map_err(|e| format!("could not read {} as JSON: {e}", path.display()))?;
+    let mut out = Vec::new();
+    for entry in as_array(field(&value, "biomes", &path)?, "biomes", &path)? {
+        let biome = as_str(field(entry, "biome", &path)?, "the entry's biome", &path)?.to_owned();
+        let parameters = field(entry, "parameters", &path)?;
+        let object = parameters
+            .as_object()
+            .ok_or_else(|| format!("{}: parameters is not an object", path.display()))?;
+        let mut values = [0.0; PARAMETER_COUNT];
+        for (index, name) in PARAMETER_NAMES.iter().enumerate() {
+            let number = object.get(*name).ok_or_else(|| {
+                format!("{}: {} has no `{name}` parameter", path.display(), biome)
+            })?;
+            if !number.is_number() {
+                // Only recorded for dimensions whose entries are plain points;
+                // a ranged dimension is summarised above instead.
+                return Err(format!(
+                    "{}: {}'s {name} is {number}, not a point value",
+                    path.display(),
+                    biome
+                ));
+            }
+            values[index] = number.as_f64().unwrap_or(f64::NAN);
+        }
+        out.push(BiomePoint { biome, values });
+    }
+    out.sort_by(|a, b| a.biome.cmp(&b.biome));
+    Ok(out)
 }
 
 #[cfg(test)]
