@@ -8,10 +8,13 @@ the gates that keep the rest honest.
 
 ## Status
 
-Stage 0 — groundwork. Phases 0.1 through 0.4 are done, and Phase 0.5 extracts
-the vanilla data the rest of the server stands on: blocks, items, entity
-types, fluids, tags, recipes, loot tables, commands and packets. No server
-code. Nothing here accepts a connection.
+Stage 0 — groundwork, and the first crates the server stands on. Phases 0.1
+through 0.4 are done, and Phase 0.5 extracts the vanilla data the rest of the
+server needs: blocks, items, entity types, fluids, tags, recipes, loot tables,
+commands and packets. NBT, the world storage, the protocol codec, the datapack
+loader and the network transport all exist as crates, and the server process
+skeleton runs behind the `dust server` command — lifecycle, tick loop, clean
+shutdown. Nothing here accepts a connection yet.
 
 ## Vanilla data
 

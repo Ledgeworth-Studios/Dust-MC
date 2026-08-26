@@ -28,6 +28,7 @@ dust-registry = { path = "crates/dust-registry" }
 dust-sim = { path = "crates/dust-sim" }
 dust-world = { path = "crates/dust-world" }
 
+ctrlc = "3"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 proc-macro2 = "1"
 quote = "1"

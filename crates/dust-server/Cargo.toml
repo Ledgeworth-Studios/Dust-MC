@@ -7,7 +7,16 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+# The operator-facing program is `dust`, not `dust-server`: subcommands read
+# as `dust server …`, matching the grammar in `cli`. The library stays the
+# thing other crates build on; the binary is a thin shell over it.
+[[bin]]
+name = "dust"
+path = "src/main.rs"
+
 [dependencies]
+ctrlc.workspace = true
+dust-config.workspace = true
 
 [lints]
 workspace = true

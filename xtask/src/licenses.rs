@@ -155,6 +155,18 @@ fn tokenise(expr: &str) -> Vec<String> {
                 current.clear();
                 tokens.push(ch.to_string());
             }
+            // Cargo's older dual-licence spelling, `MIT/Apache-2.0`, predates
+            // the workspace's SPDX habit but means the same thing: the
+            // recipient's choice of either side. Reading it as `OR` keeps the
+            // checker honest about what the field says instead of failing
+            // every crate that spells it the old way.
+            '/' => {
+                if !current.trim().is_empty() {
+                    tokens.push(current.trim().to_owned());
+                }
+                current.clear();
+                tokens.push("OR".to_owned());
+            }
             c if c.is_whitespace() => {
                 if !current.trim().is_empty() {
                     tokens.push(current.trim().to_owned());
@@ -299,6 +311,27 @@ mod tests {
                 "{expr} should pass"
             );
         }
+    }
+
+    #[test]
+    fn the_slash_spelling_of_a_dual_licence_means_or() {
+        // `MIT/Apache-2.0` is Cargo's legacy spelling of
+        // `MIT OR Apache-2.0`; ctrlc arrives exactly this way, and a checker
+        // that rejected it would be parsing punctuation, not licences.
+        for expr in ["MIT/Apache-2.0", "Apache-2.0/MIT", "Unlicense/MIT"] {
+            assert!(
+                audit_one(package("fine", Some(expr))).is_empty(),
+                "{expr} should pass"
+            );
+        }
+    }
+
+    #[test]
+    fn the_slash_spelling_still_rejects_a_bad_half() {
+        // Dual licensing lets the *recipient* choose, so one good side is
+        // enough — but both sides bad is still both sides bad.
+        let rejections = audit_one(package("dubious", Some("AGPL-3.0-only/GPL-2.0-only")));
+        assert_eq!(rejections.len(), 1);
     }
 
     #[test]
