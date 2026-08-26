@@ -5,6 +5,7 @@
 
 pub mod crypt;
 pub mod frame;
+pub mod io;
 pub mod login;
 pub mod state;
 pub mod testkeys;
