@@ -230,16 +230,20 @@ impl From<std::io::Error> for ConnError {
 /// show is a fact about production and not about the test harness.
 ///
 /// Internally the driver is split. A writer task owns the sending half and is
-/// fed by a bounded command queue; whoever holds the [`Conn`] drives the
-/// reading half through [`next_frame`](Self::next_frame). Encryption and
-/// compression switches are themselves queued commands, so they land in the
-/// outbound byte stream strictly between everything enqueued before them and
-/// everything enqueued after — the packet that changes the mode goes out in
-/// the old mode because it entered the queue first, not because anyone
-/// remembered to flush at the right moment.
+/// fed by a bounded queue of encoded frames; whoever holds the [`Conn`] drives
+/// the reading half through [`next_frame`](Self::next_frame). The two mode
+/// changes land in exactly the right place in the outbound byte stream, by
+/// construction rather than by discipline: compression is applied when a frame
+/// is *accepted*, so its bytes are already frozen before they can be queued
+/// behind anything else, and encryption is applied when a frame is *written*,
+/// as a queued command whose position in the FIFO is the protocol's own
+/// position for it. The packet that switches either mode goes out in the old
+/// mode because it was accepted first, not because anyone remembered to
+/// flush at the right moment.
 pub struct Conn<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> {
     reader: ReadHalf<W>,
     decoder: FrameDecoder,
+    encoder: FrameEncoder,
     cipher_in: Cipher,
     machine: StateMachine,
     timeouts: Timeouts,
@@ -262,12 +266,14 @@ pub struct Conn<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> {
 
 /// What the writer task does, strictly in arrival order.
 ///
-/// The ordering is the design. The queue is FIFO, so a mode switch sits
-/// between the frames queued before it and the frames queued after it, which
-/// is exactly what Set Compression and the Encryption Response require.
+/// Frames arrive already encoded. That is what makes the mode switches work
+/// without any coordination: a frame's bytes are frozen in whichever mode was
+/// current when it was accepted, so the queue cannot scramble modes no matter
+/// how it is drained. What remains for the writer is encryption — which must
+/// be a queued concern, because the switch happens mid-stream by protocol
+/// position, not per frame — and the write itself.
 enum Command {
-    Frame(Frame),
-    SetCompression(Compress),
+    Frame(Vec<u8>),
     EnableEncryption {
         secret: [u8; SHARED_SECRET_LEN],
     },
@@ -291,13 +297,13 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
             writer,
             outbound_rx,
             abort_rx,
-            limits,
             Arc::clone(&failure),
             Arc::clone(&queued),
         ));
         Self {
             reader,
             decoder: FrameDecoder::new(limits),
+            encoder: FrameEncoder::new(limits),
             cipher_in: Cipher::disabled(),
             machine: StateMachine::new(),
             timeouts: config.timeouts,
@@ -373,19 +379,21 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
 
     /// Turn compression on or off, in both directions.
     ///
-    /// Outbound, the switch is a queued command, so it lands in the byte
-    /// stream exactly after everything already accepted — including the very
-    /// Set Compression packet that caused this call, which therefore goes out
-    /// uncompressed however busy the queue was. Inbound, it takes effect on
-    /// the next frame decoded, for the same reason it is correct in
-    /// [`FrameDecoder::set_compression`]: the packet announcing the change
-    /// travels in the old mode.
-    pub async fn set_compression(&mut self, compression: Compress) -> Result<(), ConnError> {
-        if self.ended {
-            return Err(self.take_failure().unwrap_or(ConnError::Closed));
-        }
+    /// Outbound, frames are encoded at accept time, so the switch takes
+    /// effect on everything accepted from here on and cannot touch anything
+    /// already queued: its bytes were frozen in the old mode when they were
+    /// accepted. That is exactly the protocol's requirement — including for
+    /// the very Set Compression packet that caused this call, which therefore
+    /// goes out uncompressed however busy the queue was — with no flush to
+    /// remember. Inbound, it takes effect on the next frame decoded, for the
+    /// same reason it is correct in [`FrameDecoder::set_compression`]: the
+    /// packet announcing the change travels in the old mode.
+    ///
+    /// This is synchronous because it has nothing to wait for; the queue is
+    /// never involved in a mode decision.
+    pub fn set_compression(&mut self, compression: Compress) {
+        self.encoder.set_compression(compression);
         self.decoder.set_compression(compression);
-        self.dispatch(Command::SetCompression(compression)).await
     }
 
     /// Start encrypting both directions with the session's shared secret.
@@ -394,11 +402,17 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
     /// this call reaches the wire plaintext even if it was still sitting in
     /// the queue, and everything after is encrypted. That is the protocol's
     /// own rule — the Encryption Response carrying the secret is itself the
-    /// last plaintext frame either way. Inbound, decryption begins with the
-    /// next byte handed to [`next_frame`](Self::next_frame); CFB8 has no
-    /// block alignment, so "next byte" is the whole story, and it is safe
-    /// only because the reader never decrypts past the frame it is
-    /// assembling. See [`crate::crypt`] for why that discipline exists.
+    /// last plaintext frame either way — and it holds by queue position, so
+    /// no flush or ordering discipline is asked of the caller. Inbound,
+    /// decryption begins with the next byte handed to
+    /// [`next_frame`](Self::next_frame); CFB8 has no block alignment, so
+    /// "next byte" is the whole story, and it is safe only because the reader
+    /// never decrypts past the frame it is assembling. See [`crate::crypt`]
+    /// for why that discipline exists.
+    ///
+    /// The call waits only for queue room, exactly as [`send`](Self::send)
+    /// does; a jammed queue delays the switch, which is the same backpressure
+    /// a burst of frames would meet.
     pub async fn enable_encryption(&mut self, secret: &SharedSecret) -> Result<(), ConnError> {
         if self.ended {
             return Err(self.take_failure().unwrap_or(ConnError::Closed));
@@ -538,7 +552,14 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
             self.ended = true;
             return Err(failure);
         }
-        match self.outbound.send(Command::Frame(frame)).await {
+        // Encoding happens before anything is queued, so an oversized frame
+        // is refused here — immediately, whether or not the writer is wedged,
+        // and without occupying a queue slot a well-formed frame could use.
+        // The connection itself stays healthy: this was a caller bug, not a
+        // stream problem.
+        let mut wire = Vec::with_capacity(frame.payload_len() + MAX_VAR_INT_LEN);
+        self.encoder.encode(&frame, &mut wire)?;
+        match self.outbound.send(Command::Frame(wire)).await {
             Ok(()) => {
                 self.queued.fetch_add(1, Ordering::Relaxed);
                 Ok(())
@@ -626,7 +647,7 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> std::fmt::Debug for Con
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Conn")
             .field("state", &self.machine.state())
-            .field("compression", &self.decoder.compression())
+            .field("compression", &self.encoder.compression())
             .field("encryption", &self.cipher_in.is_enabled())
             .field("outbound_queued", &self.queued.load(Ordering::Relaxed))
             .field("ended", &self.ended)
@@ -647,11 +668,9 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
     mut writer: WriteHalf<W>,
     mut inbound: mpsc::Receiver<Command>,
     mut abort: watch::Receiver<bool>,
-    limits: Limits,
     failure: Arc<Mutex<Option<ConnError>>>,
     queued: Arc<AtomicUsize>,
 ) {
-    let mut encoder = FrameEncoder::new(limits);
     let mut cipher_out = Cipher::disabled();
 
     loop {
@@ -668,13 +687,18 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
         };
 
         match command {
-            Command::SetCompression(compression) => encoder.set_compression(compression),
             Command::EnableEncryption { secret } => {
                 cipher_out.enable(&SharedSecret::from_bytes(secret));
             }
-            Command::Frame(frame) => {
+            Command::Frame(mut wire) => {
                 queued.fetch_sub(1, Ordering::Relaxed);
-                let written = emit(&mut encoder, &mut cipher_out, &mut writer, frame);
+                // Encryption is applied here, at the last moment before the
+                // bytes move, because that is what makes its position in the
+                // stream exact: everything enqueued before the switch goes
+                // out plaintext even if it was still queued when the switch
+                // arrived.
+                cipher_out.encrypt(&mut wire);
+                let written = writer.write_all(&wire);
                 // The abort flag is checked around the write as well as
                 // between commands: this is what makes `abort` prompt while
                 // the writer is wedged on a peer that reads nothing. The
@@ -684,11 +708,11 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
                     biased;
                     _ = abort.changed() => break,
                     outcome = written => {
-                        // A failed write poisons the connection: the stream
-                        // may have taken half a frame, so everything after it
-                        // is noise.
-                        if outcome.is_err() {
-                            record_failure(&failure, outcome.err());
+                        if let Err(error) = outcome {
+                            // A failed write poisons the connection: the
+                            // stream may have taken half a frame, so
+                            // everything after it is noise.
+                            record_failure(&failure, Some(ConnError::Io(error)));
                             break;
                         }
                     }
@@ -717,29 +741,6 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
 /// the cause was reported once, exactly where somebody was waiting on it.
 fn record_failure(slot: &Mutex<Option<ConnError>>, failure: Option<ConnError>) {
     *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = failure;
-}
-
-/// Encode, optionally encrypt, and write one frame.
-///
-/// Encryption happens here rather than at enqueue time for the same reason
-/// the switch is a queued command: a frame queued before the switch must go
-/// out plaintext even though nobody knew at enqueue time whether the switch
-/// was coming. Encoding errors are refused before any byte moves; a frame
-/// this driver was handed but cannot encode never reaches the wire half
-/// written.
-async fn emit<W: AsyncWrite + Unpin>(
-    encoder: &mut FrameEncoder,
-    cipher: &mut Cipher,
-    writer: &mut W,
-    frame: Frame,
-) -> Result<(), ConnError> {
-    let mut wire = Vec::with_capacity(frame.payload_len() + MAX_VAR_INT_LEN);
-    encoder.encode(&frame, &mut wire)?;
-    // A disabled cipher leaves bytes alone, so callers do not branch. See
-    // `Cipher::encrypt`.
-    cipher.encrypt(&mut wire);
-    writer.write_all(&wire).await?;
-    Ok(())
 }
 
 /// The liveness arithmetic, kept separate from the I/O so it can be tested
