@@ -31,7 +31,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::finding::nearest;
-use crate::ResourceLocation;
+use crate::registry::RegistryId;
+use crate::{LoadedData, ResourceLocation};
 
 /// What a registry contains, as far as the caller can say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +129,111 @@ impl Vocabulary for KnownNames {
     }
 }
 
+/// The names the packs themselves defined, as a vocabulary.
+///
+/// The first reason [`Vocabulary`] is a parameter is that **a datapack adds
+/// registry entries** — so the world being checked against does not exist
+/// until a load has run. This provider is that load's own contribution:
+/// every resource name of every loaded registry, and every loaded function.
+/// It knows nothing about blocks or items — that is dust-registry's half,
+/// which is why this type exists instead of the loader reaching for tables it
+/// must not own.
+///
+/// Tag *members* are deliberately absent. A tag's entries are not definitions;
+/// whether `#minecraft:logs` naming `minecraft:stobe` is an error is decided
+/// by resolving against the block registry, not by the fact that some pack
+/// once wrote the word down.
+#[derive(Debug, Clone, Default)]
+pub struct PackDefined {
+    names: KnownNames,
+}
+
+impl PackDefined {
+    /// Collect everything `data` itself defines.
+    pub fn from_load(data: &LoadedData) -> Self {
+        let mut names = KnownNames::new();
+        for key in data.registries() {
+            if let Some(entries) = data.registry(key) {
+                names = names.with(key.as_str().to_owned(), entries.keys().cloned());
+            }
+        }
+        if let Some(functions) = data.functions(&RegistryId::new("function")) {
+            names = names.with("function".to_owned(), functions.keys().cloned());
+        }
+        Self { names }
+    }
+}
+
+impl Vocabulary for PackDefined {
+    fn contains(&self, registry: &str, name: &ResourceLocation) -> Known {
+        self.names.contains(registry, name)
+    }
+
+    fn suggest(&self, registry: &str, name: &ResourceLocation) -> Option<String> {
+        self.names.suggest(registry, name)
+    }
+}
+
+/// Several vocabularies asked in order; the first one with an opinion wins.
+///
+/// This is how dust-registry slots in without a dependency edge: a caller
+/// builds the chain as `registry's provider` first, then
+/// [`PackDefined`] for what the packs added, then anything else. Order
+/// expresses authority — a later provider is only asked when every earlier
+/// one answered [`Known::Unknown`] — so two providers disagreeing about one
+/// name is impossible by construction rather than by vigilance.
+pub struct Chained<'a> {
+    providers: Vec<&'a dyn Vocabulary>,
+}
+
+impl std::fmt::Debug for Chained<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Chained({} providers)", self.providers.len())
+    }
+}
+
+impl<'a> Chained<'a> {
+    pub fn new() -> Self {
+        Self {
+            providers: Vec::new(),
+        }
+    }
+
+    /// Add the next provider to ask. Earlier additions are more authoritative.
+    #[must_use]
+    pub fn then(mut self, provider: &'a dyn Vocabulary) -> Self {
+        self.providers.push(provider);
+        self
+    }
+}
+
+impl Default for Chained<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Vocabulary for Chained<'_> {
+    fn contains(&self, registry: &str, name: &ResourceLocation) -> Known {
+        for provider in &self.providers {
+            match provider.contains(registry, name) {
+                Known::Unknown => continue,
+                answer => return answer,
+            }
+        }
+        Known::Unknown
+    }
+
+    fn suggest(&self, registry: &str, name: &ResourceLocation) -> Option<String> {
+        // The first suggestion on offer, from the most authoritative source
+        // that has any idea — mixing suggestions from two providers would
+        // produce advice neither of them would give alone.
+        self.providers
+            .iter()
+            .find_map(|provider| provider.suggest(registry, name))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +285,86 @@ mod tests {
         assert_eq!(
             vocabulary.suggest("item", &location("minecraft:stobe")),
             None
+        );
+    }
+
+    #[test]
+    fn a_chain_answers_from_the_first_provider_with_an_opinion() {
+        let registry = KnownNames::new().with("block", [location("minecraft:stone")]);
+        let packs = KnownNames::new()
+            .with("block", [location("somemod:gadget")])
+            .with("gadget", [location("somemod:gizmo")]);
+
+        let chained = Chained::new().then(&registry).then(&packs);
+        // Known to the first: answered there, the second never consulted.
+        assert_eq!(
+            chained.contains("block", &location("minecraft:stone")),
+            Known::Yes
+        );
+        // Absent from the first *registry* — but the first provider owns the
+        // `block` registry, so its No is authoritative and the fallback for
+        // that registry is never reached. That is the authority ordering
+        // working: dust-registry saying "no such block" outranks anything a
+        // later provider would guess.
+        assert_eq!(
+            chained.contains("block", &location("somemod:gadget")),
+            Known::No
+        );
+        // A registry only the second holds at all.
+        assert_eq!(
+            chained.contains("gadget", &location("somemod:gizmo")),
+            Known::Yes
+        );
+        // Nobody knows it: Unknown, never a silent No.
+        assert_eq!(
+            chained.contains("block", &location("minecraft:stobe")),
+            Known::No
+        );
+        assert_eq!(
+            chained.contains("enchantment", &location("minecraft:sharpness")),
+            Known::Unknown
+        );
+    }
+
+    #[test]
+    fn an_empty_chain_knows_nothing() {
+        let chained = Chained::new();
+        assert_eq!(
+            chained.contains("block", &location("minecraft:stone")),
+            Known::Unknown
+        );
+    }
+
+    #[test]
+    fn pack_defined_names_come_from_the_load_and_only_from_definitions() {
+        use crate::testing::MemPack;
+        use crate::{load, LoadOptions, PackSource};
+
+        let pack = MemPack::with_meta(
+            "maker",
+            &[
+                ("data/minecraft/function/build.mcfunction", "say hi\n"),
+                ("data/somemod/advancement/first.json", r#"{"criteria":{}}"#),
+            ],
+        );
+        let refs: Vec<&dyn PackSource> = vec![&pack];
+        let data = load(&refs, &LoadOptions::default());
+
+        let defined = PackDefined::from_load(&data);
+        assert_eq!(
+            defined.contains("function", &location("minecraft:build")),
+            Known::Yes,
+            "the function the pack defines is known"
+        );
+        assert_eq!(
+            defined.contains("advancement", &location("somemod:first")),
+            Known::Yes
+        );
+        // Nothing else is claimed — this provider is not pretending to be the
+        // block registry.
+        assert_eq!(
+            defined.contains("block", &location("minecraft:stone")),
+            Known::Unknown
         );
     }
 }

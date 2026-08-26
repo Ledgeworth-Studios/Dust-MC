@@ -3,7 +3,8 @@
 //!
 //! # What a datapack is
 //!
-//! A tree of JSON under `data/<namespace>/<registry>/<path>.json`, plus a
+//! A tree of JSON under `data/<namespace>/<registry>/<path>.json` — plus
+//! `.mcfunction` text under `function/`, read by [`function`] — and a
 //! `pack.mcmeta` at the root saying which version of the format it was written
 //! for. It ships as a directory or as a zip; both are read here and both must
 //! produce the same result. The server's own vanilla data is the same shape and
@@ -71,12 +72,16 @@
 //! is, and [`json::unknown_keys`] is public so it reports its unknown keys in
 //! the same words this one does.
 //!
-//! Also not modelled, on purpose: `function/` (`.mcfunction` is a command
-//! language, not data), `structure/` (NBT, which belongs to `dust-nbt`),
-//! pack `filter` sections, and feature flags. The first two are
-//! [`registry::RegistryKind::Unread`] so their directories are not mistaken for
-//! typos; the last two parse and produce a warning saying they are not
-//! applied. Nothing is skipped silently.
+//! Also not fully modelled: `function/` files are **read** — every command
+//! line is kept, with its line number, under the file rules in [`function`] —
+//! but the commands stay opaque strings, because deciding what
+//! `execute as @e at @s run tp @s ~ ~-1 ~` means belongs to the layer that
+//! runs commands, and half-parsing the grammar would be the two-readers
+//! mistake again with much sharper edges. `structure/` (NBT, which belongs to
+//! `dust-nbt`) remains [`registry::RegistryKind::Unread`] so its directory is
+//! not mistaken for a typo; pack `filter` sections and feature flags parse
+//! and produce a warning saying they are not applied. Nothing is skipped
+//! silently.
 //!
 //! # The `dust-registry` seam
 //!
@@ -95,12 +100,42 @@
 //! The other seam is NBT, which simply does not appear here: structures are
 //! [`registry::RegistryKind::Unread`] until `dust-nbt` lands.
 //!
-//! On top of the raw load sit three conveniences that share its rules instead
-//! of inventing their own: [`discover::discover`] reads a `datapacks/` folder
-//! into load order ([`discover::load_directory`] does discovery plus loading in one
-//! call), [`overlay`] layers a pack's own format alternatives, and
-//! [`LoadedData::diagnostic_dump`] renders the whole result — winners,
-//! losers, provenance, findings — as stable, diffable text.
+//! # The surface, module by module
+//!
+//! Reading runs bottom-up, so the map goes the same way:
+//!
+//! * [`location`] — `namespace:path`, defaulted at the parse boundary and
+//!   settled forever after;
+//! * [`registry`] — which directories under `data/<namespace>/` are
+//!   registries, and what kind of thing each holds;
+//! * [`pack`] — the two containers, directories and zips; [`zip`] is the
+//!   archive reader with its caps and refusals, [`inflate`] its
+//!   decompressor;
+//! * [`json`] and [`function`] — the two file readers, JSON with positions
+//!   and lines under Minecraft's comment rules;
+//! * [`meta`] — `pack.mcmeta`; [`overlay`] — a pack's own per-format layers,
+//!   applied as a name mapping over any container;
+//! * [`tag`] — the one resource that merges, and the resolver that flattens
+//!   it; [`shape`] — the skeletons pinning a recipe, loot table or
+//!   advancement to its raw document;
+//! * [`advancement`] and [`loot`] — the two opt-in passes over a finished
+//!   load: parent graphs, and misspelled serializer keys against the
+//!   baseline definitions;
+//! * [`vocabulary`] — the registry seam, with providers for what the packs
+//!   themselves defined and a chain for whoever supplies the real
+//!   registries later;
+//! * [`reload`] — the atomic stack swap a running server owns, with the
+//!   old-to-new diff and the policy that keeps a broken candidate out;
+//! * [`finding`] — how all of the above say what went wrong, named by pack
+//!   and file.
+//!
+//! Two conveniences tie it together for callers: [`discover::discover`]
+//! reads a `datapacks/` folder into load order
+//! ([`discover::load_directory`] does discovery plus loading in one call),
+//! and [`LoadedData::diagnostic_dump`] renders the whole result — winners,
+//! losers, provenance, findings — as stable, diffable text, the same
+//! guarantee [`ReloadDiff::render`](reload::ReloadDiff::render) gives a
+//! reload summary.
 //!
 //! # What the guards here do not catch
 //!
@@ -113,23 +148,29 @@
 //!   names nothing parseable comes back with `None`, not a finding — deciding
 //!   whether that is broken belongs to whoever reads recipes for real.
 //! * **Unknown keys are only checked in the shapes this crate owns** —
-//!   `pack.mcmeta` and tag files. A misspelled key inside a recipe is invisible
-//!   from here, by the same argument as above.
+//!   `pack.mcmeta` and tag files — plus the one opt-in pass: [`loot::audit`]
+//!   reports misspelled keys on the loot conditions and functions its
+//!   baseline tables cover. A misspelled key inside a recipe is still
+//!   invisible from here, by the same argument as above.
 //! * **The registry table is vanilla 1.21.1's.** A mod's registry directory
 //!   will be reported as unknown until somebody calls
 //!   [`registry::Registries::with_extra`].
 //! * **A vocabulary is optional and its absence is the default.** Read the
 //!   unvalidated count before believing a clean run.
 
+pub mod advancement;
 pub mod discover;
 pub mod finding;
+pub mod function;
 pub mod inflate;
 pub mod json;
 pub mod location;
+pub mod loot;
 pub mod meta;
 pub mod overlay;
 pub mod pack;
 pub mod registry;
+pub mod reload;
 pub mod shape;
 pub mod tag;
 pub mod vocabulary;
@@ -142,16 +183,24 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
+pub use advancement::{validate as validate_advancements, AdvancementCycle, AdvancementReport};
 pub use discover::{discover, load_directory};
 pub use finding::{error_count, Finding, Severity};
+pub use function::{FunctionFile, FunctionLine, LoadedFunction};
 pub use location::{LocationError, ResourceLocation, MINECRAFT};
+pub use loot::{
+    audit as audit_loot, condition_def, function_def, SerializerDef, CONDITION_DEFS, FUNCTION_DEFS,
+};
 pub use meta::{PackMeta, DUST_PACK_FORMAT};
 pub use overlay::{OverlainPack, OverlayPlan, Refusal};
 pub use pack::{DirectoryPack, PackError, PackSource, ZipPack};
 pub use registry::{Registries, RegistryDef, RegistryId, RegistryKind};
+pub use reload::{
+    Definition, RejectedReload, ReloadDiff, ReloadHandle, ReloadPolicy, Replacement, TagChange,
+};
 pub use shape::{AdvancementSkeleton, LootTableSkeleton, RecipeSkeleton, ShapeReport};
 pub use tag::{MergedTag, ResolvedTags, TagStats};
-pub use vocabulary::{Known, Vocabulary};
+pub use vocabulary::{Chained, Known, KnownNames, PackDefined, Unchecked, Vocabulary};
 
 use registry::DirectoryMatch;
 use tag::{TagFile, TagSet};
@@ -248,6 +297,8 @@ pub struct LoadStats {
     pub resources: usize,
     /// Distinct tags after merging.
     pub tags: usize,
+    /// Distinct function files after overriding.
+    pub functions: usize,
     /// Resources a later pack replaced.
     pub overrides: usize,
 }
@@ -258,6 +309,7 @@ pub struct LoadedData {
     packs: Vec<PackReport>,
     resources: BTreeMap<RegistryId, BTreeMap<ResourceLocation, Resource>>,
     tags: BTreeMap<RegistryId, TagSet>,
+    functions: BTreeMap<RegistryId, BTreeMap<ResourceLocation, LoadedFunction>>,
     member_registry: BTreeMap<RegistryId, String>,
     findings: Vec<Finding>,
     stats: LoadStats,
@@ -307,9 +359,29 @@ impl LoadedData {
         self.tags.keys()
     }
 
+    /// Every loaded function file of one registry — `function`, today — by
+    /// name, winners only. Commands are opaque strings; see
+    /// [`crate::function`] for where that line is drawn.
+    pub fn functions(
+        &self,
+        registry: &RegistryId,
+    ) -> Option<&BTreeMap<ResourceLocation, LoadedFunction>> {
+        self.functions.get(registry)
+    }
+
+    /// Every registry holding function files.
+    pub fn function_registries(&self) -> impl Iterator<Item = &RegistryId> {
+        self.functions.keys()
+    }
+
     /// One tag as merged, before references are followed.
     pub fn merged_tag(&self, registry: &RegistryId, name: &ResourceLocation) -> Option<&MergedTag> {
         self.tags.get(registry)?.get(name)
+    }
+
+    /// Every tag of one registry, merged, before references are followed.
+    pub fn merged_tags(&self, registry: &RegistryId) -> Option<&TagSet> {
+        self.tags.get(registry)
     }
 
     /// Follow every `#` reference and flatten every tag.
@@ -328,6 +400,9 @@ impl LoadedData {
             out.extend(registry.keys().map(ResourceLocation::namespace));
         }
         for registry in self.tags.values() {
+            out.extend(registry.keys().map(ResourceLocation::namespace));
+        }
+        for registry in self.functions.values() {
             out.extend(registry.keys().map(ResourceLocation::namespace));
         }
         out
@@ -368,7 +443,25 @@ impl LoadedData {
             })
             .filter(|(_, entries)| !entries.is_empty())
             .collect();
-        NamespaceView { resources, tags }
+        let functions = self
+            .functions
+            .iter()
+            .map(|(registry, entries)| {
+                (
+                    registry,
+                    entries
+                        .iter()
+                        .filter(|(name, _)| name.namespace() == namespace)
+                        .collect::<BTreeMap<_, _>>(),
+                )
+            })
+            .filter(|(_, entries)| !entries.is_empty())
+            .collect();
+        NamespaceView {
+            resources,
+            tags,
+            functions,
+        }
     }
 
     /// The whole load as a human-readable provenance report: which pack won
@@ -464,10 +557,34 @@ impl LoadedData {
             }
         }
 
+        out.push_str("functions:\n");
+        if self.functions.is_empty() {
+            out.push_str("  <none>\n");
+        }
+        for (registry, functions) in &self.functions {
+            out.push_str(&format!("  {registry}: {} function(s)\n", functions.len()));
+            for (name, function) in functions {
+                out.push_str(&format!(
+                    "    {name} <- {} ({} command(s))",
+                    function.pack,
+                    function.file.command_count()
+                ));
+                if !function.overridden.is_empty() {
+                    out.push_str(&format!(" (displaced: {})", function.overridden.join(", ")));
+                }
+                out.push_str(&format!("\n      {}\n", function.path));
+            }
+        }
+
         out.push_str(&format!(
             "totals: {} file(s) seen, {} read; {} resource(s); {} tag(s); {} \
-             override(s)\n",
-            stats.files_seen, stats.files_read, stats.resources, stats.tags, stats.overrides,
+             override(s); {} function(s)\n",
+            stats.files_seen,
+            stats.files_read,
+            stats.resources,
+            stats.tags,
+            stats.overrides,
+            stats.functions,
         ));
 
         out.push_str(&format!("findings: {}\n", self.findings.len()));
@@ -486,6 +603,7 @@ impl LoadedData {
 pub struct NamespaceView<'a> {
     pub resources: BTreeMap<&'a RegistryId, BTreeMap<&'a ResourceLocation, &'a Resource>>,
     pub tags: BTreeMap<&'a RegistryId, BTreeMap<&'a ResourceLocation, &'a MergedTag>>,
+    pub functions: BTreeMap<&'a RegistryId, BTreeMap<&'a ResourceLocation, &'a LoadedFunction>>,
 }
 
 /// Read every pack in order, later overriding earlier.
@@ -546,6 +664,7 @@ pub fn load(packs: &[&dyn PackSource], options: &LoadOptions) -> LoadedData {
 
     data.stats.resources = data.resources.values().map(BTreeMap::len).sum();
     data.stats.tags = data.tags.values().map(BTreeMap::len).sum();
+    data.stats.functions = data.functions.values().map(BTreeMap::len).sum();
     data
 }
 
@@ -557,6 +676,15 @@ struct PackTally {
     unread_registries: BTreeMap<String, usize>,
     legacy_directories: BTreeMap<String, RegistryId>,
     non_json: BTreeMap<String, usize>,
+    /// Files in a [`RegistryKind::Commands`] registry whose extension is not
+    /// the one that registry holds. Counted per registry, with the expected
+    /// extension kept beside the count so the warning can name it.
+    wrong_extension: BTreeMap<String, (usize, &'static str)>,
+    /// Paths inside the pack that are themselves zip archives. A pack inside
+    /// a pack is never read — not by Minecraft, not by here — and it is
+    /// almost always an accident of zipping one directory too high, so it is
+    /// named rather than treated as inert junk.
+    nested_archives: Vec<String>,
     /// Files seen under each namespace. Read counts are kept separately so a
     /// namespace that held files but contributed nothing is visible as such.
     namespace_files: BTreeMap<String, usize>,
@@ -648,6 +776,17 @@ fn load_pack(source: &dyn PackSource, options: &LoadOptions, data: &mut LoadedDa
     }
 
     let mut tally = PackTally::default();
+
+    // Nested archives are spotted on the raw listing rather than during the
+    // per-file walk: a `.zip` beside `pack.mcmeta` never reaches a registry
+    // match, so the walk would stay silent about exactly the case that most
+    // needs saying. The raw listing rather than the layered view, because an
+    // archive under an inert overlay is still being carried.
+    for path in &listing {
+        if path.ends_with(".zip") || path.ends_with(".ZIP") {
+            tally.nested_archives.push(path.clone());
+        }
+    }
 
     if plan.applied.is_empty() {
         for path in &listing {
@@ -808,6 +947,14 @@ fn read_file(
             .insert(matched.written_as.to_string(), matched.def.key.clone());
     }
 
+    // A commands registry holds one file extension and no JSON. Everything
+    // below this point is the JSON pipeline, so it branches off here.
+    if let RegistryKind::Commands { extension } = matched.def.kind {
+        return read_function(
+            source, id, path, &matched, namespace, extension, tally, data,
+        );
+    }
+
     let Some(stem) = matched.remainder.strip_suffix(".json") else {
         *tally
             .non_json
@@ -915,6 +1062,161 @@ fn read_file(
     true
 }
 
+/// Returns whether the file became a loaded function file.
+///
+/// The function-side twin of the JSON pipeline below it: same listing, same
+/// provenance, same override rule, but a text reader instead of a JSON one
+/// and no shape work at all.
+#[allow(clippy::too_many_arguments)]
+fn read_function(
+    source: &dyn PackSource,
+    id: &str,
+    path: &str,
+    matched: &DirectoryMatch<'_>,
+    namespace: &str,
+    extension: &'static str,
+    tally: &mut PackTally,
+    data: &mut LoadedData,
+) -> bool {
+    let Some(stem) = matched.remainder.strip_suffix(extension) else {
+        let slot = tally
+            .wrong_extension
+            .entry(matched.def.key.to_string())
+            .or_insert((0, extension));
+        slot.0 += 1;
+        return false;
+    };
+
+    let name = match ResourceLocation::new(namespace, stem) {
+        Ok(name) => name,
+        Err(error) => {
+            data.findings.push(Finding::error(
+                id,
+                path,
+                format!("is not in a usable place: {error}"),
+            ));
+            return false;
+        }
+    };
+
+    let bytes = match source.read(path) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            // Listed a moment ago and gone now — the pack-being-edited case
+            // the JSON path describes. Same situation, same message, because
+            // an operator should not have to know which kind of file lost
+            // the race.
+            data.findings.push(Finding::error(
+                id,
+                path,
+                "was listed by the pack and then could not be read. If the pack \
+                 is being edited, reload again once it has settled.",
+            ));
+            return false;
+        }
+        Err(error) => {
+            data.findings.push(Finding::error(
+                id,
+                path,
+                format!("could not be read: {error}"),
+            ));
+            return false;
+        }
+    };
+
+    let (file, findings) = function::FunctionFile::parse(&bytes, id, path);
+    let previous_errors = error_count(&data.findings);
+    data.findings
+        .extend(findings.into_iter().map(|f| f.about(name.clone())));
+
+    // An error means the resource is not loaded — the same contract the JSON
+    // pipeline keeps. An undecodable file contributes nothing rather than an
+    // empty function wearing its name.
+    if error_count(&data.findings) > previous_errors {
+        return false;
+    }
+
+    insert_function(matched, name, file, id, path, data);
+    *tally
+        .namespace_reads
+        .entry(namespace.to_owned())
+        .or_default() += 1;
+    data.stats.files_read += 1;
+    true
+}
+
+fn insert_function(
+    matched: &DirectoryMatch<'_>,
+    name: ResourceLocation,
+    file: function::FunctionFile,
+    id: &str,
+    path: &str,
+    data: &mut LoadedData,
+) {
+    let slot = data
+        .functions
+        .entry(matched.def.key.clone())
+        .or_default()
+        .entry(name.clone());
+    match slot {
+        std::collections::btree_map::Entry::Vacant(vacant) => {
+            vacant.insert(LoadedFunction {
+                file,
+                pack: id.to_owned(),
+                path: path.to_owned(),
+                overridden: Vec::new(),
+            });
+        }
+        std::collections::btree_map::Entry::Occupied(mut occupied) => {
+            let previous = occupied.get_mut();
+            if previous.pack == id {
+                // One pack reached one name by two paths: the pre-1.21
+                // spelling beside the current one. Minecraft would never see
+                // both; Dust merges the spellings into one namespace, so the
+                // collision has to be resolved here, and silently picking a
+                // winner would leave half the pack mysteriously inert. The
+                // current spelling wins, whatever order the listing had.
+                let incoming_is_canonical = !matched.is_legacy();
+                let winner = if incoming_is_canonical {
+                    path
+                } else {
+                    &previous.path
+                };
+                data.findings.push(Finding::warning(
+                    id,
+                    path,
+                    format!(
+                        "defines the function `{name}` twice: once at `{}` and \
+                         again at `{path}`. `{winner}` is the copy under the \
+                         current directory spelling, so that one is used.",
+                        previous.path
+                    ),
+                ));
+                if incoming_is_canonical {
+                    *previous = LoadedFunction {
+                        file,
+                        pack: id.to_owned(),
+                        path: path.to_owned(),
+                        overridden: std::mem::take(&mut previous.overridden),
+                    };
+                }
+                return;
+            }
+            // A different pack: the ordinary override, recorded the same way
+            // resources record it.
+            let mut overridden = std::mem::take(&mut previous.overridden);
+            overridden.push(previous.pack.clone());
+            data.stats.overrides += 1;
+            *previous = LoadedFunction {
+                file,
+                pack: id.to_owned(),
+                path: path.to_owned(),
+                overridden,
+            };
+        }
+    }
+}
+
 fn insert_resource(
     matched: &DirectoryMatch<'_>,
     name: ResourceLocation,
@@ -998,6 +1300,41 @@ fn report_tally(id: &str, tally: &PackTally, options: &LoadOptions, data: &mut L
             format!(
                 "holds {count} file(s) that do not end in `.json`. Resources are \
                  named after their file, so those files are not loaded."
+            ),
+        ));
+    }
+    for (registry, (count, extension)) in &tally.wrong_extension {
+        data.findings.push(Finding::warning(
+            id,
+            format!("data/*/{registry}/"),
+            format!(
+                "holds {count} file(s) that do not end in `{extension}`. Functions \
+                 are named after their file, so those files are not loaded."
+            ),
+        ));
+    }
+    if !tally.nested_archives.is_empty() {
+        let (named, more) = match tally.nested_archives.len() {
+            0..=5 => (tally.nested_archives.join(", "), 0),
+            n => (
+                format!("{} …", tally.nested_archives[..5].join(", ")),
+                n - 5,
+            ),
+        };
+        let and_more = if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        };
+        data.findings.push(Finding::warning(
+            id,
+            &tally.nested_archives[0],
+            format!(
+                "is a zip archive carried inside this pack, as {}{and_more}. \
+                 Nothing inside a zip inside a pack is read — Minecraft would \
+                 not read it either — so if that archive was meant to be part \
+                 of the pack, its files have to be unpacked into it.",
+                named
             ),
         ));
     }
@@ -1203,15 +1540,85 @@ mod tests {
     #[test]
     fn a_directory_dust_knows_and_does_not_read_says_which_it_is() {
         let pack = MemPack::with_meta(
-            "with_functions",
-            &[("data/minecraft/function/tick.mcfunction", "say hi")],
+            "with_structures",
+            &[("data/minecraft/structure/hut.nbt", "not really nbt")],
         );
         let data = load(&[&pack], &LoadOptions::default());
         assert_eq!(data.error_count(), 0, "{:?}", data.findings());
         assert!(
-            data.findings()[0].message.contains(".mcfunction"),
+            data.findings()[0].message.contains(".nbt"),
             "{:?}",
             data.findings()
+        );
+    }
+
+    #[test]
+    fn a_function_file_loads_with_its_commands_opaque_and_counted() {
+        let pack = MemPack::with_meta(
+            "functions",
+            &[(
+                "data/minecraft/function/tick.mcfunction",
+                "# setup\nsay hello\n\ntellraw @a \"bye\"\n",
+            )],
+        );
+        let data = load(&[&pack], &LoadOptions::default());
+        assert_eq!(data.error_count(), 0, "{:?}", data.findings());
+        assert_eq!(data.stats().functions, 1);
+        let functions = data
+            .functions(&RegistryId::new("function"))
+            .expect("function registry");
+        let tick = functions.get(&location("minecraft:tick")).expect("loaded");
+        assert_eq!(tick.file.command_count(), 2);
+        assert_eq!(tick.file.lines[1].command, r#"tellraw @a "bye""#);
+        assert_eq!(tick.pack, "functions");
+    }
+
+    #[test]
+    fn a_nested_zip_inside_a_pack_is_named_rather_than_ignored() {
+        // The classic accident: the whole `datapacks/` folder zipped instead
+        // of one pack. The inner archives are inert here and in Minecraft,
+        // and an operator deserves to be told that in those words.
+        let pack = MemPack::with_meta(
+            "wrapped",
+            &[
+                ("inner_pack.zip", "not really a zip, but named like one"),
+                ("data/minecraft/recipe/stick.json", typed_recipe()),
+            ],
+        );
+        let data = load(&[&pack], &LoadOptions::default());
+        assert!(data
+            .get(&RegistryId::new("recipe"), &location("minecraft:stick"))
+            .is_some());
+        let finding = data
+            .findings()
+            .iter()
+            .find(|f| f.message.contains("nested archive") || f.file == "inner_pack.zip")
+            .expect("the nested archive is named");
+        assert!(finding.message.contains("unpacked into it"), "{}", finding);
+    }
+
+    #[test]
+    fn a_nested_zip_is_one_finding_even_when_there_are_several() {
+        let files: Vec<(String, &str)> = (0..7)
+            .map(|index| (format!("bundle{index}.zip"), "junk"))
+            .collect();
+        let owned: Vec<(&str, &str)> = files.iter().map(|(p, b)| (p.as_str(), *b)).collect();
+        let pack = MemPack::with_meta("many", &owned);
+        let data = load(&[&pack], &LoadOptions::default());
+        assert_eq!(
+            data.findings()
+                .iter()
+                .filter(|f| f.message.contains("zip"))
+                .count(),
+            1,
+            "{:?}",
+            data.findings()
+        );
+        // Five are named; the rest are counted rather than listed.
+        assert!(
+            data.findings()[0].message.contains("and 2 more"),
+            "{}",
+            data.findings()[0]
         );
     }
 

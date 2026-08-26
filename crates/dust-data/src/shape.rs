@@ -85,11 +85,19 @@ pub const LOOT_ENTRY_KINDS: &[&str] = &[
 ];
 
 /// Loot condition types vanilla 1.21.1 ships.
+///
+/// The composite wrappers (`all_of`, `any_of`, `inverted`) and
+/// `enchantment_active_check` are confirmed by vanilla's own data files, not
+/// just by the type list — they were added to this table after the extract.
 pub const LOOT_CONDITION_KINDS: &[&str] = &[
+    "minecraft:all_of",
+    "minecraft:any_of",
     "minecraft:block_state_property",
     "minecraft:damage_source_properties",
+    "minecraft:enchantment_active_check",
     "minecraft:entity_properties",
     "minecraft:entity_scores",
+    "minecraft:inverted",
     "minecraft:killed_by_player",
     "minecraft:location_check",
     "minecraft:match_tool",
@@ -104,11 +112,16 @@ pub const LOOT_CONDITION_KINDS: &[&str] = &[
 ];
 
 /// Loot function types vanilla 1.21.1 ships.
+///
+/// `enchanted_count_increase` and `set_ominous_bottle_amplifier` are
+/// confirmed by vanilla's own data files, not just by the type list — they
+/// were added to this table after the extract.
 pub const LOOT_FUNCTION_KINDS: &[&str] = &[
     "minecraft:apply_bonus",
     "minecraft:copy_components",
     "minecraft:copy_nbt",
     "minecraft:copy_state",
+    "minecraft:enchanted_count_increase",
     "minecraft:enchant_randomly",
     "minecraft:enchant_with_levels",
     "minecraft:exploration_map",
@@ -128,6 +141,7 @@ pub const LOOT_FUNCTION_KINDS: &[&str] = &[
     "minecraft:set_loot_table",
     "minecraft:set_name",
     "minecraft:set_lore",
+    "minecraft:set_ominous_bottle_amplifier",
     "minecraft:set_potion",
     "minecraft:set_stew_effect",
     "minecraft:set_ticket",
@@ -208,6 +222,17 @@ pub struct LootTableSkeleton {
     pub raw: Value,
 }
 
+impl LootTableSkeleton {
+    /// Pull one spine out of an already-parsed loot table document.
+    ///
+    /// Public for the same reason [`AdvancementSkeleton::from_raw`] is: a
+    /// pass that only wants loot tables should not pay for recipes and
+    /// advancements it never looks at.
+    pub fn from_raw(value: &Value) -> Self {
+        loot_skeleton(value)
+    }
+}
+
 /// A recipe's spine.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecipeSkeleton {
@@ -227,7 +252,7 @@ pub struct RecipeSkeleton {
 }
 
 /// An advancement's spine.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AdvancementSkeleton {
     /// `parent`, which is how an advancement hangs off another — and how a
     /// pack silently depends on whoever defined the parent.
@@ -236,11 +261,32 @@ pub struct AdvancementSkeleton {
     pub icon: Option<ResourceLocation>,
     /// Criteria by name; the value is the trigger id each one uses.
     pub criteria: BTreeMap<String, String>,
-    /// `rewards.recipes` and `rewards.loot` — the advancement granting things.
+    /// Every `rewards` field, inventoried: the recipes and loot tables the
+    /// advancement grants, the experience it pays, and the function it runs.
+    /// Kept as a complete set rather than the two fields a report happens to
+    /// want today, because "what does unlocking this grant" is one question
+    /// with four answers and reporting two of them invites the other two to
+    /// be forgotten.
     pub granted_recipes: Vec<ResourceLocation>,
     pub granted_loot: Vec<ResourceLocation>,
+    /// `rewards.experience`, as written.
+    pub granted_experience: Option<i64>,
+    /// `rewards.function`, naming a function file in the merged stack.
+    pub reward_function: Option<ResourceLocation>,
     /// The whole advancement, verbatim.
     pub raw: Value,
+}
+
+impl AdvancementSkeleton {
+    /// Pull one spine out of an already-parsed advancement document.
+    ///
+    /// Public alongside [`ShapeReport::scan`] because scanning builds all
+    /// three shapes at once, and a pass that only wants advancement graphs —
+    /// [`crate::advancement::validate`] — should not pay for every recipe
+    /// and loot table it never looks at.
+    pub fn from_raw(value: &Value) -> Self {
+        advancement_skeleton(value)
+    }
 }
 
 /// Skeletons for every recipe, loot table and advancement in a load.
@@ -516,6 +562,15 @@ fn advancement_skeleton(value: &Value) -> AdvancementSkeleton {
         ),
         None => (Vec::new(), Vec::new()),
     };
+    let granted_experience = value
+        .get("rewards")
+        .and_then(|rewards| rewards.get("experience"))
+        .and_then(Value::as_i64);
+    let reward_function = value
+        .get("rewards")
+        .and_then(|rewards| rewards.get("function"))
+        .and_then(Value::as_str)
+        .and_then(|text| ResourceLocation::parse(text).ok());
 
     AdvancementSkeleton {
         parent,
@@ -523,6 +578,8 @@ fn advancement_skeleton(value: &Value) -> AdvancementSkeleton {
         criteria,
         granted_recipes,
         granted_loot,
+        granted_experience,
+        reward_function,
         raw: value.clone(),
     }
 }

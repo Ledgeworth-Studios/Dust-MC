@@ -49,10 +49,21 @@ pub enum RegistryKind {
     /// because most of them (`block`, `item`, `entity_type`, `fluid`) are
     /// built into the server and never appear as a datapack directory at all.
     Tag(&'static str),
+    /// Text files read line by line, one command per line, the commands kept
+    /// as opaque strings. See [`crate::function`] for what is and is not
+    /// decided at this layer.
+    ///
+    /// A later pack's copy replaces an earlier pack's, exactly like
+    /// [`RegistryKind::Content`]: a function file is one definition of one
+    /// name, not a membership list.
+    Commands {
+        /// The single file extension the registry holds, dot included.
+        extension: &'static str,
+    },
     /// A directory Dust knows the name of and does not read, with the reason.
     ///
     /// These exist so the directory does not show up as a mystery. Saying "this
-    /// is `.mcfunction`, which Dust does not run yet" is a different message
+    /// is `.nbt`, which belongs to another crate" is a different message
     /// from "this is not a registry", and the difference is what tells an
     /// operator whether they made a mistake.
     Unread {
@@ -199,10 +210,8 @@ fn vanilla_defs() -> Vec<RegistryDef> {
     defs.push(RegistryDef {
         key: RegistryId::new("function"),
         legacy: vec![RegistryId::new("functions")],
-        kind: Unread {
+        kind: RegistryKind::Commands {
             extension: ".mcfunction",
-            why: "Dust does not run commands yet. The files are left alone \
-                  rather than half-read",
         },
     });
     defs.push(RegistryDef {

@@ -181,6 +181,20 @@ impl MemPack {
         }
     }
 
+    /// A pack whose files are given as raw bytes. The text builders cover
+    /// everything JSON-shaped; this one exists for the tests that are
+    /// precisely about bytes a text builder cannot write — invalid UTF-8,
+    /// hostile headers, truncated anything.
+    pub fn with_raw(id: &str, files: &[(&str, &[u8])]) -> Self {
+        Self {
+            id: id.to_owned(),
+            files: files
+                .iter()
+                .map(|(path, body)| ((*path).to_owned(), body.to_vec()))
+                .collect(),
+        }
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -213,78 +227,242 @@ impl dust_data::PackSource for MemPack {
 /// This is the other half of `crate::zip`: the reader has no compressor, so
 /// the tests bring their own writer, checked against the reader's CRC and
 /// length fields. Deflated entries are exercised against archives produced by
-/// the system `zip` binary instead — see `the_system_zipper_and_dust_agree`.
+/// the system `zip` binary instead — see `the_system_zipper_and_dust_agree` —
+/// and against [`write_deflate_fixed`] below, which needs no outside tool.
 pub fn write_stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
     assert!(entries.len() <= u16::MAX as usize);
+    let raw: Vec<RawZipEntry> = entries
+        .iter()
+        .map(|(name, body)| RawZipEntry {
+            name: name.as_bytes().to_vec(),
+            flags: 0,
+            method: 0,
+            crc: dust_data::zip::crc32(body),
+            compressed_size: body.len() as u32,
+            uncompressed_size: body.len() as u32,
+            body: body.to_vec(),
+        })
+        .collect();
+    write_layouted_zip(&raw).0
+}
+
+/// One entry for [`write_layouted_zip`]: every field both of the archive's
+/// records carry, under the test's control.
+///
+/// The ordinary builder fills these in consistently; this one exists so the
+/// hostile-crafting tests can make the two records *disagree*, or promise a
+/// name is UTF-8 when it is not. Nothing here is reachable from a well-formed
+/// pack, which is the point.
+#[derive(Clone)]
+pub struct RawZipEntry {
+    /// Name bytes exactly as they sit in the archive — not necessarily UTF-8.
+    pub name: Vec<u8>,
+    pub flags: u16,
+    pub method: u16,
+    /// Checksum of the **uncompressed** payload, which is what a real writer
+    /// records whatever the compression method is.
+    pub crc: u32,
+    pub compressed_size: u32,
+    pub uncompressed_size: u32,
+    /// The bytes between the headers: a stored payload or a deflate stream.
+    pub body: Vec<u8>,
+}
+
+/// Where each entry's two records start, plus the end-of-central-directory.
+///
+/// Returned so a test can patch one field of one record without doing
+/// arithmetic against a layout it cannot see.
+pub struct ZipLayout {
+    pub entries: Vec<ZipEntryLayout>,
+    pub eocd: usize,
+}
+
+pub struct ZipEntryLayout {
+    pub local_header: usize,
+    pub central_directory: usize,
+}
+
+/// Write a zip with full control over every recorded field, and hand back
+/// where everything landed.
+pub fn write_layouted_zip(entries: &[RawZipEntry]) -> (Vec<u8>, ZipLayout) {
     const LOCAL: u32 = 0x0403_4b50;
     const CENTRAL: u32 = 0x0201_4b50;
     const EOCD: u32 = 0x0605_4b50;
 
     let mut out = Vec::new();
-    struct Central {
-        name: String,
-        crc: u32,
-        size: u32,
-        offset: u32,
-    }
-    let mut central: Vec<Central> = Vec::new();
+    let mut layout = ZipLayout {
+        entries: Vec::new(),
+        eocd: 0,
+    };
 
-    for (name, body) in entries {
-        let offset = out.len() as u32;
-        let crc = dust_data::zip::crc32(body);
+    // Pass one: every local record, back to back.
+    let mut offsets = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let local_header = out.len();
         out.extend_from_slice(&LOCAL.to_le_bytes());
         out.extend_from_slice(&20_u16.to_le_bytes());
-        out.extend_from_slice(&0_u16.to_le_bytes()); // flags
-        out.extend_from_slice(&0_u16.to_le_bytes()); // method: stored
+        out.extend_from_slice(&entry.flags.to_le_bytes());
+        out.extend_from_slice(&entry.method.to_le_bytes());
         out.extend_from_slice(&0_u16.to_le_bytes()); // time
         out.extend_from_slice(&0x21_u16.to_le_bytes()); // date: 1980-01-01
-        out.extend_from_slice(&crc.to_le_bytes());
-        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&entry.crc.to_le_bytes());
+        out.extend_from_slice(&entry.compressed_size.to_le_bytes());
+        out.extend_from_slice(&entry.uncompressed_size.to_le_bytes());
+        out.extend_from_slice(&(entry.name.len() as u16).to_le_bytes());
         out.extend_from_slice(&0_u16.to_le_bytes()); // extra
-        out.extend_from_slice(name.as_bytes());
-        out.extend_from_slice(body);
-        central.push(Central {
-            name: (*name).to_owned(),
-            crc,
-            size: body.len() as u32,
-            offset,
-        });
+        out.extend_from_slice(&entry.name);
+        out.extend_from_slice(&entry.body);
+        offsets.push(local_header);
     }
 
-    let directory_at = out.len();
-    for entry in &central {
+    // Pass two: the central directory, one record per entry, contiguous.
+    for (entry, &local_header) in entries.iter().zip(&offsets) {
+        let central_directory = out.len();
         out.extend_from_slice(&CENTRAL.to_le_bytes());
         out.extend_from_slice(&20_u16.to_le_bytes()); // version made by
         out.extend_from_slice(&20_u16.to_le_bytes()); // version needed
-        out.extend_from_slice(&0_u16.to_le_bytes()); // flags
-        out.extend_from_slice(&0_u16.to_le_bytes()); // method
+        out.extend_from_slice(&entry.flags.to_le_bytes());
+        out.extend_from_slice(&entry.method.to_le_bytes());
         out.extend_from_slice(&0_u16.to_le_bytes()); // time
         out.extend_from_slice(&0x21_u16.to_le_bytes()); // date
         out.extend_from_slice(&entry.crc.to_le_bytes());
-        out.extend_from_slice(&entry.size.to_le_bytes());
-        out.extend_from_slice(&entry.size.to_le_bytes());
+        out.extend_from_slice(&entry.compressed_size.to_le_bytes());
+        out.extend_from_slice(&entry.uncompressed_size.to_le_bytes());
         out.extend_from_slice(&(entry.name.len() as u16).to_le_bytes());
         out.extend_from_slice(&0_u16.to_le_bytes()); // extra
         out.extend_from_slice(&0_u16.to_le_bytes()); // comment
         out.extend_from_slice(&0_u16.to_le_bytes()); // disk start
         out.extend_from_slice(&0_u16.to_le_bytes()); // internal attrs
         out.extend_from_slice(&0_u32.to_le_bytes()); // external attrs
-        out.extend_from_slice(&entry.offset.to_le_bytes());
-        out.extend_from_slice(entry.name.as_bytes());
+        out.extend_from_slice(&(local_header as u32).to_le_bytes());
+        out.extend_from_slice(&entry.name);
+        layout.entries.push(ZipEntryLayout {
+            local_header,
+            central_directory,
+        });
     }
-    let directory_size = (out.len() - directory_at) as u32;
 
+    let directory_size = out.len()
+        - layout
+            .entries
+            .first()
+            .map_or(out.len(), |first| first.central_directory);
+    let eocd = out.len();
     out.extend_from_slice(&EOCD.to_le_bytes());
     out.extend_from_slice(&0_u16.to_le_bytes()); // this disk
     out.extend_from_slice(&0_u16.to_le_bytes()); // cd disk
-    out.extend_from_slice(&(central.len() as u16).to_le_bytes());
-    out.extend_from_slice(&(central.len() as u16).to_le_bytes());
-    out.extend_from_slice(&directory_size.to_le_bytes());
-    out.extend_from_slice(&(directory_at as u32).to_le_bytes());
+    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(directory_size as u32).to_le_bytes());
+    out.extend_from_slice(
+        &(layout
+            .entries
+            .first()
+            .map_or(0, |first| first.central_directory) as u32)
+            .to_le_bytes(),
+    );
     out.extend_from_slice(&0_u16.to_le_bytes()); // comment len
-    out
+    layout.eocd = eocd;
+    (out, layout)
+}
+
+/// A DEFLATE stream of one final, **fixed-Huffman** block holding `payload`
+/// as literals — no back-references, nothing clever.
+///
+/// Exists because the deflated-entry paths must be exercisable on machines
+/// with no system `zip`, and because a stream produced by code nobody in this
+/// repository wrote would defeat itself; the encoder here is twenty lines of
+/// RFC 1951 §3.2.6 and the decoder still has to earn the bytes through its
+/// own Huffman tables. Every literal goes through the fixed literal table;
+/// the CRC the caller records is what proves the round trip.
+pub fn write_deflate_fixed(payload: &[u8]) -> Vec<u8> {
+    let mut bits = DeflateBits::new();
+    bits.header_final_fixed();
+    for &byte in payload {
+        if byte < 144 {
+            bits.code(0x30 + u32::from(byte), 8);
+        } else {
+            bits.code(0x190 + u32::from(byte - 144), 9);
+        }
+    }
+    bits.end_of_block();
+    bits.finish()
+}
+
+/// A fixed-Huffman stream that expands `repeats` times via back-references:
+/// three literals, then `length 258, distance 3` pairs.
+///
+/// This is the zip-bomb shape — roughly 1.7 bytes of stream per 258 bytes of
+/// output — written out because the cap on expansion must be tested against
+/// a stream that genuinely wants to blow past it, not against a stored entry
+/// merely *claiming* to be large.
+pub fn deflate_repeat_stream(repeats: usize) -> Vec<u8> {
+    let mut bits = DeflateBits::new();
+    bits.header_final_fixed();
+    for &byte in b"abc" {
+        bits.code(0x30 + u32::from(byte), 8);
+    }
+    for _ in 0..repeats {
+        // Length symbol 285: base 258, no extra bits.
+        bits.code(0b1100_0101, 8);
+        // Distance symbol 2: base 3, no extra bits, five-bit code.
+        bits.code(0b00010, 5);
+    }
+    bits.end_of_block();
+    bits.finish()
+}
+
+/// Bit-level output for the two streams above: plain fields go in
+/// least-significant-first, Huffman codes most-significant-first, per
+/// RFC 1951 §3.1.1.
+struct DeflateBits {
+    out: Vec<u8>,
+    held: u32,
+    used: u32,
+}
+
+impl DeflateBits {
+    fn new() -> Self {
+        Self {
+            out: Vec::new(),
+            held: 0,
+            used: 0,
+        }
+    }
+
+    fn push_lsb(&mut self, value: u32, count: u32) {
+        self.held |= value << self.used;
+        self.used += count;
+        while self.used >= 8 {
+            self.out.push((self.held & 0xff) as u8);
+            self.held >>= 8;
+            self.used -= 8;
+        }
+    }
+
+    /// One final block with the fixed tables' type bits.
+    fn header_final_fixed(&mut self) {
+        self.push_lsb(1, 1); // BFINAL
+        self.push_lsb(1, 2); // BTYPE = 01, fixed
+    }
+
+    fn code(&mut self, code: u32, count: u32) {
+        for bit in (0..count).rev() {
+            self.push_lsb((code >> bit) & 1, 1);
+        }
+    }
+
+    fn end_of_block(&mut self) {
+        // Symbol 256, the seven all-zero code.
+        self.code(0, 7);
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        if self.used > 0 {
+            self.out.push((self.held & 0xff) as u8);
+        }
+        self.out
+    }
 }
 
 // ---------------------------------------------------------------------------
