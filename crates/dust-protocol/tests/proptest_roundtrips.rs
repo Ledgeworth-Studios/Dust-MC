@@ -8,22 +8,18 @@
 //! reason they exist — a minimal failing value turns "the chunk packet
 //! sometimes fails" into an afternoon off.
 
-use dust_protocol::packets::play::chat::{
-    AcknowledgedMessage, ChatFilter, MessageAcknowledgement,
-};
+use dust_protocol::packets::play::chat::{AcknowledgedMessage, ChatFilter, MessageAcknowledgement};
 use dust_protocol::packets::play::chunk::{ChunkData, LightArray, LIGHT_SECTION_BYTES};
-use dust_protocol::packets::play::metadata::{
-    MetadataEntries, MetadataEntry, MetadataValue, Pose,
-};
+use dust_protocol::packets::play::metadata::{MetadataEntries, MetadataEntry, MetadataValue, Pose};
 use dust_protocol::packets::play::serverbound as sb;
 use dust_protocol::packets::play::{
-    Abilities, BlockChangeEntry, ChunkSectionPosition, EntityDelta, EntityVelocity, Gamemode,
-    GameModeByte, PreviousGameMode, TeleportFlags,
+    Abilities, BlockChangeEntry, ChunkSectionPosition, EntityDelta, EntityVelocity, GameModeByte,
+    Gamemode, PreviousGameMode, TeleportFlags,
 };
 use dust_protocol::text::{Body, Color, Component, NamedColor, Style};
 use dust_protocol::types::{
-    Angle, BitSet, BoundedString, Decode, Encode, FixedBitSet, Identifier, Position,
-    PrefixedBytes, RestOfPacket, Uuid, VarInt, VarLong,
+    Angle, BitSet, BoundedString, Decode, Encode, FixedBitSet, Identifier, Position, PrefixedBytes,
+    RestOfPacket, Uuid, VarInt, VarLong,
 };
 use dust_protocol::version;
 use dust_protocol::wire::{DecodeError, Reader, WireWrite, Writer};

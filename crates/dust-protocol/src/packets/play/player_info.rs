@@ -77,11 +77,10 @@ impl Decode for PlayerInfoBody {
             });
         }
         let count = VarInt::decode(input, version)?;
-        let count =
-            usize::try_from(count.0).map_err(|_| DecodeError::NegativeLength {
-                field: "player info entries",
-                value: count.0,
-            })?;
+        let count = usize::try_from(count.0).map_err(|_| DecodeError::NegativeLength {
+            field: "player info entries",
+            value: count.0,
+        })?;
         let mut entries = Vec::with_capacity(count.min(input.remaining()));
         for _ in 0..count {
             entries.push(PlayerInfoEntry::decode_with(&actions, input, version)?);

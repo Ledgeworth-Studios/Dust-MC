@@ -19,13 +19,13 @@ use dust_protocol::conformance::{
     check_field_types, check_nbt, check_wire, in_crate_nbt, in_crate_wire,
 };
 use dust_protocol::nbt::{self, TextComponent};
-use dust_protocol::packets::{undefined_for, unclaimed_for, COMPLETE_PAIRS};
+use dust_protocol::packets::{unclaimed_for, undefined_for, COMPLETE_PAIRS};
 use dust_protocol::types::{
     Angle, BitSet, BoundedString, ChatVisibility, Decode, Encode, FixedBitSet, Identifier,
-    MainHand, NextState, Position, PrefixedBytes, Slot, Uuid, VarInt,
+    MainHand, NextState, Position, Slot,
 };
-use dust_protocol::wire::{DecodeError, EncodeError, Reader, WireRead, WireWrite, Writer};
-use dust_protocol::{version, ConnectionState, Direction, ProtocolVersion};
+use dust_protocol::wire::{DecodeError, Reader, WireRead, WireWrite, Writer};
+use dust_protocol::{ConnectionState, Direction, ProtocolVersion};
 
 #[test]
 fn the_wire_primitives_agree_with_the_vectors() {
@@ -185,7 +185,10 @@ fn an_unknown_enum_discriminant_is_a_named_error_and_never_a_default() {
         Err(DecodeError::UnknownVariant { value: -1, .. })
     ));
     for state in NextState::ALL {
-        assert_eq!(NextState::from_discriminant(state.discriminant()), Some(*state));
+        assert_eq!(
+            NextState::from_discriminant(state.discriminant()),
+            Some(*state)
+        );
     }
 }
 
@@ -260,7 +263,14 @@ fn an_identifier_is_validated_and_a_bare_path_takes_the_default_namespace() {
     assert_eq!(id("minecraft:stone").to_string(), "minecraft:stone");
     assert_eq!(id("stone").namespace, "minecraft");
     assert_eq!(id("dust:some/path.thing-1").path, "some/path.thing-1");
-    for bad in ["", ":", "Minecraft:stone", "minecraft:", "a b:c", "mine/craft:x"] {
+    for bad in [
+        "",
+        ":",
+        "Minecraft:stone",
+        "minecraft:",
+        "a b:c",
+        "mine/craft:x",
+    ] {
         assert!(
             Identifier::parse(bad).is_err(),
             "`{bad}` should not be an identifier"
@@ -355,12 +365,14 @@ fn play_is_partially_defined_and_marked_incomplete() {
     // quietly mistake a long definition list for a finished state. When the
     // last packet lands, the pair graduates and `every_complete_pair...`
     // above becomes its guard from that moment.
-    let incomplete: Vec<(ConnectionState, Direction)> =
-        [(ConnectionState::Play, Direction::Clientbound), (ConnectionState::Play, Direction::Serverbound)]
-            .iter()
-            .copied()
-            .filter(|pair| !COMPLETE_PAIRS.contains(pair))
-            .collect();
+    let incomplete: Vec<(ConnectionState, Direction)> = [
+        (ConnectionState::Play, Direction::Clientbound),
+        (ConnectionState::Play, Direction::Serverbound),
+    ]
+    .iter()
+    .copied()
+    .filter(|pair| !COMPLETE_PAIRS.contains(pair))
+    .collect();
     assert_eq!(
         incomplete.len(),
         2,
@@ -381,9 +393,7 @@ fn play_is_partially_defined_and_marked_incomplete() {
         (ConnectionState::Play, Direction::Serverbound),
     ]
     .iter()
-    .flat_map(|&(state, direction)| {
-        v().table(state, direction).packets().map(|(_, name)| name)
-    })
+    .flat_map(|&(state, direction)| v().table(state, direction).packets().map(|(_, name)| name))
     .collect();
     for name in &claimed {
         assert!(
@@ -444,16 +454,15 @@ fn a_body_that_ends_early_or_late_is_an_error_rather_than_a_shrug() {
     // than this.
     let frame = corpus()
         .into_iter()
-        .find(|frame| frame.name == "minecraft:ping_request" && frame.state == ConnectionState::Status)
+        .find(|frame| {
+            frame.name == "minecraft:ping_request" && frame.state == ConnectionState::Status
+        })
         .expect("the status ping is in the corpus");
 
     let mut bytes = frame.bytes.clone();
     bytes.push(0xff);
     assert_eq!(
-        dust_protocol::packets::status::serverbound::Packet::decode(
-            &mut Reader::new(&bytes),
-            v()
-        ),
+        dust_protocol::packets::status::serverbound::Packet::decode(&mut Reader::new(&bytes), v()),
         Err(DecodeError::TrailingBytes { left: 1 })
     );
 
@@ -502,7 +511,11 @@ fn a_packet_takes_its_id_from_the_generated_table_and_not_from_a_constant() {
     );
     assert_eq!(
         dust_protocol::packets::play::clientbound::Login::protocol_id(v()),
-        v().protocol_id(ConnectionState::Play, Direction::Clientbound, "minecraft:login")
+        v().protocol_id(
+            ConnectionState::Play,
+            Direction::Clientbound,
+            "minecraft:login"
+        )
     );
 
     // Every definition resolves through its version's table, both directions

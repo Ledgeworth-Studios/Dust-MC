@@ -48,8 +48,8 @@
 use std::fmt;
 
 use crate::nbt;
-use crate::wire::{DecodeError, EncodeError, WireRead, WireWrite};
 use crate::types::{Decode, Encode};
+use crate::wire::{DecodeError, EncodeError, WireRead, WireWrite};
 use crate::ProtocolVersion;
 
 const TAG_END: u8 = 0;
@@ -348,7 +348,10 @@ fn write_compound_payload<W: WireWrite + ?Sized>(
         write_key(out, "color");
         write_nbt_string(out, &color.to_string());
     }
-    for (key, flag) in [("bold", component.style.bold), ("italic", component.style.italic)] {
+    for (key, flag) in [
+        ("bold", component.style.bold),
+        ("italic", component.style.italic),
+    ] {
         if let Some(value) = flag {
             write_tag(out, TAG_BYTE);
             write_key(out, key);
@@ -363,11 +366,10 @@ fn write_compound_payload<W: WireWrite + ?Sized>(
         // ones, because a mixed list cannot be spelled in NBT at all.
         let all_bare = component.extra.iter().all(is_bare_string);
         let element = if all_bare { TAG_STRING } else { TAG_COMPOUND };
-        let count = i32::try_from(component.extra.len()).map_err(|_| {
-            EncodeError::TooManyElements {
+        let count =
+            i32::try_from(component.extra.len()).map_err(|_| EncodeError::TooManyElements {
                 count: component.extra.len(),
-            }
-        })?;
+            })?;
         write_tag(out, TAG_LIST);
         write_key(out, "extra");
         write_tag(out, element);
@@ -474,10 +476,15 @@ fn read_component(reader: &mut ReaderAtEnd<'_>, depth: u32) -> Result<Component,
     }
 }
 
-fn read_compound(
-    reader: &mut ReaderAtEnd<'_>,
-    depth: u32,
-) -> Result<Component, DecodeError> {
+fn read_compound(reader: &mut ReaderAtEnd<'_>, depth: u32) -> Result<Component, DecodeError> {
+    // Checked here as well as at the entry point because nested `extra`
+    // children arrive at this function directly, bypassing the dispatcher —
+    // and the attacker's tree does not care which path it recurses through.
+    if depth > MAX_DEPTH {
+        return Err(DecodeError::Nbt {
+            why: "a component nests deeper than the limit",
+        });
+    }
     let mut body = Body::default();
     let mut style = Style::default();
     let mut extra: Vec<Component> = Vec::new();
@@ -489,10 +496,12 @@ fn read_compound(
         let key = read_nbt_string(reader)?;
         match (key.as_str(), entry) {
             ("text", TAG_STRING) => body = Body::Text(read_nbt_string(reader)?),
-            ("translate", TAG_STRING) => body = Body::Translate {
-                key: read_nbt_string(reader)?,
-                fallback: None,
-            },
+            ("translate", TAG_STRING) => {
+                body = Body::Translate {
+                    key: read_nbt_string(reader)?,
+                    fallback: None,
+                }
+            }
             ("fallback", TAG_STRING) => {
                 let fallback = read_nbt_string(reader)?;
                 match &mut body {
@@ -506,7 +515,7 @@ fn read_compound(
             }
             ("color", TAG_STRING) => {
                 let spelling = read_nbt_string(reader)?;
-                style.color = Some(Color::parse(&spelling).ok_or_else(|| DecodeError::Nbt {
+                style.color = Some(Color::parse(&spelling).ok_or(DecodeError::Nbt {
                     why: "the color name is not one the client knows",
                 })?);
             }

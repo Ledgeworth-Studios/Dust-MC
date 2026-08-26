@@ -8,16 +8,16 @@
 //! Mojang's client agrees with all of it; that is what pointing a real
 //! 1.21.1 client at this crate is for.
 
+use crate::nbt::Nbt;
 use crate::packet_group;
 use crate::packets::play::chunk::{BlockEntity, ChunkData, LightData};
 use crate::packets::play::metadata::MetadataEntries;
 use crate::packets::play::player_info::PlayerInfoBody;
+use crate::packets::play::{chat as chat_fields, TeleportFlags};
 use crate::packets::play::{Abilities, BlockChangeEntry, ChunkSectionPosition, DeathLocation};
 use crate::packets::play::{EntityDelta, EntityVelocity, GameModeByte, PreviousGameMode};
-use crate::packets::play::{TeleportFlags, chat as chat_fields};
 use crate::text::Component;
 use crate::types::{Angle, BoundedString, Identifier, Position, RestOfPacket, Uuid, VarInt};
-use crate::nbt::Nbt;
 
 packet_group! {
     state: Play,

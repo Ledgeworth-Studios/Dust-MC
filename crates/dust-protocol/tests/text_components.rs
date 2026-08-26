@@ -14,7 +14,7 @@ use common::v;
 use dust_protocol::text::DEPTH_PER_LEVEL;
 use dust_protocol::text::{Body, Color, Component, NamedColor, Style};
 use dust_protocol::types::{Decode, Encode};
-use dust_protocol::wire::{DecodeError, EncodeError, Reader, WireWrite, Writer};
+use dust_protocol::wire::{DecodeError, EncodeError, Reader, Writer};
 
 fn round_trip(component: &Component) -> Vec<u8> {
     let mut writer = Writer::new();
@@ -54,12 +54,9 @@ fn translate_keys_carry_optional_fallbacks() {
     let keyed = Component::translate("chat.type.text", None);
     round_trip(&keyed);
 
-    let with_fallback = Component::translate(
-        "dust:greeting",
-        Some("Hello, {name}".to_owned()),
-    )
-    .colored(Color::Named(NamedColor::Aqua))
-    .italic(false);
+    let with_fallback = Component::translate("dust:greeting", Some("Hello, {name}".to_owned()))
+        .colored(Color::Named(NamedColor::Aqua))
+        .italic(false);
     let decoded = {
         let mut writer = Writer::new();
         with_fallback.encode(&mut writer, v()).expect("encodes");

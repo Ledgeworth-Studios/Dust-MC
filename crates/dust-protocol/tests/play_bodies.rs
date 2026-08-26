@@ -22,12 +22,10 @@ use dust_protocol::packets::play::player_info::{
 };
 use dust_protocol::packets::play::serverbound as sb;
 use dust_protocol::packets::play::{
-    Abilities, BlockChangeEntry, ChunkSectionPosition, EntityVelocity, Gamemode, GameModeByte,
+    Abilities, BlockChangeEntry, ChunkSectionPosition, EntityVelocity, GameModeByte, Gamemode,
     PreviousGameMode, TeleportFlags,
 };
-use dust_protocol::types::{
-    BitSet, Decode, Encode, FixedBitSet, PrefixedBytes, VarInt,
-};
+use dust_protocol::types::{BitSet, Decode, Encode, FixedBitSet, PrefixedBytes, VarInt};
 use dust_protocol::wire::{DecodeError, EncodeError, Reader, WireRead, WireWrite, Writer};
 
 // ---------------------------------------------------------------------------
@@ -38,7 +36,12 @@ use dust_protocol::wire::{DecodeError, EncodeError, Reader, WireRead, WireWrite,
 fn a_chunk_section_position_sign_extends_its_three_fields() {
     // 22/20/22 bits this time, negative y included, because sections below y=0
     // are where everyone digs first.
-    for (x, y, z) in [(-4, 3, 12), (-1, -5, -1), (262_143, -524_288, -262_144), (0, 0, 0)] {
+    for (x, y, z) in [
+        (-4, 3, 12),
+        (-1, -5, -1),
+        (262_143, -524_288, -262_144),
+        (0, 0, 0),
+    ] {
         let packed = ChunkSectionPosition::pack(x, y, z);
         assert_eq!(packed.x(), x, "{packed:?}");
         assert_eq!(packed.y(), y, "{packed:?}");
@@ -50,8 +53,8 @@ fn a_chunk_section_position_sign_extends_its_three_fields() {
     ChunkSectionPosition::pack(-2, -1, 3)
         .encode(&mut writer, v())
         .expect("encodes");
-    let back = ChunkSectionPosition::decode(&mut Reader::new(writer.as_bytes()), v())
-        .expect("decodes");
+    let back =
+        ChunkSectionPosition::decode(&mut Reader::new(writer.as_bytes()), v()).expect("decodes");
     assert_eq!((back.x(), back.y(), back.z()), (-2, -1, 3));
 }
 
@@ -124,16 +127,14 @@ fn metadata_offsets_distinguish_absent_from_zero() {
     let mut writer = Writer::new();
     present.encode(&mut writer, v()).expect("encodes");
     assert_eq!(writer.as_bytes(), &[20, 1], "entity zero is wire 1");
-    let back =
-        MetadataValue::read(20, &mut Reader::new(&[1]), v()).expect("decodes");
+    let back = MetadataValue::read(20, &mut Reader::new(&[1]), v()).expect("decodes");
     assert_eq!(back, present);
 
     let block_state = MetadataValue::OptionalBlockState(Some(VarInt(9)));
     let mut writer = Writer::new();
     block_state.encode(&mut writer, v()).expect("encodes");
     assert_eq!(writer.as_bytes(), &[15, 10]);
-    let back =
-        MetadataValue::read(15, &mut Reader::new(&[10]), v()).expect("decodes");
+    let back = MetadataValue::read(15, &mut Reader::new(&[10]), v()).expect("decodes");
     assert_eq!(back, block_state);
 }
 
@@ -143,13 +144,13 @@ fn unknown_metadata_serializers_are_refused_by_id_and_never_guessed_at() {
     // serializer names its reason; an unmodelled id says why no guess is
     // possible. Neither may panic, default, or skip.
     for (serializer, payload) in [
-        (7i32, &[][..]),   // item stack: the Slot seam
-        (17, &[0][..]),    // particle: options have no length
-        (18, &[][..]),     // particles
-        (23, &[0][..]),    // wolf variant, inline form
-        (26, &[0][..]),    // painting variant, inline form
-        (31, &[0][..]),    // not modelled at all on this version
-        (-3, &[][..]),     // hostile id
+        (7i32, &[][..]), // item stack: the Slot seam
+        (17, &[0][..]),  // particle: options have no length
+        (18, &[][..]),   // particles
+        (23, &[0][..]),  // wolf variant, inline form
+        (26, &[0][..]),  // painting variant, inline form
+        (31, &[0][..]),  // not modelled at all on this version
+        (-3, &[][..]),   // hostile id
     ] {
         let bytes = one_entry(0, serializer, payload);
         match MetadataEntries::decode(&mut Reader::new(&bytes), v()) {
@@ -194,7 +195,9 @@ impl Section for FakeSection {
         _version: dust_protocol::ProtocolVersion,
     ) -> Result<Self, DecodeError> {
         let bytes = input.read_slice(4)?;
-        Ok(Self(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])))
+        Ok(Self(u32::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ])))
     }
 
     fn encode_wire<W: dust_protocol::wire::WireWrite + ?Sized>(
@@ -278,7 +281,10 @@ fn light_arrays_carry_exactly_two_kilobytes_each() {
     hostile.write_var_int(100);
     assert!(matches!(
         LightArray::decode(&mut Reader::new(hostile.as_bytes()), v()),
-        Err(DecodeError::StringTooLong { limit: 2048, actual: 100 })
+        Err(DecodeError::StringTooLong {
+            limit: 2048,
+            actual: 100
+        })
     ));
 }
 
@@ -320,8 +326,14 @@ fn an_acknowledged_message_with_id_zero_carries_its_signature_inline() {
     // refusals, because writing either would desynchronise the peer.
     let mut writer = Writer::new();
     let lies = [
-        AcknowledgedMessage { id: VarInt(0), signature: None },
-        AcknowledgedMessage { id: VarInt(2), signature: Some(signature) },
+        AcknowledgedMessage {
+            id: VarInt(0),
+            signature: None,
+        },
+        AcknowledgedMessage {
+            id: VarInt(2),
+            signature: Some(signature),
+        },
     ];
     for lie in &lies {
         assert!(matches!(
@@ -341,8 +353,7 @@ fn the_chat_filter_mask_exists_only_when_filtering_was_partial() {
         let mut writer = Writer::new();
         filter.encode(&mut writer, v()).expect("encodes");
         assert_eq!(writer.len(), 1 + extra_bytes, "{filter:?}");
-        let back =
-            ChatFilter::decode(&mut Reader::new(writer.as_bytes()), v()).expect("decodes");
+        let back = ChatFilter::decode(&mut Reader::new(writer.as_bytes()), v()).expect("decodes");
         assert_eq!(back, filter);
     }
 }
@@ -397,7 +408,9 @@ fn the_previous_gamemode_sentinel_survives_a_round_trip() {
     }
     // None is the -1 byte, which is the whole point of the wrapper.
     let mut writer = Writer::new();
-    PreviousGameMode(None).encode(&mut writer, v()).expect("encodes");
+    PreviousGameMode(None)
+        .encode(&mut writer, v())
+        .expect("encodes");
     assert_eq!(writer.as_bytes(), &[0xFF]);
 
     // And an out-of-range byte is refused by naming the variant table.
@@ -515,13 +528,12 @@ fn play_definitions_claim_the_only_version_there_is() {
     assert_eq!(
         sb::TeleportConfirm::protocol_id(v()),
         Some(
-            v()
-                .protocol_id(
-                    dust_protocol::ConnectionState::Play,
-                    dust_protocol::Direction::Serverbound,
-                    "minecraft:accept_teleportation"
-                )
-                .expect("in table")
+            v().protocol_id(
+                dust_protocol::ConnectionState::Play,
+                dust_protocol::Direction::Serverbound,
+                "minecraft:accept_teleportation"
+            )
+            .expect("in table")
         )
     );
 }

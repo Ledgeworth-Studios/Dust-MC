@@ -308,7 +308,16 @@ macro_rules! packet_group {
         )*
 
         /// Every packet this pair can carry.
+        ///
+        /// The bodies share one enum so a caller can hold "some packet from
+        /// this pair" without knowing which. Bodies differ wildly in size —
+        /// a keep-alive is eight bytes, a chat envelope several hundred —
+        /// and boxing every body to even them out would cost an allocation
+        /// per frame on a hot path to save memory that is only ever held
+        /// briefly. The size difference is deliberate and measured, hence
+        /// the allowance.
         #[derive(Debug, Clone, PartialEq)]
+        #[allow(clippy::large_enum_variant)]
         pub enum Packet {
             $($packet($packet),)*
         }
@@ -500,17 +509,22 @@ mod tests {
         }
         // Every pair is held complete here, including Play, which is how the
         // day 1.21.4's table lands will actually look.
-        let problems = undefined_in_partial("1.21.4", &table, GROUPS, &[
-            (ConnectionState::Handshake, Direction::Serverbound),
-            (ConnectionState::Status, Direction::Clientbound),
-            (ConnectionState::Status, Direction::Serverbound),
-            (ConnectionState::Login, Direction::Clientbound),
-            (ConnectionState::Login, Direction::Serverbound),
-            (ConnectionState::Configuration, Direction::Clientbound),
-            (ConnectionState::Configuration, Direction::Serverbound),
-            (ConnectionState::Play, Direction::Clientbound),
-            (ConnectionState::Play, Direction::Serverbound),
-        ]);
+        let problems = undefined_in_partial(
+            "1.21.4",
+            &table,
+            GROUPS,
+            &[
+                (ConnectionState::Handshake, Direction::Serverbound),
+                (ConnectionState::Status, Direction::Clientbound),
+                (ConnectionState::Status, Direction::Serverbound),
+                (ConnectionState::Login, Direction::Clientbound),
+                (ConnectionState::Login, Direction::Serverbound),
+                (ConnectionState::Configuration, Direction::Clientbound),
+                (ConnectionState::Configuration, Direction::Serverbound),
+                (ConnectionState::Play, Direction::Clientbound),
+                (ConnectionState::Play, Direction::Serverbound),
+            ],
+        );
         assert_eq!(
             problems.len(),
             table.len(),
@@ -553,8 +567,7 @@ mod tests {
         // Held complete, every unclaimed packet is a complaint; incomplete,
         // only `minecraft:not_written_yet`'s absence is tolerated and nothing
         // else is wrong.
-        let problems =
-            undefined_in_partial("1.21.1", &table, &[CLAIMED], &all_complete);
+        let problems = undefined_in_partial("1.21.1", &table, &[CLAIMED], &all_complete);
         assert_eq!(problems.len(), 1, "{problems:#?}");
         assert!(problems[0].contains("not_written_yet"), "{problems:#?}");
         let problems = undefined_in_partial("1.21.1", &table, &[CLAIMED], &[]);

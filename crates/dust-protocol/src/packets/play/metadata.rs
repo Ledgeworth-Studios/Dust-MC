@@ -32,9 +32,7 @@
 //! place to put it.
 
 use crate::nbt::Nbt;
-use crate::types::{
-    Decode, Encode, Identifier, Position, ProtocolString, Uuid, VarInt, VarLong,
-};
+use crate::types::{Decode, Encode, Identifier, Position, ProtocolString, Uuid, VarInt, VarLong};
 use crate::wire::{DecodeError, EncodeError, WireRead, WireWrite};
 use crate::{text::Component, ProtocolVersion};
 
@@ -241,10 +239,14 @@ fn refusal_why(serializer: i32) -> &'static str {
     match serializer {
         7 => "an item stack needs component layouts, which no report extracts yet",
         17 | 18 => "particle options have no length and their layouts live outside any report",
-        23 | 26 => "wolf and painting variants may be inline definitions, which are outside \
-                    the supported subset",
-        _ => "this serializer id is not modelled; its value has no length, so it cannot be \
-              stepped over and the packet is refused",
+        23 | 26 => {
+            "wolf and painting variants may be inline definitions, which are outside \
+                    the supported subset"
+        }
+        _ => {
+            "this serializer id is not modelled; its value has no length, so it cannot be \
+              stepped over and the packet is refused"
+        }
     }
 }
 
@@ -312,7 +314,8 @@ impl Encode for MetadataValue {
                         position.encode(out, version)
                     }
                 };
-            }        }
+            }
+        }
         Ok(())
     }
 }

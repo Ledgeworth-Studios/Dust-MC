@@ -113,13 +113,12 @@ impl Decode for PreviousGameMode {
         let raw = input.read_i8()?;
         Ok(Self(match raw {
             -1 => None,
-            other => Some(
-                Gamemode::from_discriminant(i32::from(other))
-                    .ok_or(DecodeError::UnknownVariant {
-                        name: "Gamemode",
-                        value: i32::from(other),
-                    })?,
-            ),
+            other => Some(Gamemode::from_discriminant(i32::from(other)).ok_or(
+                DecodeError::UnknownVariant {
+                    name: "Gamemode",
+                    value: i32::from(other),
+                },
+            )?),
         }))
     }
 }
