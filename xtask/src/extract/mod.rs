@@ -41,6 +41,7 @@ mod fluids;
 mod items;
 mod numbers;
 mod packets;
+mod recipes;
 mod registries;
 mod sha1;
 mod worldgen;
@@ -73,6 +74,8 @@ pub enum Domain {
     Fluids,
     /// The brigadier command graph.
     Commands,
+    /// Recipe shapes: the serialiser vocabulary and the keys each takes.
+    Recipes,
     /// Packet id tables for `dust-protocol`.
     Packets,
     /// Worldgen: the ore baseline in `dust-gen`.
@@ -86,6 +89,7 @@ pub const ALL_DOMAINS: &[Domain] = &[
     Domain::Entities,
     Domain::Fluids,
     Domain::Commands,
+    Domain::Recipes,
     Domain::Packets,
     Domain::Worldgen,
 ];
@@ -99,6 +103,7 @@ impl Domain {
             Self::Entities => "entities",
             Self::Fluids => "fluids",
             Self::Commands => "commands",
+            Self::Recipes => "recipes",
             Self::Packets => "packets",
             Self::Worldgen => "worldgen",
         }
@@ -108,7 +113,8 @@ impl Domain {
         ALL_DOMAINS.iter().copied().find(|d| d.name() == name)
     }
 
-    /// Whether this domain reads the `--reports` tree.
+    /// Whether this domain reads the `--reports` tree. Recipes does because its
+    /// shapes are checked against the recipe_serializer registry on the way in.
     fn needs_reports(self) -> bool {
         matches!(
             self,
@@ -117,13 +123,14 @@ impl Domain {
                 | Self::Entities
                 | Self::Fluids
                 | Self::Commands
+                | Self::Recipes
                 | Self::Packets
         )
     }
 
     /// Whether this domain reads the `--server` data pack tree.
     fn needs_data(self) -> bool {
-        matches!(self, Self::Worldgen)
+        matches!(self, Self::Recipes | Self::Worldgen)
     }
 }
 
@@ -313,6 +320,9 @@ pub fn run(options: &Options, workspace_root: &Path) -> Result<(), String> {
             )?,
             Domain::Commands => {
                 commands_domain(registries.as_ref().expect("parsed above"), &context)?
+            }
+            Domain::Recipes => {
+                recipes_domain(registries.as_ref().expect("parsed above"), &context)?
             }
             Domain::Packets => packets_domain(&context)?,
             Domain::Worldgen => worldgen_domain(&context)?,
@@ -536,6 +546,49 @@ fn entities_domain(flat: &registries::Registries, context: &Context) -> Result<O
     Ok(format!(
         "{} entity types, all sampled",
         parsed.reported.len()
+    ))
+}
+
+/// Walk the recipe data pack and regenerate the recipe-shape catalogue.
+fn recipes_domain(flat: &registries::Registries, context: &Context) -> Result<Outcome, String> {
+    let parsed = recipes::parse(&context.data()?.join("data"), flat)?;
+
+    println!(
+        "read {} recipe files from {} namespace(s) into {} shapes, each one an entry of \
+         the recipe_serializer registry",
+        parsed.total,
+        parsed.namespaces.join(", "),
+        parsed.shapes.len()
+    );
+    for shape in &parsed.shapes {
+        let mut line = format!(
+            "  {:<44} {:>4} recipes; keys {}",
+            shape.serializer,
+            shape.uses,
+            shape.required.join(", ")
+        );
+        if !shape.optional.is_empty() {
+            line.push_str(&format!(" | optional: {}", shape.optional.join(", ")));
+        }
+        println!("{line}");
+    }
+    if parsed.unused_serializers.is_empty() {
+        println!("  every registered serialiser is exercised by the data");
+    } else {
+        println!(
+            "  registered but unused by vanilla data (the special, computed recipes): {}",
+            parsed.unused_serializers.join(", ")
+        );
+    }
+
+    let path = context.generated_registry_dir()?.join("recipes.rs");
+    std::fs::write(&path, codegen::recipes(&parsed, context.version))
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    println!("wrote {}", path.display());
+    Ok(format!(
+        "{} recipe files into {} shapes",
+        parsed.total,
+        parsed.shapes.len()
     ))
 }
 
