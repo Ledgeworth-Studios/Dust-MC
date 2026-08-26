@@ -223,6 +223,51 @@ impl Tag {
             _ => return None,
         })
     }
+
+    /// Follow a path of segments from this tag.
+    ///
+    /// A segment names a compound field, or — if the current tag is a list —
+    /// parses as a decimal index into it, so
+    /// `root.get_path(&["sections", "0", "block_states"])` reads the way the
+    /// same navigation reads in `/data`. Returns `None` the first time a
+    /// segment does not resolve: a missing field, an out-of-range index, or
+    /// any segment applied to a scalar.
+    ///
+    /// What this deliberately is not is vanilla's full selector syntax: no
+    /// ranges, no `{}`-matches-every-child, no recursion. Callers needing
+    /// those have Minecraft knowledge, and per the crate note that lives with
+    /// the code that has it.
+    ///
+    /// ```
+    /// use dust_nbt::{Compound, Tag};
+    ///
+    /// let mut sections = dust_nbt::List::new(dust_nbt::TagType::Compound);
+    /// let mut section = Compound::new();
+    /// section.insert("Y", Tag::Byte(-4));
+    /// sections.push(Tag::Compound(section)).expect("homogeneous");
+    /// let mut root = Compound::new();
+    /// root.insert("sections", Tag::List(sections));
+    ///
+    /// assert_eq!(
+    ///     Tag::Compound(root).get_path(&["sections", "0", "Y"]),
+    ///     Some(&Tag::Byte(-4))
+    /// );
+    /// ```
+    pub fn get_path(&self, path: &[&str]) -> Option<&Tag> {
+        let mut current = self;
+        for segment in path {
+            current = step(current, segment)?;
+        }
+        Some(current)
+    }
+}
+
+fn step<'a>(current: &'a Tag, segment: &str) -> Option<&'a Tag> {
+    match current {
+        Tag::Compound(compound) => compound.get(segment),
+        Tag::List(list) => list.get(segment.parse::<usize>().ok()?),
+        _ => None,
+    }
 }
 
 impl PartialEq for Tag {
@@ -506,6 +551,33 @@ impl Compound {
     pub fn keys(&self) -> impl Iterator<Item = &str> {
         self.fields.iter().map(|(key, _)| key.as_str())
     }
+
+    /// Follow a path of segments from this compound.
+    ///
+    /// The same walk as [`Tag::get_path`], starting one level in so a caller
+    /// already holding a `Compound` need not wrap it first.
+    ///
+    /// ```
+    /// use dust_nbt::{Compound, Tag};
+    ///
+    /// let mut inner = Compound::new();
+    /// inner.insert("id", Tag::String("minecraft:stone".to_owned()));
+    /// let mut root = Compound::new();
+    /// root.insert("item", Tag::Compound(inner));
+    ///
+    /// assert_eq!(
+    ///     root.get_path(&["item", "id"]).and_then(Tag::as_str),
+    ///     Some("minecraft:stone")
+    /// );
+    /// ```
+    pub fn get_path(&self, path: &[&str]) -> Option<&Tag> {
+        let (first, rest) = path.split_first()?;
+        let mut current = self.get(first)?;
+        for segment in rest {
+            current = step(current, segment)?;
+        }
+        Some(current)
+    }
 }
 
 impl PartialEq for Compound {
@@ -535,5 +607,113 @@ impl FromIterator<(String, Tag)> for Compound {
         Self {
             fields: iter.into_iter().collect(),
         }
+    }
+}
+
+impl<'a> IntoIterator for &'a mut Compound {
+    type Item = &'a mut (String, Tag);
+    type IntoIter = std::slice::IterMut<'a, (String, Tag)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.fields.iter_mut()
+    }
+}
+
+impl IntoIterator for Compound {
+    type Item = (String, Tag);
+    type IntoIter = std::vec::IntoIter<(String, Tag)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.fields.into_iter()
+    }
+}
+
+impl IntoIterator for List {
+    type Item = Tag;
+    type IntoIter = std::vec::IntoIter<Tag>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.elements.into_iter()
+    }
+}
+
+// The `From` conversions below exist for the shape of document *building*: a
+// caller assembling a component payload or a test fixture thinks in values,
+// and every one of these is a tag whose variant is exactly the value's type.
+// Conversions that would have to choose a representation — a number widened
+// to a wider tag, a slice copied — are left out; where the choice matters,
+// the caller should make it visibly.
+
+impl From<bool> for Tag {
+    /// NBT has no boolean; Minecraft spells one as a byte. This picks the
+    /// spelling SNBT's `true` and `false` parse to.
+    fn from(value: bool) -> Self {
+        Self::Byte(i8::from(value))
+    }
+}
+
+impl From<i8> for Tag {
+    fn from(value: i8) -> Self {
+        Self::Byte(value)
+    }
+}
+
+impl From<i16> for Tag {
+    fn from(value: i16) -> Self {
+        Self::Short(value)
+    }
+}
+
+impl From<i32> for Tag {
+    fn from(value: i32) -> Self {
+        Self::Int(value)
+    }
+}
+
+impl From<i64> for Tag {
+    fn from(value: i64) -> Self {
+        Self::Long(value)
+    }
+}
+
+impl From<f32> for Tag {
+    fn from(value: f32) -> Self {
+        Self::Float(value)
+    }
+}
+
+impl From<f64> for Tag {
+    fn from(value: f64) -> Self {
+        Self::Double(value)
+    }
+}
+
+impl From<&str> for Tag {
+    fn from(value: &str) -> Self {
+        Self::String(value.to_owned())
+    }
+}
+
+impl From<String> for Tag {
+    fn from(value: String) -> Self {
+        Self::String(value)
+    }
+}
+
+impl From<Vec<i8>> for Tag {
+    fn from(value: Vec<i8>) -> Self {
+        Self::ByteArray(value)
+    }
+}
+
+impl From<Vec<i32>> for Tag {
+    fn from(value: Vec<i32>) -> Self {
+        Self::IntArray(value)
+    }
+}
+
+impl From<Vec<i64>> for Tag {
+    fn from(value: Vec<i64>) -> Self {
+        Self::LongArray(value)
     }
 }

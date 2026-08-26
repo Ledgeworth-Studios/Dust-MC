@@ -161,6 +161,19 @@ pub struct Named {
 /// Trailing bytes are not an error — a region file stores each chunk in a slot
 /// padded to a multiple of 4 KiB, and the padding follows the document. Use
 /// [`from_bytes_exact`] where nothing should follow.
+///
+/// ```
+/// use dust_nbt::{read, write, Tag};
+///
+/// # fn main() -> Result<(), dust_nbt::Error> {
+/// let original = write::to_vec("level", &Tag::Long(3955))?;
+///
+/// let document = read::from_bytes(&original)?;
+/// assert_eq!(document.name, "level");
+/// assert_eq!(document.tag, Tag::Long(3955));
+/// # Ok(())
+/// # }
+/// ```
 pub fn from_bytes(input: &[u8]) -> Result<Named> {
     from_bytes_with(input, Limits::default())
 }
@@ -185,6 +198,19 @@ pub fn from_bytes_exact(input: &[u8]) -> Result<Named> {
 /// the single byte `00`, which is how the protocol spells "no NBT here" — a
 /// slot with no components, an entity with no custom data. Treating that as a
 /// parse error would reject the most common value on the wire.
+///
+/// ```
+/// use dust_nbt::{read, write, Tag};
+///
+/// # fn main() -> Result<(), dust_nbt::Error> {
+/// let absent = read::from_bytes_network(&[0x00])?;
+/// assert_eq!(absent, None);
+///
+/// let bytes = write::to_vec_network(Some(&Tag::Byte(1)))?;
+/// assert_eq!(read::from_bytes_network(&bytes)?, Some(Tag::Byte(1)));
+/// # Ok(())
+/// # }
+/// ```
 pub fn from_bytes_network(input: &[u8]) -> Result<Option<Tag>> {
     from_bytes_network_with(input, Limits::NETWORK)
 }

@@ -28,6 +28,18 @@ use std::fmt::Write as _;
 use crate::tag::{Compound, List, Tag};
 
 /// Print a tag as compact SNBT.
+///
+/// ```
+/// use dust_nbt::{snbt, Compound, Tag};
+///
+/// let mut compound = Compound::new();
+/// compound.insert("Count", Tag::Byte(1));
+/// compound.insert("id", Tag::String("minecraft:stone".to_owned()));
+/// assert_eq!(
+///     snbt::to_string(&Tag::Compound(compound)),
+///     "{Count:1b,id:\"minecraft:stone\"}"
+/// );
+/// ```
 pub fn to_string(tag: &Tag) -> String {
     let mut out = String::new();
     write_tag(&mut out, tag);

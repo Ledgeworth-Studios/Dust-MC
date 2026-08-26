@@ -20,6 +20,16 @@ use crate::tag::{Compound, List, Tag, TagType};
 /// The name is the empty string in every file Minecraft writes. It is a
 /// parameter rather than a constant because reading gives one back, and a
 /// round-trip that silently dropped it would not be one.
+///
+/// ```
+/// use dust_nbt::{write, Tag};
+///
+/// # fn main() -> Result<(), dust_nbt::Error> {
+/// let bytes = write::to_vec("", &Tag::Byte(-1))?;
+/// assert_eq!(bytes, vec![0x01, 0x00, 0x00, 0xff]);
+/// # Ok(())
+/// # }
+/// ```
 pub fn to_vec(name: &str, tag: &Tag) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(1024);
     write_into(&mut out, name, tag)?;

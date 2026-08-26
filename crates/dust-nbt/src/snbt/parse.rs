@@ -101,6 +101,17 @@ const MAX_DEPTH: usize = 512;
 ///
 /// Trailing text is an error. `TagParser.parseTag` behaves the same way and
 /// reports it as `argument.nbt.trailing`.
+///
+/// ```
+/// use dust_nbt::{snbt, Tag};
+///
+/// # fn main() -> Result<(), dust_nbt::snbt::ParseError> {
+/// let item = snbt::parse("{Count:3b,id:'minecraft:diamond'}")?;
+/// let compound = item.as_compound().expect("a compound");
+/// assert_eq!(compound.get("Count"), Some(&Tag::Byte(3)));
+/// # Ok(())
+/// # }
+/// ```
 pub fn parse(input: &str) -> Result<Tag, ParseError> {
     let mut parser = Parser::new(input);
     let tag = parser.value()?;
