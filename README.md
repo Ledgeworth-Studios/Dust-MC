@@ -2,34 +2,59 @@
 
 A Minecraft Java Edition server, written in Rust.
 
-Dust is being built from nothing. It is not usable yet, and this README will say
-so until it is — but it now answers.
+Dust is being built from nothing. It is not finished, and this README will keep
+saying so — but you can connect to it.
 
 ## Status
 
-**Dust answers the server-list ping.** `dust server` binds `[server].bind`,
-serves the handshake and status exchange over protocol 767, builds the entry
-from the MOTD, player count and favicon in `dust.toml`, returns the eight bytes
-a client measures its round trip with, and refuses a login attempt with a
-reason the client can render rather than a dropped socket. That is the first
-half of Phase 1 of the build plan.
+**A client connects, logs in and stands in a world.** `dust server` binds
+`[server].bind`, answers the server-list ping, runs the login exchange in
+either offline or online mode, syncs the eleven datapack registries a 1.21.1
+client needs, and streams chunks around the spawn point. The connection stays
+up across keep-alives.
 
-What proves it is a test that speaks the protocol by hand — its own VarInts,
-its own length prefixes, sharing no code with the server — because a client
-built on Dust's own framing would agree with Dust under any convention,
-including a wrong one. What that test cannot prove is that a *real* client is
-happy with the document, and no claim is made here that one has been pointed at
-it: that is the differential harness's job and it is not built yet.
+The world is a superflat and is not pretending otherwise: worldgen is Phase 6.
+What exists is the whole path from the socket to the block table — framing,
+compression, encryption, the four connection states, the paletted section
+codec, the chunk packet — exercised by something a player can stand on.
 
-**Nobody can play yet.** Login, the configuration state and the play state are
-not implemented, so a client that clicks Join is told so and disconnected.
+Not yet: movement does anything, blocks can be placed, chat, persistence,
+lighting (every chunk is sent fully lit, deliberately and visibly), tags,
+plugins, or more than one player being interesting.
 
-Underneath it: Stage 0's workspace, configuration system and gates; the vanilla
-data extractor (blocks, items, entity types, fluids, tags, recipes, loot
-tables, commands, packets, worldgen); and the crates the rest stands on — NBT,
-world storage with paletted containers, heightmaps and a light engine, the
-1.21.1 protocol codec, the datapack loader, and a network transport with
-framing, compression, encryption and session authentication.
+### How it is checked
+
+Two ways, and the second is the one that matters.
+
+The protocol tests speak the wire by hand — their own VarInts, their own length
+prefixes, their own zlib — sharing no code with the server. A test client built
+on Dust's own framing would agree with Dust by construction, under any
+convention including a wrong one.
+
+And the formats are captured from a **real Minecraft 1.21.1 server** rather than
+read off a wiki: the configuration order, the eleven registries and their entry
+counts, the offline-mode UUID derivation, and a chunk section decoded field by
+field until its 18,779 bytes were consumed exactly. Doing that found three
+defects nothing else would have — Login Start's shape was inverted, so no real
+client could have logged in; the offline profile id was derived from a
+lowercased name, so every offline player had a different identity from the one
+they have everywhere else; and the status document carried two keys vanilla
+does not send. Each had passing tests over it, because the tests were written
+from the same understanding as the code.
+
+Underneath: Stage 0's workspace, configuration system and gates; the vanilla
+data extractor; and the crates the rest stands on — NBT, world storage with
+paletted containers, heightmaps and a light engine, the 1.21.1 protocol codec,
+the datapack loader, and the network transport.
+
+## Try it
+
+```
+cargo run -p dust-server -- server
+```
+
+Then add `localhost` to a 1.21.1 client's server list. Set
+`online_mode = false` in `dust.toml` first unless you want Mojang consulted.
 
 ## Vanilla data
 

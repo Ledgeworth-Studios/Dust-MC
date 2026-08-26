@@ -167,9 +167,16 @@ fn refused_reloads_under_contention_leave_only_accepted_worlds_visible() {
     let acceptable = good(r#"{"type":"minecraft:crafting_shapeless"}"#);
 
     let stop = Arc::new(AtomicUsize::new(0));
+    // Published by the refuser so the main thread can see it running. Without
+    // it the test asserts an overlap it never arranged: the readers finish,
+    // `stop` is set, and a refuser the scheduler had not reached yet observes
+    // the flag on its first look and does nothing. It passed alone and failed
+    // under a full workspace run, which is what that shape of race looks like.
+    let flipped = Arc::new(AtomicUsize::new(0));
     let refuser = {
         let handle = Arc::clone(&handle);
         let stop = Arc::clone(&stop);
+        let flipped = Arc::clone(&flipped);
         std::thread::spawn(move || {
             let mut flips = 0;
             while stop.load(Ordering::Relaxed) == 0 && flips < 500 {
@@ -180,10 +187,19 @@ fn refused_reloads_under_contention_leave_only_accepted_worlds_visible() {
                 );
                 assert!(outcome.is_err(), "a broken pack is always refused");
                 flips += 1;
+                flipped.store(flips, Ordering::Release);
             }
             flips
         })
     };
+
+    // Wait for the refuser to land one refusal before the readers start, so
+    // the contention this test is named for demonstrably happens rather than
+    // being hoped for. It keeps refusing throughout the readers' run; all this
+    // rules out is the case where it never began.
+    while flipped.load(Ordering::Acquire) == 0 {
+        std::thread::yield_now();
+    }
 
     let mut readers = Vec::new();
     for _ in 0..2 {
@@ -209,7 +225,11 @@ fn refused_reloads_under_contention_leave_only_accepted_worlds_visible() {
     }
     stop.store(1, Ordering::Relaxed);
     let flips = refuser.join().expect("refuser survived");
-    assert!(flips > 0, "refusal actually ran against the readers");
+    assert!(
+        flips > 0,
+        "refusal actually ran against the readers — and the wait above should \
+         have made this unreachable rather than merely unlikely"
+    );
 
     // And an honest swap still lands afterwards.
     handle
