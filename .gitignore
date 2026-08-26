@@ -3,7 +3,9 @@
 # changes. They are reviewed and moved into tests/ui/, never committed as-is.
 wip/
 .dust-extract/
-# A vanilla server the conformance test speaks to, stood up by hand. It holds
-# Mojang's world data and Mojang's logs, and none of that is this repository's
-# to carry. See crates/dust-protocol/tests/vanilla_conformance.rs.
+# A vanilla server run directory, wherever an operator happens to leave one:
+# the jars are Mojang's, the worlds are generated from them, and the logs are
+# Mojang's too. None of it is this repository's to carry, and it is what both
+# the protocol conformance test and the differential harness speak to. See
+# crates/dust-protocol/tests/vanilla_conformance.rs.
 .dust-vanilla/

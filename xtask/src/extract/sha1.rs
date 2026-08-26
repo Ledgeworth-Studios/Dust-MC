@@ -59,7 +59,17 @@ impl Sha1 {
     }
 
     /// The digest, lowercase hex, as Mojang publishes it.
-    pub fn finish(mut self) -> String {
+    pub fn finish(self) -> String {
+        let mut hex = String::with_capacity(40);
+        for byte in self.finish_bytes() {
+            hex.push_str(&format!("{byte:02x}"));
+        }
+        hex
+    }
+
+    /// The raw twenty digest bytes, for callers that compare or store them
+    /// rather than print them (the differential harness's content digests).
+    pub fn finish_bytes(mut self) -> [u8; 20] {
         let length_bits = self.length_bits;
         self.update(&[0x80]);
         // The length field occupies the last eight bytes of the final block.
@@ -74,11 +84,11 @@ impl Sha1 {
         };
         self.compress(&block);
 
-        let mut hex = String::with_capacity(40);
-        for word in self.state {
-            hex.push_str(&format!("{word:08x}"));
+        let mut out = [0u8; 20];
+        for (word, slot) in self.state.iter().zip(out.chunks_exact_mut(4)) {
+            slot.copy_from_slice(&word.to_be_bytes());
         }
-        hex
+        out
     }
 
     fn compress(&mut self, block: &[u8; 64]) {
