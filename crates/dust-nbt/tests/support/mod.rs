@@ -610,3 +610,19 @@ pub fn any_root_name() -> impl Strategy<Value = String> {
 pub fn any_text() -> impl Strategy<Value = String> {
     text()
 }
+
+/// A finite `f32`, edges included. For suites about *printable* numbers:
+/// everything here survives an SNBT round trip, which a NaN or an infinity
+/// does not.
+pub fn any_finite_float() -> BoxedStrategy<f32> {
+    float_value()
+        .prop_filter("must be finite to print losslessly", |v| v.is_finite())
+        .boxed()
+}
+
+/// A finite `f64`, edges included — see [`any_finite_float`].
+pub fn any_finite_double() -> BoxedStrategy<f64> {
+    double_value()
+        .prop_filter("must be finite to print losslessly", |v| v.is_finite())
+        .boxed()
+}

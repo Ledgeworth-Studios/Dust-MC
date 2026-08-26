@@ -64,14 +64,24 @@
 //! # What this printer does not do
 //!
 //! It produces SNBT that Mojang's parser accepts and that re-parses to the tag
-//! it came from. It does not reproduce vanilla's output byte for byte, because
-//! the float and double formatting go through Rust's shortest-round-trip
-//! formatter and vanilla's go through Java's, and the two disagree on
-//! presentation — Java writes `1.0E10` where Rust writes `10000000000`, and
-//! Java writes `1.0` where Rust writes `1`. Both re-parse to the same number.
+//! it came from. By default it does not reproduce vanilla's output byte for
+//! byte, because the float and double formatting go through Rust's
+//! shortest-round-trip formatter and vanilla's go through Java's, and the two
+//! disagree on *presentation* — Java writes `1.0E10` where Rust writes
+//! `10000000000`, and Java writes `1.0` where Rust writes `1`. Both re-parse
+//! to the same number.
+//!
+//! [`PrintProfile::JAVA`] moves the float and double shapes over to Java's —
+//! the decimal/scientific threshold, the `E`-notation spelling, the forced
+//! fraction — for callers whose output is read next to vanilla's. What it
+//! reproduces and what it only approximates (the choice of shortest digits at
+//! the subnormal edge) is written out on [`NumericStyle`]; suffixes, integer
+//! plainness, quoting and everything else are identical under both profiles.
 
 mod parse;
 mod print;
 
 pub use parse::{parse, parse_compound, Expected, ParseError};
-pub use print::{to_string, to_string_named};
+pub use print::{
+    to_string, to_string_named, to_string_named_with, to_string_with, NumericStyle, PrintProfile,
+};

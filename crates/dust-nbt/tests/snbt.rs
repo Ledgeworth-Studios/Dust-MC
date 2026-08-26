@@ -17,6 +17,8 @@
 //! compound key prints as `""` but vanilla's rule against empty keys refuses
 //! to read it back.
 
+mod support;
+
 use dust_nbt::{snbt, Compound, List, Tag, TagType};
 
 /// A compound with one field, for small grammar cases.
@@ -396,4 +398,151 @@ fn named_printing_labels_the_document_the_way_data_get_does() {
     // which is what makes a round trip through to_string lossless for the
     // empty root names every vanilla file carries.
     assert_eq!(snbt::to_string_named("", &Tag::Byte(5)), "5b");
+}
+
+// ---------------------------------------------------------------------------
+// The Java presentation profile
+//
+// `PrintProfile::JAVA` reproduces `Double.toString`/`Float.toString` *shapes*.
+// Each golden below was worked out from the JDK's documented rules — decimal
+// form exactly within [10^-3, 10^7), upper case `E`, no `+`, no padding, and
+// always a fractional digit — and cross-checked against the values those
+// rules are famous for. What the profile approximates rather than reproduces
+// (the choice of shortest digits at the subnormal edge) is on
+// `NumericStyle`'s doc comment, asserted further down.
+// ---------------------------------------------------------------------------
+
+/// Doubles whose Java spellings are pinned, including both threshold
+/// neighbours: 9999999 stays decimal while 10^7 flips to scientific, 0.001
+/// stays decimal while anything smaller flips.
+#[test]
+fn the_java_profile_shapes_doubles_like_double_tostring() {
+    let cases: &[(f64, &str)] = &[
+        (0.0, "0.0d"),
+        (-0.0, "-0.0d"),
+        (1.0, "1.0d"),
+        (-1.5, "-1.5d"),
+        (100.0, "100.0d"),
+        (123.456, "123.456d"),
+        (9999999.0, "9999999.0d"),
+        (1.0e7, "1.0E7d"),
+        (5.9999968e7, "5.9999968E7d"),
+        (1.0e23, "1.0E23d"),
+        (0.001, "0.001d"),
+        (9.999e-4, "9.999E-4d"),
+        (-2.5e-12, "-2.5E-12d"),
+        (f64::MAX, "1.7976931348623157E308d"),
+        (f64::MIN_POSITIVE, "2.2250738585072014E-308d"),
+        (0.1 + 0.2, "0.30000000000000004d"),
+    ];
+    for (value, expected) in cases {
+        assert_eq!(
+            snbt::to_string_with(snbt::PrintProfile::JAVA, &Tag::Double(*value)),
+            *expected,
+            "{value}e0 shaped wrong"
+        );
+    }
+}
+
+/// The float path keeps `f32` precision throughout: the digits are the
+/// shortest that round-trip through an `f32`, never the promoted double's,
+/// with the same 10^-3/10^7 window `Float.toString` applies.
+#[test]
+fn the_java_profile_shapes_floats_like_float_tostring() {
+    let cases: &[(f32, &str)] = &[
+        (1.0, "1.0f"),
+        (0.5, "0.5f"),
+        (16777216.0, "1.6777216E7f"),
+        (3.4028235e38, "3.4028235E38f"),
+        (1.1754944e-38, "1.1754944E-38f"),
+        (-0.03043, "-0.03043f"),
+        (9999999.0, "9999999.0f"),
+    ];
+    for (value, expected) in cases {
+        assert_eq!(
+            snbt::to_string_with(snbt::PrintProfile::JAVA, &Tag::Float(*value)),
+            *expected,
+            "{value}e0 shaped wrong"
+        );
+    }
+}
+
+/// Only the floating shapes change. Integers stay bare, the byte/short/long
+/// suffixes keep their letters and case, arrays are untouched, and the
+/// default profile still answers for every tag exactly as it always did.
+#[test]
+fn the_java_profile_leaves_every_non_float_decision_alone() {
+    let mut compound = Compound::new();
+    compound.insert("b", Tag::Byte(-1));
+    compound.insert("s", Tag::Short(2));
+    compound.insert("i", Tag::Int(-3));
+    compound.insert("l", Tag::Long(i64::MAX));
+    compound.insert("a", Tag::IntArray(vec![1, -2]));
+    compound.insert("text", Tag::String("he said \"hi\"".to_owned()));
+
+    assert_eq!(
+        snbt::to_string_with(snbt::PrintProfile::JAVA, &Tag::Compound(compound)),
+        "{b:-1b,s:2s,i:-3,l:9223372036854775807L,a:[I;1,-2],text:'he said \"hi\"'}"
+    );
+
+    // And the default profile is unchanged by the plumbing around it: same
+    // output as before the profile existed, exponent-free and shortest.
+    assert_eq!(snbt::to_string(&Tag::Double(5.9999968e7)), "59999968d");
+    assert_eq!(snbt::to_string(&Tag::Float(0.5)), "0.5f");
+    assert_eq!(
+        snbt::to_string_with(snbt::PrintProfile::default(), &Tag::Int(-3)),
+        "-3"
+    );
+}
+
+mod java_roundtrip {
+    //! The differential half of the profile: whatever the Java shapes print
+    //! must read back as the bits that were printed. This is the property
+    //! that makes the approximation honest — the spelling may differ from a
+    //! JDK literal at the subnormal edge, but no value survives printing as
+    //! something that parses to different bits.
+
+    use crate::support::{any_finite_double, any_finite_float};
+    use proptest::prelude::*;
+
+    use dust_nbt::{snbt, Tag};
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1024))]
+
+        #[test]
+        fn java_shaped_doubles_re_parse_to_the_same_bits(value in any_finite_double()) {
+            let printed = snbt::to_string_with(snbt::PrintProfile::JAVA, &Tag::Double(value));
+            let parsed = snbt::parse(&printed).expect("our own output parses");
+            prop_assert_eq!(parsed, Tag::Double(value), "printed as {}", printed);
+        }
+
+        #[test]
+        fn java_shaped_floats_re_parse_to_the_same_bits(value in any_finite_float()) {
+            let printed = snbt::to_string_with(snbt::PrintProfile::JAVA, &Tag::Float(value));
+            let parsed = snbt::parse(&printed).expect("our own output parses");
+            prop_assert_eq!(parsed, Tag::Float(value), "printed as {}", printed);
+        }
+    }
+}
+
+/// The documented subnormal divergence, pinned so it cannot drift silently in
+/// either direction: Rust's shortest spelling has one significant digit where
+/// the JDK prints two (`4.9E-324`). Both parse to the same bit pattern — that
+/// is the property the suite above guards — and this test names the one place
+/// a byte-diff against JDK output would notice.
+#[test]
+fn the_subnormal_edge_is_where_java_digits_are_approximated() {
+    let min_subnormal = f64::from_bits(1);
+    let printed = snbt::to_string_with(snbt::PrintProfile::JAVA, &Tag::Double(min_subnormal));
+    assert_eq!(printed, "5.0E-324d", "Rust picks the single-digit spelling");
+    assert_ne!(
+        printed, "4.9E-324d",
+        "the JDK's two-digit choice is the documented divergence"
+    );
+    assert_eq!(
+        snbt::parse(&printed).expect("parses"),
+        Tag::Double(min_subnormal),
+        "the approximation never changes the bits"
+    );
 }
