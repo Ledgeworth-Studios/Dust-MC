@@ -34,7 +34,9 @@ pub const MAX_SECTORS: u32 = 255;
 /// what a whole zeroed table says, and is why sector 0 can never hold data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Location {
+    /// The sector where the chunk's data begins.
     pub first_sector: u32,
+    /// How many sectors the chunk's data runs over.
     pub sector_count: u32,
 }
 
@@ -125,16 +127,19 @@ impl Header {
         bytes
     }
 
+    /// Where a chunk's data lives, as the header currently says.
     #[must_use]
     pub fn location(&self, pos: ChunkPos) -> Location {
         self.locations[pos.header_slot()]
     }
 
+    /// The location at a raw header slot, `0..1024`.
     #[must_use]
     pub fn location_at_slot(&self, slot: usize) -> Location {
         self.locations[slot]
     }
 
+    /// Record where a chunk's data lives.
     pub fn set_location(&mut self, pos: ChunkPos, location: Location) {
         self.locations[pos.header_slot()] = location;
     }
@@ -150,6 +155,7 @@ impl Header {
         self.timestamps[pos.header_slot()]
     }
 
+    /// Record a chunk's write time, as it arrived.
     pub fn set_timestamp(&mut self, pos: ChunkPos, seconds: i32) {
         self.timestamps[pos.header_slot()] = seconds;
     }

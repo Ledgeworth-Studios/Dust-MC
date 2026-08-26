@@ -43,15 +43,22 @@ pub const MAX_BITS: u32 = 32;
 pub enum BitStorageError {
     /// A width this module will not pack. Zero is legal and means "every value
     /// is zero, and no longs are stored"; above [`MAX_BITS`] is not.
-    UnsupportedWidth { bits: u32 },
+    UnsupportedWidth {
+        /// The width that was refused.
+        bits: u32,
+    },
     /// The long array is not the length the width and value count require.
     ///
     /// This is the error that catches a pre-1.16 array being handed to a
     /// modern reader, for every width that does not divide 64.
     WrongLongCount {
+        /// The width the array was read at.
         bits: u32,
+        /// How many values it was expected to hold.
         values: usize,
+        /// How many longs that requires.
         expected: usize,
+        /// How many longs arrived.
         found: usize,
     },
 }
@@ -187,6 +194,7 @@ impl BitStorage {
         self.len
     }
 
+    /// Whether no values are stored.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len == 0

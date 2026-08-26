@@ -34,6 +34,7 @@ impl Compression {
         }
     }
 
+    /// The scheme's usual name, for messages.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {

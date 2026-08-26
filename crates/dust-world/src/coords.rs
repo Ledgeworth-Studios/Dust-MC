@@ -20,12 +20,17 @@ pub const CHUNKS_PER_REGION: i32 = 32;
 /// the declaration order of the fields — and it is not up to each caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlockPos {
+    /// Position along the world's east-west axis.
     pub x: i32,
+    /// Height. The floor depends on the dimension; this is the world value
+    /// a block entity stores, not a section-local row.
     pub y: i32,
+    /// Position along the world's north-south axis.
     pub z: i32,
 }
 
 impl BlockPos {
+    /// Assemble a block position from its parts.
     #[must_use]
     pub const fn new(x: i32, y: i32, z: i32) -> Self {
         Self { x, y, z }
@@ -75,11 +80,14 @@ impl std::fmt::Display for BlockPos {
 /// A chunk's position in the world, in chunks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChunkPos {
+    /// The chunk column's position along the east-west axis.
     pub x: i32,
+    /// The chunk column's position along the north-south axis.
     pub z: i32,
 }
 
 impl ChunkPos {
+    /// Assemble a chunk position from its parts.
     #[must_use]
     pub const fn new(x: i32, z: i32) -> Self {
         Self { x, z }
@@ -134,11 +142,14 @@ impl std::fmt::Display for ChunkPos {
 /// A region file's position, in regions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RegionPos {
+    /// The region file's position along the east-west axis.
     pub x: i32,
+    /// The region file's position along the north-south axis.
     pub z: i32,
 }
 
 impl RegionPos {
+    /// Assemble a region position from its parts.
     #[must_use]
     pub const fn new(x: i32, z: i32) -> Self {
         Self { x, z }

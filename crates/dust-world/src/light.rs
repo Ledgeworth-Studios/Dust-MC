@@ -38,7 +38,12 @@ pub const BYTES: usize = CELLS / 2;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LightArrayError {
     /// The array is not the 2048 bytes a section's light occupies.
-    WrongLength { expected: usize, found: usize },
+    WrongLength {
+        /// How many bytes a section's light packs into.
+        expected: usize,
+        /// How many bytes arrived.
+        found: usize,
+    },
 }
 
 impl std::fmt::Display for LightArrayError {

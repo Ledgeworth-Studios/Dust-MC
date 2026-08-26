@@ -14,5 +14,14 @@ authors.workspace = true
 # nothing here is hot enough to need them.
 flate2 = { workspace = true }
 
+# Comparative costs on fixed workloads -- palette promotions, region round
+# trips, light walks over a full column -- timed with a stopwatch and printed,
+# the same shape as `dust-nbt`'s bench. A framework brings statistics and a
+# dozen dependencies to answer questions these are too coarse for anyway; see
+# the note at the top of the bench.
+[[bench]]
+name = "workloads"
+harness = false
+
 [lints]
 workspace = true

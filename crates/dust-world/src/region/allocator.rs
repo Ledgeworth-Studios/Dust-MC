@@ -27,6 +27,7 @@ pub struct SectorAllocator {
 /// A sector claimed twice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SectorTaken {
+    /// The first sector of the run that is already in use.
     pub sector: u32,
 }
 

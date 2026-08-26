@@ -24,57 +24,113 @@ use crate::region::compression::{Compression, UnsupportedScheme};
 pub enum RegionError {
     /// The underlying bytes could not be read or written.
     Io {
+        /// The region file the failure happened in.
         region: RegionPos,
+        /// What was being done to it, in words a log line can carry.
         doing: &'static str,
+        /// Why, as the operating system said it.
         source: io::Error,
     },
     /// The file is not long enough to hold the 8 KiB header.
-    HeaderTruncated { region: RegionPos, length: u64 },
+    HeaderTruncated {
+        /// The file that is too short.
+        region: RegionPos,
+        /// How many bytes it actually holds.
+        length: u64,
+    },
     /// A chunk claims a sector inside the header.
-    SectorInHeader { chunk: ChunkPos, first_sector: u32 },
+    SectorInHeader {
+        /// The chunk whose location table entry is impossible.
+        chunk: ChunkPos,
+        /// The sector it claims, which is inside the 8 KiB header.
+        first_sector: u32,
+    },
     /// A chunk has an offset but occupies no sectors.
-    EmptySectorRun { chunk: ChunkPos, first_sector: u32 },
+    EmptySectorRun {
+        /// The chunk that claims an offset but no length.
+        chunk: ChunkPos,
+        /// Where its data would begin.
+        first_sector: u32,
+    },
     /// A chunk's sectors run past the end of the file.
     ChunkPastEnd {
+        /// The chunk whose run leaves the file.
         chunk: ChunkPos,
+        /// Where its data begins.
         first_sector: u32,
+        /// How many sectors it claims.
         sector_count: u32,
+        /// How many sectors the file actually has.
         file_sectors: u64,
     },
     /// Two chunks claim the same sector.
     OverlappingChunks {
+        /// The chunk being examined.
         chunk: ChunkPos,
+        /// The other claimant of the same ground.
         other: ChunkPos,
+        /// A sector both lay claim to.
         sector: u32,
     },
     /// A chunk's payload declares a length longer than the sectors it was
     /// given.
     StreamPastSectors {
+        /// The chunk whose payload overruns its own sectors.
         chunk: ChunkPos,
+        /// How many bytes the payload declares.
         declared: u32,
+        /// How many bytes its sector run can hold.
         available: u32,
     },
     /// A chunk's payload declares a negative length.
-    NegativeStreamLength { chunk: ChunkPos, declared: i32 },
+    NegativeStreamLength {
+        /// The chunk that declares one.
+        chunk: ChunkPos,
+        /// The negative length, as read.
+        declared: i32,
+    },
     /// A chunk has sectors allocated and nothing in them.
-    EmptyStream { chunk: ChunkPos },
+    EmptyStream {
+        /// The chunk with ground claimed and nothing on it.
+        chunk: ChunkPos,
+    },
     /// A compression byte this crate will not decode.
     UnsupportedCompression {
+        /// The chunk carrying the unknown byte.
         chunk: ChunkPos,
+        /// What is wrong with the byte.
         source: UnsupportedScheme,
     },
     /// A chunk says its payload is in a `.mcc` file that is not there.
-    ExternalChunkMissing { chunk: ChunkPos, file: String },
+    ExternalChunkMissing {
+        /// The chunk that points elsewhere for its payload.
+        chunk: ChunkPos,
+        /// The `.mcc` name it pointed at, which is not there.
+        file: String,
+    },
     /// A chunk says its payload is external and carries inline bytes too.
-    ExternalChunkAlsoInline { chunk: ChunkPos, inline_bytes: u32 },
+    ExternalChunkAlsoInline {
+        /// The chunk that claims both forms at once.
+        chunk: ChunkPos,
+        /// How many inline bytes came with the external flag.
+        inline_bytes: u32,
+    },
     /// The payload is not a valid stream of the compression it claims.
     Decompress {
+        /// The chunk whose payload would not decompress.
         chunk: ChunkPos,
+        /// The compression it claimed.
         scheme: Compression,
+        /// How the decoder failed.
         source: io::Error,
     },
     /// A chunk was asked of a region file that does not hold it.
-    NotInRegion { chunk: ChunkPos, region: RegionPos },
+    NotInRegion {
+        /// The chunk that was asked after.
+        chunk: ChunkPos,
+        /// The region file that was asked.
+        region: RegionPos,
+    },
 }
 
 impl RegionError {

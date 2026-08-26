@@ -24,17 +24,13 @@
 //! When it lands, it replaces `DirectFormat` below and these tests keep
 //! running unchanged against it.
 //!
-//! One consequence shows up as a helper rather than an `==`:
-//! `Chunk`'s derived equality includes each container's *in-memory* palette
-//! shape, and a serialised chunk deliberately does not carry that shape --
-//! vanilla re-palettes on every write, entries in first-appearance order
-//! over the cells. So a chunk that went through a file and came back holds
-//! the same blocks, biomes, light, heightmaps and records with its palettes
-//! rebuilt canonically. The tests call that equivalent, and check it cell by
-//! cell; the determinism tests separately pin that the canonical form is a
-//! pure function of those contents.
+//! Equality of a round-tripped chunk with its original is plain `==`. That is
+//! deliberate and load-bearing: container equality in this crate is content
+//! equality -- every cell decoding to the same id -- so the palette shape a
+//! serialisation normalises away cannot make a restored chunk read as unequal.
+//! If `==` ever grows stricter than "same blocks, biomes, light, heightmaps
+//! and records", these tests are where it will first break.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use dust_world::chunk::Section;
@@ -43,7 +39,7 @@ use dust_world::light::LightArray;
 use dust_world::region::{Compression, MemoryStore, RegionFile};
 use dust_world::{
     BlockEntityHandle, BlockPos, Chunk, ChunkPos, NbtReader, NbtWriter, PalettedContainer,
-    RegionPos, Strategy, WorldHeight,
+    RegionPos, Slab, Strategy, WorldHeight,
 };
 
 const REGION: RegionPos = RegionPos::new(-4, 5);
@@ -236,9 +232,11 @@ impl NbtWriter for DirectFormat {
             put_long_array(&mut out, map.as_longs());
         }
 
-        // Block entities in key order, which BTreeMap guarantees.
-        out.extend_from_slice(&(chunk.block_entities().len() as u32).to_be_bytes());
-        for (pos, handle) in chunk.block_entities() {
+        // Block entities in position order, which is what the chunk's
+        // by-position walk guarantees whatever order they were built in.
+        out.extend_from_slice(&(chunk.block_entity_count() as u32).to_be_bytes());
+        for handle in chunk.block_entities_by_position() {
+            let pos = handle.position;
             out.extend_from_slice(&pos.x.to_be_bytes());
             out.extend_from_slice(&pos.y.to_be_bytes());
             out.extend_from_slice(&pos.z.to_be_bytes());
@@ -298,16 +296,16 @@ impl NbtReader for DirectFormat {
         }
 
         let entity_count = cursor.u32()? as usize;
-        let mut entities = BTreeMap::new();
+        let mut entities = Slab::new();
         for _ in 0..entity_count {
             let x = cursor.i32()?;
             let y = cursor.i32()?;
             let z = cursor.i32()?;
             let state = cursor.u32()?;
-            entities.insert(
-                BlockPos::new(x, y, z),
-                BlockEntityHandle { block_state: state },
-            );
+            entities.insert(BlockEntityHandle {
+                position: BlockPos::new(x, y, z),
+                block_state: state,
+            });
         }
 
         Ok(Chunk::from_parts(
@@ -378,14 +376,14 @@ fn interesting_chunk(pos: ChunkPos) -> Chunk {
         HeightmapKind::MotionBlockingNoLeaves => state != 0,
     });
 
-    chunk.insert_block_entity(
-        BlockPos::new(pos.x * 16 + 7, -30, pos.z * 16 + 7),
-        BlockEntityHandle { block_state: 43 },
-    );
-    chunk.insert_block_entity(
-        BlockPos::new(pos.x * 16 + 15, 15, pos.z * 16),
-        BlockEntityHandle { block_state: 77 },
-    );
+    chunk.insert_block_entity(BlockEntityHandle {
+        position: BlockPos::new(pos.x * 16 + 7, -30, pos.z * 16 + 7),
+        block_state: 43,
+    });
+    chunk.insert_block_entity(BlockEntityHandle {
+        position: BlockPos::new(pos.x * 16 + 15, 15, pos.z * 16),
+        block_state: 77,
+    });
     chunk
 }
 
@@ -393,52 +391,6 @@ fn encode(chunk: &Chunk) -> Vec<u8> {
     DirectFormat
         .write_chunk(chunk)
         .expect("a sound chunk encodes")
-}
-
-/// The equivalence a round trip can honestly promise: identical identity,
-/// identical contents cell by cell, identical heightmaps, light and records.
-/// Deliberately *not* `==`, which also compares each container's in-memory
-/// palette -- the thing serialisation normalises away. See the module
-/// documentation.
-fn assert_chunks_equivalent(left: &Chunk, right: &Chunk) {
-    assert_eq!(left.pos(), right.pos());
-    assert_eq!(left.world(), right.world());
-    assert_eq!(left.block_registry_size(), right.block_registry_size());
-    assert_eq!(left.biome_registry_size(), right.biome_registry_size());
-    assert_eq!(left.section_count(), right.section_count());
-    for index in 0..left.section_count() {
-        let (a, b) = (&left.sections()[index], &right.sections()[index]);
-        assert_eq!(a.states().len(), b.states().len());
-        for cell in 0..a.states().len() {
-            assert_eq!(
-                a.states().get(cell),
-                b.states().get(cell),
-                "section {index}, block cell {cell}"
-            );
-        }
-        for cell in 0..a.biomes().len() {
-            assert_eq!(
-                a.biomes().get(cell),
-                b.biomes().get(cell),
-                "section {index}, biome cell {cell}"
-            );
-        }
-        assert_eq!(a.sky_light(), b.sky_light(), "section {index} sky light");
-        assert_eq!(
-            a.block_light(),
-            b.block_light(),
-            "section {index} block light"
-        );
-    }
-    for kind in HeightmapKind::ALL {
-        assert_eq!(
-            left.heightmaps().get(kind).as_longs(),
-            right.heightmaps().get(kind).as_longs(),
-            "{}",
-            kind.nbt_key()
-        );
-    }
-    assert_eq!(left.block_entities(), right.block_entities());
 }
 
 fn cycle_through_memory(chunk: &Chunk, timestamp: i32) -> Chunk {
@@ -468,7 +420,10 @@ fn a_chunk_survives_an_in_memory_round_trip_through_the_region_store() {
     let original = interesting_chunk(pos);
     let restored = cycle_through_memory(&original, 1_234_567_890);
 
-    assert_chunks_equivalent(&restored, &original);
+    assert_eq!(
+        restored, original,
+        "the chunk that came back is the chunk that left"
+    );
 
     // Spot-check the parts that matter most, in case the helper ever grows a
     // blind spot. The middle section's junk layer tops out at y = -16 in
@@ -496,7 +451,7 @@ fn a_chunk_survives_an_in_memory_round_trip_through_the_region_store() {
             kind.nbt_key()
         );
     }
-    assert_eq!(restored.block_entities().len(), 2);
+    assert_eq!(restored.block_entity_count(), 2);
 }
 
 #[test]
@@ -544,7 +499,10 @@ fn a_chunk_survives_a_round_trip_through_a_file_on_disk() {
     let restored = DirectFormat
         .read_chunk(pos, world(), stored.as_bytes())
         .expect("decodes");
-    assert_chunks_equivalent(&restored, &original);
+    assert_eq!(
+        restored, original,
+        "the chunk that came back is the chunk that left"
+    );
 }
 
 #[test]
@@ -605,17 +563,24 @@ fn chunks_with_identical_contents_but_different_histories_save_identically() {
     }
 
     // Same treatment for the block-entity list: inserted in opposite orders,
-    // which only matters if the carrying structure's iteration is stable.
+    // which only matters if the save order follows contents rather than
+    // insertion history.
     let spots = [
         BlockPos::new(pos.x * 16 + 1, -20, pos.z * 16 + 2),
         BlockPos::new(pos.x * 16 + 3, -10, pos.z * 16 + 4),
         BlockPos::new(pos.x * 16 + 5, 0, pos.z * 16 + 6),
     ];
     for spot in spots {
-        straight.insert_block_entity(spot, BlockEntityHandle { block_state: 5 });
+        straight.insert_block_entity(BlockEntityHandle {
+            position: spot,
+            block_state: 5,
+        });
     }
     for spot in spots.iter().rev() {
-        scenic.insert_block_entity(*spot, BlockEntityHandle { block_state: 5 });
+        scenic.insert_block_entity(BlockEntityHandle {
+            position: *spot,
+            block_state: 5,
+        });
     }
 
     assert_eq!(
@@ -672,7 +637,7 @@ fn many_chunks_across_a_region_round_trip_together() {
         let restored = DirectFormat
             .read_chunk(*pos, world(), stored.as_bytes())
             .expect("decodes");
-        assert_chunks_equivalent(&restored, &expected);
+        assert_eq!(restored, expected);
         assert_eq!(reopened.timestamp(*pos), Some(index as i32));
     }
 }
