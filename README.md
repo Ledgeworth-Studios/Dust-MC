@@ -9,7 +9,8 @@ the gates that keep the rest honest.
 ## Status
 
 Stage 0 — groundwork. Phases 0.1 through 0.4 are done, and Phase 0.5 extracts
-the block registry. No server code. Nothing here accepts a connection.
+the block registry and the packet id tables. No server code. Nothing here
+accepts a connection.
 
 ## Vanilla data
 
@@ -22,7 +23,7 @@ cargo xtask extract --version 1.21.1
 
 That resolves the version through Mojang's manifest, downloads the server jar to
 a gitignored cache, verifies its SHA-1, runs Minecraft's own data generators and
-regenerates the tables in `dust-registry`. It needs a network and a JDK 21 or
+regenerates the tables in `dust-registry` and `dust-protocol`. It needs a network and a JDK 21 or
 newer, runs by hand a few times per Minecraft release, and is deliberately not
 part of `just verify` — what CI checks is the generated code.
 

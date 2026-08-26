@@ -1,7 +1,22 @@
 //! Generated vanilla registries: blocks, items, entities, fluids.
 //!
-//! Only blocks so far. The table in [`generated`] is produced by
-//! `cargo xtask extract`; everything here is the hand-written API over it.
+//! The tables in [`generated`] are produced by `cargo xtask extract` from
+//! Minecraft's own data generators; everything here is the hand-written API
+//! over them. Two tables, because Minecraft's registries come in two shapes:
+//!
+//! - **Blocks** have a state space — [`Block`], [`BlockState`], and the
+//!   properties below.
+//! - **The flat registries** are a name and a number and nothing else: items,
+//!   entity types, fluids, particles, sound events, seventy-odd of them.
+//!   [`Item`], [`EntityType`] and [`Fluid`] have first-class types because
+//!   passing one where another belongs is a mistake worth making impossible;
+//!   the rest are reached through [`Registry`] by registry id.
+//!
+//! `minecraft:block` is in the flat report too and is deliberately not in
+//! [`Registry`]: a block's protocol id is its position in the block table, so a
+//! second list of block names would be a second answer to the same question.
+//! The extractor checks the two reports agree on that order rather than
+//! assuming it.
 //!
 //! # Block states
 //!
@@ -13,9 +28,17 @@
 //! `xtask/src/extract/blocks.rs`, where four blocks on 1.21.1 turn out to
 //! disagree with the obvious reading of the report.
 
+pub mod flat;
 pub mod generated;
+pub mod items;
+pub mod registry;
 
+pub use flat::{EntityType, Fluid, Item};
 pub use generated::blocks::{DATA_VERSION, STATE_COUNT, STATE_SAMPLES};
+pub use generated::items::COMPONENT_SAMPLES;
+pub use generated::registries::{ENTRY_COUNT, ENTRY_SAMPLES};
+pub use items::{ComponentValue, Components, Rarity};
+pub use registry::{Registry, RegistryDef};
 
 /// One property of a block, and the values it may take, in id order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
