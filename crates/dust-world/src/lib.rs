@@ -99,6 +99,7 @@
 //!   A region file is consistent against a crashed process and not against a
 //!   lost power supply.
 
+pub mod anvil;
 pub mod bits;
 pub mod chunk;
 pub mod column_light;

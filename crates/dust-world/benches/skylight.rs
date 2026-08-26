@@ -67,6 +67,30 @@ fn main() {
     let world = WorldHeight::OVERWORLD;
     let opacity = DefaultOpacity::transparent_only([AIR]);
 
+    // Generation split into its three parts, because "generation is 2.7 ms"
+    // named no suspect. Two of these turned out to be nearly free.
+    time("  allocate an empty column             ", ROUNDS, || {
+        std::hint::black_box(Chunk::uniform(
+            ChunkPos::new(0, 0),
+            world,
+            26_684,
+            64,
+            AIR,
+            0,
+        ));
+    });
+    time("  ...plus writing the five solid rows  ", ROUNDS, || {
+        let mut chunk = Chunk::uniform(ChunkPos::new(0, 0), world, 26_684, 64, AIR, 0);
+        for x in 0..16 {
+            for z in 0..16 {
+                for y in world.min_y()..=SURFACE {
+                    chunk.set_block(x, y, z, STONE);
+                }
+            }
+        }
+        std::hint::black_box(chunk);
+    });
+
     time("overworld column, generate only        ", ROUNDS, || {
         std::hint::black_box(generate(world));
     });

@@ -13,6 +13,9 @@ authors.workspace = true
 # container already lives; see src/network.rs.
 dust-protocol.workspace = true
 
+# Reading the chunk NBT inside a region file; see src/anvil.rs.
+dust-nbt.workspace = true
+
 # gzip and zlib, which region files use and Dust does not get to choose. The
 # pure-Rust backend is selected explicitly: the C `zlib-sys` backends would put
 # a build-time C toolchain between a contributor and a working checkout, and
@@ -32,6 +35,9 @@ harness = false
 workspace = true
 
 [dev-dependencies]
+# The Anvil test reads chunk NBT directly to build its own name tables, so it
+# checks the parser rather than the registry.
+dust-nbt.workspace = true
 
 [[bench]]
 name = "skylight"

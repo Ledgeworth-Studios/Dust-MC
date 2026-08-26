@@ -76,7 +76,38 @@ impl StopState {
     }
 
     /// Wake every parker alongside the stop bit.
+    ///
+    /// # Why this takes a lock it does not need for its own sake
+    ///
+    /// The stop bit is an atomic and is set without any lock, so acquiring the
+    /// sleeper mutex here protects nothing about the *flag*. What it protects
+    /// is the window inside [`park_until_stopped_or`] between that function
+    /// checking the flag and starting to wait — a window it is inside while
+    /// holding this mutex.
+    ///
+    /// Without this, the interleaving is the textbook lost wake-up:
+    ///
+    /// ```text
+    /// parker   lock; is_stopped() -> false
+    /// stopper                          set the bit; notify_all()   <- nobody waiting
+    /// parker   wait_timeout(...)                                   <- sleeps the whole deadline
+    /// ```
+    ///
+    /// and the parker sleeps out its full deadline with a stop already
+    /// requested. Taking the mutex makes both orderings safe: either the
+    /// stopper blocks until the parker is genuinely waiting, or the parker
+    /// finds the bit already set before it waits at all.
+    ///
+    /// The mutex guards nothing and is released immediately; it exists to be a
+    /// place the two threads cannot pass each other. That is what a condition
+    /// variable's mutex is *for*, and this one was being held by only one side.
+    ///
+    /// Found by CI, on a parker with a sixty-second deadline that slept
+    /// through a stop. In production the deadline is one tick, so the symptom
+    /// is a shutdown that takes 50 ms longer than it should — which is why
+    /// nothing noticed.
     pub(crate) fn broadcast_stop(&self) {
+        let _window = self.sleeper.lock().unwrap();
         self.wake.notify_all();
     }
 }
@@ -397,6 +428,62 @@ mod tests {
         let deadline = clock.now_ns() + 1_000_000;
         state.park_until_stopped_or(deadline, clock.as_ref());
         assert!(clock.now_ns() >= deadline);
+    }
+
+    /// A stop landing at an arbitrary point in a parker's progress must still
+    /// wake it.
+    ///
+    /// # What this proves, and what it does not
+    ///
+    /// It does **not** reproduce the lost wake-up it was written for. That
+    /// window is a handful of instructions between the parker checking the
+    /// stop bit and calling `wait_timeout`, and removing the fix and running
+    /// this two hundred times did not land in it once on the machine it was
+    /// written on. CI landed in it on the first try, with a sixty-second
+    /// deadline, which is how the bug was found at all.
+    ///
+    /// So this is a smoke test and is labelled as one. **The argument that the
+    /// bug is gone is structural, not empirical**: `broadcast_stop` now takes
+    /// the mutex the parker holds across that window, so the two orderings
+    /// that remain are "the stopper waits until the parker is genuinely
+    /// waiting" and "the parker finds the bit set before it waits at all".
+    /// See that function's own documentation.
+    ///
+    /// A test that *did* force the window would have to drive the parker from
+    /// inside — the injected clock is called in exactly that gap, so a clock
+    /// that requested a stop would land there every time. It cannot be used:
+    /// with the fix in place that stop runs on the parker's own thread and
+    /// deadlocks on the mutex it already holds. Which is worth knowing on its
+    /// own — **nothing may request a stop from inside a park** — and is not a
+    /// constraint any real caller comes near, since the clock is the only code
+    /// that runs there.
+    #[test]
+    fn a_stop_request_at_any_point_still_wakes_the_parker() {
+        for round in 0..50 {
+            let state = Arc::new(StopState::default());
+            let clock = Arc::new(MonotonicClock::new());
+            let handle = StopHandle::new(Arc::clone(&state));
+
+            let parked_state = Arc::clone(&state);
+            let parked_clock = Arc::clone(&clock);
+            let worker = thread::spawn(move || {
+                parked_state.park_until_stopped_or(
+                    parked_clock.now_ns() + 60_000_000_000,
+                    parked_clock.as_ref(),
+                );
+            });
+
+            // No yield and no sleep: the point is to land anywhere in the
+            // parker's progress rather than reliably before it.
+            handle.request_stop();
+
+            let started = std::time::Instant::now();
+            worker.join().expect("the parker must return");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "round {round}: the parker slept through a stop request"
+            );
+        }
     }
 
     #[test]

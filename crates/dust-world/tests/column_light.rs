@@ -285,3 +285,118 @@ mod agreement {
         let _ = g.level(0, 0, 0);
     }
 }
+
+/// The heightmap walk skips whole sections; these are the cases that lets it
+/// get wrong.
+///
+/// `recompute_from_sections` decides per *section* whether it can contain a
+/// match, so that a column of air above the terrain costs nothing. Three
+/// answers, and each has a way to be wrong: a uniformly non-matching section
+/// skipped when it should not be, a uniformly *matching* one answered from its
+/// top row when the row is off by one, and a mixed one walked as before.
+mod heightmaps {
+    use super::*;
+    use dust_world::heightmap::HeightmapKind;
+
+    fn world() -> WorldHeight {
+        WorldHeight::new(-64, 384)
+    }
+
+    fn empty() -> Chunk {
+        Chunk::uniform(ChunkPos::new(0, 0), world(), REGISTRY, BIOMES, AIR, 0)
+    }
+
+    fn height(chunk: &Chunk, x: u32, z: u32) -> i32 {
+        chunk
+            .heightmaps()
+            .get(HeightmapKind::MotionBlocking)
+            .first_available(x, z)
+    }
+
+    #[test]
+    fn a_world_of_nothing_but_air_has_its_floor_as_the_first_available_row() {
+        let mut chunk = empty();
+        chunk.recompute_heightmaps(|_, state| state != AIR);
+        assert_eq!(height(&chunk, 0, 0), world().min_y());
+        assert_eq!(height(&chunk, 15, 15), world().min_y());
+    }
+
+    #[test]
+    fn a_column_solid_to_the_ceiling_reports_the_ceiling() {
+        // The `Some(true)` case: a section where *every* cell matches is
+        // answered from its top row without reading a cell, and the top row of
+        // the top section is the top of the world. An off-by-one here would
+        // report the row below the ceiling and nothing else would notice.
+        let mut chunk = empty();
+        let top = world().min_y() + world().height() as i32 - 1;
+        for x in 0..16 {
+            for z in 0..16 {
+                for y in world().min_y()..=top {
+                    chunk.set_block(x, y, z, STONE);
+                }
+            }
+        }
+        chunk.recompute_heightmaps(|_, state| state != AIR);
+        assert_eq!(height(&chunk, 7, 7), top + 1, "one above the highest block");
+    }
+
+    #[test]
+    fn one_block_in_an_otherwise_empty_section_is_still_found() {
+        // The case a section-level skip could swallow: the section is *not*
+        // uniform, so it must be walked, and the single block in it is the
+        // answer. If the uniformity test read the wrong cell — cell zero of a
+        // mixed container is air here — this would report the floor.
+        let mut chunk = empty();
+        chunk.set_block(3, 100, 5, STONE);
+        chunk.recompute_heightmaps(|_, state| state != AIR);
+        assert_eq!(height(&chunk, 3, 5), 101);
+        assert_eq!(
+            height(&chunk, 4, 5),
+            world().min_y(),
+            "and the column beside it is untouched"
+        );
+    }
+
+    #[test]
+    fn a_higher_block_wins_over_a_lower_one_across_a_section_boundary() {
+        // Two blocks in two different sections, with uniform air between and
+        // above. The walk has to skip the air, find the higher one, and stop —
+        // reporting the lower would mean it walked past the higher without
+        // seeing it.
+        let mut chunk = empty();
+        chunk.set_block(1, 0, 1, STONE);
+        chunk.set_block(1, 200, 1, STONE);
+        chunk.recompute_heightmaps(|_, state| state != AIR);
+        assert_eq!(height(&chunk, 1, 1), 201);
+    }
+
+    #[test]
+    fn a_block_at_the_very_top_and_very_bottom_are_both_found() {
+        // The boundaries of the walk. The top row of the top section and the
+        // bottom row of the bottom one are the two the section arithmetic can
+        // put out of range.
+        let top = world().min_y() + world().height() as i32 - 1;
+
+        let mut high = empty();
+        high.set_block(0, top, 0, STONE);
+        high.recompute_heightmaps(|_, state| state != AIR);
+        assert_eq!(height(&high, 0, 0), top + 1);
+
+        let mut low = empty();
+        low.set_block(0, world().min_y(), 0, STONE);
+        low.recompute_heightmaps(|_, state| state != AIR);
+        assert_eq!(height(&low, 0, 0), world().min_y() + 1);
+    }
+
+    #[test]
+    fn a_predicate_that_accepts_air_makes_every_section_uniformly_matching() {
+        // The `Some(true)` path again, reached from the other direction: the
+        // world is all air and the predicate accepts air, so the top section
+        // answers from its top row. A skip that assumed "uniform means skip"
+        // rather than asking the predicate would report the floor here.
+        let mut chunk = empty();
+        let top = world().min_y() + world().height() as i32 - 1;
+        chunk.recompute_heightmaps(|_, _state| true);
+        assert_eq!(height(&chunk, 9, 9), top + 1);
+    }
+}

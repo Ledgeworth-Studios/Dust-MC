@@ -728,6 +728,7 @@ impl Server {
         let motd = config.server.motd.clone();
         let max_players = config.server.max_players;
         let favicon_path = config.server.favicon.clone();
+        let world_source = config.server.world_source.clone();
         let online_mode = config.server.online_mode;
 
         let fail = |message: String| -> ServerError {
@@ -800,9 +801,41 @@ impl Server {
             .id_of("minecraft:overworld")
             .ok_or_else(|| fail("the dimension types have no overworld".to_owned()))?
             as u32;
-        let world = std::sync::Arc::new(crate::net::edits::EditedWorld::new(
-            crate::net::world::FlatWorld::new(palette, plains, biomes.entries.len() as u32),
-        ));
+        let flat = crate::net::world::FlatWorld::new(palette, plains, biomes.entries.len() as u32);
+
+        // Where columns come from. An empty setting means the flat world; a
+        // path means a world Minecraft wrote, with the flat one kept as the
+        // fallback for columns it does not contain.
+        //
+        // The path is checked here rather than at the first column, because a
+        // mistyped one otherwise produces a server that starts, serves flat
+        // terrain, and never says why.
+        let source = if world_source.is_empty() {
+            crate::net::source::Source::Flat(flat)
+        } else {
+            let directory = std::path::PathBuf::from(&world_source);
+            if !crate::net::source::AnvilWorld::is_region_directory(&directory) {
+                return Err(fail(format!(
+                    "[server] world_source = {world_source:?} holds no .mca files; it should \
+                     be a world's `region` directory"
+                )));
+            }
+            let names = crate::net::source::RegistryNames::new().ok_or_else(|| {
+                fail(
+                    "the synced registries have no biome registry to resolve names against"
+                        .to_owned(),
+                )
+            })?;
+            self.options.logger.info(
+                "dust::server",
+                format!("serving the world at {}", directory.display()),
+            );
+            crate::net::source::Source::Anvil(crate::net::source::AnvilWorld::new(
+                directory, names, flat,
+            ))
+        };
+
+        let world = std::sync::Arc::new(crate::net::edits::EditedWorld::new(source));
 
         // What players changed last time, and where they were standing. A
         // world that has never been played has no file and that is not an
@@ -849,6 +882,10 @@ impl Server {
         // arrived.
         let counters = std::sync::Arc::new(crate::net::Counters::default());
 
+        // Everybody connected, shared with the console so `list` and `say`
+        // reach the same players the sessions do.
+        let roster: std::sync::Arc<crate::net::players::Roster> = std::sync::Arc::default();
+
         let listener = crate::net::Listener::bind(addr).map_err(|e| fail(e.to_string()))?;
         let bound = listener.addr();
 
@@ -866,7 +903,7 @@ impl Server {
             },
             logger: self.options.logger.clone(),
             positions: std::sync::Arc::clone(&positions),
-            roster: std::sync::Arc::default(),
+            roster: std::sync::Arc::clone(&roster),
             player_entity_type: crate::net::play::player_entity_type().ok_or_else(|| {
                 fail("the generated entity table has no minecraft:player".to_owned())
             })?,
@@ -887,6 +924,19 @@ impl Server {
                 if online_mode { "online" } else { "offline" }
             ),
         });
+        // The operator's line in, started once there is something to talk to.
+        // It reads on its own thread because a blocking read on a terminal
+        // cannot be polled, and it is detached because a shutdown must not
+        // wait for somebody to press return.
+        crate::console::spawn(self.options.logger.clone(), {
+            let console = crate::console::Console {
+                stop: self.stop_handle.clone(),
+                roster: std::sync::Arc::clone(&roster),
+                logger: self.options.logger.clone(),
+            };
+            move |command| console.run(command)
+        });
+
         // Published only after the handle exists, so an observer that sees an
         // address knows there is something accepting on it.
         let _ = self.shared.bound.set(bound);

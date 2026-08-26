@@ -330,6 +330,10 @@ struct Joined {
     chunks: usize,
     forgets: usize,
     centres: usize,
+    /// The chunk packets themselves, for a test that needs to look inside
+    /// them. Kept only because one does — twenty-five columns is a megabyte,
+    /// which is fine for a test and would not be for a client.
+    chunk_bodies: Vec<Vec<u8>>,
     /// Bodies this client has been told to render.
     spawned_entities: usize,
     /// Tab-list rows it has been given.
@@ -381,7 +385,10 @@ impl Joined {
     /// Fold one packet into the counters, answering a keep-alive on the way.
     fn count(&mut self, body: &[u8], id: i32, stream: &mut TcpStream) {
         match id {
-            39 => self.chunks += 1,
+            39 => {
+                self.chunks += 1;
+                self.chunk_bodies.push(body.to_vec());
+            }
             33 => self.forgets += 1,
             84 => self.centres += 1,
             1 => self.spawned_entities += 1,
@@ -399,6 +406,23 @@ impl Joined {
             29 => panic!("the server disconnected"),
             _ => {}
         }
+    }
+
+    /// Read until `done` is satisfied, or give up and say so.
+    ///
+    /// The bounded form of draining. A plain drain stops at the first quiet
+    /// moment, which is a claim about the socket and not about the server; a
+    /// `wait_for` cannot be used when the packet in question may already have
+    /// been read by an earlier drain. This waits for a *condition on what has
+    /// been seen*, which is the thing the caller actually means.
+    fn drain_until(&mut self, stream: &mut TcpStream, done: impl Fn(&Self) -> bool) -> bool {
+        for _ in 0..40 {
+            if done(self) {
+                return true;
+            }
+            self.drain(stream);
+        }
+        done(self)
     }
 
     fn drain_until_quiet(&mut self, stream: &mut TcpStream) {
@@ -444,6 +468,7 @@ fn join_as(stream: &mut TcpStream, addr: SocketAddr, name: &str) -> Joined {
         chunks: 0,
         forgets: 0,
         centres: 0,
+        chunk_bodies: Vec::new(),
         spawned_entities: 0,
         player_infos: 0,
         spawned_at: None,
@@ -463,7 +488,10 @@ fn join_as(stream: &mut TcpStream, addr: SocketAddr, name: &str) -> Joined {
     loop {
         let (id, body) = recv_compressed_frame(stream);
         match id {
-            39 => counted.chunks += 1,
+            39 => {
+                counted.chunks += 1;
+                counted.chunk_bodies.push(body.clone());
+            }
             33 => counted.forgets += 1,
             84 => counted.centres += 1,
             1 => counted.spawned_entities += 1,
@@ -677,6 +705,27 @@ fn an_offline_login_runs_the_whole_configuration_exchange_and_reaches_play() {
     let (count, rest) = read_var_int_from(&body[5..]);
     assert_eq!(count, 3, "three dimensions are named");
     assert_eq!(read_string_at(rest).0, "minecraft:overworld");
+
+    // Abilities, and this is the one whose absence is felt: a creative client
+    // that is never sent it cannot fly, because the flags are where flight is
+    // granted and the game mode in the join packet does not grant it. Found by
+    // diffing this server's join sequence against a real one's.
+    let (id, body) = recv_compressed_frame(&mut stream);
+    assert_eq!(id, 56, "player_abilities");
+    assert_ne!(body[0] & 0x04, 0, "ALLOW_FLYING, or creative mode walks");
+    assert_ne!(body[0] & 0x01, 0, "and invulnerable, as creative is");
+
+    let (id, body) = recv_compressed_frame(&mut stream);
+    assert_eq!(id, 100, "set_time");
+    let time_of_day = i64::from_be_bytes(body[8..16].try_into().expect("eight bytes"));
+    assert!(
+        time_of_day < 0,
+        "a negative time_of_day is what freezes the cycle; a positive one \
+         would start the sun moving on a server whose clock does not tick"
+    );
+
+    let (id, _) = recv_compressed_frame(&mut stream);
+    assert_eq!(id, 86, "set_default_spawn_position");
 
     // The position comes before the chunks, and that order matters: a client
     // uses where it is to decide which columns it wants, and one told about
@@ -1087,6 +1136,298 @@ fn chat_and_the_join_and_leave_lines_reach_everybody() {
     running.finish();
 }
 
+/// Decision 0005's standing guard, as the architecture states it: **turning
+/// the JVM off must leave a fully working server, minus plugins.**
+///
+/// A test already checked that `jvm.enabled = false` keeps the placeholder out
+/// of the participant list. That was all a server with no players could check.
+/// This is the guard the decision record actually asks for — a player joins,
+/// receives a world, changes it, is told about the change, and talks — with no
+/// JVM in the process at all.
+///
+/// If game logic ever leaks across the Java boundary, this is what goes red,
+/// and it goes red on the feature that leaked rather than on a count.
+#[test]
+fn everything_still_works_with_the_jvm_switched_off() {
+    let running = start("[jvm]\nenabled = false\n");
+    let addr = running.addr;
+
+    let mut stream = connect(addr);
+    let mut client = join_as(&mut stream, addr, "NoJvm");
+    assert!(client.chunks >= 25, "the world arrived");
+    assert!(
+        client.spawned_at.is_some(),
+        "and the player was put somewhere in it"
+    );
+
+    // Breaking a block, which is world state changing.
+    let (x, y, z) = (2i64, -60i64, 2i64);
+    let packed = ((x & 0x3ff_ffff) << 38) | ((z & 0x3ff_ffff) << 12) | (y & 0xfff);
+    let mut body = packed.to_be_bytes().to_vec();
+    body.insert(0, 0);
+    body.push(1);
+    write_var_int(1, &mut body);
+    send_compressed_frame(&mut stream, 36, &body);
+    client
+        .wait_for(&mut stream, 5)
+        .expect("the dig is acknowledged with no JVM in the process");
+
+    // And chat, which is the server speaking.
+    let mut said = Vec::new();
+    write_string("still here", &mut said);
+    said.extend_from_slice(&0i64.to_be_bytes());
+    said.extend_from_slice(&0i64.to_be_bytes());
+    said.push(0);
+    write_var_int(0, &mut said);
+    said.extend_from_slice(&[0u8; 3]);
+    send_compressed_frame(&mut stream, 6, &said);
+    let line = client
+        .wait_for(&mut stream, 108)
+        .expect("chat still travels");
+    assert!(String::from_utf8_lossy(&line).contains("still here"));
+
+    let report = running.finish();
+    assert!(
+        !report.participants.contains(&"jvm-placeholder".to_owned()),
+        "the JVM really was off: {:?}",
+        report.participants
+    );
+}
+
+/// Phase 3's exit criterion, in one test, as the build plan words it: connect,
+/// walk a thousand blocks across streaming chunks, chat, disconnect, and
+/// reconnect to the same position.
+///
+/// The pieces are each checked on their own elsewhere. This is the one that
+/// says the milestone is met, so it does the whole thing in order and against
+/// two server lifetimes — because "reconnect to the same position" is only
+/// worth anything if the server was stopped in between.
+///
+/// What the plan asks for and this does not do: run for ten minutes, and run
+/// as a headless bot client rather than a hand-written one. Both are the
+/// difference between this and the standing suite the plan wants from Phase 3
+/// onward, and neither is a thing to claim by leaving it unsaid.
+#[test]
+fn phase_three_walk_chat_disconnect_and_come_back() {
+    let world_dir = std::env::temp_dir().join(format!(
+        "dust-phase3-{}-{}",
+        std::process::id(),
+        ICON_SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+
+    let mut x = 0.5f64;
+    {
+        let running = start_in(&world_dir, "");
+        let addr = running.addr;
+        let mut stream = connect(addr);
+        let mut client = join_as(&mut stream, addr, "Walker");
+
+        // A thousand blocks east, one at a time, reading as we go.
+        for step in 0..1000 {
+            x += 1.0;
+            let mut walk = Vec::new();
+            walk.extend_from_slice(&x.to_be_bytes());
+            walk.extend_from_slice(&(-59.0f64).to_be_bytes());
+            walk.extend_from_slice(&0.5f64.to_be_bytes());
+            walk.push(1);
+            send_compressed_frame(&mut stream, 26, &walk);
+            if step % 16 == 0 {
+                client.drain(&mut stream);
+            }
+        }
+        // Drained to a count rather than waiting for one more recentre: the
+        // drains inside the loop above have already consumed most of them, so
+        // there may be none left to wait for.
+        assert!(
+            client.drain_until(&mut stream, |c| c.centres >= 63),
+            "the walk produced {} recentres, not the sixty-two boundaries plus \
+             the join",
+            client.centres
+        );
+        assert_eq!(client.centres, 63, "and no more than that");
+
+        // Chat.
+        let mut said = Vec::new();
+        write_string("made it", &mut said);
+        said.extend_from_slice(&0i64.to_be_bytes());
+        said.extend_from_slice(&0i64.to_be_bytes());
+        said.push(0);
+        write_var_int(0, &mut said);
+        said.extend_from_slice(&[0u8; 3]);
+        send_compressed_frame(&mut stream, 6, &said);
+        let line = client.wait_for(&mut stream, 108).expect("the message");
+        assert!(String::from_utf8_lossy(&line).contains("made it"));
+
+        // Disconnect.
+        drop(stream);
+        running.finish();
+    }
+
+    {
+        let running = start_in(&world_dir, "");
+        let addr = running.addr;
+        let mut stream = connect(addr);
+        let client = join_as(&mut stream, addr, "Walker");
+        let (back_x, _, back_z) = client.spawned_at.expect("a position on rejoining");
+        assert_eq!(back_x, x, "a thousand blocks east, where they stopped");
+        assert_eq!(back_z, 0.5);
+        assert!(client.chunks >= 25, "with the world around them");
+        drop(stream);
+        running.finish();
+    }
+
+    let _ = std::fs::remove_dir_all(&world_dir);
+}
+
+/// Phase 2's exit criterion, first half: a client is served a world Minecraft
+/// generated, not the flat one.
+///
+/// `#[ignore]`, and it says so when it is skipped rather than passing
+/// vacuously — a generated world is Mojang's content and nothing of theirs is
+/// committed, so this needs `DUST_ANVIL_WORLD` pointing at a region directory.
+/// See `crates/dust-world/tests/anvil.rs` for how to make one.
+///
+/// What it checks is that the terrain is *not flat*, which is the only claim
+/// worth making from this end: a reader that returned the fallback for every
+/// column would pass every structural check and fail this.
+#[test]
+#[ignore = "needs a real world; set DUST_ANVIL_WORLD to a region directory"]
+fn a_world_minecraft_generated_is_served_to_a_client() {
+    let Some(region) = std::env::var_os("DUST_ANVIL_WORLD") else {
+        panic!("DUST_ANVIL_WORLD is not set; see this test's own documentation");
+    };
+    let region = region.to_str().expect("a UTF-8 path");
+
+    let running = start(&format!("world_source = {region:?}\n"));
+    let addr = running.addr;
+    let mut stream = connect(addr);
+    let client = join_as(&mut stream, addr, "Explorer");
+    assert_eq!(client.chunks, 25, "the columns arrived");
+
+    // A flat column has one section with anything in it and twenty-three of
+    // air. A generated one has terrain up through the surface, so several
+    // sections carry a palette of more than one block.
+    let mut interesting = 0usize;
+    let mut stream2 = connect(addr);
+    let mut second = join_as(&mut stream2, addr, "Reader");
+    second.drain_until_quiet(&mut stream2);
+    for body in &second.chunk_bodies {
+        interesting += mixed_sections(body);
+    }
+    assert!(
+        interesting > 25,
+        "across twenty-five columns only {interesting} section(s) held more \
+         than one kind of block; that is the flat fallback, not a generated \
+         world"
+    );
+
+    drop(stream);
+    drop(stream2);
+    running.finish();
+}
+
+/// How many of a chunk packet's sections hold more than one kind of block.
+///
+/// Walks the section blob by hand, as the rest of this file does: a
+/// bits-per-entry of zero is a section of one value, and anything else is a
+/// section with terrain in it.
+fn mixed_sections(body: &[u8]) -> usize {
+    // Skip the coordinates and the heightmap NBT, then take the blob's length.
+    let mut p = 8;
+    p = skip_nbt(body, p);
+    let (size, rest) = read_var_int_from(&body[p..]);
+    let blob = &rest[..size as usize];
+
+    let mut q = 0usize;
+    let mut mixed = 0usize;
+    while q + 3 <= blob.len() {
+        q += 2; // the non-air count
+        for limit in [8u8, 3u8] {
+            let bpe = blob[q];
+            q += 1;
+            if bpe == 0 {
+                let (_value, after) = read_var_int_from(&blob[q..]);
+                q = blob.len() - after.len();
+                let (longs, after) = read_var_int_from(&blob[q..]);
+                q = blob.len() - after.len() + longs as usize * 8;
+            } else {
+                if bpe <= limit {
+                    if limit == 8 {
+                        mixed += 1;
+                    }
+                    let (count, after) = read_var_int_from(&blob[q..]);
+                    q = blob.len() - after.len();
+                    for _ in 0..count {
+                        let (_entry, after) = read_var_int_from(&blob[q..]);
+                        q = blob.len() - after.len();
+                    }
+                } else if limit == 8 {
+                    mixed += 1;
+                }
+                let (longs, after) = read_var_int_from(&blob[q..]);
+                q = blob.len() - after.len() + longs as usize * 8;
+            }
+        }
+    }
+    mixed
+}
+
+/// Step past one NBT document, returning where it ends.
+///
+/// Enough of a walker to skip the heightmap compound and no more. Written here
+/// rather than borrowed from `dust-nbt` for the reason the rest of this file
+/// hand-rolls its wire handling: a test that used the server's own reader
+/// would agree with the server about a layout neither of them checked.
+fn skip_nbt(bytes: &[u8], at: usize) -> usize {
+    fn payload(bytes: &[u8], mut at: usize, tag: u8) -> usize {
+        match tag {
+            1 => at + 1,
+            2 => at + 2,
+            3 | 5 => at + 4,
+            4 | 6 => at + 8,
+            7 => {
+                let n = i32::from_be_bytes(bytes[at..at + 4].try_into().expect("four")) as usize;
+                at + 4 + n
+            }
+            8 => {
+                let n = u16::from_be_bytes(bytes[at..at + 2].try_into().expect("two")) as usize;
+                at + 2 + n
+            }
+            9 => {
+                let inner = bytes[at];
+                at += 1;
+                let n = i32::from_be_bytes(bytes[at..at + 4].try_into().expect("four")) as usize;
+                at += 4;
+                for _ in 0..n {
+                    at = payload(bytes, at, inner);
+                }
+                at
+            }
+            10 => loop {
+                let inner = bytes[at];
+                at += 1;
+                if inner == 0 {
+                    return at;
+                }
+                let n = u16::from_be_bytes(bytes[at..at + 2].try_into().expect("two")) as usize;
+                at += 2 + n;
+                at = payload(bytes, at, inner);
+            },
+            11 => {
+                let n = i32::from_be_bytes(bytes[at..at + 4].try_into().expect("four")) as usize;
+                at + 4 + 4 * n
+            }
+            12 => {
+                let n = i32::from_be_bytes(bytes[at..at + 4].try_into().expect("four")) as usize;
+                at + 4 + 8 * n
+            }
+            other => panic!("tag {other} is not one this walker knows"),
+        }
+    }
+    let tag = bytes[at];
+    payload(bytes, at + 1, tag)
+}
+
 #[test]
 fn a_connection_that_says_nothing_costs_nothing() {
     let running = start("");
@@ -1173,4 +1514,82 @@ fn boot_expecting_failure(extra_config: &str) -> dust_server::ServerError {
     Server::new(options)
         .run()
         .expect_err("a picture the client cannot use must stop the boot")
+}
+
+/// Block properties survive being read out of a world file.
+///
+/// The reader hands `(name, value)` pairs to the registry and the registry
+/// walks them onto a state. Without that, every stair in a loaded world faces
+/// north and every log lies on its side the same way — which renders as a world
+/// that is subtly, uniformly wrong rather than as an error.
+///
+/// Checked against the registry directly rather than over the wire, because
+/// what is being tested is the resolution and not the packet. `#[ignore]` only
+/// because it is grouped with the world tests; it needs no world.
+#[test]
+fn a_block_state_is_resolved_from_its_properties_and_not_just_its_name() {
+    use dust_world::anvil::Names;
+
+    let names = dust_server::net::source::RegistryNames::new().expect("the biome registry");
+
+    // A block with no properties resolves to itself.
+    let stone = dust_registry::Block::from_name("minecraft:stone").expect("stone");
+    assert_eq!(
+        names.block("minecraft:stone", &[]),
+        Some(stone.default_state().id())
+    );
+
+    // One with properties resolves to the state those properties name, and
+    // *not* to the default — which is the whole point, so both are asserted.
+    let stairs = dust_registry::Block::from_name("minecraft:oak_stairs").expect("oak stairs");
+    let default = stairs.default_state();
+    let facing_south = names
+        .block("minecraft:oak_stairs", &[("facing", "south")])
+        .expect("a state");
+    assert_ne!(
+        facing_south,
+        default.id(),
+        "applying a property must move off the default, or nothing was applied"
+    );
+    assert_eq!(
+        dust_registry::BlockState::from_id(facing_south)
+            .expect("a real state")
+            .property("facing"),
+        Some("south")
+    );
+
+    // Several at once, since the state id is mixed-radix over all of them and
+    // applying two is where an implementation that only handled one shows.
+    let both = names
+        .block(
+            "minecraft:oak_stairs",
+            &[("facing", "west"), ("half", "top")],
+        )
+        .expect("a state");
+    let both = dust_registry::BlockState::from_id(both).expect("a real state");
+    assert_eq!(both.property("facing"), Some("west"));
+    assert_eq!(both.property("half"), Some("top"));
+
+    // A property this build does not model is skipped, not fatal: a world from
+    // a newer Minecraft or a modded server carries fields this table has never
+    // heard of, and refusing a chunk over one would make the world unopenable
+    // for a detail nobody can see. The properties that *are* understood still
+    // apply.
+    let with_nonsense = names
+        .block(
+            "minecraft:oak_stairs",
+            &[("facing", "east"), ("not_a_property", "yes")],
+        )
+        .expect("still a state");
+    assert_eq!(
+        dust_registry::BlockState::from_id(with_nonsense)
+            .expect("a real state")
+            .property("facing"),
+        Some("east"),
+        "the understood property survives the unknown one"
+    );
+
+    // And a block nobody has heard of is a `None`, which the parser turns into
+    // a named error rather than a default.
+    assert_eq!(names.block("minecraft:not_a_block", &[]), None);
 }

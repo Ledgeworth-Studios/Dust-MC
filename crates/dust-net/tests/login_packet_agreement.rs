@@ -169,3 +169,132 @@ fn set_compression_and_login_success_are_not_interchangeable() {
     cb::Packet::decode_body(LOGIN_SUCCESS_ID, &mut reader, V1_21_1)
         .expect_err("two bytes cannot be a game profile");
 }
+
+/// The bodies this crate *writes* must decode under `dust-protocol`'s
+/// definitions.
+///
+/// The reading half of this file was written after a defect in how `dust-net`
+/// parsed Login Start. It did not cover the other direction, and a defect
+/// promptly appeared there too: Login Success went out without its final
+/// `strict_error_handling` byte, so the packet ended one byte early and a real
+/// client could not log in. Nothing in this crate noticed, because every test
+/// here read that packet the same way this crate wrote it.
+///
+/// So this drives a real login over a duplex and decodes every clientbound
+/// frame it produces with the other crate's decoder. It is the same argument as
+/// the reading half: neither implementation can satisfy it alone.
+mod written {
+    use dust_net::frame::Frame;
+    use dust_net::io::{Conn, ConnConfig};
+    use dust_net::login_flow::{
+        canonical_username, offline_profile_id, LoginConfig, LoginHandler, PROFILE_ID_BYTES,
+    };
+    use dust_net::session::{JoinRequest, Profile, SessionError, SessionServer};
+    use dust_protocol::packets::login::clientbound as cb;
+    use dust_protocol::version::V1_21_1;
+    use dust_protocol::wire::{Reader, WireRead as _};
+    use std::time::Duration;
+
+    struct NoMojang;
+
+    impl SessionServer for NoMojang {
+        async fn join(&self, _request: JoinRequest<'_>) -> Result<(), SessionError> {
+            unreachable!("offline mode never asks")
+        }
+        async fn has_joined(
+            &self,
+            _username: &str,
+            _hash: &str,
+        ) -> Result<Option<Profile>, SessionError> {
+            unreachable!("offline mode never asks")
+        }
+    }
+
+    fn short_clocks() -> ConnConfig {
+        ConnConfig {
+            timeouts: dust_net::io::Timeouts {
+                idle: Some(Duration::from_secs(10)),
+                pre_auth_budget: Some(Duration::from_secs(10)),
+            },
+            ..ConnConfig::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_clientbound_login_frame_decodes_under_the_definitions() {
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let mut client = Conn::new(client_io, short_clocks());
+        let mut server = Conn::new(server_io, short_clocks());
+
+        // Handshake: next state 2, login.
+        let mut intention = Vec::new();
+        intention.push(0x8f); // protocol 767 as a VarInt
+        intention.push(0x06);
+        let host = b"localhost";
+        intention.push(host.len() as u8);
+        intention.extend_from_slice(host);
+        intention.extend_from_slice(&25565u16.to_be_bytes());
+        intention.push(2);
+        client
+            .send(Frame::new(0x00, intention))
+            .await
+            .expect("send the handshake");
+        let handshake = server
+            .next_frame()
+            .await
+            .expect("read")
+            .expect("a handshake");
+        server.handshake(2).expect("apply");
+        assert_eq!(handshake.id, 0x00);
+
+        // Login Start.
+        let mut start = Vec::new();
+        let name = "Steve";
+        start.push(name.len() as u8);
+        start.extend_from_slice(name.as_bytes());
+        start.extend_from_slice(&[0x11; PROFILE_ID_BYTES]);
+        client.send(Frame::new(0x00, start)).await.expect("send");
+
+        let driver = tokio::spawn(async move {
+            let outcome = LoginHandler::new(&mut server, LoginConfig::offline(), &NoMojang, None)
+                .authenticate()
+                .await;
+            (outcome, server)
+        });
+
+        // Set Compression, then Login Success — every frame decoded by the
+        // other crate, which is the whole point.
+        let compression = client.next_frame().await.expect("read").expect("frame");
+        let mut reader = Reader::new(&compression.body);
+        let packet = cb::Packet::decode_body(compression.id, &mut reader, V1_21_1)
+            .expect("set_compression decodes");
+        assert!(matches!(packet, cb::Packet::LoginCompression(_)));
+        assert_eq!(reader.remaining(), 0, "and is the whole body");
+        client.set_compression(dust_net::frame::Compress::At { threshold: 256 });
+
+        let success = client.next_frame().await.expect("read").expect("frame");
+        let mut reader = Reader::new(&success.body);
+        let packet = cb::Packet::decode_body(success.id, &mut reader, V1_21_1)
+            .expect("login_finished decodes; a missing trailing field fails here");
+        assert_eq!(
+            reader.remaining(),
+            0,
+            "and is the whole body — a field written twice would leave bytes"
+        );
+        let cb::Packet::GameProfile(profile) = packet else {
+            panic!("id {} must be Login Success", success.id);
+        };
+        assert_eq!(profile.username.as_str(), name);
+        assert_eq!(
+            profile.uuid.0.to_be_bytes(),
+            offline_profile_id(&canonical_username(name).expect("legal"))
+        );
+
+        client
+            .send(Frame::new(0x03, Vec::new()))
+            .await
+            .expect("acknowledge");
+        let (outcome, _server) = driver.await.expect("no panic");
+        outcome.expect("the login completed");
+    }
+}

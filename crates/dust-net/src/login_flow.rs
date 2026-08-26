@@ -636,12 +636,24 @@ where
         name: &str,
         encoded_properties: &[u8],
     ) -> Result<(), LoginError> {
-        let mut body = Vec::with_capacity(16 + 5 + name.len() + encoded_properties.len());
+        let mut body = Vec::with_capacity(17 + 5 + name.len() + encoded_properties.len());
         body.extend_from_slice(&profile_id); // UUID: two big-endian u64s
         push_wire_string(&mut body, name);
         // Already-encoded properties array, count included — see
         // `encode_properties`, whose output this is.
         body.extend_from_slice(encoded_properties);
+        // `strict_error_handling`, added in 1.20.5. One byte, and leaving it
+        // off does not truncate the packet visibly — it ends one byte early,
+        // and a client reading it runs off the end of a frame that otherwise
+        // looks complete. A real third-party client found this immediately and
+        // could not log in; nothing here had noticed, because the tests in
+        // this crate read this packet the same way this crate writes it.
+        //
+        // False: it asks the client to treat a malformed packet as fatal
+        // rather than ignore it, which is a debugging aid, and a server that
+        // turned it on would be choosing to disconnect players over its own
+        // bugs.
+        body.push(0);
         self.conn
             .send(Frame::new(LOGIN_SUCCESS_ID, body))
             .await

@@ -377,8 +377,10 @@ where
         Configured::UnknownContent => {
             // The client did not acknowledge the vanilla pack, so its
             // registries would have to carry their own contents, and Dust has
-            // none to send. Saying so beats sending three hundred entries with
-            // no definitions and leaving it in a world with no dimension types.
+            // none to send. Checked rather than assumed: serving the names
+            // anyway was tried against a client that acknowledges nothing, and
+            // it fails inside its own registry loader without ever reaching
+            // the world. See `configure`'s module documentation.
             refuse_in_configuration(
                 &mut conn,
                 ctx,
@@ -446,6 +448,13 @@ where
         version,
     )
     .await?;
+
+    // Abilities before the position, as a real server sends them. This is
+    // where creative flight is *granted*: the game mode in the join packet
+    // does not grant it, and a client that is never sent this walks.
+    send_play(conn, play_mod::abilities(true), version).await?;
+    send_play(conn, play_mod::frozen_at_noon(), version).await?;
+    send_play(conn, play_mod::default_spawn(world::SPAWN), version).await?;
 
     // Before the chunks, not after: a client uses its position to decide which
     // columns it wants, and one told about columns before it knows where it is
@@ -568,7 +577,7 @@ where
         let packet = if ctx.world.is_edited(*pos) {
             play_mod::chunk_packet(&ctx.world.chunk(*pos), *pos, ctx.version)?
         } else {
-            play_mod::chunk_packet(ctx.world.template(), *pos, ctx.version)?
+            play_mod::chunk_packet(ctx.world.template(*pos).as_chunk(), *pos, ctx.version)?
         };
         send_play(conn, packet, ctx.version).await?;
     }

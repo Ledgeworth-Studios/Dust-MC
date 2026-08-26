@@ -63,6 +63,13 @@ pub struct ServerConfig {
     #[config(restart)]
     pub log_level: LogLevel,
 
+    /// Path to a directory of `.mca` region files to serve, or empty to
+    /// generate a flat world. A column the files do not contain is generated
+    /// flat, because a world is a disc in an infinite plane and a player may
+    /// walk off the edge of it.
+    #[config(restart)]
+    pub world_source: String,
+
     /// Path to the icon shown beside this server in the client's list, or empty
     /// for none. Must be a 64x64 PNG; the client silently shows nothing for a
     /// picture it cannot use, so the server refuses one at boot instead.
@@ -80,6 +87,7 @@ impl Default for ServerConfig {
             max_catchup_ticks: 20,
             shutdown_timeout_secs: 10,
             log_level: LogLevel::default(),
+            world_source: String::new(),
             favicon: String::new(),
         }
     }

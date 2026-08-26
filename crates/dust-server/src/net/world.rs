@@ -103,21 +103,23 @@ pub const SPAWN: (f64, f64, f64) = (0.5, SURFACE_Y as f64 + 1.0, 0.5);
 /// # Why a template column rather than a generator call per chunk
 ///
 /// Every column of a flat world is identical, so generating each one is doing
-/// the same work again — and that work is not free. `dust-world`'s bench puts
-/// an overworld column at **2.7 ms to generate and 0.57 ms to light**, in
-/// release. Twenty-five of them is eighty milliseconds, which is more than a
-/// tick.
+/// the same work again. `dust-world`'s bench puts an overworld column at
+/// **0.36 ms to build and 0.65 ms to light**, in release — a millisecond
+/// apiece, and twenty-five of them on a join.
 ///
 /// So the column is built and lit once, here, and the chunk packet is told
 /// which coordinates to put on it. That is correct for *this* world and is
 /// explicitly not a general answer: the moment two columns differ, the
 /// template goes and the cost comes back.
 ///
-/// When it does, the number to beat is the 2.7 ms, not the lighting. That
-/// split is recent: whole-region sky-light seeding cost 8.2 ms until
-/// `column_light` started seeding only the boundary of the lit region, and the
-/// bottleneck moved from the light engine to putting blocks in the container
-/// one at a time.
+/// Both of those numbers were several times larger an hour ago, and how they
+/// came down is the useful part. Sky light was 8.2 ms until `column_light`
+/// started seeding only the boundary of the lit region. Generation was then
+/// 2.7 ms, of which **2.6 was recomputing heightmaps** — measured rather than
+/// guessed at, after "generation is 2.7 ms" named no suspect: allocating the
+/// column is 7 µs and writing its 1,280 blocks is 52 µs. The heightmap walk
+/// now skips a section that holds one value everywhere, which is every section
+/// above the terrain.
 #[derive(Debug, Clone)]
 pub struct FlatWorld {
     palette: Palette,

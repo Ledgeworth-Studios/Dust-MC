@@ -48,6 +48,7 @@ pub mod play;
 pub mod players;
 pub mod save;
 pub mod session;
+pub mod source;
 pub mod status;
 pub mod view;
 pub mod world;

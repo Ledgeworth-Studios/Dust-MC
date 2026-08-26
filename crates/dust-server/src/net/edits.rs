@@ -30,10 +30,12 @@ use std::sync::{Arc, RwLock};
 
 use dust_protocol::types::Position;
 use dust_world::chunk::Chunk;
+
+use super::source::Column;
 use dust_world::coords::ChunkPos;
 use tokio::sync::broadcast;
 
-use super::world::FlatWorld;
+use super::source::Source;
 
 /// A column, as the edit map keys it. Not [`ChunkPos`], because this is a hash
 /// key and giving a domain type a `Hash` it does not otherwise need would put
@@ -63,7 +65,7 @@ const EDIT_BACKLOG: usize = 64;
 /// The world as it currently stands: what was generated, plus what was changed.
 #[derive(Debug)]
 pub struct EditedWorld {
-    generated: FlatWorld,
+    generated: Source,
     /// Keyed by column so applying edits to a chunk is one lookup rather than
     /// a scan of every edit in the world.
     edits: RwLock<HashMap<ColumnKey, ColumnEdits>>,
@@ -71,7 +73,7 @@ pub struct EditedWorld {
 }
 
 impl EditedWorld {
-    pub fn new(generated: FlatWorld) -> Self {
+    pub fn new(generated: Source) -> Self {
         let (announce, _) = broadcast::channel(EDIT_BACKLOG);
         Self {
             generated,
@@ -93,7 +95,7 @@ impl EditedWorld {
 
     /// The column at `pos`, with every edit in it applied.
     pub fn chunk(&self, pos: ChunkPos) -> Chunk {
-        let mut chunk = self.generated.column().clone();
+        let mut chunk = self.generated.column(pos).as_chunk().clone();
         let edits = self.edits.read().expect("the edit map is never poisoned");
         if let Some(column) = edits.get(&(pos.x, pos.z)) {
             for ((x, y, z), state) in column {
@@ -104,7 +106,7 @@ impl EditedWorld {
             // block missing from its surface has to say so. Recomputed rather
             // than adjusted because `set_block` above does not maintain them
             // and an adjustment that disagreed would be invisible.
-            let air = self.generated.palette().air;
+            let air = self.generated.flat().palette().air;
             chunk.recompute_heightmaps(|_, state| state != air);
         }
         chunk
@@ -122,8 +124,14 @@ impl EditedWorld {
     }
 
     /// The column as generated, for the untouched case.
-    pub fn template(&self) -> &Chunk {
-        self.generated.column()
+    ///
+    /// Borrowed where the source can lend one — a flat world shares a single
+    /// column with every position — and built where it cannot. The caller
+    /// sends it and does not keep it, so a borrow is worth having: it is the
+    /// difference between a clone per column per viewer and none at all, on
+    /// the path every join takes twenty-five times.
+    pub fn template(&self, pos: ChunkPos) -> Column<'_> {
+        self.generated.column(pos)
     }
 
     /// The state at a block position.
@@ -135,7 +143,8 @@ impl EditedWorld {
             return *state;
         }
         self.generated
-            .column()
+            .column(ChunkPos::new(column.0, column.1))
+            .as_chunk()
             .get_block(local.0 as u32, local.1, local.2 as u32)
     }
 
@@ -145,7 +154,7 @@ impl EditedWorld {
     /// one refusal here — a client is entitled to ask about y = 1000 and this
     /// is not the place to be surprised by it.
     pub fn set_block(&self, position: Position, state: u32) -> bool {
-        let world = self.generated.height();
+        let world = self.generated.flat().height();
         if position.y < world.min_y() || position.y >= world.min_y() + world.height() as i32 {
             return false;
         }
@@ -172,7 +181,7 @@ impl EditedWorld {
         let mut edits = self.edits.write().expect("the edit map is never poisoned");
         let mut applied = 0;
         for (position, state) in blocks {
-            let world = self.generated.height();
+            let world = self.generated.flat().height();
             if position.y < world.min_y() || position.y >= world.min_y() + world.height() as i32 {
                 continue;
             }
@@ -251,7 +260,9 @@ mod tests {
     /// `world` binding can still make another one.
     fn fresh_world() -> EditedWorld {
         let palette = super::super::world::Palette::resolve().expect("the block table");
-        EditedWorld::new(FlatWorld::new(palette, 0, 64))
+        EditedWorld::new(Source::Flat(super::super::world::FlatWorld::new(
+            palette, 0, 64,
+        )))
     }
 
     #[test]

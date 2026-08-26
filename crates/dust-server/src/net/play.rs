@@ -403,3 +403,69 @@ pub fn player_entity_type() -> Option<i32> {
     dust_registry::EntityType::from_name("minecraft:player")
         .and_then(|t| i32::try_from(t.protocol_id()).ok())
 }
+
+// ---------------------------------------------------------------------------
+// The rest of what a joining client is told
+// ---------------------------------------------------------------------------
+
+use dust_protocol::packets::play::Abilities;
+use dust_protocol::types::Position;
+
+/// What the player may do with their own body.
+///
+/// **The one packet on this list whose absence is felt immediately.** A client
+/// in creative mode that is never sent it cannot fly: the flags are where
+/// flight is *granted*, and the client's own movement prediction runs from
+/// them, not from the game mode in the join packet. Dust puts everybody in
+/// creative and did not send this, which is a creative player who walks.
+///
+/// Compared against a real 1.21.1 server, which sends it as the third packet
+/// after login — before the position, and long before the chunks.
+pub fn abilities(creative: bool) -> play::clientbound::PlayerAbilities {
+    let flags = if creative {
+        Abilities::INVULNERABLE | Abilities::ALLOW_FLYING | Abilities::INSTANT_BREAK
+    } else {
+        0
+    };
+    play::clientbound::PlayerAbilities {
+        flags: Abilities(flags),
+        // Vanilla's own defaults. They are the values the client assumes when
+        // it has never been told, which is exactly why sending the same ones
+        // is not a no-op: the client that was never told is also the client
+        // that was never granted flight.
+        flying_speed: 0.05,
+        fov_modifier: 0.1,
+    }
+}
+
+/// Where compasses point and where a player respawns.
+///
+/// Not the same as where they currently are — a returning player is put back
+/// where they left, and the compass still points here.
+pub fn default_spawn(at: (f64, f64, f64)) -> play::clientbound::SetDefaultSpawnPosition {
+    play::clientbound::SetDefaultSpawnPosition {
+        location: Position {
+            x: at.0.floor() as i32,
+            y: at.1.floor() as i32,
+            z: at.2.floor() as i32,
+        },
+        angle: 0.0,
+    }
+}
+
+/// The world clock.
+///
+/// Two numbers, and they mean different things. `world_age` only ever counts
+/// up and is what scoreboards and some redstone read; `time_of_day` is the
+/// position of the sun within a 24,000-tick day. A **negative** `time_of_day`
+/// tells the client the cycle is frozen at its absolute value, which is what
+/// this server sends: nothing here ticks a clock, and a sun that never moves is
+/// better than one that jumps back to dawn every time somebody joins.
+pub fn frozen_at_noon() -> play::clientbound::SetTime {
+    /// Midday, when a superflat looks like anything at all.
+    const NOON: i64 = 6_000;
+    play::clientbound::SetTime {
+        world_age: 0,
+        time_of_day: -NOON,
+    }
+}
