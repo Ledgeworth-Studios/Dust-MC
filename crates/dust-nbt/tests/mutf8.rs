@@ -315,3 +315,92 @@ fn a_key_too_long_to_write_is_refused_too() {
     compound.insert(long, Tag::Byte(1));
     assert!(write::to_vec("", &Tag::Compound(compound)).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Properties, against a reference transcoder
+//
+// The vectors above were recorded from the JDK; this section re-derives them
+// continuously. The reference below implements `DataOutputStream.writeUTF`'s
+// own loop shape — one pass over UTF-16 code units, three ranges per unit —
+// which shares nothing structurally with the implementation's character-wise
+// bit arithmetic except the recorded rule itself. Agreement between two such
+// different derivations is worth far more than either alone.
+//
+// mod support brings in the shared string strategy; see tests/support/mod.rs.
+
+mod support;
+
+use proptest::prelude::*;
+use support::any_text;
+
+/// Encode `text` the way the JDK's loop does: UTF-16 units, each written as
+/// one, two or three bytes, with NUL special-cased to the two-byte form.
+fn reference_encode(text: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buffer = [0u16; 2];
+    for ch in text.chars() {
+        for unit in ch.encode_utf16(&mut buffer) {
+            let unit = *unit;
+            if unit == 0 {
+                out.extend_from_slice(&[0xc0, 0x80]);
+            } else if unit < 0x80 {
+                out.push(unit as u8);
+            } else if unit < 0x800 {
+                out.push((0xc0 | (unit >> 6)) as u8);
+                out.push((0x80 | (unit & 0x3f)) as u8);
+            } else {
+                out.push((0xe0 | (unit >> 12)) as u8);
+                out.push((0x80 | ((unit >> 6) & 0x3f)) as u8);
+                out.push((0x80 | (unit & 0x3f)) as u8);
+            }
+        }
+    }
+    out
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// The encoder agrees with an independent derivation of the same rule,
+    /// including the length it reports for the writer's prefix.
+    #[test]
+    fn encoding_agrees_with_a_reference_transcoder(text in any_text()) {
+        prop_assert_eq!(mutf8::encode(&text), reference_encode(&text));
+        prop_assert_eq!(mutf8::encoded_len(&text), reference_encode(&text).len());
+    }
+
+    /// Decoding inverts encoding for every string generated — ASCII, NULs,
+    /// surrogate-pair characters, control characters, the lot.
+    #[test]
+    fn decoding_inverts_encoding(text in any_text()) {
+        let encoded = mutf8::encode(&text);
+        let decoded = mutf8::decode(&encoded)
+            .expect("the encoder's own output must decode")
+            .into_owned();
+        prop_assert_eq!(decoded, text);
+    }
+
+    /// Arbitrary payloads never panic, never half-decode, and — the strong
+    /// half — are only ever accepted when they are already canonical:
+    /// accepting means re-encoding gives back exactly these bytes. A decoder
+    /// that tolerated overlong forms or a raw NUL would fail this, because
+    /// acceptance would silently rewrite the document on its way through.
+    #[test]
+    fn arbitrary_payloads_are_accepted_only_when_canonical(
+        bytes in proptest::collection::vec(any::<u8>(), 0..64),
+    ) {
+        match mutf8::decode(&bytes) {
+            Ok(decoded) => {
+                prop_assert_eq!(mutf8::encode(decoded.as_ref()), bytes);
+            }
+            Err(error) => {
+                prop_assert!(
+                    error.offset() < bytes.len(),
+                    "error at byte {} of a {}-byte payload",
+                    error.offset(),
+                    bytes.len()
+                );
+            }
+        }
+    }
+}

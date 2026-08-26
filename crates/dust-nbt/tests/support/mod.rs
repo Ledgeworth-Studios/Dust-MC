@@ -606,3 +606,9 @@ pub fn any_tag_surviving_snbt() -> BoxedStrategy<Tag> {
 pub fn any_root_name() -> impl Strategy<Value = String> {
     text()
 }
+
+/// Any string, for suites that exercise strings directly rather than wrapped
+/// in documents.
+pub fn any_text() -> impl Strategy<Value = String> {
+    text()
+}
