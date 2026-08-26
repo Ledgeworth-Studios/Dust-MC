@@ -16,8 +16,10 @@
 
 mod blocks;
 mod codegen;
+mod commands;
 mod download;
 mod items;
+mod numbers;
 mod registries;
 mod sha1;
 
