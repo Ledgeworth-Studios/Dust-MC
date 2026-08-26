@@ -141,7 +141,7 @@ pub fn parse(data_root: &Path, registries: &Registries) -> Result<LootTables, St
 
     // Every type the data used has to be registered: the registry report read
     // beside these files is the second witness to the vocabulary.
-    for ((kind, name), _) in &counted {
+    for (kind, name) in counted.keys() {
         let known = match kind {
             Kind::Condition => &conditions,
             Kind::Function => &functions,

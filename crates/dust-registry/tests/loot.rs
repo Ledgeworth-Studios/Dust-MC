@@ -47,8 +47,8 @@ fn lookups_find_tables_by_whole_namespaced_id() {
     assert!(loot::table_exists("minecraft:blocks/stone"));
     assert!(loot::table_exists("minecraft:entities/zombie"));
     // Bare paths and unknown ids both miss.
-    assert_eq!(loot::table_exists("blocks/stone"), false);
-    assert_eq!(loot::table_exists("minecraft:blocks/not_a_block"), false);
+    assert!(!loot::table_exists("blocks/stone"));
+    assert!(!loot::table_exists("minecraft:blocks/not_a_block"));
 }
 
 #[test]
