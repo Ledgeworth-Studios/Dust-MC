@@ -118,8 +118,10 @@
 //!   names nothing parseable comes back with `None`, not a finding — deciding
 //!   whether that is broken belongs to whoever reads recipes for real.
 //! * **Unknown keys are only checked in the shapes this crate owns** —
-//!   `pack.mcmeta` and tag files. A misspelled key inside a recipe is invisible
-//!   from here, by the same argument as above.
+//!   `pack.mcmeta` and tag files — plus the one opt-in pass: [`loot::audit`]
+//!   reports misspelled keys on the loot conditions and functions its
+//!   baseline tables cover. A misspelled key inside a recipe is still
+//!   invisible from here, by the same argument as above.
 //! * **The registry table is vanilla 1.21.1's.** A mod's registry directory
 //!   will be reported as unknown until somebody calls
 //!   [`registry::Registries::with_extra`].
@@ -133,6 +135,7 @@ pub mod function;
 pub mod inflate;
 pub mod json;
 pub mod location;
+pub mod loot;
 pub mod meta;
 pub mod overlay;
 pub mod pack;
@@ -154,13 +157,16 @@ pub use discover::{discover, load_directory};
 pub use finding::{error_count, Finding, Severity};
 pub use function::{FunctionFile, FunctionLine, LoadedFunction};
 pub use location::{LocationError, ResourceLocation, MINECRAFT};
+pub use loot::{
+    audit as audit_loot, condition_def, function_def, SerializerDef, CONDITION_DEFS, FUNCTION_DEFS,
+};
 pub use meta::{PackMeta, DUST_PACK_FORMAT};
 pub use overlay::{OverlainPack, OverlayPlan, Refusal};
 pub use pack::{DirectoryPack, PackError, PackSource, ZipPack};
 pub use registry::{Registries, RegistryDef, RegistryId, RegistryKind};
 pub use shape::{AdvancementSkeleton, LootTableSkeleton, RecipeSkeleton, ShapeReport};
 pub use tag::{MergedTag, ResolvedTags, TagStats};
-pub use vocabulary::{Known, Vocabulary};
+pub use vocabulary::{Chained, Known, KnownNames, PackDefined, Unchecked, Vocabulary};
 
 use registry::DirectoryMatch;
 use tag::{TagFile, TagSet};

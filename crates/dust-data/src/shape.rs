@@ -85,11 +85,19 @@ pub const LOOT_ENTRY_KINDS: &[&str] = &[
 ];
 
 /// Loot condition types vanilla 1.21.1 ships.
+///
+/// The composite wrappers (`all_of`, `any_of`, `inverted`) and
+/// `enchantment_active_check` are confirmed by vanilla's own data files, not
+/// just by the type list — they were added to this table after the extract.
 pub const LOOT_CONDITION_KINDS: &[&str] = &[
+    "minecraft:all_of",
+    "minecraft:any_of",
     "minecraft:block_state_property",
     "minecraft:damage_source_properties",
+    "minecraft:enchantment_active_check",
     "minecraft:entity_properties",
     "minecraft:entity_scores",
+    "minecraft:inverted",
     "minecraft:killed_by_player",
     "minecraft:location_check",
     "minecraft:match_tool",
@@ -104,11 +112,16 @@ pub const LOOT_CONDITION_KINDS: &[&str] = &[
 ];
 
 /// Loot function types vanilla 1.21.1 ships.
+///
+/// `enchanted_count_increase` and `set_ominous_bottle_amplifier` are
+/// confirmed by vanilla's own data files, not just by the type list — they
+/// were added to this table after the extract.
 pub const LOOT_FUNCTION_KINDS: &[&str] = &[
     "minecraft:apply_bonus",
     "minecraft:copy_components",
     "minecraft:copy_nbt",
     "minecraft:copy_state",
+    "minecraft:enchanted_count_increase",
     "minecraft:enchant_randomly",
     "minecraft:enchant_with_levels",
     "minecraft:exploration_map",
@@ -128,6 +141,7 @@ pub const LOOT_FUNCTION_KINDS: &[&str] = &[
     "minecraft:set_loot_table",
     "minecraft:set_name",
     "minecraft:set_lore",
+    "minecraft:set_ominous_bottle_amplifier",
     "minecraft:set_potion",
     "minecraft:set_stew_effect",
     "minecraft:set_ticket",
@@ -206,6 +220,17 @@ pub struct LootTableSkeleton {
     pub pools: Vec<LootPoolSkeleton>,
     /// The whole table, verbatim.
     pub raw: Value,
+}
+
+impl LootTableSkeleton {
+    /// Pull one spine out of an already-parsed loot table document.
+    ///
+    /// Public for the same reason [`AdvancementSkeleton::from_raw`] is: a
+    /// pass that only wants loot tables should not pay for recipes and
+    /// advancements it never looks at.
+    pub fn from_raw(value: &Value) -> Self {
+        loot_skeleton(value)
+    }
 }
 
 /// A recipe's spine.
