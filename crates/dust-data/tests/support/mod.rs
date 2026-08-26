@@ -376,47 +376,93 @@ pub fn write_layouted_zip(entries: &[RawZipEntry]) -> (Vec<u8>, ZipLayout) {
 /// own Huffman tables. Every literal goes through the fixed literal table;
 /// the CRC the caller records is what proves the round trip.
 pub fn write_deflate_fixed(payload: &[u8]) -> Vec<u8> {
-    /// Huffman codes are written most-significant-bit first, unlike every
-    /// other field in the stream, which is why this writer has both orders.
-    fn push_lsb(out: &mut Vec<u8>, held: &mut u32, used: &mut u32, value: u32, count: u32) {
-        *held |= value << *used;
-        *used += count;
-        while *used >= 8 {
-            out.push((*held & 0xff) as u8);
-            *held >>= 8;
-            *used -= 8;
-        }
-    }
-
-    fn push_code_msb(out: &mut Vec<u8>, held: &mut u32, used: &mut u32, code: u32, count: u32) {
-        for bit in (0..count).rev() {
-            push_lsb(out, held, used, (code >> bit) & 1, 1);
-        }
-    }
-
-    let mut out = Vec::new();
-    let mut held = 0u32;
-    let mut used = 0u32;
-    push_lsb(&mut out, &mut held, &mut used, 1, 1); // BFINAL
-    push_lsb(&mut out, &mut held, &mut used, 1, 2); // BTYPE = fixed
+    let mut bits = DeflateBits::new();
+    bits.header_final_fixed();
     for &byte in payload {
         if byte < 144 {
-            push_code_msb(&mut out, &mut held, &mut used, 0x30 + u32::from(byte), 8);
+            bits.code(0x30 + u32::from(byte), 8);
         } else {
-            push_code_msb(
-                &mut out,
-                &mut held,
-                &mut used,
-                0x190 + u32::from(byte - 144),
-                9,
-            );
+            bits.code(0x190 + u32::from(byte - 144), 9);
         }
     }
-    push_code_msb(&mut out, &mut held, &mut used, 0, 7); // end of block
-    if used > 0 {
-        out.push((held & 0xff) as u8);
+    bits.end_of_block();
+    bits.finish()
+}
+
+/// A fixed-Huffman stream that expands `repeats` times via back-references:
+/// three literals, then `length 258, distance 3` pairs.
+///
+/// This is the zip-bomb shape — roughly 1.7 bytes of stream per 258 bytes of
+/// output — written out because the cap on expansion must be tested against
+/// a stream that genuinely wants to blow past it, not against a stored entry
+/// merely *claiming* to be large.
+pub fn deflate_repeat_stream(repeats: usize) -> Vec<u8> {
+    let mut bits = DeflateBits::new();
+    bits.header_final_fixed();
+    for &byte in b"abc" {
+        bits.code(0x30 + u32::from(byte), 8);
     }
-    out
+    for _ in 0..repeats {
+        // Length symbol 285: base 258, no extra bits.
+        bits.code(0b1100_0101, 8);
+        // Distance symbol 2: base 3, no extra bits, five-bit code.
+        bits.code(0b00010, 5);
+    }
+    bits.end_of_block();
+    bits.finish()
+}
+
+/// Bit-level output for the two streams above: plain fields go in
+/// least-significant-first, Huffman codes most-significant-first, per
+/// RFC 1951 §3.1.1.
+struct DeflateBits {
+    out: Vec<u8>,
+    held: u32,
+    used: u32,
+}
+
+impl DeflateBits {
+    fn new() -> Self {
+        Self {
+            out: Vec::new(),
+            held: 0,
+            used: 0,
+        }
+    }
+
+    fn push_lsb(&mut self, value: u32, count: u32) {
+        self.held |= value << self.used;
+        self.used += count;
+        while self.used >= 8 {
+            self.out.push((self.held & 0xff) as u8);
+            self.held >>= 8;
+            self.used -= 8;
+        }
+    }
+
+    /// One final block with the fixed tables' type bits.
+    fn header_final_fixed(&mut self) {
+        self.push_lsb(1, 1); // BFINAL
+        self.push_lsb(1, 2); // BTYPE = 01, fixed
+    }
+
+    fn code(&mut self, code: u32, count: u32) {
+        for bit in (0..count).rev() {
+            self.push_lsb((code >> bit) & 1, 1);
+        }
+    }
+
+    fn end_of_block(&mut self) {
+        // Symbol 256, the seven all-zero code.
+        self.code(0, 7);
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        if self.used > 0 {
+            self.out.push((self.held & 0xff) as u8);
+        }
+        self.out
+    }
 }
 
 // ---------------------------------------------------------------------------
