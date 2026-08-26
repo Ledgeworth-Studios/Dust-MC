@@ -182,18 +182,18 @@ pub fn parse(json: &[u8], registries: &Registries) -> Result<Commands, String> {
     // `execute` is a backward index, and there is no order in which a tree of
     // owned values could hold it.
     let mut redirects = Vec::new();
-    for index in 0..nodes.len() {
-        let Some(path) = nodes[index].redirect_path.clone() else {
+    for (index, flattened) in nodes.iter_mut().enumerate() {
+        let Some(path) = flattened.redirect_path.clone() else {
             continue;
         };
         let joined = path.join("/");
         let target = *by_path.get(&joined).ok_or_else(|| {
             format!(
                 "{} redirects to {joined}, which is not a node in this report",
-                nodes[index].node.path
+                flattened.node.path
             )
         })?;
-        nodes[index].node.redirect = Some(target);
+        flattened.node.redirect = Some(target);
         redirects.push((index, target));
     }
 
