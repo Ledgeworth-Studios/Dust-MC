@@ -701,6 +701,15 @@ fn an_offline_login_runs_the_whole_configuration_exchange_and_reaches_play() {
          arrives and the client keeps waiting"
     );
 
+    // A player is told about their own arrival, as on every server since
+    // 2010, and it comes before the keep-alive because the roster is joined
+    // as soon as the world is on screen.
+    let (id, announcement) = recv_compressed_frame(&mut stream);
+    assert_eq!(id, 108, "system_chat");
+    let text = String::from_utf8_lossy(&announcement);
+    assert!(text.contains("Tester"), "{text:?}");
+    assert!(text.contains("joined the game"), "{text:?}");
+
     // And the connection stays up. A keep-alive arrives and is answered, which
     // is what turns "the packets were sent" into "the player is still there".
     let (id, body) = recv_compressed_frame(&mut stream);
@@ -979,6 +988,68 @@ fn two_players_see_each_other_arrive_move_and_leave() {
     first
         .wait_for(&mut first_stream, 61)
         .expect("and so is the tab-list row");
+
+    drop(first_stream);
+    running.finish();
+}
+
+/// What one player types, the other reads — and both are told who came and
+/// went.
+#[test]
+fn chat_and_the_join_and_leave_lines_reach_everybody() {
+    let running = start("");
+    let addr = running.addr;
+
+    let mut first_stream = connect(addr);
+    let mut first = join_as(&mut first_stream, addr, "First");
+    first.drain_until_quiet(&mut first_stream);
+
+    let mut second_stream = connect(addr);
+    let mut second = join_as(&mut second_stream, addr, "Second");
+    second.drain_until_quiet(&mut second_stream);
+
+    // The first player is told the second arrived.
+    let line = first
+        .wait_for(&mut first_stream, 108)
+        .expect("a join announcement");
+    let text = String::from_utf8_lossy(&line);
+    assert!(text.contains("Second"), "{text:?}");
+    assert!(text.contains("joined the game"), "{text:?}");
+
+    // The second says something.
+    let message = "hello from over here";
+    let mut body = Vec::new();
+    write_string(message, &mut body);
+    body.extend_from_slice(&0i64.to_be_bytes()); // timestamp
+    body.extend_from_slice(&0i64.to_be_bytes()); // salt
+    body.push(0); // no signature
+    write_var_int(0, &mut body); // acknowledgement offset
+    body.extend_from_slice(&[0u8; 3]); // the fixed acknowledgement bitset
+    send_compressed_frame(&mut second_stream, 6, &body);
+
+    // And the first reads it, with the sender's name in it.
+    let line = first
+        .wait_for(&mut first_stream, 108)
+        .expect("the message arrives");
+    let text = String::from_utf8_lossy(&line);
+    assert!(text.contains(message), "{text:?}");
+    assert!(text.contains("Second"), "{text:?}");
+
+    // A speaker sees their own words too, which is why the roster does not
+    // filter them: a session adding them back locally would be a second code
+    // path for one line.
+    let own = second
+        .wait_for(&mut second_stream, 108)
+        .expect("the speaker sees their own message");
+    assert!(String::from_utf8_lossy(&own).contains(message));
+
+    // And leaving is announced.
+    drop(second_stream);
+    let line = first
+        .wait_for(&mut first_stream, 108)
+        .expect("a leave announcement");
+    let text = String::from_utf8_lossy(&line);
+    assert!(text.contains("left the game"), "{text:?}");
 
     drop(first_stream);
     running.finish();

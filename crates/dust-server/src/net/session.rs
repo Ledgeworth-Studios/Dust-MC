@@ -493,6 +493,8 @@ where
     let joined = ctx.roster.join(profile_id, username.to_owned(), start);
     let me = joined.player.clone();
     let mut roster_changes = joined.listener;
+    ctx.roster
+        .say(SERVER_SPEAKING, super::chat::joined(&me.name));
 
     // Everybody already here, both halves each: the tab-list row and the body.
     for other in &joined.existing {
@@ -522,7 +524,10 @@ where
     .await;
 
     // Left however the loop ended, so a session that failed does not leave a
-    // body standing in the world forever.
+    // body standing in the world forever. The announcement goes first, while
+    // this player is still on the roster — a leave line for somebody the
+    // roster no longer has is a line nobody can attribute.
+    ctx.roster.say(SERVER_SPEAKING, super::chat::left(&me.name));
     ctx.roster.leave(me.entity_id);
     ctx.positions
         .lock()
@@ -695,6 +700,25 @@ where
                         .await?;
                         send_play(conn, play_mod::turn_head(entity_id, yaw), ctx.version).await?;
                     }
+                    // Chat reaches everybody, the speaker included — a player
+                    // has to see their own words, and filtering them here
+                    // would mean every session adding them back locally.
+                    Ok(RosterChange::Said { text, .. }) => {
+                        send_play(
+                            conn,
+                            play::clientbound::SystemChat {
+                                content: text,
+                                // The log, not the action bar. `overlay`
+                                // sends a line to the strip above the hotbar,
+                                // where it replaces whatever is there and
+                                // vanishes — which is right for a status
+                                // readout and wrong for anything anybody said.
+                                overlay: false,
+                            },
+                            ctx.version,
+                        )
+                        .await?;
+                    }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
                     // Behind on the roster means showing players who left and
@@ -743,6 +767,21 @@ where
                         ctx.roster
                             .moved(me.entity_id, m.x, m.y, m.z, m.yaw, m.pitch);
                         moved(conn, ctx, &mut view, m.x, m.z).await?;
+                    }
+                    Ok(play::serverbound::Packet::Chat(said)) => {
+                        // The signature and the acknowledgement chain are
+                        // decoded and dropped. Relaying the signature would be
+                        // worse than not signing: it covers the message *and*
+                        // the chain it was sent in, so a server that reorders
+                        // or delays anything produces a signature the client
+                        // rejects.
+                        let message = said.message.as_str();
+                        if super::chat::is_sendable(message) {
+                            ctx.roster.say(
+                                me.entity_id,
+                                super::chat::player_said(&me.name, message),
+                            );
+                        }
                     }
                     // Turning on the spot. It changes no column, so it does not
                     // stream — but it is what everybody else sees, so it does
@@ -861,6 +900,13 @@ fn offset(location: dust_protocol::types::Position, face: u8) -> dust_protocol::
         z: location.z + dz,
     }
 }
+
+/// The entity id chat carries when the server itself is speaking.
+///
+/// Zero rather than an `Option`, because every reader of a chat line either
+/// wants to know who said it or does not, and none of them wants to handle a
+/// case that never has an answer. No player is entity 0.
+const SERVER_SPEAKING: i32 = 0;
 
 /// The entity id the player is given.
 ///

@@ -77,6 +77,22 @@ pub enum RosterChange {
         yaw: f32,
         pitch: f32,
     },
+    /// Something to put in everybody's chat log.
+    ///
+    /// Carried on the roster's channel rather than a second one because it is
+    /// the same fan-out to the same set, and two channels would mean two
+    /// orderings — a join announcement could arrive after a message from the
+    /// player who had not joined yet.
+    ///
+    /// The text is already rendered, because rendering it once is cheaper than
+    /// once per recipient and because the sender's name has to be kept apart
+    /// from the sender's words, which is `chat`'s job and not every reader's.
+    Said {
+        /// The entity that said it, so a session can tell its own words apart
+        /// if it ever needs to. Zero for the server itself.
+        entity_id: i32,
+        text: dust_protocol::text::Component,
+    },
 }
 
 /// Everyone currently connected.
@@ -181,6 +197,11 @@ impl Roster {
             yaw,
             pitch,
         });
+    }
+
+    /// Put a line in everybody's chat log.
+    pub fn say(&self, entity_id: i32, text: dust_protocol::text::Component) {
+        let _ = self.changes.send(RosterChange::Said { entity_id, text });
     }
 
     /// Everyone here, for rebuilding a session that fell behind.
@@ -306,6 +327,29 @@ mod tests {
         let seen = &arriving.existing[0];
         assert_eq!((seen.x, seen.y, seen.z), (100.0, 64.0, -50.0));
         assert_eq!(seen.yaw, 90.0, "and facing the way they turned");
+    }
+
+    #[test]
+    fn a_message_reaches_everybody_including_the_speaker() {
+        // Including the speaker, deliberately: a player has to see their own
+        // words in the log, and filtering them out here would mean every
+        // session had to add them back locally — two code paths for one line.
+        let roster = Roster::default();
+        let speaker = roster.join(uuid(1), "Speaker".to_owned(), (0.0, 0.0, 0.0));
+        let mut listener = roster.join(uuid(2), "Listener".to_owned(), (0.0, 0.0, 0.0));
+        roster.say(
+            speaker.player.entity_id,
+            dust_protocol::text::Component::text("hello"),
+        );
+
+        let mut heard = 0;
+        while let Ok(change) = listener.listener.try_recv() {
+            if let RosterChange::Said { entity_id, .. } = change {
+                assert_eq!(entity_id, speaker.player.entity_id);
+                heard += 1;
+            }
+        }
+        assert_eq!(heard, 1);
     }
 
     #[test]
