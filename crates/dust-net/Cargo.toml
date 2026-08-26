@@ -87,6 +87,14 @@ sha1 = "0.11"
 # licence audit, so nothing new enters either.
 serde_json = { version = "1", default-features = false, features = ["std"] }
 
+# MD-5 for offline-mode profile ids. Not a security choice, twice over: the
+# protocol specifies it — a vanilla server derives an offline player's UUID as
+# `nameUUIDFromBytes("OfflinePlayer:" + name)` and that method is MD5-based
+# UUID version 3 — and the digest authenticates nothing. Interoperability with
+# a fixed algorithm, exactly like the SHA-1 above; same RustCrypto 0.11 line,
+# so both ride one `digest` implementation.
+md-5 = "0.11"
+
 # Real TLS for the session-server call, behind the `tls` feature and off by
 # default: tests inject scripted transports and never touch a socket, and a
 # build that does not need the network stack should not compile one. The pieces

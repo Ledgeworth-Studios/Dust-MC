@@ -154,9 +154,12 @@ async fn encrypted_egress_is_counted_at_its_wire_size() {
         .expect("send");
 
     // Wait until the ciphertext has actually left for the peer, so the
-    // writer's count has settled before it is read.
+    // writer's count has settled before it is read. The deadline is a stall
+    // guard only — sixteen bytes cross a duplex in microseconds when the
+    // machine is idle — and is set wide enough that a fully loaded CI box
+    // scheduling the whole suite in parallel cannot trip it.
     let mut wire = vec![0u8; wire_of(0x09, b"secret").len()];
-    tokio::time::timeout(Duration::from_secs(5), client_raw.read_exact(&mut wire))
+    tokio::time::timeout(Duration::from_secs(30), client_raw.read_exact(&mut wire))
         .await
         .expect("drain")
         .expect("read");
