@@ -1887,7 +1887,7 @@ pub fn worldgen_vocabulary(data: &WorldgenVocabulary, version: &str) -> String {
           /// how many objects of each appear across all five generator variants\n\
           /// (nested appearances included) and the top-level argument keys each one\n\
           /// is called with, `type` itself excluded. Each name is an entry of the\n\
-          /// `worldgen/density_function_type` registry, checked at extraction.\n"
+          /// `worldgen/density_function_type` registry, checked at extraction."
     );
     let _ = writeln!(
         out,
@@ -1913,7 +1913,7 @@ pub fn worldgen_vocabulary(data: &WorldgenVocabulary, version: &str) -> String {
         out,
         "/// The noise-router slots, identical across every noise setting on {version}\n\
           /// — checked per file, because one deviant would mean terrain's wiring\n\
-          /// changed shape.\n"
+          /// changed shape."
     );
     let slots: Vec<String> = data
         .noise_router_slots
@@ -1929,7 +1929,7 @@ pub fn worldgen_vocabulary(data: &WorldgenVocabulary, version: &str) -> String {
     let _ = writeln!(
         out,
         "/// The multi-noise parameter names, alphabetically. Every biome-parameter\n\
-          /// entry carries exactly these seven.\n"
+          /// entry carries exactly these seven."
     );
     let parameters: Vec<String> = super::worldgen::PARAMETER_NAMES
         .iter()
@@ -1945,7 +1945,7 @@ pub fn worldgen_vocabulary(data: &WorldgenVocabulary, version: &str) -> String {
         out,
         "/// Per dimension: how many parameter entries the report wrote, how many were\n\
           /// range-shaped rather than point-shaped, and how many distinct biomes they\n\
-          /// name. The summary is what stays; the expansion itself is world data.\n"
+          /// name. The summary is what stays; the expansion itself is world data."
     );
     let _ = writeln!(
         out,

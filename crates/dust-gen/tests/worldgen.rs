@@ -6,6 +6,7 @@
 //! 0.5 and offset of 0.375 written out by hand, because a golden sample that
 //! only agreed with itself would agree with anything.
 
+use dust_gen::generated::worldgen::NOISE_ROUTER_SLOTS;
 use dust_gen::worldgen::{
     self, density_function_type, nether_biome_points, parameter_value, PARAMETER_NAMES,
 };
@@ -34,9 +35,9 @@ fn the_named_facts_about_terrain_are_still_true() {
     );
 
     // Every noise setting wires the same fifteen slots.
-    assert_eq!(dust_gen::generated::worldgen::NOISE_ROUTER_SLOTS.len(), 15);
-    assert!(dust_gen::generated::worldgen::NOISE_ROUTER_SLOTS.contains(&"final_density"));
-    assert!(dust_gen::generated::worldgen::NOISE_ROUTER_SLOTS.contains(&"continents"));
+    assert_eq!(NOISE_ROUTER_SLOTS.len(), 15);
+    assert!(NOISE_ROUTER_SLOTS.contains(&"final_density"));
+    assert!(NOISE_ROUTER_SLOTS.contains(&"continents"));
 }
 
 #[test]

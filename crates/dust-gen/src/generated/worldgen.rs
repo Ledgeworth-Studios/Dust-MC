@@ -18,7 +18,6 @@ pub const DATA_VERSION: &str = "1.21.1";
 /// (nested appearances included) and the top-level argument keys each one
 /// is called with, `type` itself excluded. Each name is an entry of the
 /// `worldgen/density_function_type` registry, checked at extraction.
-
 pub static DENSITY_FUNCTION_TYPES: &[DensityFunctionType] = &[
     DensityFunctionType {
         name: "minecraft:abs",
@@ -164,7 +163,6 @@ pub static DENSITY_FUNCTION_TYPES: &[DensityFunctionType] = &[
 /// The noise-router slots, identical across every noise setting on 1.21.1
 /// — checked per file, because one deviant would mean terrain's wiring
 /// changed shape.
-
 pub static NOISE_ROUTER_SLOTS: &[&str] = &[
     "barrier",
     "continents",
@@ -185,7 +183,6 @@ pub static NOISE_ROUTER_SLOTS: &[&str] = &[
 
 /// The multi-noise parameter names, alphabetically. Every biome-parameter
 /// entry carries exactly these seven.
-
 pub static BIOME_PARAMETER_NAMES: &[&str] = &[
     "continentalness",
     "depth",
@@ -199,7 +196,6 @@ pub static BIOME_PARAMETER_NAMES: &[&str] = &[
 /// Per dimension: how many parameter entries the report wrote, how many were
 /// range-shaped rather than point-shaped, and how many distinct biomes they
 /// name. The summary is what stays; the expansion itself is world data.
-
 pub static BIOME_PARAMETER_DIMENSIONS: &[BiomeParameterDimension] = &[
     BiomeParameterDimension {
         dimension: "minecraft:nether",
