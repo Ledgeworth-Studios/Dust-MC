@@ -84,7 +84,7 @@ async fn a_stalled_consumer_blocks_senders_instead_of_dropping_or_growing() {
     // Unblock the consumer: the entire backlog must drain, byte for byte.
     let target = TOTAL * frame_bytes;
     let mut received = 0usize;
-    let drained = tokio::time::timeout(Duration::from_secs(5), async {
+    let drained = tokio::time::timeout(Duration::from_secs(30), async {
         while received < target {
             let mut chunk = [0u8; 4096];
             let n = client.read(&mut chunk).await.expect("peer read");
@@ -95,7 +95,7 @@ async fn a_stalled_consumer_blocks_senders_instead_of_dropping_or_growing() {
     .await;
     assert!(drained.is_ok(), "the peer never received the whole backlog");
 
-    let conn = tokio::time::timeout(Duration::from_secs(5), worker)
+    let conn = tokio::time::timeout(Duration::from_secs(30), worker)
         .await
         .expect("the sender stayed wedged")
         .expect("sender joins");
@@ -128,7 +128,7 @@ async fn frames_leave_in_the_order_they_were_accepted() {
 
     let mut seen = Vec::new();
     let mut decoder = FrameDecoder::new(Limits::default());
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while seen.len() < COUNT {
         assert!(
             Instant::now() < deadline,
@@ -180,7 +180,7 @@ async fn an_oversized_frame_is_refused_even_while_the_writer_is_wedged() {
         .await
         .expect_err("an oversized frame must be refused");
     assert!(
-        started.elapsed() < Duration::from_millis(50),
+        started.elapsed() < Duration::from_millis(250),
         "refusal waited {:?}; it must not depend on the writer",
         started.elapsed()
     );

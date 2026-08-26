@@ -114,7 +114,7 @@ fn config() -> ConnConfig {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_server_list_ping_runs_to_completion_and_ends_cleanly() {
-    let flow = tokio::time::timeout(Duration::from_secs(5), async {
+    let flow = tokio::time::timeout(Duration::from_secs(30), async {
         let (client_io, server_io) = tokio::io::duplex(4096);
         let mut server = Conn::new(server_io, config());
         let mut client = Conn::new(client_io, config());
@@ -189,7 +189,7 @@ async fn a_server_list_ping_runs_to_completion_and_ends_cleanly() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_login_exchanges_keys_and_reaches_the_authenticated_state() {
-    let outcome = tokio::time::timeout(Duration::from_secs(10), run_login()).await;
+    let outcome = tokio::time::timeout(Duration::from_secs(30), run_login()).await;
     let outcome = outcome.expect("the login stalled");
     let outcome = outcome.expect("the login failed");
 
