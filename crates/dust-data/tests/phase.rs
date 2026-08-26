@@ -23,7 +23,7 @@ fn phases() {
     let pack = DirectoryPack::builtin(&root, "vanilla", 48);
     let t = Instant::now();
     let list = pack.list().unwrap();
-    println!("list {:?} for {}", t.elapsed(), list.len());
+    let list_time = t.elapsed();
     let t = Instant::now();
     let mut total = 0usize;
     let mut blobs = Vec::with_capacity(list.len());
@@ -33,7 +33,7 @@ fn phases() {
             blobs.push(b);
         }
     }
-    println!("read {:?} for {} bytes", t.elapsed(), total);
+    let read_time = t.elapsed();
     let t = Instant::now();
     let mut n = 0;
     for b in &blobs {
@@ -41,5 +41,13 @@ fn phases() {
             n += 1;
         }
     }
-    println!("parse {:?} for {n}", t.elapsed());
+    let parse_time = t.elapsed();
+    // Through `report`, not `println!`: the harness captures stdout, so the
+    // numbers would otherwise be visible only on a failing run, and a timing
+    // probe exists to be read on a passing one.
+    support::report(&[
+        format!("list   {list_time:?} for {} files", list.len()),
+        format!("read   {read_time:?} for {total} bytes"),
+        format!("parse  {parse_time:?} for {n}"),
+    ]);
 }

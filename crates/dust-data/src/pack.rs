@@ -31,6 +31,22 @@ use crate::zip::{ZipArchive, ZipEntry, ZipError};
 /// loop into a message.
 pub const MAX_DEPTH: usize = 32;
 
+/// The largest a single file inside a pack may be.
+///
+/// Sixty-four megabytes. The largest file in vanilla 1.21.1's data tree is
+/// under 400 KiB; this is three orders of magnitude of headroom for a
+/// legitimate pack and still a number a server can refuse to allocate past.
+///
+/// One cap covers both containers on purpose. A datapack ships as a directory
+/// or as a zip, an operator moves one to the other by zipping it, and a limit
+/// that differed between the two would mean the same pack loads from a folder
+/// and refuses from an archive — a distinction nobody can be expected to debug.
+/// [`crate::zip`] enforces it against the archive's own declared sizes before
+/// decompressing, which is where a lying header is caught; here it is enforced
+/// against the file's length on disk before reading, which is where a
+/// multi-gigabyte log someone left inside a pack is caught.
+pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Why a pack's bytes could not be got at.
 #[derive(Debug)]
 pub enum PackError {
@@ -45,6 +61,9 @@ pub enum PackError {
     TooDeep {
         path: String,
     },
+    TooLarge {
+        path: String,
+    },
 }
 
 impl std::fmt::Display for PackError {
@@ -56,6 +75,12 @@ impl std::fmt::Display for PackError {
                 f,
                 "{path} nests more than {MAX_DEPTH} directories deep. If that is \
                  not a mistake it is a symlink pointing back at itself."
+            ),
+            Self::TooLarge { path } => write!(
+                f,
+                "{path} is larger than the {MAX_FILE_BYTES}-byte limit Dust reads \
+                 from one file in a pack. It is almost certainly not data — a \
+                 world backup or a log left inside the pack directory."
             ),
         }
     }
@@ -206,6 +231,27 @@ impl PackSource for DirectoryPack {
 
     fn read(&self, path: &str) -> Result<Option<Vec<u8>>, PackError> {
         let full = self.root.join(path);
+        // The size is checked before the read, not after: the point of the cap
+        // is to refuse to allocate, and a read that checks its own length has
+        // already paid for the allocation. A file that grows between the two
+        // calls gets caught by the zip reader's equivalent check on the next
+        // load; a pack being edited under a running server is re-read anyway.
+        let length = match std::fs::metadata(&full) {
+            Ok(meta) if meta.is_file() => meta.len(),
+            Ok(_) => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(PackError::Io {
+                    path: full.display().to_string(),
+                    source,
+                })
+            }
+        };
+        if length > MAX_FILE_BYTES {
+            return Err(PackError::TooLarge {
+                path: full.display().to_string(),
+            });
+        }
         match std::fs::read(&full) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -329,6 +375,32 @@ fn directory_id(path: &Path) -> String {
 mod tests {
     use super::*;
 
+    /// A directory that exists only for this test, named after it so two
+    /// runners on one machine cannot collide.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("dust-data-pack-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("temp dir");
+            Self(path)
+        }
+
+        fn write(&self, relative: &str, bytes: &[u8]) {
+            let full = self.0.join(relative);
+            std::fs::create_dir_all(full.parent().expect("parent")).expect("parent dir");
+            std::fs::write(full, bytes).expect("file");
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn a_pack_is_named_after_its_directory_and_not_its_whole_path() {
         let pack = DirectoryPack::open("/somewhere/deep/my_pack");
@@ -367,5 +439,42 @@ mod tests {
         let temp = std::env::temp_dir();
         let opened = open(&temp).expect("a directory opens");
         assert_eq!(opened.origin(), temp.display().to_string());
+    }
+
+    #[test]
+    fn a_file_past_the_size_cap_is_refused_before_it_is_read() {
+        let temp = TempDir::new("too_large");
+        // Written sparse: the length is set without the bytes ever existing, so
+        // the test does not move 64 MiB to check a number.
+        let big = temp.0.join("data/minecraft/recipe/big.json");
+        std::fs::create_dir_all(big.parent().unwrap()).unwrap();
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_FILE_BYTES + 1)
+            .unwrap();
+
+        let pack = DirectoryPack::open(&temp.0);
+        let error = pack
+            .read("data/minecraft/recipe/big.json")
+            .expect_err("too large");
+        assert!(matches!(error, PackError::TooLarge { .. }), "{error}");
+        assert!(error.to_string().contains("limit"), "{error}");
+    }
+
+    #[test]
+    fn a_file_at_the_cap_reads_and_one_byte_under_it_too() {
+        // The boundary is inclusive: a file exactly the size of the cap is
+        // legitimate data, and an off-by-one here would reject it.
+        let temp = TempDir::new("at_the_cap");
+        let body = " ".repeat(1024);
+        temp.write("data/minecraft/recipe/a.json", body.as_bytes());
+        let pack = DirectoryPack::open(&temp.0);
+        assert_eq!(
+            pack.read("data/minecraft/recipe/a.json")
+                .expect("reads")
+                .expect("present")
+                .len(),
+            1024
+        );
     }
 }

@@ -10,7 +10,7 @@
 //! A zip in `datapacks/` came from wherever the operator got it, so this is an
 //! untrusted parser and the limits are part of the design rather than tidying:
 //!
-//! * **[`MAX_ENTRY_BYTES`]** caps one entry's decompressed size, and the
+//! * **[`MAX_FILE_BYTES`]** caps one entry's decompressed size, and the
 //!   declared size from the central directory is passed to the decompressor as
 //!   well, so a header that lies about how small an entry is fails on the
 //!   *first* byte past the limit instead of on the last byte of memory.
@@ -34,13 +34,14 @@
 //! one that says it cannot.
 
 use crate::inflate::{inflate, InflateError};
+use crate::pack::MAX_FILE_BYTES;
 
-/// The largest a single file inside a pack may decompress to.
+/// [`MAX_FILE_BYTES`] as the `usize` the entry sizes are parsed into.
 ///
-/// Sixty-four megabytes. The largest file in vanilla 1.21.1's data tree is
-/// under 400 KiB; this is three orders of magnitude of headroom for a
-/// legitimate pack and still a number a server can refuse to allocate past.
-pub const MAX_ENTRY_BYTES: usize = 64 * 1024 * 1024;
+/// The cap is a file size and lives as `u64` where file sizes live; the entry
+/// fields are 32-bit, so everything they can hold compares cleanly against a
+/// 64 MiB limit on any platform that can run this server at all.
+const ENTRY_LIMIT: usize = MAX_FILE_BYTES as usize;
 
 /// The largest number of entries a pack archive may hold.
 ///
@@ -292,18 +293,16 @@ impl ZipArchive {
             .get(start..end)
             .ok_or(ZipError::Truncated { at: start })?;
 
-        if entry.uncompressed_size > MAX_ENTRY_BYTES {
+        if entry.uncompressed_size > ENTRY_LIMIT {
             return Err(ZipError::Inflate {
                 name: entry.name.clone(),
-                source: InflateError::TooLarge {
-                    limit: MAX_ENTRY_BYTES,
-                },
+                source: InflateError::TooLarge { limit: ENTRY_LIMIT },
             });
         }
 
         let bytes = match entry.method {
             METHOD_STORED => raw.to_vec(),
-            _ => inflate(raw, entry.uncompressed_size.min(MAX_ENTRY_BYTES)).map_err(|source| {
+            _ => inflate(raw, entry.uncompressed_size.min(ENTRY_LIMIT)).map_err(|source| {
                 ZipError::Inflate {
                     name: entry.name.clone(),
                     source,
