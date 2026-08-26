@@ -55,20 +55,21 @@ fn scalar_widths_are_big_endian_and_signed() {
     compound.insert("d", Tag::Double(-2.0));
 
     let bytes = write::to_vec("", &Tag::Compound(compound.clone())).expect("writes");
-    let expected: Vec<u8> = [
-        &[
-            0x0a, 0x00, 0x00, //
-            0x01, 0x00, 0x01, b'b', 0xff, //
-            0x02, 0x00, 0x01, b's', 0xff, 0xfe, //
-            0x03, 0x00, 0x01, b'i', 0xff, 0xff, 0xff, 0xfd, //
-            0x04, 0x00, 0x01, b'l', 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc, //
-            0x05, 0x00, 0x01, b'f', 0x3f, 0x80, 0x00, 0x00, //
-            0x06, 0x00, 0x01, b'd', 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
-            0x00,
-        ][..],
-    ]
+    let expected: Vec<u8> = [&[
+        0x0a, 0x00, 0x00, //
+        0x01, 0x00, 0x01, b'b', 0xff, //
+        0x02, 0x00, 0x01, b's', 0xff, 0xfe, //
+        0x03, 0x00, 0x01, b'i', 0xff, 0xff, 0xff, 0xfd, //
+        0x04, 0x00, 0x01, b'l', 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc, //
+        0x05, 0x00, 0x01, b'f', 0x3f, 0x80, 0x00, 0x00, //
+        0x06, 0x00, 0x01, b'd', 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+        0x00,
+    ][..]]
     .concat();
-    assert_eq!(bytes, expected, "payloads are two's complement and IEEE 754 big-endian");
+    assert_eq!(
+        bytes, expected,
+        "payloads are two's complement and IEEE 754 big-endian"
+    );
 
     // And the same bytes are *read back* into the same tags, so the check does
     // not depend on the writer having been the one to produce them.
@@ -98,7 +99,11 @@ fn a_string_through_the_stack_stays_byte_identical() {
     expected.extend_from_slice(&payload);
     // Skip the root id and name; compare the payload the length prefix describes.
     assert_eq!(&bytes[3..], &payload[..]);
-    assert_eq!(&bytes[3..5], &[0x00, 0x0d][..], "the u16 prefix counts encoded bytes");
+    assert_eq!(
+        &bytes[3..5],
+        &[0x00, 0x0d][..],
+        "the u16 prefix counts encoded bytes"
+    );
 
     let document = read::from_bytes_exact(&bytes).expect("reads");
     assert_eq!(document.tag, Tag::String(text.to_owned()));
@@ -157,14 +162,12 @@ fn an_empty_lists_declared_type_survives_a_rewrite() {
 #[test]
 fn duplicate_keys_are_preserved_and_resolve_to_the_last() {
     // {id: "first", id: "second"} with both bindings intact.
-    let bytes: Vec<u8> = [
-        &[
-            0x0a, 0x00, 0x00, //
-            0x08, 0x00, 0x01, b'a', 0x00, 0x05, b'f', b'i', b'r', b's', b't', //
-            0x08, 0x00, 0x01, b'a', 0x00, 0x06, b's', b'e', b'c', b'o', b'n', b'd', //
-            0x00,
-        ][..],
-    ]
+    let bytes: Vec<u8> = [&[
+        0x0a, 0x00, 0x00, //
+        0x08, 0x00, 0x01, b'a', 0x00, 0x05, b'f', b'i', b'r', b's', b't', //
+        0x08, 0x00, 0x01, b'a', 0x00, 0x06, b's', b'e', b'c', b'o', b'n', b'd', //
+        0x00,
+    ][..]]
     .concat();
 
     let document = read::from_bytes_exact(&bytes).expect("reads");
@@ -230,9 +233,7 @@ fn malformed_documents_are_refused_with_precise_errors() {
     lying.push(0x00);
     match read::from_bytes(&lying).map(|n| n.tag) {
         Err(Error::LengthExceedsInput {
-            claimed,
-            available,
-            ..
+            claimed, available, ..
         }) => {
             assert_eq!(claimed, 1_000_000);
             assert_eq!(available, 1);
@@ -253,7 +254,11 @@ fn malformed_documents_are_refused_with_precise_errors() {
     // Truncation mid-payload names how many bytes were missing.
     assert!(matches!(
         read::from_bytes(&[0x03, 0x00, 0x00, 0x12]),
-        Err(Error::UnexpectedEnd { needed: 4, available: 1, .. })
+        Err(Error::UnexpectedEnd {
+            needed: 4,
+            available: 1,
+            ..
+        })
     ));
 }
 
@@ -272,10 +277,13 @@ fn trailing_padding_is_tolerated_then_reported() {
 
     let mut reader = read::Reader::new(&padded, Limits::default());
     let named = reader.read_root(Mode::File).expect("reads");
-    assert_eq!(named, Named {
-        name: String::new(),
-        tag: Tag::Byte(-7)
-    });
+    assert_eq!(
+        named,
+        Named {
+            name: String::new(),
+            tag: Tag::Byte(-7)
+        }
+    );
     assert_eq!(reader.position(), document_bytes.len());
     assert!(reader.finish().is_err(), "padding is still there");
 }
@@ -310,11 +318,14 @@ fn file_bytes_through_the_network_reader_succeed_and_are_wrong() {
 
     // An empty-name compound reads as an empty compound — right-shaped, wrong
     // size, with the entire original body left behind as trailing bytes.
-    let body = write::to_vec("", &Tag::Compound({
-        let mut c = Compound::new();
-        c.insert("x", Tag::Byte(7));
-        c
-    }))
+    let body = write::to_vec(
+        "",
+        &Tag::Compound({
+            let mut c = Compound::new();
+            c.insert("x", Tag::Byte(7));
+            c
+        }),
+    )
     .expect("writes");
     let misread = read::from_bytes_network(&body)
         .expect("still no error")

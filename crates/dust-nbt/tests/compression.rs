@@ -43,8 +43,7 @@ fn both_schemes_round_trip_and_none_borrows() {
 
     // `None` is required to be free: no copy, no allocation, and the limit
     // does not apply to bytes that were never inflated.
-    let borrowed =
-        compression::decompress(&plain, Compression::None, 0).expect("borrows");
+    let borrowed = compression::decompress(&plain, Compression::None, 0).expect("borrows");
     assert!(matches!(borrowed, std::borrow::Cow::Borrowed(_)));
 }
 
@@ -54,9 +53,7 @@ fn both_schemes_round_trip_and_none_borrows() {
 fn detection_recognises_each_scheme() {
     let plain = document();
     assert_eq!(
-        Compression::detect(
-            &compression::compress(&plain, Compression::Gzip).expect("writes")
-        ),
+        Compression::detect(&compression::compress(&plain, Compression::Gzip).expect("writes")),
         Compression::Gzip,
         "the gzip magic number is unambiguous"
     );
@@ -105,14 +102,20 @@ fn corrupted_streams_are_refused_with_the_scheme_named() {
     bad_magic[1] ^= 0xff;
     assert!(matches!(
         compression::decompress(&bad_magic, Compression::Gzip, usize::MAX),
-        Err(CompressionError::Malformed { scheme: Compression::Gzip, .. })
+        Err(CompressionError::Malformed {
+            scheme: Compression::Gzip,
+            ..
+        })
     ));
 
     // Truncation: half a stream has no final block and no trailer.
     let truncated = &gzip[..gzip.len() / 2];
     assert!(matches!(
         compression::decompress(truncated, Compression::Gzip, usize::MAX),
-        Err(CompressionError::Malformed { scheme: Compression::Gzip, .. })
+        Err(CompressionError::Malformed {
+            scheme: Compression::Gzip,
+            ..
+        })
     ));
 
     // Bad CRC32: valid deflate, damaged trailer. This one matters most — the
@@ -122,7 +125,10 @@ fn corrupted_streams_are_refused_with_the_scheme_named() {
     bad_crc[last - 5] ^= 0x01;
     assert!(matches!(
         compression::decompress(&bad_crc, Compression::Gzip, usize::MAX),
-        Err(CompressionError::Malformed { scheme: Compression::Gzip, .. })
+        Err(CompressionError::Malformed {
+            scheme: Compression::Gzip,
+            ..
+        })
     ));
 
     // --- zlib ---------------------------------------------------------------
@@ -134,7 +140,10 @@ fn corrupted_streams_are_refused_with_the_scheme_named() {
     bad_adler[last - 1] ^= 0x80;
     assert!(matches!(
         compression::decompress(&bad_adler, Compression::Zlib, usize::MAX),
-        Err(CompressionError::Malformed { scheme: Compression::Zlib, .. })
+        Err(CompressionError::Malformed {
+            scheme: Compression::Zlib,
+            ..
+        })
     ));
 
     // Broken header check: the second byte must make the first two a multiple
@@ -143,13 +152,19 @@ fn corrupted_streams_are_refused_with_the_scheme_named() {
     bad_header[1] ^= 0x01;
     assert!(matches!(
         compression::decompress(&bad_header, Compression::Zlib, usize::MAX),
-        Err(CompressionError::Malformed { scheme: Compression::Zlib, .. })
+        Err(CompressionError::Malformed {
+            scheme: Compression::Zlib,
+            ..
+        })
     ));
 
     // Truncated mid-stream, as a region file with a short chunk would be.
     assert!(matches!(
         compression::decompress(&zlib[..zlib.len() / 2], Compression::Zlib, usize::MAX),
-        Err(CompressionError::Malformed { scheme: Compression::Zlib, .. })
+        Err(CompressionError::Malformed {
+            scheme: Compression::Zlib,
+            ..
+        })
     ));
 }
 
@@ -175,7 +190,10 @@ fn decompression_bombs_stop_at_the_limit() {
 
         match compression::decompress(&bomb, scheme, 1024 * 1024) {
             Err(CompressionError::TooLarge { limit }) => assert_eq!(limit, 1024 * 1024),
-            other => panic!("{scheme:?}: expected TooLarge, got {:?}", other.map(|c| c.len())),
+            other => panic!(
+                "{scheme:?}: expected TooLarge, got {:?}",
+                other.map(|c| c.len())
+            ),
         }
 
         // Just under the limit is fine, which is what separates a cap from a

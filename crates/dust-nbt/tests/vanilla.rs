@@ -201,7 +201,10 @@ fn vanilla_structures_hold_the_values_the_format_says_they_do() {
         assert_eq!(size.len(), 3, "{name}: size should have three entries");
         let dimensions: Vec<i64> = size
             .iter()
-            .map(|t| t.as_i64().unwrap_or_else(|| panic!("{name}: size entries are numbers")))
+            .map(|t| {
+                t.as_i64()
+                    .unwrap_or_else(|| panic!("{name}: size entries are numbers"))
+            })
             .collect();
         assert!(
             dimensions.iter().all(|d| *d > 0),
@@ -304,7 +307,10 @@ fn the_corpus_reaches_ten_of_the_twelve_value_tags() {
 
     let mut seen = std::collections::BTreeMap::new();
     for (_, bytes) in &files {
-        count(&read::from_bytes_exact(bytes).expect("parses").tag, &mut seen);
+        count(
+            &read::from_bytes_exact(bytes).expect("parses").tag,
+            &mut seen,
+        );
     }
 
     for tag in [
@@ -371,7 +377,10 @@ fn a_real_int_array_is_a_uuid_of_four_words() {
 
     let mut uuids = Vec::new();
     for (_, bytes) in &files {
-        find_uuid(&read::from_bytes_exact(bytes).expect("parses").tag, &mut uuids);
+        find_uuid(
+            &read::from_bytes_exact(bytes).expect("parses").tag,
+            &mut uuids,
+        );
     }
     assert!(
         !uuids.is_empty(),

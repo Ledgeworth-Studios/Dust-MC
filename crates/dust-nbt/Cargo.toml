@@ -19,7 +19,13 @@ flate2.workspace = true
 # The generated-document suites: round-trips through both binary dialects and
 # the SNBT printer/parser differential. The strategies live with the rest of
 # the test plumbing in `tests/support/mod.rs`.
-proptest = "1"
+#
+# Default features are off because the defaults include process-forking test
+# isolation (`rusty-fork`), whose dependency tree declares its licences in the
+# legacy slash form — `MIT/Apache-2.0` — that is not valid SPDX and that our
+# licence gate rightly refuses to parse by guessing. Nothing here forks;
+# `std` and `bit-set` are everything the strategies use.
+proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }
 
 # A stopwatch and nothing else; see the note at the top of the bench.
 [[bench]]

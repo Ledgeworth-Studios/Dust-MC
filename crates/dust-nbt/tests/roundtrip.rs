@@ -143,8 +143,6 @@ fn nesting_one_under_the_limit_round_trips() {
 /// mistranslated, this names it.
 #[test]
 fn every_boundary_value_survives_both_dialects() {
-    use std::f32::INFINITY as F32_INF;
-
     let mut compound = dust_nbt::Compound::new();
     compound.insert("byte_min", Tag::Byte(i8::MIN));
     compound.insert("byte_max", Tag::Byte(i8::MAX));
@@ -154,16 +152,24 @@ fn every_boundary_value_survives_both_dialects() {
     compound.insert("long_max", Tag::Long(i64::MAX));
     compound.insert("float_neg_zero", Tag::Float(-0.0));
     compound.insert("float_nan", Tag::Float(f32::from_bits(0x7fc0_0001)));
-    compound.insert("float_inf", Tag::Float(F32_INF));
+    compound.insert("float_inf", Tag::Float(f32::INFINITY));
     compound.insert("double_neg_zero", Tag::Double(-0.0));
-    compound.insert("double_nan", Tag::Double(f64::from_bits(0xfff8_0000_0000_0001)));
+    compound.insert(
+        "double_nan",
+        Tag::Double(f64::from_bits(0xfff8_0000_0000_0001)),
+    );
 
     let bytes = write::to_vec("", &Tag::Compound(compound.clone())).expect("writes");
-    assert_eq!(read::from_bytes_exact(&bytes).expect("reads").tag, Tag::Compound(compound.clone()));
+    assert_eq!(
+        read::from_bytes_exact(&bytes).expect("reads").tag,
+        Tag::Compound(compound.clone())
+    );
 
     let network = write::to_vec_network(Some(&Tag::Compound(compound.clone()))).expect("writes");
     assert_eq!(
-        read::from_bytes_network(&network).expect("reads").expect("not absent"),
+        read::from_bytes_network(&network)
+            .expect("reads")
+            .expect("not absent"),
         Tag::Compound(compound)
     );
 }

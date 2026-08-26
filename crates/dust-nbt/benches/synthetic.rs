@@ -109,7 +109,10 @@ fn main() {
     });
     measure("binary parse (network)", ROUNDS, |rounds| {
         for _ in 0..rounds {
-            drop(read::from_bytes_network_with(&network_bytes, dust_nbt::Limits::FILE));
+            drop(read::from_bytes_network_with(
+                &network_bytes,
+                dust_nbt::Limits::FILE,
+            ));
         }
     });
     measure("snbt print", TEXT_ROUNDS, |rounds| {

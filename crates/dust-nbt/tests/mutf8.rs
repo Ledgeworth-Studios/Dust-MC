@@ -61,9 +61,21 @@ fn encoding_matches_the_jdk() {
         ("U+FFFF", "\u{ffff}", &[0xef, 0xbf, 0xbf]),
         ("section sign", "\u{00a7}", &[0xc2, 0xa7]),
         // Above the BMP: a surrogate pair, six bytes, not the four-byte form.
-        ("U+1F600 emoji", "\u{1f600}", &[0xed, 0xa0, 0xbd, 0xed, 0xb8, 0x80]),
-        ("U+10000", "\u{10000}", &[0xed, 0xa0, 0x80, 0xed, 0xb0, 0x80]),
-        ("U+10FFFF", "\u{10ffff}", &[0xed, 0xaf, 0xbf, 0xed, 0xbf, 0xbf]),
+        (
+            "U+1F600 emoji",
+            "\u{1f600}",
+            &[0xed, 0xa0, 0xbd, 0xed, 0xb8, 0x80],
+        ),
+        (
+            "U+10000",
+            "\u{10000}",
+            &[0xed, 0xa0, 0x80, 0xed, 0xb0, 0x80],
+        ),
+        (
+            "U+10FFFF",
+            "\u{10ffff}",
+            &[0xed, 0xaf, 0xbf, 0xed, 0xbf, 0xbf],
+        ),
         (
             "emoji then NUL",
             "\u{1f600}\u{0000}",

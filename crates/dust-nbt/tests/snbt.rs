@@ -33,21 +33,45 @@ fn one_field(key: &str, value: Tag) -> Tag {
 #[test]
 fn integer_suffix_forms_parse_to_their_widths() {
     assert_eq!(snbt::parse("42b"), Ok(Tag::Byte(42)));
-    assert_eq!(snbt::parse("42B"), Ok(Tag::Byte(42)), "suffixes are case-insensitive");
+    assert_eq!(
+        snbt::parse("42B"),
+        Ok(Tag::Byte(42)),
+        "suffixes are case-insensitive"
+    );
     assert_eq!(snbt::parse("-129s"), Ok(Tag::Short(-129)));
     assert_eq!(snbt::parse("9223372036854775807L"), Ok(Tag::Long(i64::MAX)));
-    assert_eq!(snbt::parse("-0"), Ok(Tag::Int(0)), "negative zero of an int is zero");
-    assert_eq!(snbt::parse("+7"), Ok(Tag::Int(7)), "a leading plus is part of the pattern");
+    assert_eq!(
+        snbt::parse("-0"),
+        Ok(Tag::Int(0)),
+        "negative zero of an int is zero"
+    );
+    assert_eq!(
+        snbt::parse("+7"),
+        Ok(Tag::Int(7)),
+        "a leading plus is part of the pattern"
+    );
 }
 
 #[test]
 fn float_and_double_forms_parse_to_their_widths() {
-    assert_eq!(snbt::parse("1f"), Ok(Tag::Float(1.0)), "a bare integer takes the f suffix");
+    assert_eq!(
+        snbt::parse("1f"),
+        Ok(Tag::Float(1.0)),
+        "a bare integer takes the f suffix"
+    );
     assert_eq!(snbt::parse("1F"), Ok(Tag::Float(1.0)));
     assert_eq!(snbt::parse(".5f"), Ok(Tag::Float(0.5)));
-    assert_eq!(snbt::parse("1.d"), Ok(Tag::Double(1.0)), "digits-then-point needs no fraction");
+    assert_eq!(
+        snbt::parse("1.d"),
+        Ok(Tag::Double(1.0)),
+        "digits-then-point needs no fraction"
+    );
     assert_eq!(snbt::parse("-2.5e10d"), Ok(Tag::Double(-2.5e10)));
-    assert_eq!(snbt::parse("5."), Ok(Tag::Double(5.0)), "the bare-double rule wants the point");
+    assert_eq!(
+        snbt::parse("5."),
+        Ok(Tag::Double(5.0)),
+        "the bare-double rule wants the point"
+    );
     assert_eq!(
         snbt::parse("-.25"),
         Ok(Tag::Double(-0.25)),
@@ -94,7 +118,11 @@ fn true_and_false_are_bytes_case_insensitively() {
     );
 
     // And printing goes back through the numeric path, which round-trips.
-    assert_eq!(snbt::to_string(&Tag::Byte(1)), "1b", "there is no boolean tag to print");
+    assert_eq!(
+        snbt::to_string(&Tag::Byte(1)),
+        "1b",
+        "there is no boolean tag to print"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -142,11 +170,8 @@ fn empty_arrays_have_all_three_spellings() {
 
 #[test]
 fn lists_take_the_type_of_their_first_element() {
-    let expected = List::from_elements(
-        TagType::Float,
-        vec![Tag::Float(1.0), Tag::Float(2.0)],
-    )
-    .expect("homogeneous");
+    let expected = List::from_elements(TagType::Float, vec![Tag::Float(1.0), Tag::Float(2.0)])
+        .expect("homogeneous");
     assert_eq!(snbt::parse("[1f,2f]"), Ok(Tag::List(expected)));
     assert_eq!(snbt::parse("[]"), Ok(Tag::List(List::new(TagType::End))));
     assert_eq!(snbt::to_string(&Tag::List(List::new(TagType::End))), "[]");
@@ -178,7 +203,10 @@ fn whitespace_is_tolerated_between_tokens() {
 fn quoted_strings_choose_and_escape_their_quote() {
     // The quote character follows the first quote-ish character in the
     // string; only the chosen quote and backslash ever escape.
-    assert_eq!(snbt::parse(r#""plain""#), Ok(Tag::String("plain".to_owned())));
+    assert_eq!(
+        snbt::parse(r#""plain""#),
+        Ok(Tag::String("plain".to_owned()))
+    );
     assert_eq!(
         snbt::parse("'he said \"hi\"'"),
         Ok(Tag::String("he said \"hi\"".to_owned())),
@@ -265,7 +293,8 @@ fn keys_follow_the_same_quoting_rules_as_values() {
     // The printer quotes a key against `[A-Za-z0-9._+-]+`, so this parses
     // back to the same key.
     assert_eq!(
-        snbt::parse(&snbt::to_string(&one_field("weird key:!", Tag::Byte(3)))).expect("round-trips"),
+        snbt::parse(&snbt::to_string(&one_field("weird key:!", Tag::Byte(3))))
+            .expect("round-trips"),
         one_field("weird key:!", Tag::Byte(3))
     );
 }

@@ -206,10 +206,7 @@ impl<'a> Zip<'a> {
 }
 
 fn read_u16(data: &[u8], at: usize) -> Option<u16> {
-    Some(u16::from_le_bytes([
-        *data.get(at)?,
-        *data.get(at + 1)?,
-    ]))
+    Some(u16::from_le_bytes([*data.get(at)?, *data.get(at + 1)?]))
 }
 
 fn read_u32(data: &[u8], at: usize) -> Option<u32> {
@@ -294,7 +291,6 @@ fn read_be_u16(data: &[u8], at: usize) -> Option<u16> {
 /// appear both as vanilla writes them (element type `TAG_End`) and with a
 /// declared type preserved from some other tool, because those two encode
 /// differently and must both survive.
-
 use dust_nbt::Tag;
 use proptest::prelude::*;
 
@@ -598,7 +594,9 @@ pub fn survives_snbt(tag: &Tag) -> bool {
 /// [`any_tag`] restricted to what SNBT can carry losslessly, for the
 /// printer/parser differential.
 pub fn any_tag_surviving_snbt() -> BoxedStrategy<Tag> {
-    any_tag().prop_filter("must survive SNBT", survives_snbt).boxed()
+    any_tag()
+        .prop_filter("must survive SNBT", survives_snbt)
+        .boxed()
 }
 
 /// A root name for the file dialect: any string at all, empty most often in

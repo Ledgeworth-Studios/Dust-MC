@@ -191,9 +191,14 @@ fn a_raised_limit_on_a_generous_stack_reads_deeper_documents() {
             ..Limits::FILE
         };
         let mut reader = read::Reader::new(&deep, limits);
-        let document = reader.read_root(Mode::File).expect("reads within its allowance");
+        let document = reader
+            .read_root(Mode::File)
+            .expect("reads within its allowance");
         assert_eq!(document.name, "");
-        assert!(document.tag.as_list().is_some(), "the outermost value is the list");
+        assert!(
+            document.tag.as_list().is_some(),
+            "the outermost value is the list"
+        );
 
         // And the same knob tightens as well as loosens.
         let strict = Limits {
@@ -308,11 +313,11 @@ fn corpus_documents() -> Vec<Vec<u8>> {
     let mut compound = dust_nbt::Compound::new();
     compound.insert("name", Tag::String("notch\u{0000}\u{1f600}".to_owned()));
     compound.insert("floats", Tag::Float(f32::from_bits(0x7fc0_0001)));
-    compound.insert("empty", Tag::List(dust_nbt::List::new(dust_nbt::TagType::Int)));
     compound.insert(
-        "words",
-        Tag::IntArray(vec![i32::MIN, -1, 0, 1, i32::MAX]),
+        "empty",
+        Tag::List(dust_nbt::List::new(dust_nbt::TagType::Int)),
     );
+    compound.insert("words", Tag::IntArray(vec![i32::MIN, -1, 0, 1, i32::MAX]));
 
     let mut duplicated = dust_nbt::Compound::new();
     duplicated.insert("id", Tag::String("first".to_owned()));
@@ -322,10 +327,7 @@ fn corpus_documents() -> Vec<Vec<u8>> {
     let named = vec![
         ("root".to_owned(), Tag::Compound(compound.clone())),
         (String::new(), Tag::ByteArray(vec![i8::MIN, 0, i8::MAX])),
-        (
-            "tiny".to_owned(),
-            Tag::Long(i64::MIN),
-        ),
+        ("tiny".to_owned(), Tag::Long(i64::MIN)),
     ];
     named
         .into_iter()
@@ -455,7 +457,10 @@ fn thousands_of_mutated_snbt_texts_never_panic() {
         "too many inputs were skipped as non-UTF-8 ({skipped} of {ITERATIONS}); the \
          mutation rate needs tuning"
     );
-    assert!(parsed > 50 && refused > 50, "both outcomes should be common");
+    assert!(
+        parsed > 50 && refused > 50,
+        "both outcomes should be common"
+    );
 }
 
 /// Empty and one-byte inputs, the boundary every reader hits first.
