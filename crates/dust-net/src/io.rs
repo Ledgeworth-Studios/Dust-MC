@@ -35,10 +35,13 @@
 //! adds is that the *timeout policy reads the state* — the pre-authentication
 //! budget applies only while [`State::is_pre_authentication`] says it should.
 //!
-//! Nor is it a rate limiter. A peer may send legal frames at full line rate
-//! forever and trip nothing here; pacing misbehaving connections belongs to
-//! the layer above the transport, which knows about other connections. This
-//! one deliberately does not.
+//! It does pace, but only per connection: the optional inbound bucket from
+//! [`crate::limits`] is charged against raw bytes before the codec runs,
+//! so a peer's share of the server's attention is whatever its own policy
+//! allows and nothing else. What this layer still does not see is *other*
+//! connections. A global cap on live connections is a semaphore with a
+//! number somebody else chose — [`crate::limits::AdmissionGate`] provides
+//! the type, and the accept loop above owns the decision.
 //!
 //! # Delivery semantics, stated precisely
 //!
@@ -64,6 +67,8 @@ use tokio::task::JoinHandle;
 
 use crate::crypt::{Cipher, SharedSecret, SHARED_SECRET_LEN};
 use crate::frame::{Compress, Frame, FrameDecoder, FrameEncoder, FrameError, Limits, Needed};
+use crate::limits::{InboundRate, TokenBucket};
+use crate::metrics::{ConnCounters, StatsSnapshot};
 use crate::state::{Connection as StateMachine, HandshakeError, IllegalTransition, Intent, State};
 use crate::varint::MAX_VAR_INT_LEN;
 
@@ -133,6 +138,16 @@ pub struct ConnConfig {
     /// chunk, so this number appears directly in that bound. See
     /// [`FrameDecoder`].
     pub read_chunk: usize,
+    /// The inbound pacing policy, applied to raw socket bytes before the
+    /// decoder — and therefore before decompression — ever sees them. See
+    /// [`InboundRate`] and [`crate::limits`] for why it lives there.
+    ///
+    /// `None` disables pacing entirely: every read proceeds at line rate,
+    /// and the only bounds on a peer's cost are the frame limits and the
+    /// liveness clocks. The default is generous rather than absent, for the
+    /// reason given in [`InboundRate::generous`]: an unpaced connection is
+    /// exactly as expensive to attack with as to use.
+    pub inbound_rate: Option<InboundRate>,
 }
 
 impl Default for ConnConfig {
@@ -142,6 +157,7 @@ impl Default for ConnConfig {
             timeouts: Timeouts::default(),
             outbound_capacity: 64,
             read_chunk: 8 * 1024,
+            inbound_rate: Some(InboundRate::generous()),
         }
     }
 }
@@ -273,6 +289,12 @@ pub struct Conn<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> {
     /// Where the writer records a write failure for the next operation that
     /// cares to look. Shared with the writer task; see `poisoned`.
     failure: Arc<Mutex<Option<ConnError>>>,
+    /// The connection's counters, shared with the writer task so both halves
+    /// of the stream report into the same totals. See [`crate::metrics`].
+    stats: Arc<ConnCounters>,
+    /// The inbound pacer, if a policy was configured. Charged against raw
+    /// wire bytes in [`fill`](Self::fill), before the decoder runs.
+    pacer: Option<TokenBucket>,
     /// Kept so a panic in the writer is noticed rather than detached into
     /// silence; nothing joins this handle in the normal path.
     _writer: JoinHandle<()>,
@@ -308,12 +330,14 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
         let limits = config.limits;
         let failure: Arc<Mutex<Option<ConnError>>> = Arc::default();
         let queued: Arc<AtomicUsize> = Arc::default();
+        let stats: Arc<ConnCounters> = Arc::new(ConnCounters::new());
         let handle = tokio::spawn(write_loop(
             writer,
             outbound_rx,
             abort_rx,
             Arc::clone(&failure),
             Arc::clone(&queued),
+            Arc::clone(&stats),
         ));
         Self {
             reader,
@@ -324,10 +348,14 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
             timeouts: config.timeouts,
             started_at: Instant::now(),
             scratch: vec![0u8; config.read_chunk.max(1)],
+            pacer: config
+                .inbound_rate
+                .map(|rate| TokenBucket::new(rate, Instant::now())),
             outbound: outbound_tx,
             queued,
             abort_flag,
             failure,
+            stats,
             _writer: handle,
             ended: false,
         }
@@ -386,6 +414,28 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
         self.queued.load(Ordering::Relaxed)
     }
 
+    /// A snapshot of this connection's counters: frames and bytes in each
+    /// direction, and terminal failures by kind. See [`crate::metrics`] for
+    /// what each count means and where it is taken.
+    ///
+    /// The numbers are exact at the instants their events happened; the
+    /// snapshot itself may already be behind a connection that kept moving.
+    /// Take another to see later.
+    pub fn stats(&self) -> StatsSnapshot {
+        let c = &*self.stats;
+        StatsSnapshot {
+            frames_in: c.frames_in.load(Ordering::Relaxed),
+            frames_out: c.frames_out.load(Ordering::Relaxed),
+            bytes_in: c.bytes_in.load(Ordering::Relaxed),
+            bytes_out: c.bytes_out.load(Ordering::Relaxed),
+            protocol_errors: c.protocol_errors.load(Ordering::Relaxed),
+            io_errors: c.io_errors.load(Ordering::Relaxed),
+            truncated_frames: c.truncated_frames.load(Ordering::Relaxed),
+            idle_timeouts: c.idle_timeouts.load(Ordering::Relaxed),
+            pre_auth_deadlines: c.pre_auth_deadlines.load(Ordering::Relaxed),
+        }
+    }
+
     /// Whether the transport has ended — cleanly, badly, or by local close.
     /// Afterwards every operation fails with [`ConnError::Closed`].
     pub fn has_ended(&self) -> bool {
@@ -435,10 +485,16 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
             return Err(self.take_failure().unwrap_or(ConnError::Closed));
         }
         self.cipher_in.enable(secret);
-        self.dispatch(Command::EnableEncryption {
-            secret: *secret.as_bytes(),
-        })
-        .await
+        if let Err(error) = self
+            .dispatch(Command::EnableEncryption {
+                secret: *secret.as_bytes(),
+            })
+            .await
+        {
+            self.stats.note_error(&error);
+            return Err(error);
+        }
+        Ok(())
     }
 
     // -- Reading -------------------------------------------------------------
@@ -466,9 +522,17 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
         // after a timeout or a bad frame there is no operation this driver
         // can still perform honestly.
         match self.pull_until_frame().await {
+            Ok(Some(frame)) => {
+                self.stats.frames_in.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(frame))
+            }
             Ok(outcome) => Ok(outcome),
             Err(error) => {
                 self.ended = true;
+                // Counted here, once, at the place the failure became an
+                // error; every later call returns Closed, which is not an
+                // event and is not counted.
+                self.stats.note_error(&error);
                 Err(error)
             }
         }
@@ -509,14 +573,19 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
     /// The prefix is five bytes at most, so the price is a handful of
     /// single-byte reads per frame, paid on the straggling head of the
     /// stream only. See [`Needed`].
+    ///
+    /// When a pacing policy is configured, the pull is capped again to what
+    /// the bucket will pay for, and charged after the bytes arrive — before
+    /// the decoder, and therefore before decompression, sees any of them.
     async fn fill(&mut self) -> Result<bool, ConnError> {
-        let wanted = match self.decoder.needed() {
+        let mut wanted = match self.decoder.needed() {
             Needed::Unknown => 1,
             // Zero means the decoder already holds a verdict — a frame or an
             // error — and reading anything would be reading past it.
             Needed::Exactly(0) => return Ok(true),
             Needed::Exactly(more) => more.min(self.scratch.len()).max(1),
         };
+        wanted = self.pace(wanted).await?;
 
         let read = self.reader.read(&mut self.scratch[..wanted]);
         let allowance = liveness::budget(
@@ -543,10 +612,69 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
         if n == 0 {
             return Ok(false);
         }
+        // Charged for what actually arrived: a short read costs what it
+        // used, not what it was offered. The charge lands before decode or
+        // decompress, which is the whole point of the placement.
+        if let Some(pacer) = self.pacer.as_mut() {
+            pacer.take(n, Instant::now());
+        }
+        // Counted beside the charge: this is the wire cost the peer chose
+        // to impose, whatever decryption and decompression turn it into.
+        self.stats.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
         let arrived = &mut self.scratch[..n];
         self.cipher_in.decrypt(arrived);
         self.decoder.feed(arrived);
         Ok(true)
+    }
+
+    /// Cap a read length to what the pacer will currently pay for, waiting
+    /// — within the liveness budget, never beyond it — until at least one
+    /// byte is affordable.
+    ///
+    /// The wait shares the connection's clocks rather than running its own,
+    /// so a flooder cannot convert "slow down" into "stay forever": when the
+    /// idle timeout or the pre-authentication budget expires mid-wait, the
+    /// same errors fire that a silent peer would have produced. Without a
+    /// policy configured this passes its argument straight through.
+    async fn pace(&mut self, wanted: usize) -> Result<usize, ConnError> {
+        if self.pacer.is_none() {
+            return Ok(wanted);
+        }
+        loop {
+            let now = Instant::now();
+            let affordable = self.pacer.as_mut().expect("checked above").available(now);
+            if affordable >= 1 {
+                return Ok((wanted as u64).min(affordable) as usize);
+            }
+
+            let wait = self
+                .pacer
+                .as_mut()
+                .expect("checked above")
+                .wait_for_one(now);
+            let allowance = liveness::budget(
+                self.timeouts.idle,
+                self.timeouts.pre_auth_budget,
+                self.started_at,
+                self.machine.state(),
+            );
+            match allowance {
+                Some((window, kind)) => {
+                    let nap = tokio::time::sleep(wait);
+                    if tokio::time::timeout(window, nap).await.is_err() {
+                        return Err(match kind {
+                            liveness::Kind::PreAuth => ConnError::PreAuthDeadline {
+                                budget: self.timeouts.pre_auth_budget.unwrap_or(window),
+                            },
+                            liveness::Kind::Idle => ConnError::IdleTimeout { limit: window },
+                        });
+                    }
+                    // Whether another byte became affordable is re-decided
+                    // at the top of the loop; waking early converges too.
+                }
+                None => tokio::time::sleep(wait).await,
+            }
+        }
     }
 
     // -- Writing -------------------------------------------------------------
@@ -568,6 +696,7 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
         }
         if let Some(failure) = self.take_failure() {
             self.ended = true;
+            self.stats.note_error(&failure);
             return Err(failure);
         }
         // Encoding happens before anything is queued, so an oversized frame
@@ -579,12 +708,15 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
         self.encoder.encode(&frame, &mut wire)?;
         match self.outbound.send(Command::Frame(wire)).await {
             Ok(()) => {
+                self.stats.frames_out.fetch_add(1, Ordering::Relaxed);
                 self.queued.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
             Err(_) => {
                 self.ended = true;
-                Err(self.take_failure().unwrap_or(ConnError::Closed))
+                let error = self.take_failure().unwrap_or(ConnError::Closed);
+                self.stats.note_error(&error);
+                Err(error)
             }
         }
     }
@@ -626,9 +758,15 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
             return Err(self.take_failure().unwrap_or(ConnError::Closed));
         }
         let (done_tx, done_rx) = oneshot::channel();
-        self.dispatch(Command::Finish { done: done_tx }).await?;
+        if let Err(error) = self.dispatch(Command::Finish { done: done_tx }).await {
+            self.stats.note_error(&error);
+            return Err(error);
+        }
         let outcome = done_rx.await.unwrap_or(Err(ConnError::Closed));
         self.ended = true;
+        if let Err(error) = &outcome {
+            self.stats.note_error(error);
+        }
         outcome
     }
 
@@ -688,6 +826,7 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
     mut abort: watch::Receiver<bool>,
     failure: Arc<Mutex<Option<ConnError>>>,
     queued: Arc<AtomicUsize>,
+    stats: Arc<ConnCounters>,
 ) {
     let mut cipher_out = Cipher::disabled();
 
@@ -733,6 +872,12 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
                             record_failure(&failure, Some(ConnError::Io(error)));
                             break;
                         }
+                        // Counted here rather than at accept time so that
+                        // `bytes_out` is what the socket actually took, the
+                        // honest counterpart to `bytes_in`'s wire cost. The
+                        // two counters answer different questions on a
+                        // stalled connection, which is the point.
+                        stats.bytes_out.fetch_add(wire.len() as u64, Ordering::Relaxed);
                     }
                 }
             }
