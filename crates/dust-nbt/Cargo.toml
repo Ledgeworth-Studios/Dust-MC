@@ -10,6 +10,12 @@ authors.workspace = true
 [dependencies]
 flate2.workspace = true
 
+[dev-dependencies]
+# The same crate the library uses. The tests need it directly because the
+# external corpus lives inside the server jar, and reading a jar means
+# inflating deflate streams — see `tests/support/mod.rs`.
+flate2.workspace = true
+
 [lints.rust]
 # The stub of this crate opted out of the workspace `unsafe_code = "deny"` in
 # anticipation of a zero-copy reader that would need it. The implementation
