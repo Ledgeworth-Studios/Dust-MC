@@ -28,11 +28,17 @@
 //! Bounding the *output* of decompression is the only place that particular
 //! bomb can be caught, so every function here takes a limit and none of them
 //! has a default that means "no limit".
+//!
+//! Completeness is checked as well as size. A deflate body that stops early is
+//! reported as malformed rather than returned as a short, plausible document —
+//! a prefix of a chunk parses exactly wrong enough to corrupt a world. Bytes
+//! *after* a complete stream are refused for the same reason; a caller holding
+//! a padded region-file slot slices to the header's length before asking here.
 
 use std::fmt;
 use std::io::Read;
 
-use flate2::read::{GzDecoder, ZlibDecoder};
+use flate2::read::GzDecoder;
 use flate2::write::{GzEncoder, ZlibEncoder};
 use flate2::Compression as Level;
 
@@ -168,8 +174,11 @@ pub fn decompress(
 ) -> std::result::Result<std::borrow::Cow<'_, [u8]>, CompressionError> {
     match scheme {
         Compression::None => Ok(std::borrow::Cow::Borrowed(bytes)),
+        // The gzip container validates itself — the trailer carries the
+        // payload's CRC32 and length, and the decoder refuses to report the
+        // end of input without them — so a plain bounded read is enough.
         Compression::Gzip => inflate(GzDecoder::new(bytes), scheme, limit).map(Into::into),
-        Compression::Zlib => inflate(ZlibDecoder::new(bytes), scheme, limit).map(Into::into),
+        Compression::Zlib => inflate_zlib(bytes, scheme, limit).map(Into::into),
     }
 }
 
@@ -220,6 +229,75 @@ fn inflate<R: Read>(
             }
         }
     }
+}
+
+/// Inflate a zlib stream, refusing anything that is not the whole stream.
+///
+/// This cannot go through the plain read loop above, because the backend under
+/// flate2 reports running out of *input* much like running out of *stream*: a
+/// truncated body inflates happily into a short `Ok`, a plausible prefix of
+/// the document that would parse exactly wrong enough to corrupt a world.
+/// Driving [`flate2::mem::Decompress`] directly gives the one signal that
+/// matters — `Status::StreamEnd`, which for zlib also means the adler32 has
+/// been checked — and lets success be defined as three conditions at once:
+/// the stream said it ended, it consumed every byte it was given, and it never
+/// produced more than `limit`.
+fn inflate_zlib(
+    bytes: &[u8],
+    scheme: Compression,
+    limit: usize,
+) -> std::result::Result<Vec<u8>, CompressionError> {
+    use flate2::{Decompress, FlushDecompress, Status};
+
+    const CHUNK: usize = 64 * 1024;
+    let mut decoder = Decompress::new(true);
+    let mut out = Vec::new();
+    loop {
+        // Reserve the next block of output here rather than letting the
+        // decoder grow the buffer: `decompress_vec` writes only into spare
+        // capacity, so memory stays bounded by `limit` plus one block instead
+        // of by whatever the stream claimed.
+        out.reserve(CHUNK);
+        let start = out.len();
+        let consumed_before = decoder.total_in() as usize;
+        let status = decoder
+            .decompress_vec(&bytes[consumed_before..], &mut out, FlushDecompress::None)
+            .map_err(|error| CompressionError::Malformed {
+                scheme,
+                detail: error.to_string(),
+            })?;
+        if out.len() > limit {
+            return Err(CompressionError::TooLarge { limit });
+        }
+        match status {
+            Status::StreamEnd => break,
+            Status::Ok | Status::BufError => {}
+        }
+        if decoder.total_in() as usize == bytes.len() {
+            return Err(CompressionError::Malformed {
+                scheme,
+                detail: "the input ran out before the stream's final block".to_owned(),
+            });
+        }
+        if decoder.total_in() as usize == consumed_before && out.len() == start {
+            return Err(CompressionError::Malformed {
+                scheme,
+                detail: "the stream made no progress".to_owned(),
+            });
+        }
+    }
+    let consumed = decoder.total_in() as usize;
+    if consumed != bytes.len() {
+        return Err(CompressionError::Malformed {
+            scheme,
+            detail: format!(
+                "the stream ended after {} bytes but {} were given",
+                consumed,
+                bytes.len()
+            ),
+        });
+    }
+    Ok(out)
 }
 
 /// Compress `bytes`.
