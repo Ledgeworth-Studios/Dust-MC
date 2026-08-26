@@ -379,6 +379,7 @@ version = "0.0.0"
 name = "dust-world"
 version = "0.0.0"
 dependencies = [
+ "dust-protocol",
  "flate2",
 ]
 

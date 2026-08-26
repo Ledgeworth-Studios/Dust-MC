@@ -105,6 +105,7 @@ pub mod container;
 pub mod coords;
 pub mod heightmap;
 pub mod light;
+pub mod network;
 pub mod palette;
 pub mod propagation;
 pub mod region;

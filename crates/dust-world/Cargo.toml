@@ -8,6 +8,11 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+# The chunk packet's section blob. dust-protocol owns the envelope and leaves
+# the contents behind a trait for this crate, which is where the paletted
+# container already lives; see src/network.rs.
+dust-protocol.workspace = true
+
 # gzip and zlib, which region files use and Dust does not get to choose. The
 # pure-Rust backend is selected explicitly: the C `zlib-sys` backends would put
 # a build-time C toolchain between a contributor and a working checkout, and
@@ -25,3 +30,5 @@ harness = false
 
 [lints]
 workspace = true
+
+[dev-dependencies]
