@@ -12,6 +12,21 @@ publish = false
 dust-config.workspace = true
 dust-data.workspace = true
 flate2.workspace = true
+
+# `harness rewrite` runs Dust's own Anvil reader and writer over a world and
+# hands the result back to vanilla. It has to be Dust's real code — a second
+# implementation here would be testing this crate's opinion of the format
+# rather than the server's. dust-server is the dependency and not just
+# dust-world because the registry-backed `Names`/`Ids` pair lives there, and
+# duplicating that mapping is the exact shape of defect this project keeps
+# finding: two implementations of one format, each agreeing with itself.
+#
+# The digest side deliberately does NOT share code. `harness::nbt` and
+# `harness::region` stay the throwaway independent readers they were, because
+# the whole value of the comparison is that the judge was not built here.
+dust-nbt.workspace = true
+dust-server.workspace = true
+dust-world.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

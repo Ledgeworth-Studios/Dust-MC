@@ -1245,6 +1245,9 @@ version = "0.0.0"
 dependencies = [
  "dust-config",
  "dust-data",
+ "dust-nbt",
+ "dust-server",
+ "dust-world",
  "flate2",
  "serde",
  "serde_json",

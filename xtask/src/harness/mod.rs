@@ -13,7 +13,12 @@
 //! harness provision --version 1.21.1 --seed 0 --yes   jar + run dir + properties
 //! harness capture --version 1.21.1 --seed 0 --radius 2  boot → pregen → digests
 //! harness compare A B                                 diff two digest sets
+//! harness rewrite --version 1.21.1 --seed 0 --radius 2  Dust writes it, vanilla reads it
 //! ```
+//!
+//! `rewrite` is the one verb that puts Dust's own code in the loop, and it is
+//! Phase 2's exit criterion made runnable — see [`rewrite`] for what a green
+//! run does and does not prove.
 //!
 //! `harness rcon` stands alone as a small client for talking to a running
 //! server (`/stop`, status queries), which both `capture` and operators use.
@@ -59,6 +64,7 @@ mod properties;
 mod provision;
 mod rcon;
 mod region;
+mod rewrite;
 
 use std::process::ExitCode;
 
@@ -94,6 +100,13 @@ outside the repository (override with DUST_HARNESS_CACHE).
       a human-readable chunks.tsv into the cache. Refuses to run before
       `provision` has accepted the EULA.
 
+  rewrite --version <v> --seed <n> --radius <r> [--jar <path>] [--timeout <s>]
+      Copy the provisioned world, rewrite every chunk of it through Dust's
+      own Anvil reader and writer, boot vanilla on the copy, and diff what
+      vanilla read back against this (version, seed, radius)'s capture. The
+      capture has to exist first. Exit codes match compare's: 0 the worlds
+      match, 1 they differ, 2 the run could not happen.
+
   compare <a> <b> [--tsv <path>]
       Diff two capture outputs (directories holding chunks.bin). Prints
       per-chunk rows — missing, extra, divergent, each with the digest pairs
@@ -109,6 +122,7 @@ enum Verb {
     Rcon(rcon::ClientOptions),
     Capture(capture::Options),
     Compare(compare::Options),
+    Rewrite(rewrite::Options),
 }
 
 /// Parse and run one harness verb.
@@ -134,9 +148,12 @@ pub fn dispatch(args: &[String]) -> Result<ExitCode, String> {
             capture::run(&options)?;
             Ok(ExitCode::SUCCESS)
         }
-        // Compare does not fail upward at all: its exit codes carry both the
-        // verdict (0/1) and its own operational failures (2).
+        // Neither compare nor rewrite fails upward: their exit codes carry
+        // both the verdict (0/1) and their own operational failures (2). A
+        // difference between two worlds is a finding to be read, not an error
+        // to be reported in one line with the table thrown away.
         Verb::Compare(options) => Ok(compare::run(&options)),
+        Verb::Rewrite(options) => Ok(rewrite::run(&options)),
     }
 }
 
@@ -150,8 +167,10 @@ fn parse(args: &[String]) -> Result<Verb, String> {
         "rcon" => rcon::parse_client_options(rest).map(Verb::Rcon),
         "capture" => capture::parse(rest).map(Verb::Capture),
         "compare" => compare::parse(rest).map(Verb::Compare),
+        "rewrite" => rewrite::parse(rest).map(Verb::Rewrite),
         other => Err(format!(
-            "unknown harness verb `{other}`\n\nThe verbs are: provision, rcon, capture, compare."
+            "unknown harness verb `{other}`\n\nThe verbs are: provision, rcon, capture, \
+             compare, rewrite."
         )),
     }
 }

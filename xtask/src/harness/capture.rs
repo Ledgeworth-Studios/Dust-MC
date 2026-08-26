@@ -35,7 +35,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::{cache, digest, properties, rcon};
@@ -165,24 +165,56 @@ pub fn run(options: &Options) -> Result<(), String> {
         None => crate::extract::download::server_jar(&options.version, &layout.jars)?,
     };
 
+    let label = capture_label(&options.version, options.seed, options.radius);
+    capture_from(options, &jar, &dir, &label, &layout, started)
+}
+
+/// Boot a run directory, force what is missing, and fingerprint what is on
+/// disk when it stops.
+///
+/// Split out of [`run`] because `rewrite` needs exactly this over a directory
+/// that is *not* `Layout::server_dir(version, seed)` — a copy of a world that
+/// Dust has rewritten. Sharing the function rather than the reasoning is the
+/// point: a second boot-and-scan written beside this one would be a second
+/// answer to "what counts as settled disk state", and the two would drift.
+///
+/// A run directory that already holds every expected chunk is booted anyway.
+/// That is not waste — for `rewrite` it *is* the test, because loading a world
+/// is the thing being checked, and vanilla resaving what it loaded is how the
+/// result becomes comparable.
+pub(super) fn capture_from(
+    options: &Options,
+    jar: &Path,
+    dir: &Path,
+    label: &str,
+    layout: &cache::Layout,
+    started: Instant,
+) -> Result<(), String> {
     let expected = digest::expected_chunks(options.radius);
     println!(
-        "capturing {} seed {}: {} chunks within radius {}, budget {}s",
+        "capturing {} seed {} from {}: {} chunks within radius {}, budget {}s",
         options.version,
         options.seed,
+        dir.display(),
         expected.len(),
         options.radius,
         options.timeout.as_secs()
     );
 
     let region_dir = dir.join("world/region");
-    supervise_run(options, &jar, &dir, &region_dir, &expected)?;
+    let transcript = supervise_run(options, jar, dir, &region_dir, &expected)?;
 
     let set = digest::scan(&region_dir, &expected, options.seed)?;
-    let label = capture_label(&options.version, options.seed, options.radius);
-    let out_dir = layout.capture_dir(&label);
+    let out_dir = layout.capture_dir(label);
     std::fs::create_dir_all(&out_dir)
         .map_err(|e| format!("could not create {}: {e}", out_dir.display()))?;
+    // Everything vanilla said, kept beside the digests. A digest answers "is
+    // this the same world"; the transcript answers "did the server that read it
+    // have anything to say about it", and the two are different questions. See
+    // `rewrite`, where the second one is the half the digest cannot reach.
+    let log = out_dir.join("server.log");
+    std::fs::write(&log, transcript.join("\n"))
+        .map_err(|e| format!("could not write {}: {e}", log.display()))?;
     let bin = out_dir.join("chunks.bin");
     let tsv = out_dir.join("chunks.tsv");
     digest::write_bin(&set, &bin)?;
@@ -196,6 +228,7 @@ pub fn run(options: &Options) -> Result<(), String> {
     );
     println!("digest: {}", bin.display());
     println!("table:  {}", tsv.display());
+    println!("log:    {}", log.display());
     Ok(())
 }
 
@@ -210,7 +243,7 @@ fn supervise_run(
     dir: &Path,
     region_dir: &Path,
     expected: &[(i32, i32)],
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     fn boxed(stream: impl std::io::Read + Send + 'static) -> Box<dyn std::io::Read + Send> {
         Box::new(stream)
     }
@@ -235,14 +268,25 @@ fn supervise_run(
     // reads fills after a few kilobytes and the server blocks mid-write,
     // which looks exactly like a hang and is not one.
     let (tx, rx) = mpsc::channel::<String>();
+    // Recorded as well as forwarded. The channel is consumed by whichever
+    // phase happens to be waiting, so a line that arrives during
+    // pregeneration is read by nobody — and that is exactly the window a
+    // complaint about a chunk would arrive in. The transcript is written to
+    // by the reader threads themselves so that nothing downstream has to
+    // remember to drain.
+    let transcript = Arc::new(Mutex::new(Vec::<String>::new()));
     for stream in [
         child.stdout.take().map(boxed).expect("stdout was piped"),
         child.stderr.take().map(boxed).expect("stderr was piped"),
     ] {
         let tx = tx.clone();
+        let transcript = Arc::clone(&transcript);
         std::thread::spawn(move || {
             let reader = std::io::BufReader::new(stream);
             for line in reader.lines().map_while(Result::ok) {
+                if let Ok(mut lines) = transcript.lock() {
+                    lines.push(line.clone());
+                }
                 if tx.send(line).is_err() {
                     return; // supervisor gone; nothing left to tell
                 }
@@ -259,7 +303,16 @@ fn supervise_run(
         let _ = child.kill();
         let _ = child.wait();
     }
-    outcome
+    // The reader threads end when their pipes close, which the process exiting
+    // does. Draining the channel here rather than joining them: a thread
+    // blocked on a pipe that never closes would hold the run open, and the
+    // transcript is worth having even if it is a line short.
+    while rx.recv_timeout(Duration::from_millis(50)).is_ok() {}
+    let lines = transcript
+        .lock()
+        .map(|lines| lines.clone())
+        .unwrap_or_default();
+    outcome.map(|()| lines)
 }
 
 /// Boot to readiness, pregenerate, settle, stop, confirm exit.
@@ -519,7 +572,7 @@ fn jvm_flags() -> &'static [&'static str] {
 }
 
 /// The cache label one capture is filed under.
-fn capture_label(version: &str, seed: i64, radius: i32) -> String {
+pub(super) fn capture_label(version: &str, seed: i64, radius: i32) -> String {
     format!("{version}-seed-{seed}-radius-{radius}")
 }
 
