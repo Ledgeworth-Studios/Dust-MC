@@ -19,6 +19,26 @@
 //! how you remove a vanilla entry, since there is no syntax for subtracting
 //! one. Both are implemented here.
 //!
+//! # There is no `remove` key
+//!
+//! Worth its own heading because loaders in the wild disagree. The 1.21.1 tag
+//! format has exactly two keys — `values` and `replace`; subtraction is what
+//! `"replace": true` followed by a full list is *for*. A `remove` key is an
+//! extension some platforms grew (it appears in Forge's and NeoForge's
+//! dialects, not in vanilla's files), and vanilla itself reports it as an
+//! unknown key in a tag file. Dust matches vanilla here: `remove` is reported
+//! as a key that will have no effect, which is also the honest description of
+//! what would happen to it on an unmodified game. If a later Minecraft version
+//! adds removal syntax to the format, this module is where it lands.
+//!
+//! # Finalisation is sort-and-dedup, by construction
+//!
+//! The written entries keep their file order, because provenance is per line;
+//! the *resolved* sets are [`BTreeSet`]s, so flattening sorts and dedups in
+//! the same motion. Two packs adding the same block produce one member, not
+//! two, and every consumer of [`ResolvedTags`] sees the same stable order —
+//! which is what makes two loads diffable at all.
+//!
 //! # `required: false`
 //!
 //! An entry may be written `{"id": "somemod:thing", "required": false}`, which
@@ -955,10 +975,33 @@ mod tests {
 
     #[test]
     fn an_unknown_key_in_a_tag_file_is_reported() {
+        // Including `remove`: not in the 1.21.1 format, so a pack using it is
+        // owed the sentence "this will have no effect" rather than silence.
         let value: Value = serde_json::from_str(r##"{"values":[],"remove":[]}"##).unwrap();
         let (_, findings) = TagFile::parse(&value, "p", "f.json");
         assert_eq!(findings.len(), 1);
         assert!(findings[0].message.contains("`remove`"), "{}", findings[0]);
+    }
+
+    #[test]
+    fn the_resolved_set_is_sorted_and_deduplicated_by_construction() {
+        let tags = merge(&[
+            (
+                "minecraft:mixed",
+                r##"{"values":["minecraft:z","minecraft:a","#minecraft:inner"],"replace":true}"##,
+            ),
+            (
+                "minecraft:inner",
+                r##"{"values":["minecraft:m","minecraft:a"]}"##,
+            ),
+        ]);
+        let (resolved, findings) = resolve_blocks(tags, &Unchecked);
+        assert!(findings.is_empty(), "{findings:?}");
+        let set = resolved
+            .get(&RegistryId::new("tags/block"), &location("minecraft:mixed"))
+            .expect("resolved");
+        let names: Vec<&str> = set.iter().map(|name| name.path()).collect();
+        assert_eq!(names, vec!["a", "m", "z"], "flat sets come out sorted");
     }
 
     #[test]

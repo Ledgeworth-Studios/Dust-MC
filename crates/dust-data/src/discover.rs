@@ -41,7 +41,7 @@
 use std::path::Path;
 
 use crate::finding::Finding;
-use crate::pack::{open, PackSource};
+use crate::pack::{open, PackError, PackSource, ZipPack};
 use crate::{LoadOptions, LoadedData};
 
 /// Read `directory` and return the packs in it, in load order: name ascending,
@@ -147,8 +147,25 @@ pub fn discover(directory: impl AsRef<Path>) -> (Vec<Box<dyn PackSource>>, Vec<F
             packs.retain(|pack| pack.id() != id);
             continue;
         }
-        ids_in_use.insert(id, path.display().to_string());
-        match open(&path) {
+        ids_in_use.insert(id.clone(), path.display().to_string());
+        // Zips are opened by hand rather than through `pack::open` so the
+        // source answers to the stem the collision check just used — a pack
+        // whose reported id depends on how it was opened would make every
+        // provenance line lie by one extension.
+        let opened = if is_zip {
+            std::fs::read(&path)
+                .map_err(|source| PackError::Io {
+                    path: path.display().to_string(),
+                    source,
+                })
+                .and_then(|bytes| {
+                    ZipPack::from_bytes(bytes, id.clone(), path.display().to_string())
+                })
+                .map(|pack| Box::new(pack) as Box<dyn PackSource>)
+        } else {
+            open(&path)
+        };
+        match opened {
             Ok(pack) => packs.push(pack),
             Err(error) => findings.push(Finding::error(
                 "",
