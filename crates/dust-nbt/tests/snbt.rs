@@ -376,3 +376,24 @@ fn parse_compound_demands_a_compound() {
     assert!(snbt::parse_compound("[1]").is_err());
     assert!(snbt::parse_compound("1").is_err());
 }
+
+#[test]
+fn named_printing_labels_the_document_the_way_data_get_does() {
+    let mut compound = Compound::new();
+    compound.insert("Count", Tag::Byte(2));
+
+    // A name is printed as a key in front of the value.
+    assert_eq!(
+        snbt::to_string_named("item", &Tag::Compound(compound.clone())),
+        "item:{Count:2b}"
+    );
+    // An awkward name gets quoted like any key.
+    assert_eq!(
+        snbt::to_string_named("odd name", &Tag::Byte(1)),
+        "\"odd name\":1b"
+    );
+    // The empty name prints nothing before the value — not even a colon —
+    // which is what makes a round trip through to_string lossless for the
+    // empty root names every vanilla file carries.
+    assert_eq!(snbt::to_string_named("", &Tag::Byte(5)), "5b");
+}

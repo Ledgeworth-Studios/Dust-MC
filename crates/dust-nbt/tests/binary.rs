@@ -262,6 +262,43 @@ fn malformed_documents_are_refused_with_precise_errors() {
     ));
 }
 
+/// A bad string reports its trouble at an *absolute* document offset: the
+/// string's own error knows only where things went wrong inside the payload,
+/// and the two numbers have to compose. This is what turns an operator's log
+/// line into `xxd -s <offset>` against the whole file.
+#[test]
+fn utf8_errors_compose_their_offset_with_the_strings() {
+    use dust_nbt::mutf8::Mutf8Error;
+    use dust_nbt::Error;
+
+    // Root compound, field "a", value a string whose third payload byte is a
+    // four-byte UTF-8 lead — valid elsewhere, forbidden here.
+    let bytes = [
+        0x0a, 0x00, 0x00, // compound, empty root name
+        0x08, 0x00, 0x01, 0x61, // TAG_String named "a"
+        0x00, 0x03, // three payload bytes
+        0x6f, 0x6b, 0xf0, // 'o', 'k', then the forbidden lead
+    ];
+    match read::from_bytes(&bytes).map(|n| n.tag) {
+        Err(error @ Error::Utf8 { .. }) => {
+            let Error::Utf8 {
+                offset,
+                source: Mutf8Error::InvalidStart { offset: inner, .. },
+            } = &error
+            else {
+                unreachable!("matched above")
+            };
+            assert_eq!(*inner, 2, "byte two of the payload is the trouble");
+            assert_eq!(
+                *offset, 9,
+                "the payload begins at byte nine of the document"
+            );
+            assert_eq!(error.offset(), Some(11), "and the composition lands on it");
+        }
+        other => panic!("expected Utf8, got {other:?}"),
+    }
+}
+
 /// Bytes after a complete document are padding, not an error — unless the
 /// caller asks, which is what `exact` is for and what `position` reports.
 #[test]

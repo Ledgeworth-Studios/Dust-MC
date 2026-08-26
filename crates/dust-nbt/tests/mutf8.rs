@@ -328,6 +328,27 @@ fn a_key_too_long_to_write_is_refused_too() {
     assert!(write::to_vec("", &Tag::Compound(compound)).is_err());
 }
 
+/// The limit counts *encoded* bytes, and the trap this sets for a naive
+/// `text.len()` check: emoji count six bytes each, so a string of 10,921 of
+/// them fits with two bytes to spare while 10,923 do not fit at all — though
+/// both look like "about eleven thousand characters".
+#[test]
+fn the_length_limit_is_on_encoded_bytes_and_supplementary_characters_cost_six() {
+    use dust_nbt::{write, Tag};
+
+    const EMOJI_BYTES: usize = 6;
+    let fits_exactly = mutf8::MAX_ENCODED_LEN / EMOJI_BYTES; // 10,922 → 65,532
+    let text: String = std::iter::repeat_n('\u{1f600}', fits_exactly).collect();
+    assert_eq!(mutf8::encoded_len(&text), 65_532);
+    assert!(write::to_vec("", &Tag::String(text.clone())).is_ok());
+
+    // One character more needs 65,538 — three past the prefix — and is
+    // refused, even though the string grew by one "character".
+    let one_more: String = std::iter::repeat_n('\u{1f600}', fits_exactly + 1).collect();
+    assert_eq!(mutf8::encoded_len(&one_more), mutf8::MAX_ENCODED_LEN + 3);
+    assert!(write::to_vec("", &Tag::String(one_more)).is_err());
+}
+
 // ---------------------------------------------------------------------------
 // Properties, against a reference transcoder
 //

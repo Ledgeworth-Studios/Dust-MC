@@ -513,7 +513,11 @@ impl Compound {
     /// not use it; see [`Compound::append`].
     pub fn insert(&mut self, name: impl Into<String>, value: Tag) -> Option<Tag> {
         let name = name.into();
-        if let Some(slot) = self.fields.iter_mut().find(|(key, _)| *key == name) {
+        // From the end, like every other lookup here: with duplicate keys in
+        // the document, the binding this replaces has to be the one `get`
+        // resolves, or the caller's write would land somewhere no read can
+        // see.
+        if let Some(slot) = self.fields.iter_mut().rev().find(|(key, _)| *key == name) {
             return Some(std::mem::replace(&mut slot.1, value));
         }
         self.fields.push((name, value));

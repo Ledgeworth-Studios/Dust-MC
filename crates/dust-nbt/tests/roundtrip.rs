@@ -36,10 +36,7 @@ proptest! {
 
     /// File mode: write, read back exactly, compare, rewrite byte for byte.
     #[test]
-    fn file_mode_round_trips(
-        name in any_root_name(),
-        tag in any_tag(),
-    ) {
+    fn file_mode_round_trips(name in any_root_name(), tag in any_tag()) {
         let bytes = write::to_vec(&name, &tag).expect("a generated document writes");
         let document =
             read::from_bytes_exact(&bytes).expect("what the writer produced must parse");
@@ -47,6 +44,13 @@ proptest! {
         prop_assert_eq!(&document.tag, &tag);
         let rewritten = write::to_vec(&document.name, &document.tag).expect("rewrites");
         prop_assert_eq!(rewritten.as_slice(), bytes.as_slice());
+
+        // The cursor lands on the document's last byte and knows it: this is
+        // what a region-file reader uses to find the next chunk in its slot.
+        let mut reader = read::Reader::new(&bytes, dust_nbt::Limits::FILE);
+        reader.read_root(read::Mode::File).expect("reads");
+        reader.finish().expect("nothing follows a written document");
+        prop_assert_eq!(reader.position(), bytes.len());
     }
 
     /// Network mode: the same guarantees without the root name.
