@@ -193,9 +193,9 @@ pub static RECIPE_SHAPES: &[RecipeShape] = &[
     },
 ];
 
-/// Serialisers registered on 1.21.1 that no vanilla recipe file exercises:
-/// the special recipes (map cloning, armour dyeing and friends), which the
-/// game computes from the player's input instead of writing as data. Their
-/// absence from the files is what the data means, so they are named here
-/// rather than treated as a gap.
+/// Serialisers registered on 1.21.1 that no vanilla recipe file
+/// exercises. Empty on this version — even the computed `crafting_special_*`
+/// recipes ship marker files — so anything that appears here in a later run
+/// is a serialiser the registry knows and vanilla never uses, which is
+/// exactly the kind of fact to surface rather than absorb.
 pub static UNUSED_SERIALIZERS: &[&str] = &[];
