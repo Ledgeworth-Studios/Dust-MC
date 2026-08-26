@@ -9,8 +9,9 @@ the gates that keep the rest honest.
 ## Status
 
 Stage 0 — groundwork. Phases 0.1, 0.2 and 0.3 are done; Phase 0.4 (CI) has its
-workflow and Phase 0.5 (vanilla data extraction) has not started. No server
-code. Nothing here accepts a connection.
+workflow and Phase 0.5 (vanilla data extraction) has not started. The server
+process skeleton exists behind the `dust server` command — lifecycle, tick
+loop, clean shutdown — but nothing here accepts a connection yet.
 
 ## Building
 
