@@ -399,3 +399,359 @@ fn nothing_at_all_is_an_error_not_a_crash() {
     assert!(snbt::parse("{").is_err());
     assert!(snbt::parse("[").is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Targeted mutations
+//
+// The blind loop above edits anywhere, so most of its hits land in payloads
+// where nothing interesting happens. These classes aim at the structure: the
+// bytes that *direct* a parse — length prefixes, tag ids, element types —
+// because that is where a hostile encoder aims too. Each document is laid out
+// by hand here rather than produced by the writer, so the offsets of those
+// bytes are known exactly and the mutations can hit them on every iteration
+// instead of by luck.
+//
+// The invariant is the one the blind loop checks, plus the borrowed reader:
+// an answer either way, never a panic, and anything `exact` accepts rewrites
+// to itself and agrees with the owned reader's tree.
+// ---------------------------------------------------------------------------
+
+/// What lives at a recorded offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Prefix {
+    /// An `i32` array or list length; lies may go up or down.
+    Word32,
+    /// A `u16` string length prefix.
+    Word16,
+    /// A tag id or list element-type byte.
+    TagId,
+}
+
+/// A document with its structural offsets recorded.
+struct Laid {
+    bytes: Vec<u8>,
+    marks: Vec<(usize, Prefix)>,
+}
+
+impl Laid {
+    fn push(&mut self, byte: u8, mark: Option<Prefix>) -> usize {
+        self.bytes.push(byte);
+        let at = self.bytes.len() - 1;
+        if let Some(prefix) = mark {
+            self.marks.push((at, prefix));
+        }
+        at
+    }
+
+    fn extend(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
+    }
+
+    /// A compound root carrying one of each interesting shape: a double list,
+    /// a byte array, a string, and a nested empty-typed list. Every header
+    /// byte is recorded as it is written.
+    fn specimen() -> Self {
+        let mut laid = Laid {
+            bytes: Vec::with_capacity(128),
+            marks: Vec::new(),
+        };
+
+        // Root compound, empty name.
+        laid.push(0x0a, Some(Prefix::TagId));
+        laid.extend(&[0x00, 0x00]);
+
+        // Field "pos": a list of three doubles.
+        laid.push(0x09, Some(Prefix::TagId));
+        laid.extend(&[0x00, 0x03, b'p', b'o', b's']);
+        laid.push(0x06, Some(Prefix::TagId)); // element type: TAG_Double
+        let list_len_at = laid.bytes.len();
+        laid.extend(&3i32.to_be_bytes());
+        laid.marks.push((list_len_at, Prefix::Word32));
+        laid.extend(&1.5f64.to_be_bytes());
+        laid.extend(&64.0f64.to_be_bytes());
+        laid.extend(&(-2.25f64).to_be_bytes());
+
+        // Field "raw": a byte array of five.
+        laid.push(0x07, Some(Prefix::TagId));
+        laid.extend(&[0x00, 0x03, b'r', b'a', b'w']);
+        let raw_len_at = laid.bytes.len();
+        laid.extend(&5i32.to_be_bytes());
+        laid.marks.push((raw_len_at, Prefix::Word32));
+        laid.extend(&[1, 2, 3, 4, 5]);
+
+        // Field "name": a string of nine.
+        laid.push(0x08, Some(Prefix::TagId));
+        laid.extend(&[0x00, 0x04, b'n', b'a', b'm', b'e']);
+        let name_len_at = laid.bytes.len();
+        laid.extend(&9u16.to_be_bytes());
+        laid.marks.push((name_len_at, Prefix::Word16));
+        laid.extend(b"structure");
+
+        // Field "spare": an empty list vanilla-flavoured (element type End).
+        laid.push(0x09, Some(Prefix::TagId));
+        laid.extend(&[0x00, 0x05, b's', b'p', b'a', b'r', b'e']);
+        laid.push(0x00, Some(Prefix::TagId));
+        let spare_len_at = laid.bytes.len();
+        laid.extend(&0i32.to_be_bytes());
+        laid.marks.push((spare_len_at, Prefix::Word32));
+
+        // End of root.
+        laid.push(0x00, None);
+        laid
+    }
+
+    fn word32_marks(&self) -> Vec<usize> {
+        self.marks
+            .iter()
+            .filter(|(_, prefix)| *prefix == Prefix::Word32)
+            .map(|(at, _)| *at)
+            .collect()
+    }
+}
+
+/// Flip a bit within four bytes of a recorded length prefix or tag id — close
+/// enough to corrupt what the byte sits next to, wherever it lands.
+fn flip_bit_near(rng: &mut SplitMix64, document: &mut Laid) {
+    let (at, _) = document.marks[rng.below(document.marks.len())];
+    let window = 4;
+    let low = at.saturating_sub(window);
+    let high = (at + window).min(document.bytes.len() - 1);
+    let target = low + rng.below(high - low + 1);
+    document.bytes[target] ^= 1 << rng.below(8);
+}
+
+/// Rewrite a recorded length prefix to a lie. Upward lies claim more than the
+/// input holds; downward ones claim less, leaving trailing bytes a lazy
+/// reader might accept as padding — both are real encoders' mistakes.
+fn lie_about_length(rng: &mut SplitMix64, document: &mut Laid) {
+    let marks = document.word32_marks();
+    let at = marks[rng.below(marks.len())];
+    let original = i32::from_be_bytes([
+        document.bytes[at],
+        document.bytes[at + 1],
+        document.bytes[at + 2],
+        document.bytes[at + 3],
+    ]);
+    let lie = match rng.below(8) {
+        // Upward: more elements than bytes exist.
+        0 => original.wrapping_mul(2),
+        1 => original.saturating_add(1_000),
+        2 => i32::MAX,
+        // Downward: fewer claimed than were written.
+        3 => original.saturating_sub(1),
+        4 => original / 2,
+        5 => 0,
+        // And the sign bit, which no length may carry.
+        6 => -1,
+        _ => i32::MIN,
+    };
+    document.bytes[at..at + 4].copy_from_slice(&lie.to_be_bytes());
+
+    // Sometimes the string prefix instead, which is unsigned but small.
+    if rng.below(2) == 0 {
+        let &(at, Prefix::Word16) = document
+            .marks
+            .iter()
+            .find(|(_, prefix)| *prefix == Prefix::Word16)
+            .expect("the specimen carries a string")
+        else {
+            unreachable!()
+        };
+        let lie16 = match rng.below(3) {
+            0 => u16::MAX,
+            1 => 0u16,
+            _ => rng.below(u16::MAX as usize + 1) as u16,
+        };
+        document.bytes[at..at + 2].copy_from_slice(&lie16.to_be_bytes());
+    }
+}
+
+/// Overwrite a recorded tag id with one of the rare array types — legal ids
+/// that appear rarely in real documents, so parsers meet them least.
+fn swap_to_rare_tag(rng: &mut SplitMix64, document: &mut Laid) {
+    let tag_marks: Vec<usize> = document
+        .marks
+        .iter()
+        .filter(|(_, prefix)| *prefix == Prefix::TagId)
+        .map(|(at, _)| *at)
+        .collect();
+    let at = tag_marks[rng.below(tag_marks.len())];
+    let rare = [0x07, 0x0b, 0x0c][rng.below(3)];
+    document.bytes[at] = rare;
+}
+
+/// Splice a byte-array header plus payload into the middle of the double
+/// list's payload: nested-container confusion, asking the list reader to make
+/// sense of another tag's anatomy mid-body.
+fn splice_array_into_list(rng: &mut SplitMix64, document: &mut Laid) {
+    // The payload region of "pos": its length prefix is the Word32 whose
+    // preceding byte is the list's TAG_Double element type.
+    let list_len_at = document
+        .marks
+        .iter()
+        .filter_map(|(at, prefix)| {
+            (*prefix == Prefix::Word32 && *at >= 1 && document.bytes[*at - 1] == 0x06)
+                .then_some(*at)
+        })
+        .next()
+        .expect("the specimen carries a typed list");
+    let insert_at = list_len_at + 4 + rng.below(24).min(document.bytes.len() - list_len_at - 4);
+
+    let mut fragment = vec![0x07u8];
+    fragment.extend_from_slice(&5i32.to_be_bytes());
+    fragment.extend_from_slice(&[9u8; 5]);
+    for (index, byte) in fragment.into_iter().enumerate() {
+        document.bytes.insert(insert_at + index, byte);
+    }
+}
+
+/// Shared body of the targeted loops: answer-only, canonical-if-accepted, and
+/// in agreement with the owned reader when accepted.
+fn run_targeted(
+    iterations: usize,
+    seed: u64,
+    label: &str,
+    build: impl Fn() -> Laid,
+    mutate_one: impl Fn(&mut SplitMix64, &mut Laid),
+) {
+    let mut rng = SplitMix64::new(seed);
+    let mut accepted = 0usize;
+    let mut refused = 0usize;
+
+    for iteration in 0..iterations {
+        let mut document = build();
+        mutate_one(&mut rng, &mut document);
+
+        match read::from_bytes_exact(&document.bytes) {
+            Ok(parsed) => {
+                accepted += 1;
+                let rewritten = dust_nbt::write::to_vec(&parsed.name, &parsed.tag).expect("writes");
+                assert_eq!(
+                    rewritten, document.bytes,
+                    "{label} iteration {iteration} (seed {seed}): accepted a document \
+                     that does not rewrite to itself"
+                );
+                let borrowed = dust_nbt::borrow::from_bytes_with(&document.bytes, Limits::FILE)
+                    .expect("the owned reader accepted, so must the borrowed one");
+                let rebuilt = materialise_borrowed(&borrowed, borrowed.root());
+                assert_eq!(
+                    rebuilt, parsed.tag,
+                    "{label} iteration {iteration}: readers disagree"
+                );
+            }
+            Err(_) => refused += 1,
+        }
+
+        // Network mode over the same bytes: an answer of some kind.
+        let _ = read::from_bytes_network_with(&document.bytes, Limits::FILE);
+        let _ = dust_nbt::borrow::from_bytes_network_with(&document.bytes, Limits::FILE);
+    }
+
+    assert!(
+        accepted > 10 || refused > iterations / 2,
+        "{label}: neither outcome dominated as designed ({accepted} accepted)"
+    );
+}
+
+/// Rebuild an owned tag from a borrowed view, locally: the same walk
+/// `tests/borrow.rs` uses, kept here so this file reads without cross-suite
+/// imports beyond the shared support module.
+fn materialise_borrowed(
+    document: &dust_nbt::borrow::Document<'_>,
+    value: &dust_nbt::borrow::Value<'_>,
+) -> Tag {
+    use dust_nbt::borrow::Value;
+    match value {
+        Value::Byte(v) => Tag::Byte(*v),
+        Value::Short(v) => Tag::Short(*v),
+        Value::Int(v) => Tag::Int(*v),
+        Value::Long(v) => Tag::Long(*v),
+        Value::Float(v) => Tag::Float(*v),
+        Value::Double(v) => Tag::Double(*v),
+        Value::ByteArray(bytes) => Tag::ByteArray(bytes.iter().map(|b| b as i8).collect()),
+        Value::String(text) => Tag::String(document.text(*text).to_owned()),
+        Value::List(list) => {
+            let elements = match list.values() {
+                Some(values) => values
+                    .iter()
+                    .map(|value| materialise_borrowed(document, value))
+                    .collect(),
+                None => (0..list.len())
+                    .map(|index| {
+                        list.get(index)
+                            .map(|value| materialise_borrowed(document, &value))
+                            .expect("len bounds get")
+                    })
+                    .collect(),
+            };
+            Tag::List(
+                dust_nbt::List::from_elements(list.element_type(), elements)
+                    .expect("homogeneous on parse"),
+            )
+        }
+        Value::Compound(compound) => {
+            let mut out = dust_nbt::Compound::new();
+            for (name, value) in compound.iter() {
+                out.append(
+                    document.text(*name).to_owned(),
+                    materialise_borrowed(document, value),
+                );
+            }
+            Tag::Compound(out)
+        }
+        Value::IntArray(ints) => Tag::IntArray(ints.iter().collect()),
+        Value::LongArray(longs) => Tag::LongArray(longs.iter().collect()),
+    }
+}
+
+#[test]
+fn bit_flips_next_to_length_prefixes_stay_answer_only() {
+    const ITERATIONS: usize = 2_000;
+    const SEED: u64 = 0x5EED_0010;
+    run_targeted(
+        ITERATIONS,
+        SEED,
+        "bit-flip-near-prefix",
+        Laid::specimen,
+        |rng, document| flip_bit_near(rng, document),
+    );
+}
+
+#[test]
+fn length_prefixes_that_lie_upward_and_downward_are_answered_safely() {
+    const ITERATIONS: usize = 2_000;
+    const SEED: u64 = 0x5EED_0011;
+    run_targeted(
+        ITERATIONS,
+        SEED,
+        "length-lie",
+        Laid::specimen,
+        |rng, document| lie_about_length(rng, document),
+    );
+}
+
+#[test]
+fn tag_ids_swapped_to_the_rare_array_types_stay_answer_only() {
+    const ITERATIONS: usize = 2_000;
+    const SEED: u64 = 0x5EED_0012;
+    run_targeted(
+        ITERATIONS,
+        SEED,
+        "rare-tag-swap",
+        Laid::specimen,
+        |rng, document| swap_to_rare_tag(rng, document),
+    );
+}
+
+#[test]
+fn an_array_header_spliced_into_a_list_is_answered_not_fatal() {
+    const ITERATIONS: usize = 2_000;
+    const SEED: u64 = 0x5EED_0013;
+    run_targeted(
+        ITERATIONS,
+        SEED,
+        "array-splice",
+        Laid::specimen,
+        |rng, document| splice_array_into_list(rng, document),
+    );
+}
