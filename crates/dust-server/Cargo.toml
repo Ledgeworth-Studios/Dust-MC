@@ -24,6 +24,7 @@ dust-config.workspace = true
 dust-net = { workspace = true, features = ["tls"] }
 dust-protocol.workspace = true
 dust-registry.workspace = true
+dust-world.workspace = true
 
 # The network runtime. dust-net picked tokio and explains why in its own
 # manifest; this crate takes the same one because a second runtime in one

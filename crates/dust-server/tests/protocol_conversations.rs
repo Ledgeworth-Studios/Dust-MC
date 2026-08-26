@@ -1,4 +1,5 @@
-//! Phase 1's first exit criterion, checked by speaking the protocol.
+//! The conversations a client can have with this server, checked by speaking
+//! the protocol.
 //!
 //! # Why the client here is hand-written
 //!
@@ -451,26 +452,71 @@ fn an_offline_login_runs_the_whole_configuration_exchange_and_reaches_play() {
     // Acknowledge, which is what actually moves both ends into Play.
     send_compressed_frame(&mut stream, 0x03, &[]);
 
-    // And Play is where this server runs out of world. The disconnect here is
-    // the *play* one — a third packet id for one idea, in a third table, and
-    // it carries the authored component type rather than configuration's
-    // opaque NBT.
+    // And Play is a world. The join packet, then the position, then the
+    // columns, then the event that ends the loading screen.
     let (id, body) = recv_compressed_frame(&mut stream);
-    assert_eq!(id, 0x1d, "disconnect is id 0x1d clientbound in play");
-    let text = String::from_utf8_lossy(&body);
-    assert!(text.contains("cannot serve a world yet"), "{text:?}");
+    assert_eq!(id, 43, "login is id 43 clientbound in play");
+    assert_eq!(
+        i32::from_be_bytes(body[0..4].try_into().expect("four bytes")),
+        1,
+        "the player's entity id"
+    );
+    let (count, rest) = read_var_int_from(&body[5..]);
+    assert_eq!(count, 3, "three dimensions are named");
+    assert_eq!(read_string_at(rest).0, "minecraft:overworld");
 
-    let mut buffer = [0u8; 64];
-    let read = stream.read(&mut buffer).expect("read after the disconnect");
-    assert_eq!(read, 0, "the server closes after saying why");
+    // The position comes before the chunks, and that order matters: a client
+    // uses where it is to decide which columns it wants, and one told about
+    // columns first throws them away.
+    let (id, body) = recv_compressed_frame(&mut stream);
+    assert_eq!(id, 64, "player_position");
+    let x = f64::from_be_bytes(body[0..8].try_into().expect("eight bytes"));
+    let y = f64::from_be_bytes(body[8..16].try_into().expect("eight bytes"));
+    let z = f64::from_be_bytes(body[16..24].try_into().expect("eight bytes"));
+    // The half-block offsets are not cosmetic: integer x and z spawn a player
+    // on a block corner and the first physics tick pushes them off it.
+    assert_eq!((x, y, z), (0.5, -59.0, 0.5));
 
+    let (id, body) = recv_compressed_frame(&mut stream);
+    assert_eq!(id, 84, "set_chunk_cache_center");
+    assert_eq!(read_var_int_from(&body).0, 0, "centred on chunk 0");
+
+    // Twenty-five columns: a radius of two, which is (2*2+1)^2.
+    let mut chunks = 0;
+    let event = loop {
+        let (id, body) = recv_compressed_frame(&mut stream);
+        if id == 34 {
+            break body;
+        }
+        assert_eq!(id, 39, "only chunks come between");
+        chunks += 1;
+        assert!(chunks <= 25, "more columns than a radius of two holds");
+    };
+    assert_eq!(chunks, 25, "every column within the radius");
+    assert_eq!(
+        event[0], 13,
+        "game event 13 is what ends the loading screen; without it the terrain \
+         arrives and the client keeps waiting"
+    );
+
+    // And the connection stays up. A keep-alive arrives and is answered, which
+    // is what turns "the packets were sent" into "the player is still there".
+    let (id, body) = recv_compressed_frame(&mut stream);
+    assert_eq!(id, 38, "keep_alive");
+    assert_eq!(body.len(), 8, "eight opaque bytes");
+    send_compressed_frame(&mut stream, 24, &body);
+
+    // The player is still standing in the world when the server stops, which
+    // is what the teardown must say: one login, and one still online. A
+    // counter that only counted finished sessions would report neither, and
+    // the server-list ping quotes that same number.
     let report = running.finish();
     assert!(
         report
             .transcript
             .iter()
-            .any(|e| e.detail.contains("1 login(s)")),
-        "the teardown must account for the login: {:?}",
+            .any(|e| e.detail.contains("1 login(s)") && e.detail.contains("1 still online")),
+        "the teardown must account for the player: {:?}",
         report.transcript
     );
 }

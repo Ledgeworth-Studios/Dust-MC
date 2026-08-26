@@ -38,14 +38,17 @@ use dust_net::session::{
 use dust_net::state::{Intent, State};
 use dust_protocol::packets::{configuration, handshake, play, status};
 use dust_protocol::text::{Color, Component, NamedColor};
-use dust_protocol::types::ProtocolString;
+use dust_protocol::types::{ProtocolString, VarInt};
 use dust_protocol::wire::Reader;
 use dust_protocol::ProtocolVersion;
+use dust_world::coords::ChunkPos;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::configure::{configure, Configured};
 use super::finish;
+use super::play as play_mod;
 use super::status::StatusPolicy;
+use super::world::FlatWorld;
 use crate::to_frame;
 
 /// What one connection turned out to be, once it ended.
@@ -84,6 +87,21 @@ pub struct SessionContext {
     pub status: StatusPolicy,
     pub conn: ConnConfig,
     pub auth: Authority,
+    /// The world a joining player is put into.
+    pub world: FlatWorld,
+    /// How many columns out from the player are streamed on join.
+    pub view_distance: u32,
+    /// `minecraft:overworld`'s id in the dimension-type registry, as it was
+    /// synced during configuration.
+    ///
+    /// Resolved at boot from the same table the sync is built from, rather
+    /// than written as a number: the id is a *position* in that table, and a
+    /// constant here would be a second answer to a question the sync already
+    /// answers.
+    pub overworld_dimension_type: u32,
+    /// Shared with the accept loop. A session counts the player inside it,
+    /// because only a session knows when one has arrived and when it has left.
+    pub counters: std::sync::Arc<super::listen::Counters>,
 }
 
 /// How this server decides who a joining player is.
@@ -345,9 +363,163 @@ where
     // state the next wave of work starts from rather than one it stopped short
     // of.
     conn.transition(State::Play)?;
-    refuse_in_play(&mut conn, ctx, "Dust cannot serve a world yet.").await?;
+    serve_play(&mut conn, ctx).await?;
     conn.disconnect();
     finish(conn, outcome).await
+}
+
+/// Put the player in the world and keep them there.
+///
+/// Returns when the connection ends, which today means when the client
+/// disconnects or a keep-alive goes unanswered.
+async fn serve_play<W>(conn: &mut Conn<W>, ctx: &SessionContext) -> Result<(), SessionError>
+where
+    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let version = ctx.version;
+    let world = &ctx.world;
+
+    // Counted here rather than when the session ends, and held by a guard so
+    // that every way out of this function — a disconnect, a timeout, a decode
+    // error, a panic in the task — puts the number back.
+    let _player = ctx.counters.player_joined();
+
+    send_play(
+        conn,
+        play_mod::login_packet(
+            ENTITY_ID,
+            ctx.status.max_players(),
+            ctx.view_distance,
+            ctx.overworld_dimension_type,
+        )?,
+        version,
+    )
+    .await?;
+
+    // Before the chunks, not after: a client uses its position to decide which
+    // columns it wants, and one told about columns before it knows where it is
+    // throws them away.
+    send_play(
+        conn,
+        play_mod::position_packet(dust_world_spawn(), FIRST_TELEPORT_ID),
+        version,
+    )
+    .await?;
+
+    let centre = ChunkPos::new(0, 0);
+    send_play(
+        conn,
+        play::clientbound::SetCenterChunk {
+            chunk_x: VarInt(centre.x),
+            chunk_z: VarInt(centre.z),
+        },
+        version,
+    )
+    .await?;
+
+    for pos in play_mod::columns_around(centre, ctx.view_distance as i32) {
+        let chunk = world.chunk(pos);
+        send_play(conn, play_mod::chunk_packet(&chunk, version)?, version).await?;
+    }
+
+    // The terrain is there; this is what tells the client to stop looking at
+    // the loading screen and start rendering it.
+    send_play(
+        conn,
+        play::clientbound::GameEvent {
+            event: play_mod::LEVEL_CHUNKS_LOAD_START,
+            value: 0.0,
+        },
+        version,
+    )
+    .await?;
+
+    keep_alive_loop(conn, ctx).await
+}
+
+/// Read whatever the client sends, and prove the connection is alive.
+///
+/// A keep-alive every ten seconds, matching vanilla's cadence. The client
+/// returns the same eight bytes, and a client that stops returning them hits
+/// the connection's idle timeout — which is `dust-net`'s and already applies,
+/// so nothing here needs its own clock.
+///
+/// Everything the client sends is currently read and dropped. That is stated
+/// rather than hidden: movement, block placement and chat all arrive here and
+/// none of them does anything yet. What the loop *does* prove is that the
+/// packets decode — a client walking around a world sends a steady stream of
+/// position updates, and a decoder that got one wrong would fail here rather
+/// than the first time somebody built on it.
+async fn keep_alive_loop<W>(conn: &mut Conn<W>, ctx: &SessionContext) -> Result<(), SessionError>
+where
+    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut next_id: i64 = 1;
+    // `interval`'s first tick fires immediately, and that is kept rather than
+    // skipped: one keep-alive right after the chunks proves the round trip
+    // works while the join is still the thing being debugged, instead of ten
+    // seconds later when it is not.
+    let mut ticker = tokio::time::interval(KEEP_ALIVE_PERIOD);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                send_play(
+                    conn,
+                    play::clientbound::KeepAlive { id: next_id },
+                    ctx.version,
+                )
+                .await?;
+                next_id = next_id.wrapping_add(1);
+            }
+            frame = conn.next_frame() => {
+                let Some(frame) = frame? else { return Ok(()) };
+                let mut reader = Reader::new(&frame.body);
+                // Decoded and dropped. Decoding it anyway is the point: this
+                // is the only place in the project where a real client's
+                // serverbound Play packets meet the generated definitions.
+                match play::serverbound::Packet::decode_body(frame.id, &mut reader, ctx.version) {
+                    Ok(_) => {}
+                    // A packet this server has no definition for is not a
+                    // reason to drop a player. The list of unclaimed Play
+                    // packets is published in dust-protocol, and meeting one
+                    // is expected rather than exceptional.
+                    Err(dust_protocol::wire::DecodeError::UnknownPacket { .. }) => {}
+                    Err(e) => return Err(SessionError::Protocol(e)),
+                }
+            }
+        }
+    }
+}
+
+/// The entity id the player is given.
+///
+/// A constant because there is one player at a time and no entities beside
+/// them. It becomes an allocator the moment there are two.
+const ENTITY_ID: i32 = 1;
+
+/// The id of the teleport that places a joining player.
+const FIRST_TELEPORT_ID: i32 = 1;
+
+/// How often a keep-alive goes out. Vanilla's cadence.
+const KEEP_ALIVE_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn dust_world_spawn() -> (f64, f64, f64) {
+    super::world::SPAWN
+}
+
+/// Encode one clientbound Play packet and queue it.
+async fn send_play<W, P>(
+    conn: &mut Conn<W>,
+    body: P,
+    version: dust_protocol::ProtocolVersion,
+) -> Result<(), SessionError>
+where
+    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    P: Into<play::clientbound::Packet>,
+{
+    let frame = to_frame!(body.into(), version);
+    conn.send(frame).await?;
+    Ok(())
 }
 
 /// Send a configuration-state disconnect carrying `message`.
@@ -370,40 +542,14 @@ where
     Ok(())
 }
 
-/// Send a play-state disconnect carrying `message`.
-///
-/// A third spelling of one idea, at a third packet id. Play's disconnect
-/// carries NBT like configuration's and sits at a different number in a
-/// different table, which is why this goes through the generated tables rather
-/// than a constant somebody has to remember correctly.
-async fn refuse_in_play<W>(
-    conn: &mut Conn<W>,
-    ctx: &SessionContext,
-    message: &str,
-) -> Result<(), SessionError>
-where
-    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    // Play's disconnect takes the *authored* component type, while
-    // configuration's takes the opaque NBT one. Same idea, two field types,
-    // two packets apart — and the type system is the only thing that will
-    // remember which is which.
-    let _ = ctx;
-    let reason = Component::text(message).colored(Color::Named(NamedColor::Red));
-    let packet = play::clientbound::Packet::from(play::clientbound::Disconnect { reason });
-    let frame = to_frame!(packet, ctx.version);
-    conn.send(frame).await?;
-    Ok(())
-}
-
 /// The session server for offline mode: there isn't one.
 ///
 /// `LoginHandler` takes a session server unconditionally because the type it
 /// needs is decided at compile time, and offline mode never calls either
 /// method. Both bodies are unreachable rather than unimplemented, and they say
 /// so by failing loudly instead of returning something plausible — a stub that
-/// answered "yes, that player is who they say" would turn a wiring mistake into
-/// an authentication bypass.
+/// answered "yes, that player is who they say" would turn a wiring mistake
+/// into an authentication bypass.
 struct NoSessionServer;
 
 impl SessionServer for NoSessionServer {
@@ -460,7 +606,7 @@ where
                 // about one — but it is checked rather than unwrapped, because
                 // the alternative is a panic on a path an unauthenticated
                 // stranger reaches.
-                let json = ProtocolString::new(ctx.status.render(0))?;
+                let json = ProtocolString::new(ctx.status.render(ctx.counters.online()))?;
                 let response = status::clientbound::StatusResponse { json };
                 let frame = to_frame!(status::clientbound::Packet::from(response), ctx.version);
                 conn.send(frame).await?;

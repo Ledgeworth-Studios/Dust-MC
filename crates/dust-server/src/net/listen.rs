@@ -71,9 +71,18 @@ impl Listener {
 
     /// Start accepting, on a runtime this call creates and owns.
     ///
-    /// Returns once the accept loop is running. Dropping the returned handle
-    /// stops it.
-    pub fn serve(self, ctx: Arc<SessionContext>, logger: Logger) -> io::Result<ListenerHandle> {
+    /// The counters are passed in rather than created here because the session
+    /// layer needs them too — a player entering Play is counted the moment it
+    /// happens, not when the session ends, since the server-list ping quotes
+    /// that number and a player standing in the world has not ended.
+    ///
+    /// Returns once the accept loop is running. Dropping the handle stops it.
+    pub fn serve(
+        self,
+        ctx: Arc<SessionContext>,
+        counters: Arc<Counters>,
+        logger: Logger,
+    ) -> io::Result<ListenerHandle> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_io()
             .enable_time()
@@ -85,7 +94,6 @@ impl Listener {
             .build()?;
 
         let addr = self.addr;
-        let counters = Arc::new(Counters::default());
         let shutdown = Arc::new(Notify::new());
 
         let accept_ctx = Arc::clone(&ctx);
@@ -138,6 +146,50 @@ pub struct Counters {
     logins: AtomicU64,
     logins_failed: AtomicU64,
     failed: AtomicU64,
+    /// Players in Play *right now*, as opposed to logins that have finished.
+    ///
+    /// A separate number because the two answer different questions and the
+    /// totals cannot answer this one: a session is counted as a login when it
+    /// ends, and a player who is still standing in the world has not ended.
+    /// This is the number the server-list ping quotes, so getting it from the
+    /// totals would have told every pinger that nobody was on.
+    online: AtomicU64,
+}
+
+impl Counters {
+    /// Record a player entering Play. The returned guard decrements on drop.
+    ///
+    /// A guard rather than a matching `left()` call, because every path out of
+    /// a session — a clean disconnect, a timeout, a decode error, a panic in
+    /// the task — has to decrement, and a list of paths is a list somebody
+    /// eventually adds to without looking.
+    pub fn player_joined(self: &Arc<Self>) -> PlayerGuard {
+        self.online.fetch_add(1, Ordering::Relaxed);
+        self.logins.fetch_add(1, Ordering::Relaxed);
+        PlayerGuard {
+            counters: Arc::clone(self),
+        }
+    }
+
+    /// How many players are in Play.
+    pub fn online(&self) -> u32 {
+        // Saturating rather than `as`: the count cannot exceed u32 in any real
+        // deployment, and a wrap would put a negative-looking number in every
+        // server list.
+        self.online.load(Ordering::Relaxed).min(u64::from(u32::MAX)) as u32
+    }
+}
+
+/// Holds one player's place in the online count for as long as it lives.
+#[derive(Debug)]
+pub struct PlayerGuard {
+    counters: Arc<Counters>,
+}
+
+impl Drop for PlayerGuard {
+    fn drop(&mut self) {
+        self.counters.online.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// A point-in-time reading of the counters.
@@ -148,6 +200,7 @@ pub struct NetStats {
     pub logins: u64,
     pub logins_failed: u64,
     pub failed: u64,
+    pub online: u64,
 }
 
 async fn accept_loop(
@@ -205,14 +258,9 @@ async fn accept_loop(
                     username,
                     profile_id,
                 }) => {
-                    counters.logins.fetch_add(1, Ordering::Relaxed);
                     logger.info(
                         "dust::net",
-                        format!(
-                            "{peer}: {username} ({}) logged in; disconnected because \
-                             there is no world to join yet",
-                            hyphenated(&profile_id)
-                        ),
+                        format!("{peer}: {username} ({}) left", hyphenated(&profile_id)),
                     );
                 }
                 Ok(Served::LoginFailed { reason }) => {
@@ -279,6 +327,7 @@ impl ListenerHandle {
             logins: self.counters.logins.load(Ordering::Relaxed),
             logins_failed: self.counters.logins_failed.load(Ordering::Relaxed),
             failed: self.counters.failed.load(Ordering::Relaxed),
+            online: self.counters.online.load(Ordering::Relaxed),
         }
     }
 

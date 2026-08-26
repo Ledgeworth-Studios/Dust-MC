@@ -42,8 +42,10 @@ use tokio::io::{AsyncRead, AsyncWrite};
 pub mod configure;
 pub mod favicon;
 pub mod listen;
+pub mod play;
 pub mod session;
 pub mod status;
+pub mod world;
 
 /// Turn a packet into a frame without writing its id into its own body.
 ///
@@ -101,6 +103,6 @@ where
 }
 
 pub use favicon::{Favicon, FaviconError};
-pub use listen::{Listener, ListenerHandle};
+pub use listen::{Counters, Listener, ListenerHandle, NetStats};
 pub use session::{Authority, Served, SessionContext, SessionError};
 pub use status::StatusPolicy;

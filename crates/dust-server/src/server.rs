@@ -762,6 +762,32 @@ impl Server {
             crate::net::Authority::Offline
         };
 
+        // The world, and the two registry positions the join packet quotes.
+        // Both are looked up in the same synced tables the configuration state
+        // sends, because an id here is a *position in what the client was
+        // told* — a constant would be a second answer to a question the sync
+        // already answers, and the two would disagree the day a registry gains
+        // an entry.
+        let palette = crate::net::world::Palette::resolve().map_err(|e| fail(e.to_string()))?;
+        let biomes = dust_registry::synced::by_name("minecraft:worldgen/biome")
+            .ok_or_else(|| fail("the synced registries have no biome registry".to_owned()))?;
+        let plains = biomes.id_of("minecraft:plains").ok_or_else(|| {
+            fail("the biome registry has no minecraft:plains to build a flat world from".to_owned())
+        })? as u32;
+        let dimension_types = dust_registry::synced::by_name("minecraft:dimension_type")
+            .ok_or_else(|| fail("the synced registries have no dimension types".to_owned()))?;
+        let overworld = dimension_types
+            .id_of("minecraft:overworld")
+            .ok_or_else(|| fail("the dimension types have no overworld".to_owned()))?
+            as u32;
+        let world = crate::net::world::FlatWorld::new(palette, plains, biomes.entries.len() as u32);
+
+        // Shared between the accept loop and every session on it: the accept
+        // loop counts connections, and the sessions count the players inside
+        // them, because only a session knows when somebody has actually
+        // arrived.
+        let counters = std::sync::Arc::new(crate::net::Counters::default());
+
         let listener = crate::net::Listener::bind(addr).map_err(|e| fail(e.to_string()))?;
         let bound = listener.addr();
 
@@ -770,10 +796,14 @@ impl Server {
             status: crate::net::StatusPolicy::new(version, motd, max_players, favicon),
             conn: dust_net::io::ConnConfig::default(),
             auth: authority,
+            world,
+            view_distance: VIEW_DISTANCE,
+            overworld_dimension_type: overworld,
+            counters: std::sync::Arc::clone(&counters),
         });
 
         let handle = listener
-            .serve(ctx, self.options.logger.clone())
+            .serve(ctx, counters, self.options.logger.clone())
             .map_err(|e| fail(format!("could not start serving: {e}")))?;
 
         transcript.push(TranscriptEntry {
@@ -856,12 +886,14 @@ impl Server {
                         handle.shutdown();
                         format!(
                             "released {addr} after {} connection(s): {} ping(s), \
-                             {} login(s), {} login(s) refused, {} failed",
+                             {} login(s), {} login(s) refused, {} failed, \
+                             {} still online",
                             stats.accepted,
                             stats.status_served,
                             stats.logins,
                             stats.logins_failed,
-                            stats.failed
+                            stats.failed,
+                            stats.online
                         )
                     }
                     // The bind failed, so the phase never completed and this
@@ -909,6 +941,14 @@ impl Server {
         }
     }
 }
+
+/// How many columns out from a joining player are streamed.
+///
+/// Two, which is twenty-five columns: enough to stand on and look at, small
+/// enough that a join is one burst rather than a stream. It is not
+/// `[server].view_distance` because there is no such setting yet — adding one
+/// before there is a streaming loop to honour it would be a knob that lies.
+const VIEW_DISTANCE: u32 = 2;
 
 /// Resolve a `host:port` bind string to the address the real listener will
 /// take.

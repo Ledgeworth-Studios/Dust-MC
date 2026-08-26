@@ -1,0 +1,165 @@
+//! The world a joining player is put into.
+//!
+//! # What this is, honestly
+//!
+//! A superflat: bedrock, three rows of dirt, one of grass, air above, one
+//! biome everywhere. Every chunk is identical and every chunk is generated on
+//! demand from the same six lines.
+//!
+//! It is not worldgen and it is not pretending to be. Phase 6 builds the
+//! generator; what this exists for is to be a *world* — a real column of real
+//! block states at real coordinates, encoded through the real section codec,
+//! streamed through the real chunk packet — so that everything between the
+//! socket and the block table gets exercised by something a player can stand
+//! on. A join that sends no chunks is a join nobody can tell is broken.
+//!
+//! # Why the block ids come from the registry and not from constants
+//!
+//! `minecraft:grass_block` is not a number this file may know. Its state id
+//! depends on the block table the extractor produced, which depends on the
+//! Minecraft version, and a constant here would be right until a version bump
+//! and then silently place something else. Looking them up costs a scan at
+//! boot and buys a failure that names the block.
+
+use dust_registry::Block;
+use dust_world::chunk::Chunk;
+use dust_world::coords::ChunkPos;
+use dust_world::heightmap::{HeightmapKind, WorldHeight};
+
+/// The block states one flat world is built from, resolved once.
+#[derive(Debug, Clone, Copy)]
+pub struct Palette {
+    pub air: u32,
+    pub bedrock: u32,
+    pub dirt: u32,
+    pub grass: u32,
+}
+
+impl Palette {
+    /// Resolve every block this world needs, or name the one that is missing.
+    ///
+    /// Called during boot rather than per chunk, and fallible rather than
+    /// unwrapping: the block table is generated, and a generated table that
+    /// stopped containing `minecraft:bedrock` is a thing an operator has to be
+    /// told about at start-up rather than the first time somebody joins.
+    pub fn resolve() -> Result<Self, MissingBlock> {
+        let state = |name: &'static str| {
+            Block::from_name(name)
+                .map(|block| block.default_state().id())
+                .ok_or(MissingBlock { name })
+        };
+        Ok(Self {
+            air: state("minecraft:air")?,
+            bedrock: state("minecraft:bedrock")?,
+            dirt: state("minecraft:dirt")?,
+            grass: state("minecraft:grass_block")?,
+        })
+    }
+}
+
+/// A block the generated table does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingBlock {
+    pub name: &'static str,
+}
+
+impl std::fmt::Display for MissingBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the generated block table has no {}; it is not the table this \
+             server was built against",
+            self.name
+        )
+    }
+}
+
+impl std::error::Error for MissingBlock {}
+
+/// The y of the topmost solid row. One block of grass at the world's floor
+/// plus four, which is where a vanilla superflat puts it.
+pub const SURFACE_Y: i32 = -60;
+
+/// Where a player spawns: the middle of a block, standing on the surface.
+///
+/// The half-block offsets are not cosmetic. A client handed integer x and z
+/// spawns on a block *corner*, and the first physics tick pushes it off; a
+/// client handed a y equal to the surface spawns *inside* the grass and is
+/// ejected upward. Both look like the server sent a bad position, which it
+/// did.
+pub const SPAWN: (f64, f64, f64) = (0.5, SURFACE_Y as f64 + 1.0, 0.5);
+
+/// One flat world.
+#[derive(Debug, Clone, Copy)]
+pub struct FlatWorld {
+    palette: Palette,
+    height: WorldHeight,
+    biome: u32,
+    block_registry_size: u32,
+    biome_registry_size: u32,
+}
+
+impl FlatWorld {
+    /// Build the world description. `biome` is an id into the biome registry
+    /// as it was synced during configuration — the *same* order, because the
+    /// client built its mapping from the packet this server sent it and a
+    /// second ordering here would name a different biome.
+    pub fn new(palette: Palette, biome: u32, biome_registry_size: u32) -> Self {
+        Self {
+            palette,
+            height: WorldHeight::OVERWORLD,
+            biome,
+            block_registry_size: dust_registry::STATE_COUNT,
+            biome_registry_size,
+        }
+    }
+
+    pub fn height(&self) -> WorldHeight {
+        self.height
+    }
+
+    /// Generate the column at `pos`.
+    ///
+    /// Every column is identical, so this is a fill and five row writes rather
+    /// than anything worth caching — and a cache would have to be invalidated
+    /// the day a block is placed, which is the next thing to happen here.
+    pub fn chunk(&self, pos: ChunkPos) -> Chunk {
+        let mut chunk = Chunk::uniform(
+            pos,
+            self.height,
+            self.block_registry_size,
+            self.biome_registry_size,
+            self.palette.air,
+            self.biome,
+        );
+        let floor = self.height.min_y();
+        for x in 0..16 {
+            for z in 0..16 {
+                chunk.set_block(x, floor, z, self.palette.bedrock);
+                for y in (floor + 1)..SURFACE_Y {
+                    chunk.set_block(x, y, z, self.palette.dirt);
+                }
+                chunk.set_block(x, SURFACE_Y, z, self.palette.grass);
+            }
+        }
+        // The heightmaps travel in the chunk packet and the client uses them
+        // for lighting and for where rain lands. Recomputed from the sections
+        // rather than written by hand, so that the day this stops being flat
+        // the heights follow the blocks instead of a constant.
+        let air = self.palette.air;
+        // Every kind counts the same blocks here, because a flat world has no
+        // leaves, no water and no non-solid surface — the four maps only
+        // diverge where those exist. The predicate still takes the kind, so
+        // the day this world grows one, the divergence has somewhere to go.
+        chunk.recompute_heightmaps(|_kind, state| state != air);
+        chunk
+    }
+
+    /// Which heightmaps a 1.21.1 client is sent.
+    ///
+    /// Two of the four: the other two are server-side bookkeeping that vanilla
+    /// keeps out of the packet, and sending them would be sending the client
+    /// something it has no use for and no code to read.
+    pub const NETWORK_HEIGHTMAPS: [HeightmapKind; 2] =
+        [HeightmapKind::MotionBlocking, HeightmapKind::WorldSurface];
+}
