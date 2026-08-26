@@ -8,13 +8,22 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+flate2.workspace = true
+
+[dev-dependencies]
+# The same crate the library uses. The tests need it directly because the
+# external corpus lives inside the server jar, and reading a jar means
+# inflating deflate streams — see `tests/support/mod.rs`.
+flate2.workspace = true
 
 [lints.rust]
-# On the unsafe allow-list; see docs/decisions/0005-implementation-language.md.
-# The workspace denies unsafe, and this crate cannot do its job without it, so
-# it opts out here rather than sprinkling `#[allow]` at each use site — the
-# exception is then visible in one place per crate instead of many.
-unsafe_code = "warn"
+# The stub of this crate opted out of the workspace `unsafe_code = "deny"` in
+# anticipation of a zero-copy reader that would need it. The implementation
+# turned out not to: see the `Tag::String` note in `src/tag.rs` for why nothing
+# in NBT can be borrowed from the input in the general case, which removed the
+# reason for the exception. The deny is back, so the exception is not sitting
+# open for a later change to walk through.
+unsafe_code = "deny"
 missing_debug_implementations = "warn"
 
 [lints.clippy]

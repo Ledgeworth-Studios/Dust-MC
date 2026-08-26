@@ -2,3 +2,4 @@
 # trybuild writes proposed expectations here when a compile-fail message
 # changes. They are reviewed and moved into tests/ui/, never committed as-is.
 wip/
+.dust-extract/

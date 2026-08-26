@@ -8,9 +8,23 @@ the gates that keep the rest honest.
 
 ## Status
 
-Stage 0 — groundwork. Phases 0.1, 0.2 and 0.3 are done; Phase 0.4 (CI) has its
-workflow and Phase 0.5 (vanilla data extraction) has not started. No server
-code. Nothing here accepts a connection.
+Stage 0 — groundwork. Phases 0.1 through 0.4 are done, and Phase 0.5 extracts
+the block registry. No server code. Nothing here accepts a connection.
+
+## Vanilla data
+
+Dust ships no Mojang data and no Mojang assets. What the repository holds is the
+extractor, and the Rust that results from running it:
+
+```
+cargo xtask extract --version 1.21.1
+```
+
+That resolves the version through Mojang's manifest, downloads the server jar to
+a gitignored cache, verifies its SHA-1, runs Minecraft's own data generators and
+regenerates the tables in `dust-registry`. It needs a network and a JDK 21 or
+newer, runs by hand a few times per Minecraft release, and is deliberately not
+part of `just verify` — what CI checks is the generated code.
 
 ## Building
 

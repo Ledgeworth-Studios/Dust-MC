@@ -3,6 +3,7 @@
 //! Everything here is something `just verify` runs, so that the local gate and
 //! the remote gate execute the same code rather than two descriptions of it.
 
+mod extract;
 mod licenses;
 
 use std::path::{Path, PathBuf};
@@ -15,6 +16,12 @@ cargo xtask <command>
                    With --check, verify the committed file matches and fail if
                    it does not, rather than rewriting it.
   licenses         Audit every dependency's licence for GPL-3.0 compatibility.
+
+  extract --version <v> [--server-jar <path>]
+                   Download the Minecraft server jar for <v>, run its own data
+                   generators, and regenerate the tables in dust-registry from
+                   the reports. Needs a network and a JDK 21 or newer. Not part
+                   of `just verify`, and not something CI runs.
 ";
 
 fn main() -> ExitCode {
@@ -22,6 +29,7 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("docs") => docs(args.iter().any(|a| a == "--check")),
         Some("licenses") => audit_licenses(),
+        Some("extract") => extract_data(&args[1..]),
         Some("--help" | "-h") | None => {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -70,6 +78,39 @@ fn docs(check: bool) -> Result<(), String> {
             path.display()
         ))
     }
+}
+
+fn extract_data(args: &[String]) -> Result<(), String> {
+    let mut version = None;
+    let mut server_jar = None;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--version" => {
+                version = Some(
+                    rest.next()
+                        .ok_or("--version needs a Minecraft version, e.g. 1.21.1")?
+                        .clone(),
+                )
+            }
+            "--server-jar" => {
+                server_jar = Some(PathBuf::from(
+                    rest.next().ok_or("--server-jar needs a path")?,
+                ))
+            }
+            other => return Err(format!("unknown option `{other}`\n\n{USAGE}")),
+        }
+    }
+    let version = version.ok_or_else(|| {
+        format!("extract needs --version, e.g. `cargo xtask extract --version 1.21.1`\n\n{USAGE}")
+    })?;
+    extract::run(
+        &extract::Options {
+            version,
+            server_jar,
+        },
+        &workspace_root(),
+    )
 }
 
 fn audit_licenses() -> Result<(), String> {
