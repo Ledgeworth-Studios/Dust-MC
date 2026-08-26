@@ -23,7 +23,7 @@
 //! for the reason every golden sample in this repository gives: a table that
 //! agrees with itself has proved nothing except that it agrees with itself.
 
-use crate::generated::fluids::{FLUID_DEFS, FLUID_SAMPLES};
+use crate::generated::fluids::FLUID_DEFS;
 use crate::{Block, Fluid, Item};
 
 /// One fluid's relationships, as the generated table holds them.
