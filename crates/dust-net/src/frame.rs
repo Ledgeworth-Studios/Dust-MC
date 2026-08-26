@@ -270,6 +270,17 @@ impl std::fmt::Display for FrameError {
 
 impl std::error::Error for FrameError {}
 
+/// How many more bytes [`FrameDecoder::next_frame`] needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Needed {
+    /// The length prefix is not complete, so the frame's size is not yet
+    /// knowable. Feed one more byte and ask again.
+    Unknown,
+    /// Exactly this many more bytes. Zero means a frame — or the error that
+    /// replaces it — is ready now.
+    Exactly(usize),
+}
+
 /// Whether compression is on, and the size at which it starts.
 ///
 /// The threshold is a `usize` rather than the protocol's signed VarInt because
@@ -349,6 +360,41 @@ impl FrameDecoder {
     pub fn feed(&mut self, bytes: &[u8]) {
         self.compact();
         self.buffer.extend_from_slice(bytes);
+    }
+
+    /// How many more bytes the decoder wants before it can produce a frame.
+    ///
+    /// This exists for the encrypted read path, and it is the reason that path
+    /// is safe. CFB8 state advances per byte, so a reader that decrypts a
+    /// whole socket chunk speculatively has committed the cipher to bytes it
+    /// may not be entitled to interpret yet — and at the moment encryption is
+    /// switched on, the bytes past the Encryption Response are exactly that.
+    /// [`crate::io`] instead decrypts a byte at a time until the length prefix
+    /// is complete, then exactly the body in one call, so nothing beyond the
+    /// current frame is ever fed through the cipher.
+    ///
+    /// [`Needed::Exactly(0)`](Needed::Exactly) also covers "the next call will
+    /// return an error": a malformed or oversized prefix is reported by
+    /// [`next_frame`](Self::next_frame), not here, so there is one place that
+    /// decides what is wrong with a frame.
+    pub fn needed(&self) -> Needed {
+        let available = &self.buffer[self.start..];
+        match read_var_int(available) {
+            Ok((declared, prefix)) if declared > 0 => {
+                let declared = declared as usize;
+                if declared > self.limits.max_frame_len {
+                    // `next_frame` is about to refuse it; asking for the bytes
+                    // would be reading a body that will never be looked at.
+                    return Needed::Exactly(0);
+                }
+                Needed::Exactly((prefix + declared).saturating_sub(available.len()))
+            }
+            // Zero, negative, or unreadable: all errors, all reported by
+            // `next_frame`.
+            Ok(_) => Needed::Exactly(0),
+            Err(VarIntError::Incomplete { .. }) => Needed::Unknown,
+            Err(_) => Needed::Exactly(0),
+        }
     }
 
     /// How many unread bytes are buffered.
