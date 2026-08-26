@@ -50,17 +50,17 @@
 //! name is resolved through a caller-supplied lookup, because which id a block
 //! has is `dust-registry`'s business and this crate does not depend on it.
 //!
-//! Properties are **not** applied: this returns each block's default state.
-//! That is a real and bounded loss — a chunk of stairs comes back as stairs
-//! all facing north — and it is named here rather than left for somebody to
-//! find, because the fix is a property resolver in the registry crate and not
-//! a change to this parser.
+//! Properties are read and passed to the lookup, so a chunk of stairs comes
+//! back facing the way it was written. They arrive as `(name, value)` pairs of
+//! strings, which is how the file spells them, and turning those into a state
+//! id is the registry's job — this crate does not know that `facing` has six
+//! values or which of them is which.
 //!
-//! It also has a consequence one real chunk was enough to hit: **a palette can
-//! list one block name twice**, as two states of the same block, and resolving
-//! by name collapses them to one id. The file is not wrong and neither is the
-//! reader; the indices still point where they should. See the note in
-//! [`read_container`] for why that rules out the fast path through
+//! Even so, **a palette can list one block name twice** and resolve to one id:
+//! a lookup may legitimately ignore a property it does not model, and two
+//! entries differing only in that property then collapse. The file is not wrong
+//! and neither is the reader; the indices still point where they should. See
+//! the note in [`read_container`] for why that rules out the fast path through
 //! `PalettedContainer::from_parts`.
 
 use std::collections::HashMap;
@@ -123,8 +123,19 @@ impl std::error::Error for AnvilError {}
 /// that could pass a block table from one version and a biome table from
 /// another would be a caller able to build a chunk neither table describes.
 pub trait Names {
-    /// The default state id of a block, by name.
-    fn block(&self, name: &str) -> Option<u32>;
+    /// The state id of a block, by name and property values.
+    ///
+    /// `properties` is what the palette entry carried, as `(name, value)`
+    /// pairs — `("facing", "north")`, `("waterlogged", "false")`. A block with
+    /// none has an empty slice, which is the common case and the one the
+    /// implementation should be fast for.
+    ///
+    /// A property the block does not have, or a value it does not take, is the
+    /// implementation's to decide about. Refusing the whole state is defensible
+    /// and so is ignoring the pair; what is not is silently returning the
+    /// default, since that turns one wrong property into a block that looks
+    /// right and is not.
+    fn block(&self, name: &str, properties: &[(&str, &str)]) -> Option<u32>;
     /// A biome's id, by name. This must be its position in the registry the
     /// *client* was told about, not an internal one — the two are the same
     /// number only if somebody made them so.
@@ -300,11 +311,26 @@ fn block_ids(palette: &Tag, names: &impl Names) -> Result<Vec<u32>, AnvilError> 
                 name: "block palette Name",
             });
         };
-        // Properties are read past, not applied. See the module note: a chunk
-        // of stairs comes back facing north.
+
+        // `Properties` is absent for a block that has none, which is most of
+        // them by count and nearly all of them by volume — stone, dirt, air.
+        // The borrow is of the tag rather than a copy, so the common case
+        // allocates nothing.
+        let mut pairs: Vec<(&str, &str)> = Vec::new();
+        if let Some(Tag::Compound(properties)) = block.get("Properties") {
+            for (key, value) in properties.iter() {
+                let Tag::String(value) = value else {
+                    return Err(AnvilError::Field {
+                        name: "a block property value",
+                    });
+                };
+                pairs.push((key.as_str(), value.as_str()));
+            }
+        }
+
         out.push(
             names
-                .block(name)
+                .block(name, &pairs)
                 .ok_or_else(|| AnvilError::UnknownBlock { name: name.clone() })?,
         );
     }
@@ -344,6 +370,8 @@ fn int(root: &Compound, name: &'static str) -> Result<i32, AnvilError> {
 /// A [`Names`] backed by two maps, for callers that already have the tables.
 #[derive(Debug, Default)]
 pub struct NameTables {
+    /// Keyed by name alone: this is for tests and for callers that have a flat
+    /// table, and it ignores properties by construction.
     pub blocks: HashMap<String, u32>,
     pub biomes: HashMap<String, u32>,
     pub block_registry_size: u32,
@@ -351,7 +379,7 @@ pub struct NameTables {
 }
 
 impl Names for NameTables {
-    fn block(&self, name: &str) -> Option<u32> {
+    fn block(&self, name: &str, _properties: &[(&str, &str)]) -> Option<u32> {
         self.blocks.get(name).copied()
     }
 

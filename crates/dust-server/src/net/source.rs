@@ -242,8 +242,26 @@ impl RegistryNames {
 }
 
 impl Names for RegistryNames {
-    fn block(&self, name: &str) -> Option<u32> {
-        dust_registry::Block::from_name(name).map(|block| block.default_state().id())
+    /// Resolve a block *state*, not just a block.
+    ///
+    /// Start at the block's default state and apply each property the file
+    /// named. `BlockState::with` returns `None` for a property this block does
+    /// not have or a value it does not take, and that is **skipped rather than
+    /// refused**: a world written by a newer Minecraft, or by a modded server,
+    /// carries properties this build's table does not model, and refusing the
+    /// whole chunk over one of them would make a world unopenable for a detail
+    /// nobody can see. What is not done is returning the default and calling it
+    /// the state — the properties that *are* understood are applied, so a
+    /// staircase faces the way it was written even if some other field on it is
+    /// unknown.
+    fn block(&self, name: &str, properties: &[(&str, &str)]) -> Option<u32> {
+        let mut state = dust_registry::Block::from_name(name)?.default_state();
+        for (property, value) in properties {
+            if let Some(next) = state.with(property, value) {
+                state = next;
+            }
+        }
+        Some(state.id())
     }
 
     fn biome(&self, name: &str) -> Option<u32> {

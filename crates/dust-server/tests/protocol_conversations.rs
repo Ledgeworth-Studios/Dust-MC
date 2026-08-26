@@ -1515,3 +1515,81 @@ fn boot_expecting_failure(extra_config: &str) -> dust_server::ServerError {
         .run()
         .expect_err("a picture the client cannot use must stop the boot")
 }
+
+/// Block properties survive being read out of a world file.
+///
+/// The reader hands `(name, value)` pairs to the registry and the registry
+/// walks them onto a state. Without that, every stair in a loaded world faces
+/// north and every log lies on its side the same way — which renders as a world
+/// that is subtly, uniformly wrong rather than as an error.
+///
+/// Checked against the registry directly rather than over the wire, because
+/// what is being tested is the resolution and not the packet. `#[ignore]` only
+/// because it is grouped with the world tests; it needs no world.
+#[test]
+fn a_block_state_is_resolved_from_its_properties_and_not_just_its_name() {
+    use dust_world::anvil::Names;
+
+    let names = dust_server::net::source::RegistryNames::new().expect("the biome registry");
+
+    // A block with no properties resolves to itself.
+    let stone = dust_registry::Block::from_name("minecraft:stone").expect("stone");
+    assert_eq!(
+        names.block("minecraft:stone", &[]),
+        Some(stone.default_state().id())
+    );
+
+    // One with properties resolves to the state those properties name, and
+    // *not* to the default — which is the whole point, so both are asserted.
+    let stairs = dust_registry::Block::from_name("minecraft:oak_stairs").expect("oak stairs");
+    let default = stairs.default_state();
+    let facing_south = names
+        .block("minecraft:oak_stairs", &[("facing", "south")])
+        .expect("a state");
+    assert_ne!(
+        facing_south,
+        default.id(),
+        "applying a property must move off the default, or nothing was applied"
+    );
+    assert_eq!(
+        dust_registry::BlockState::from_id(facing_south)
+            .expect("a real state")
+            .property("facing"),
+        Some("south")
+    );
+
+    // Several at once, since the state id is mixed-radix over all of them and
+    // applying two is where an implementation that only handled one shows.
+    let both = names
+        .block(
+            "minecraft:oak_stairs",
+            &[("facing", "west"), ("half", "top")],
+        )
+        .expect("a state");
+    let both = dust_registry::BlockState::from_id(both).expect("a real state");
+    assert_eq!(both.property("facing"), Some("west"));
+    assert_eq!(both.property("half"), Some("top"));
+
+    // A property this build does not model is skipped, not fatal: a world from
+    // a newer Minecraft or a modded server carries fields this table has never
+    // heard of, and refusing a chunk over one would make the world unopenable
+    // for a detail nobody can see. The properties that *are* understood still
+    // apply.
+    let with_nonsense = names
+        .block(
+            "minecraft:oak_stairs",
+            &[("facing", "east"), ("not_a_property", "yes")],
+        )
+        .expect("still a state");
+    assert_eq!(
+        dust_registry::BlockState::from_id(with_nonsense)
+            .expect("a real state")
+            .property("facing"),
+        Some("east"),
+        "the understood property survives the unknown one"
+    );
+
+    // And a block nobody has heard of is a `None`, which the parser turns into
+    // a named error rather than a default.
+    assert_eq!(names.block("minecraft:not_a_block", &[]), None);
+}
