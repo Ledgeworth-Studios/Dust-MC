@@ -161,6 +161,11 @@ pub enum ConnError {
     Protocol(FrameError),
     /// The layer above asked for a transition the state machine forbids.
     Illegal(IllegalTransition),
+    /// The handshake's next-state field named no intent at all (see
+    /// [`UnknownIntent`](crate::state::UnknownIntent)). Kept distinct from
+    /// [`ConnError::Illegal`] because "the client asked for nothing that
+    /// exists" and "the caller broke the table" are different log lines.
+    Handshake(HandshakeError),
     /// The connection had already ended when this operation ran. The error
     /// that originally ended it was reported to whoever saw it first; see
     /// the delivery-semantics note in the module docs.
@@ -183,6 +188,7 @@ impl std::fmt::Display for ConnError {
             Self::Io(error) => write!(f, "the socket failed: {error}"),
             Self::Protocol(error) => write!(f, "the connection carried a bad frame: {error}"),
             Self::Illegal(error) => write!(f, "{error}"),
+            Self::Handshake(error) => write!(f, "{error}"),
             Self::Closed => f.write_str("the connection has already ended"),
             Self::IdleTimeout { limit } => write!(
                 f,
@@ -212,6 +218,15 @@ impl From<FrameError> for ConnError {
 impl From<IllegalTransition> for ConnError {
     fn from(error: IllegalTransition) -> Self {
         Self::Illegal(error)
+    }
+}
+
+impl From<HandshakeError> for ConnError {
+    fn from(error: HandshakeError) -> Self {
+        match error {
+            HandshakeError::Illegal(inner) => Self::Illegal(inner),
+            other => Self::Handshake(other),
+        }
     }
 }
 

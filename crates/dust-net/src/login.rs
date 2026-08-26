@@ -27,8 +27,10 @@
 //! **The session-server call is Phase 1's job and this crate does not make
 //! it.** No HTTP client is a dependency of `dust-net`, no Mojang endpoint
 //! appears in it, and nothing in this module was tested against Mojang's
-//! infrastructure — the live-server work in `tests/vanilla_status.rs` runs
-//! against a local server in offline mode and nothing else.
+//! infrastructure at all. The closest standing check is the ciphertext a
+//! real JVM produced after parsing this crate's key encoding — captured once
+//! in [`crate::testkeys`] so CI needs no Java — and even that stops short of
+//! an HTTP call.
 //!
 //! What is here is everything that can be built and checked without
 //! credentials: the key pair, the encoding a real client parses, the

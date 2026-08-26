@@ -34,11 +34,11 @@
 //!   bytes pass the cipher on the way into a buffer and again on the way out.
 //!
 //! Neither is caught by a test that encrypts a buffer and decrypts it again.
-//! `tests/encryption_switch.rs` drives the real transition over a real socket
-//! and checks that the frame after the switch arrives intact — including the
-//! case where the peer pipelines its next frame into the same TCP segment as
-//! the Encryption Response, which is the case an honest client does not
-//! produce and a hostile one does.
+//! `tests/encryption_switch.rs` drives the real transition over an in-memory
+//! stream and checks that the frames after the switch arrive intact —
+//! including the case where the peer pipelines encrypted frames into the same
+//! write as the Encryption Response, which is the case an honest client does
+//! not produce and a hostile one does.
 //!
 //! [`crate::io`] handles the read side by never decrypting further than the
 //! frame it is currently assembling: the length prefix is decrypted a byte at

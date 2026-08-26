@@ -285,7 +285,7 @@ pub enum Needed {
 ///
 /// The threshold is a `usize` rather than the protocol's signed VarInt because
 /// a negative threshold is not "compress everything" — it is a Set Compression
-/// packet meaning *disable*, which is [`Compression::Disabled`] here. Making
+/// packet meaning *disable*, which is [`Compress::Disabled`] here. Making
 /// that a different variant rather than a negative number means no arm of any
 /// match on it can forget the case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -568,7 +568,8 @@ fn decompress(input: &[u8], declared: usize, absolute: usize) -> Result<Vec<u8>,
 /// boundary: what this encoder produces is what that decoder accepts, and the
 /// `round_trips_through_the_decoder` tests hold the two together. That
 /// agreement is *not* evidence that either matches Minecraft — see the crate
-/// docs — which is what `tests/vanilla_status.rs` is for.
+/// docs. The part that can be checked offline is checked structurally, on
+/// raw wire bytes, in `tests/compression_matrix.rs`.
 #[derive(Debug)]
 pub struct FrameEncoder {
     limits: Limits,

@@ -507,8 +507,10 @@ fn round_trips_through_the_decoder_in_both_modes() {
     // Deliberately last, and deliberately labelled. This proves the encoder
     // and the decoder in this crate agree with each other. It does not prove
     // either agrees with Minecraft, and it would pass just as green with the
-    // VarInt groups reversed in both halves. `tests/vanilla_status.rs` is the
-    // test that can tell.
+    // VarInt groups reversed in both halves. The published wire tables in
+    // `varint.rs`'s own tests, and the externally generated fixtures in
+    // `testkeys.rs`, are what stand between this and self-consistent
+    // nonsense.
     let modes = [
         Compress::Disabled,
         Compress::At { threshold: 1 },

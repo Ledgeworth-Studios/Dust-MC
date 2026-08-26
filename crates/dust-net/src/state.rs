@@ -362,8 +362,8 @@ impl std::error::Error for HandshakeError {}
 /// The type-level half of the state machine.
 ///
 /// [`Connection`] checks transitions at run time because the wire decides
-/// them. Where a *path* is known at compile time — the status ping in
-/// `tests/vanilla_status.rs`, a login sequence written out in order — the
+/// them. Where a *path* is known at compile time — the full login
+/// conversation written out in order in `tests/login_session.rs` — the
 /// state can be a type parameter instead, and the illegal transitions are then
 /// methods that do not exist.
 ///

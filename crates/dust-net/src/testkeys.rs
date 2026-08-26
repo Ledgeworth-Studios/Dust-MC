@@ -26,8 +26,8 @@
 //!
 //! so the DER encoding and the PKCS#1 v1.5 ciphertexts are LibreSSL's, and
 //! the tests that use them are comparing this crate against LibreSSL rather
-//! than against itself. No JVM is needed, which is why this check runs in CI
-//! and the `X509EncodedKeySpec` check in `tests/vanilla_status.rs` does not.
+//! than against itself. No JVM is needed for any of it, which is why every
+//! check here runs in CI.
 
 /// The test key pair's private half, PKCS#8 DER.
 pub const PRIVATE_KEY_PKCS8_DER: &[u8] = &[
