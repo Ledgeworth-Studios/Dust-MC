@@ -48,6 +48,59 @@ A full cold run — download plus both generators plus every table — takes a f
 minutes, almost all of it inside Java. A warm run against the cache takes
 seconds.
 
+## Differential testing
+
+Testing against vanilla is the highest-value test this project will have: run
+the real server and Dust over identical inputs and let Mojang's implementation
+argue with ours. The groundwork for that is the harness — three verbs that
+provision a vanilla server, fingerprint a world it generates, and compare
+fingerprints:
+
+```
+cargo xtask harness provision --version 1.21.1 --seed 0 --yes
+cargo xtask harness capture --version 1.21.1 --seed 0 --radius 2
+cargo xtask harness compare captures/a captures/b
+```
+
+`provision` resolves the server jar through the same manifest-and-SHA-1 path
+the extractor uses (verified on every run, including cache hits), writes a
+run directory tuned for headless determinism into the harness cache, and —
+only with `--yes` — accepts Minecraft's EULA on your behalf by writing
+`eula.txt`. Without that flag the file is left unwritten and vanilla refuses
+to boot until you have read the EULA and chosen; agreeing to a licence is an
+act, and the flag keeps it visible in your shell history where it belongs.
+
+`capture` boots the provisioned server headless, watches its own log for the
+readiness line, force-generates the square of chunks within `--radius` chunks
+of spawn with `forceload`, waits until every chunk has reached disk, flushes,
+stops the server over RCON, and then reads the region files directly — anvil
+layout, chunk decompression, a minimal NBT walk — to produce one digest per
+chunk: a block-state multiset hash (order-independent), a biome hash, and
+per-heightmap hashes. Output lands as `chunks.bin` plus a human-readable
+`chunks.tsv`. `harness rcon` stands alone for talking to a running server.
+
+`compare` diffs two capture sets and prints one row per chunk that is missing,
+extra or divergent, with both digests side by side:
+
+```
+$ cargo xtask harness compare 1.21.1-seed-0-radius-2 1.21.1-seed-0-radius-2-rerun
+comparing seed 0 data version 3953: 25 chunks vs 25 chunks
+identical
+```
+
+Its exit codes are for scripts: **0** when identical, **1** when they differ
+(a finding, not a failure), **2** when the comparison could not run at all.
+
+Two honesty notes. First, what is seed-stable: terrain, biomes, ore and
+structure placement are stable for a fixed seed and version, and that is
+exactly what the digest covers; everything clock-shaped (mob cycles, weather,
+container loot) is excluded by construction rather than filtered afterwards.
+Second, where things live: nothing Mojang ships and nothing vanilla generates
+is ever committed. Jars, worlds and digests stay under the harness cache —
+outside the repository, shared by all worktrees, movable with
+`DUST_HARNESS_CACHE`. Each verb's own usage (`cargo xtask harness`) carries
+the operational details.
+
 ## Building
 
 ```

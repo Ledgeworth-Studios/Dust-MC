@@ -4,6 +4,7 @@
 //! the remote gate execute the same code rather than two descriptions of it.
 
 mod extract;
+mod harness;
 mod licenses;
 
 use std::path::{Path, PathBuf};
@@ -24,10 +25,29 @@ cargo xtask <command>
                    or newer. Not part of `just verify`, and not something CI
                    runs. With --only, extract just the named domains (blocks,
                    items, packets, worldgen) instead of all of them.
+
+  harness <verb>   Differential-testing groundwork against vanilla: provision
+                   a cached server, capture a fingerprint of a world it
+                   generates, compare two fingerprints. Has its own usage —
+                   run `cargo xtask harness` to see it. Not part of `just
+                   verify`; needs Java on PATH and (once) a network.
 ";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // The harness owns its exit codes (compare reports a *finding* with 1 and
+    // keeps 2 for failures), so it returns one rather than mapping onto the
+    // success/failure pair every other command uses.
+    if args.first().map(String::as_str) == Some("harness") {
+        return match harness::dispatch(&args[1..]) {
+            Ok(code) => code,
+            Err(message) => {
+                eprintln!("error: {message}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let result = match args.first().map(String::as_str) {
         Some("docs") => docs(args.iter().any(|a| a == "--check")),
         Some("licenses") => audit_licenses(),

@@ -35,7 +35,6 @@
 mod blocks;
 mod codegen;
 mod commands;
-mod download;
 mod entities;
 mod fluids;
 mod items;
@@ -44,9 +43,15 @@ mod numbers;
 mod packets;
 mod recipes;
 mod registries;
-mod sha1;
 mod tags;
 mod worldgen;
+
+// Reused by the differential harness (`cargo xtask harness provision`), which
+// needs the same jar resolved the same way: manifest lookup, SHA-1 checked on
+// every run including cache hits. One resolver means one place that can be
+// wrong about either.
+pub(crate) mod download;
+pub(crate) mod sha1;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
