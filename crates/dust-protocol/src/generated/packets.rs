@@ -12,6 +12,7 @@ pub mod v1_21_1;
 /// `ProtocolVersion` indexes them.
 pub static VERSIONS: &[VersionDef] = &[VersionDef {
     name: v1_21_1::VERSION_NAME,
+    protocol: v1_21_1::PROTOCOL_NUMBER,
     tables: v1_21_1::TABLES,
     samples: v1_21_1::PACKET_SAMPLES,
 }];

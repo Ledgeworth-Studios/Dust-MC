@@ -207,6 +207,10 @@ pub struct Options {
 struct Context<'a> {
     version: &'a str,
     workspace_root: &'a Path,
+    /// The server jar itself. Almost everything is read from what the data
+    /// generators *produced*, but the protocol number is not in any report —
+    /// it lives in the jar's own `version.json`. See [`protocol_number`].
+    jar: &'a Path,
     /// The `--reports` tree, once any report-reading domain has asked for it.
     reports: Option<PathBuf>,
     /// The `--server` data pack tree, likewise.
@@ -281,6 +285,7 @@ pub fn run(options: &Options, workspace_root: &Path) -> Result<(), String> {
     let mut context = Context {
         version,
         workspace_root,
+        jar: &jar,
         reports: None,
         data: None,
     };
@@ -730,7 +735,12 @@ fn loot_domain(flat: &registries::Registries, context: &Context) -> Result<Outco
 }
 
 fn packets_domain(context: &Context) -> Result<Outcome, String> {
-    extract_packets(context.reports()?, context.version, context.workspace_root)?;
+    extract_packets(
+        context.reports()?,
+        context.jar,
+        context.version,
+        context.workspace_root,
+    )?;
     Ok("packet tables regenerated".to_owned())
 }
 
@@ -867,10 +877,17 @@ fn report_what_the_registries_said(flat: &registries::Registries) {
 /// table is its own module, and the index that lists them is rebuilt from the
 /// modules on disk. Running this for 1.21.4 later adds a file and a row rather
 /// than replacing 1.21.1.
-fn extract_packets(reports: &Path, version: &str, workspace_root: &Path) -> Result<(), String> {
+fn extract_packets(
+    reports: &Path,
+    jar: &Path,
+    version: &str,
+    workspace_root: &Path,
+) -> Result<(), String> {
     let json = std::fs::read(reports.join("reports/packets.json"))
         .map_err(|e| format!("could not read the generated packet report: {e}"))?;
     let parsed = packets::parse(&json)?;
+    let protocol = protocol_number(jar)?;
+    println!("the jar declares protocol number {protocol}");
 
     println!("read {} packets from the packet report:", parsed.total);
     for group in &parsed.groups {
@@ -906,7 +923,7 @@ fn extract_packets(reports: &Path, version: &str, workspace_root: &Path) -> Resu
         .map_err(|e| format!("could not create {}: {e}", versions.display()))?;
 
     let path = versions.join(format!("{module}.rs"));
-    std::fs::write(&path, codegen::packets(&parsed, version))
+    std::fs::write(&path, codegen::packets(&parsed, version, protocol))
         .map_err(|e| format!("could not write {}: {e}", path.display()))?;
     println!("wrote {}", path.display());
 
@@ -915,6 +932,50 @@ fn extract_packets(reports: &Path, version: &str, workspace_root: &Path) -> Resu
         .map_err(|e| format!("could not write {}: {e}", path.display()))?;
     println!("wrote {}", path.display());
     Ok(())
+}
+
+/// The protocol number this jar speaks, from its own `version.json`.
+///
+/// Not derivable from anything else in the extraction. The packet report names
+/// packets and ids; it never says which number a client puts in a handshake,
+/// and that number is the one the whole connection turns on. Guessing it from
+/// the Minecraft version id is not possible either — the two are unrelated
+/// sequences, and several Minecraft releases share one protocol number.
+///
+/// Read through `dust-data`'s zip reader rather than a second one written here:
+/// it is the archive reader this workspace already hardened, and a jar is a zip
+/// like any other. The refusal is loud because a missing or unreadable
+/// `version.json` means this is not the jar anybody thinks it is.
+fn protocol_number(jar: &Path) -> Result<i32, String> {
+    let bytes = std::fs::read(jar).map_err(|e| format!("could not read {}: {e}", jar.display()))?;
+    let archive = dust_data::zip::ZipArchive::open(bytes)
+        .map_err(|e| format!("{} is not a readable archive: {e}", jar.display()))?;
+    let entry = archive
+        .entries()
+        .iter()
+        .find(|entry| entry.name == "version.json")
+        .ok_or_else(|| {
+            format!(
+                "{} has no version.json; a Minecraft server jar always does, so this is \
+                 not one",
+                jar.display()
+            )
+        })?;
+    let raw = archive
+        .read(entry)
+        .map_err(|e| format!("could not read version.json out of {}: {e}", jar.display()))?;
+    let parsed: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|e| format!("version.json in {} is not JSON: {e}", jar.display()))?;
+    let number = parsed
+        .get("protocol_version")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| {
+            format!(
+                "version.json in {} has no numeric protocol_version",
+                jar.display()
+            )
+        })?;
+    i32::try_from(number).map_err(|_| format!("protocol_version {number} does not fit in an i32"))
 }
 
 /// Read the vanilla ore baseline out of the `--server` tree and write it into

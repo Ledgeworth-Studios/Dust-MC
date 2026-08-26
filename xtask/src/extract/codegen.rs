@@ -521,7 +521,7 @@ fn static_name(group: &Group) -> String {
 /// the state and direction it is for, so that the direct index the lookup uses
 /// is checkable rather than merely believed. See the test in `dust-protocol`
 /// that reads those fields back.
-pub fn packets(data: &Packets, version: &str) -> String {
+pub fn packets(data: &Packets, version: &str, protocol: i32) -> String {
     let mut out = String::with_capacity(64 * 1024);
 
     let _ = writeln!(
@@ -548,6 +548,18 @@ pub fn packets(data: &Packets, version: &str) -> String {
          /// name, so that the module name stays a file name and nothing more."
     );
     let _ = writeln!(out, "pub const VERSION_NAME: &str = {version:?};\n");
+
+    let _ = writeln!(
+        out,
+        "/// The number a client puts in its handshake to ask for this version.\n\
+         ///\n\
+         /// From the jar's own `version.json`, which is the only place it appears:\n\
+         /// the packet report names packets and ids and never says which number\n\
+         /// selects the table they are in. It is also not derivable from the version\n\
+         /// id above — several Minecraft releases share one protocol number, and the\n\
+         /// two sequences are unrelated."
+    );
+    let _ = writeln!(out, "pub const PROTOCOL_NUMBER: i32 = {protocol};\n");
 
     for group in &data.groups {
         if !group.present {
@@ -689,8 +701,8 @@ fn packet_samples(out: &mut String, reported: &Report) {
 /// The rows are in file-name order, which is not version order — `1.21.10`
 /// would sort before `1.21.4`. Nothing here depends on the order, and there is
 /// deliberately no `latest()` for that reason: the number that orders protocol
-/// versions is the one in the jar's `version.json`, which this extractor does
-/// not read.
+/// versions is `PROTOCOL_NUMBER`, and a caller that wants the newest should say
+/// so by comparing those rather than by trusting a position in this list.
 pub fn packet_index(modules: &[String]) -> String {
     let mut out = String::with_capacity(4 * 1024);
     let _ = writeln!(
@@ -716,7 +728,8 @@ pub fn packet_index(modules: &[String]) -> String {
     for module in modules {
         let _ = writeln!(
             out,
-            "    VersionDef {{ name: {module}::VERSION_NAME, tables: {module}::TABLES, \
+            "    VersionDef {{ name: {module}::VERSION_NAME, \
+             protocol: {module}::PROTOCOL_NUMBER, tables: {module}::TABLES, \
              samples: {module}::PACKET_SAMPLES }},"
         );
     }

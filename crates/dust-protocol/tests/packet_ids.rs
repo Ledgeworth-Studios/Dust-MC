@@ -295,3 +295,42 @@ fn every_version_is_findable_by_name_and_names_itself() {
     assert_eq!(version::V1_21_1.name(), "1.21.1");
     assert!(ProtocolVersion::all().any(|v| v == version::V1_21_1));
 }
+
+/// The handshake's number resolves to the version whose table it selects, and
+/// nothing else does.
+///
+/// The two directions are asserted against each other rather than against a
+/// literal 767 alone, because a table that agreed with itself about a wrong
+/// number would satisfy either check on its own. The literal is here too, from
+/// the jar's `version.json` — it is the one number in this crate that a
+/// generator cannot derive and a test cannot recompute.
+#[test]
+fn a_protocol_number_selects_exactly_one_version() {
+    assert_eq!(version::V1_21_1.number(), 767);
+    assert_eq!(
+        ProtocolVersion::from_protocol_number(767),
+        Some(version::V1_21_1)
+    );
+
+    for v in ProtocolVersion::all() {
+        assert_eq!(
+            ProtocolVersion::from_protocol_number(v.number()),
+            Some(v),
+            "{} must resolve back to itself",
+            v.name()
+        );
+    }
+
+    // An unsupported client is a `None`, not a panic and not a nearest match:
+    // this is the point at which a server has to be able to say no politely.
+    for absent in [-1, 0, 1, 766, 768, i32::MAX] {
+        if ProtocolVersion::all().any(|v| v.number() == absent) {
+            continue;
+        }
+        assert_eq!(
+            ProtocolVersion::from_protocol_number(absent),
+            None,
+            "{absent} is not a version this server has a table for"
+        );
+    }
+}

@@ -1233,6 +1233,7 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "dust-config",
+ "dust-data",
  "flate2",
  "serde",
  "serde_json",

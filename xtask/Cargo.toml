@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 dust-config.workspace = true
+dust-data.workspace = true
 flate2.workspace = true
 serde.workspace = true
 serde_json.workspace = true

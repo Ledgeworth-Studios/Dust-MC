@@ -16,6 +16,15 @@ use crate::{ConnectionState, Direction, PacketTable};
 /// name, so that the module name stays a file name and nothing more.
 pub const VERSION_NAME: &str = "1.21.1";
 
+/// The number a client puts in its handshake to ask for this version.
+///
+/// From the jar's own `version.json`, which is the only place it appears:
+/// the packet report names packets and ids and never says which number
+/// selects the table they are in. It is also not derivable from the version
+/// id above — several Minecraft releases share one protocol number, and the
+/// two sequences are unrelated.
+pub const PROTOCOL_NUMBER: i32 = 767;
+
 /// `handshake` / `serverbound`, indexed by protocol id.
 static HANDSHAKE_SERVERBOUND: &[&str] = &["minecraft:intention"];
 /// Indices into [`HANDSHAKE_SERVERBOUND`], ordered by name, for binary search.

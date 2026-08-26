@@ -181,6 +181,8 @@ impl Direction {
 pub struct VersionDef {
     /// The Minecraft version id, e.g. `1.21.1`.
     pub name: &'static str,
+    /// The number a client sends in its handshake to ask for this version.
+    pub protocol: i32,
     /// Ten tables, at `state as usize * 2 + direction as usize`.
     pub tables: &'static [PacketTable],
     /// `(state, direction, protocol id, packet name)` straight from Mojang's
@@ -284,6 +286,29 @@ impl ProtocolVersion {
 
     pub fn name(self) -> &'static str {
         self.def().name
+    }
+
+    /// The number a client puts in its handshake to ask for this version.
+    ///
+    /// Signed, because the field on the wire is a VarInt and a client may send
+    /// any number at all including a negative one — resolving it is exactly
+    /// where "no" gets said, so the type has to be able to hold the values that
+    /// get refused.
+    pub fn number(self) -> i32 {
+        self.def().protocol
+    }
+
+    /// Resolve the number out of a client's handshake.
+    ///
+    /// `None` is the ordinary answer, not an error condition: it is what an
+    /// unsupported client looks like, and the caller's job is to say so
+    /// politely rather than to drop the connection. This is why the handshake
+    /// packet carries a plain VarInt and not one of these.
+    pub fn from_protocol_number(number: i32) -> Option<Self> {
+        VERSIONS
+            .iter()
+            .position(|version| version.protocol == number)
+            .map(|index| Self(index as u16))
     }
 
     /// The packets of one (state, direction) pair.
