@@ -2,50 +2,30 @@
 
 A Minecraft Java Edition server, written in Rust.
 
-Dust is being built from nothing. It is not finished, and this README will keep
-saying so — but you can connect to it.
+Dust is being built from nothing and is not finished — but you can play on it.
 
 ## Status
 
-**A client connects, logs in and stands in a world.** `dust server` binds
-`[server].bind`, answers the server-list ping, runs the login exchange in
-either offline or online mode, syncs the eleven datapack registries a 1.21.1
-client needs, and streams chunks around the spawn point. The connection stays
-up across keep-alives.
+**Two people can connect, walk around a shared world, break and place blocks,
+see each other doing it, and talk.** What they change is still there after a
+restart, and so is where they were standing.
+
+`dust server` binds `[server].bind`, answers the server-list ping with the MOTD,
+player count and favicon from `dust.toml`, runs login in either offline or
+online mode, syncs the eleven datapack registries a 1.21.1 client needs, streams
+chunks as players move, and keeps the connection up.
 
 The world is a superflat and is not pretending otherwise: worldgen is Phase 6.
 What exists is the whole path from the socket to the block table — framing,
-compression, encryption, the four connection states, the paletted section
-codec, the chunk packet — exercised by something a player can stand on.
+compression, encryption, the four connection states, the paletted section codec,
+the chunk packet, the light engine — exercised by something people can stand on.
 
-Not yet: movement does anything, blocks can be placed, chat, persistence,
-lighting (every chunk is sent fully lit, deliberately and visibly), tags,
-plugins, or more than one player being interesting.
-
-### How it is checked
-
-Two ways, and the second is the one that matters.
-
-The protocol tests speak the wire by hand — their own VarInts, their own length
-prefixes, their own zlib — sharing no code with the server. A test client built
-on Dust's own framing would agree with Dust by construction, under any
-convention including a wrong one.
-
-And the formats are captured from a **real Minecraft 1.21.1 server** rather than
-read off a wiki: the configuration order, the eleven registries and their entry
-counts, the offline-mode UUID derivation, and a chunk section decoded field by
-field until its 18,779 bytes were consumed exactly. Doing that found three
-defects nothing else would have — Login Start's shape was inverted, so no real
-client could have logged in; the offline profile id was derived from a
-lowercased name, so every offline player had a different identity from the one
-they have everywhere else; and the status document carried two keys vanilla
-does not send. Each had passing tests over it, because the tests were written
-from the same understanding as the code.
-
-Underneath: Stage 0's workspace, configuration system and gates; the vanilla
-data extractor; and the crates the rest stands on — NBT, world storage with
-paletted containers, heightmaps and a light engine, the 1.21.1 protocol codec,
-the datapack loader, and the network transport.
+**Not yet**, and each of these is stated where the code for it would go: no
+physics, block updates, drops, tool checks or reach validation, so a player may
+break bedrock from across the map; no inventory, so there is one placeable
+block; no tags; no light across chunk boundaries and no block light; no plugins;
+and the save format is Dust's own, not Anvil — a vanilla server cannot open a
+Dust world and Dust cannot open one of vanilla's.
 
 ## Try it
 
@@ -53,8 +33,43 @@ the datapack loader, and the network transport.
 cargo run -p dust-server -- server
 ```
 
-Then add `localhost` to a 1.21.1 client's server list. Set
-`online_mode = false` in `dust.toml` first unless you want Mojang consulted.
+Then add `localhost` to a 1.21.1 client's server list. Set `online_mode = false`
+in `dust.toml` first unless you want Mojang consulted.
+
+## How it is checked
+
+Two ways, and the second is the one that matters.
+
+The protocol tests **speak the wire by hand** — their own VarInts, their own
+length prefixes, their own zlib — sharing no code with the server. A test client
+built on Dust's own framing would agree with Dust by construction, under any
+convention including a wrong one.
+
+And the formats are **captured from a running Minecraft 1.21.1 server** rather
+than read off a wiki: the configuration order, the eleven registries and their
+entry counts, the offline-mode UUID derivation, and a chunk section decoded
+field by field until its 18,779 bytes were consumed exactly.
+
+Doing that found three defects in an afternoon, each with passing tests over it:
+
+- **Login Start's shape was inverted.** The transport expected an optional
+  profile id behind a presence flag — true in 1.20.2–1.20.4, wrong since
+  1.20.5 — so it accepted exactly the two shapes vanilla refuses. *No real
+  client could have logged in.* The protocol crate's definition had been right
+  the whole time; nothing tied the two together, and now a test does.
+- **The offline profile id was derived from a lowercased name.** Vanilla hashes
+  the name as typed, so every offline player on Dust had a different identity
+  from the one they have on every other server.
+- **The status document carried two keys vanilla omits**, and both justifying
+  comments had the reasoning backwards.
+
+The lesson is the rule now: a test written from the same understanding as the
+code agrees with the code, not with Minecraft.
+
+Underneath: Stage 0's workspace, configuration system and gates; the vanilla
+data extractor; and the crates the rest stands on — NBT, world storage with
+paletted containers, heightmaps and a light engine, the 1.21.1 protocol codec,
+the datapack loader, and the network transport.
 
 ## Vanilla data
 
