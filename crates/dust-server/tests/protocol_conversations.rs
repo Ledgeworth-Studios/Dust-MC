@@ -330,6 +330,10 @@ struct Joined {
     chunks: usize,
     forgets: usize,
     centres: usize,
+    /// The chunk packets themselves, for a test that needs to look inside
+    /// them. Kept only because one does — twenty-five columns is a megabyte,
+    /// which is fine for a test and would not be for a client.
+    chunk_bodies: Vec<Vec<u8>>,
     /// Bodies this client has been told to render.
     spawned_entities: usize,
     /// Tab-list rows it has been given.
@@ -381,7 +385,10 @@ impl Joined {
     /// Fold one packet into the counters, answering a keep-alive on the way.
     fn count(&mut self, body: &[u8], id: i32, stream: &mut TcpStream) {
         match id {
-            39 => self.chunks += 1,
+            39 => {
+                self.chunks += 1;
+                self.chunk_bodies.push(body.to_vec());
+            }
             33 => self.forgets += 1,
             84 => self.centres += 1,
             1 => self.spawned_entities += 1,
@@ -461,6 +468,7 @@ fn join_as(stream: &mut TcpStream, addr: SocketAddr, name: &str) -> Joined {
         chunks: 0,
         forgets: 0,
         centres: 0,
+        chunk_bodies: Vec::new(),
         spawned_entities: 0,
         player_infos: 0,
         spawned_at: None,
@@ -480,7 +488,10 @@ fn join_as(stream: &mut TcpStream, addr: SocketAddr, name: &str) -> Joined {
     loop {
         let (id, body) = recv_compressed_frame(stream);
         match id {
-            39 => counted.chunks += 1,
+            39 => {
+                counted.chunks += 1;
+                counted.chunk_bodies.push(body.clone());
+            }
             33 => counted.forgets += 1,
             84 => counted.centres += 1,
             1 => counted.spawned_entities += 1,
@@ -1266,6 +1277,155 @@ fn phase_three_walk_chat_disconnect_and_come_back() {
     }
 
     let _ = std::fs::remove_dir_all(&world_dir);
+}
+
+/// Phase 2's exit criterion, first half: a client is served a world Minecraft
+/// generated, not the flat one.
+///
+/// `#[ignore]`, and it says so when it is skipped rather than passing
+/// vacuously — a generated world is Mojang's content and nothing of theirs is
+/// committed, so this needs `DUST_ANVIL_WORLD` pointing at a region directory.
+/// See `crates/dust-world/tests/anvil.rs` for how to make one.
+///
+/// What it checks is that the terrain is *not flat*, which is the only claim
+/// worth making from this end: a reader that returned the fallback for every
+/// column would pass every structural check and fail this.
+#[test]
+#[ignore = "needs a real world; set DUST_ANVIL_WORLD to a region directory"]
+fn a_world_minecraft_generated_is_served_to_a_client() {
+    let Some(region) = std::env::var_os("DUST_ANVIL_WORLD") else {
+        panic!("DUST_ANVIL_WORLD is not set; see this test's own documentation");
+    };
+    let region = region.to_str().expect("a UTF-8 path");
+
+    let running = start(&format!("world_source = {region:?}\n"));
+    let addr = running.addr;
+    let mut stream = connect(addr);
+    let client = join_as(&mut stream, addr, "Explorer");
+    assert_eq!(client.chunks, 25, "the columns arrived");
+
+    // A flat column has one section with anything in it and twenty-three of
+    // air. A generated one has terrain up through the surface, so several
+    // sections carry a palette of more than one block.
+    let mut interesting = 0usize;
+    let mut stream2 = connect(addr);
+    let mut second = join_as(&mut stream2, addr, "Reader");
+    second.drain_until_quiet(&mut stream2);
+    for body in &second.chunk_bodies {
+        interesting += mixed_sections(body);
+    }
+    assert!(
+        interesting > 25,
+        "across twenty-five columns only {interesting} section(s) held more \
+         than one kind of block; that is the flat fallback, not a generated \
+         world"
+    );
+
+    drop(stream);
+    drop(stream2);
+    running.finish();
+}
+
+/// How many of a chunk packet's sections hold more than one kind of block.
+///
+/// Walks the section blob by hand, as the rest of this file does: a
+/// bits-per-entry of zero is a section of one value, and anything else is a
+/// section with terrain in it.
+fn mixed_sections(body: &[u8]) -> usize {
+    // Skip the coordinates and the heightmap NBT, then take the blob's length.
+    let mut p = 8;
+    p = skip_nbt(body, p);
+    let (size, rest) = read_var_int_from(&body[p..]);
+    let blob = &rest[..size as usize];
+
+    let mut q = 0usize;
+    let mut mixed = 0usize;
+    while q + 3 <= blob.len() {
+        q += 2; // the non-air count
+        for limit in [8u8, 3u8] {
+            let bpe = blob[q];
+            q += 1;
+            if bpe == 0 {
+                let (_value, after) = read_var_int_from(&blob[q..]);
+                q = blob.len() - after.len();
+                let (longs, after) = read_var_int_from(&blob[q..]);
+                q = blob.len() - after.len() + longs as usize * 8;
+            } else {
+                if bpe <= limit {
+                    if limit == 8 {
+                        mixed += 1;
+                    }
+                    let (count, after) = read_var_int_from(&blob[q..]);
+                    q = blob.len() - after.len();
+                    for _ in 0..count {
+                        let (_entry, after) = read_var_int_from(&blob[q..]);
+                        q = blob.len() - after.len();
+                    }
+                } else if limit == 8 {
+                    mixed += 1;
+                }
+                let (longs, after) = read_var_int_from(&blob[q..]);
+                q = blob.len() - after.len() + longs as usize * 8;
+            }
+        }
+    }
+    mixed
+}
+
+/// Step past one NBT document, returning where it ends.
+///
+/// Enough of a walker to skip the heightmap compound and no more. Written here
+/// rather than borrowed from `dust-nbt` for the reason the rest of this file
+/// hand-rolls its wire handling: a test that used the server's own reader
+/// would agree with the server about a layout neither of them checked.
+fn skip_nbt(bytes: &[u8], at: usize) -> usize {
+    fn payload(bytes: &[u8], mut at: usize, tag: u8) -> usize {
+        match tag {
+            1 => at + 1,
+            2 => at + 2,
+            3 | 5 => at + 4,
+            4 | 6 => at + 8,
+            7 => {
+                let n = i32::from_be_bytes(bytes[at..at + 4].try_into().expect("four")) as usize;
+                at + 4 + n
+            }
+            8 => {
+                let n = u16::from_be_bytes(bytes[at..at + 2].try_into().expect("two")) as usize;
+                at + 2 + n
+            }
+            9 => {
+                let inner = bytes[at];
+                at += 1;
+                let n = i32::from_be_bytes(bytes[at..at + 4].try_into().expect("four")) as usize;
+                at += 4;
+                for _ in 0..n {
+                    at = payload(bytes, at, inner);
+                }
+                at
+            }
+            10 => loop {
+                let inner = bytes[at];
+                at += 1;
+                if inner == 0 {
+                    return at;
+                }
+                let n = u16::from_be_bytes(bytes[at..at + 2].try_into().expect("two")) as usize;
+                at += 2 + n;
+                at = payload(bytes, at, inner);
+            },
+            11 => {
+                let n = i32::from_be_bytes(bytes[at..at + 4].try_into().expect("four")) as usize;
+                at + 4 + 4 * n
+            }
+            12 => {
+                let n = i32::from_be_bytes(bytes[at..at + 4].try_into().expect("four")) as usize;
+                at + 4 + 8 * n
+            }
+            other => panic!("tag {other} is not one this walker knows"),
+        }
+    }
+    let tag = bytes[at];
+    payload(bytes, at + 1, tag)
 }
 
 #[test]

@@ -31,6 +31,7 @@ Listener, identity and the basics a server needs to answer a ping.
 | `max_catchup_ticks` | `u32` | `20` | restart | The most ticks the server will try to repay after a stall, per pass of the tick loop. A stall longer than this is skipped past rather than caught up, which keeps a hiccup from becoming a death spiral. |
 | `shutdown_timeout_secs` | `u32` | `10` | restart | How long, in seconds, a shutdown may take after a stop request before the watchdog ends the process by force. Grace worth having is grace worth bounding. |
 | `log_level` | `LogLevel` | `info` | restart | The lowest severity the server logs: one of `error`, `warn`, `info`, `debug`, `trace`. Everything less severe than the chosen level is suppressed. |
+| `world_source` | `String` | `""` | restart | Path to a directory of `.mca` region files to serve, or empty to generate a flat world. A column the files do not contain is generated flat, because a world is a disc in an infinite plane and a player may walk off the edge of it. |
 | `favicon` | `String` | `""` | restart | Path to the icon shown beside this server in the client's list, or empty for none. Must be a 64x64 PNG; the client silently shows nothing for a picture it cannot use, so the server refuses one at boot instead. |
 
 ## `[jvm]`

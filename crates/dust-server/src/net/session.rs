@@ -575,7 +575,7 @@ where
         let packet = if ctx.world.is_edited(*pos) {
             play_mod::chunk_packet(&ctx.world.chunk(*pos), *pos, ctx.version)?
         } else {
-            play_mod::chunk_packet(ctx.world.template(), *pos, ctx.version)?
+            play_mod::chunk_packet(ctx.world.template(*pos).as_chunk(), *pos, ctx.version)?
         };
         send_play(conn, packet, ctx.version).await?;
     }

@@ -26,6 +26,9 @@ dust-protocol.workspace = true
 dust-registry.workspace = true
 dust-world.workspace = true
 
+# Reading the chunk NBT of a world on disk; see src/net/source.rs.
+dust-nbt.workspace = true
+
 # The save file. JSON because it is already in this workspace's dependency
 # graph and its licence audit, and because a save an operator can open in an
 # editor is one they can repair; see src/net/save.rs for what is in it.

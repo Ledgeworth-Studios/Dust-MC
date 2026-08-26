@@ -728,6 +728,7 @@ impl Server {
         let motd = config.server.motd.clone();
         let max_players = config.server.max_players;
         let favicon_path = config.server.favicon.clone();
+        let world_source = config.server.world_source.clone();
         let online_mode = config.server.online_mode;
 
         let fail = |message: String| -> ServerError {
@@ -800,9 +801,41 @@ impl Server {
             .id_of("minecraft:overworld")
             .ok_or_else(|| fail("the dimension types have no overworld".to_owned()))?
             as u32;
-        let world = std::sync::Arc::new(crate::net::edits::EditedWorld::new(
-            crate::net::world::FlatWorld::new(palette, plains, biomes.entries.len() as u32),
-        ));
+        let flat = crate::net::world::FlatWorld::new(palette, plains, biomes.entries.len() as u32);
+
+        // Where columns come from. An empty setting means the flat world; a
+        // path means a world Minecraft wrote, with the flat one kept as the
+        // fallback for columns it does not contain.
+        //
+        // The path is checked here rather than at the first column, because a
+        // mistyped one otherwise produces a server that starts, serves flat
+        // terrain, and never says why.
+        let source = if world_source.is_empty() {
+            crate::net::source::Source::Flat(flat)
+        } else {
+            let directory = std::path::PathBuf::from(&world_source);
+            if !crate::net::source::AnvilWorld::is_region_directory(&directory) {
+                return Err(fail(format!(
+                    "[server] world_source = {world_source:?} holds no .mca files; it should \
+                     be a world's `region` directory"
+                )));
+            }
+            let names = crate::net::source::RegistryNames::new().ok_or_else(|| {
+                fail(
+                    "the synced registries have no biome registry to resolve names against"
+                        .to_owned(),
+                )
+            })?;
+            self.options.logger.info(
+                "dust::server",
+                format!("serving the world at {}", directory.display()),
+            );
+            crate::net::source::Source::Anvil(crate::net::source::AnvilWorld::new(
+                directory, names, flat,
+            ))
+        };
+
+        let world = std::sync::Arc::new(crate::net::edits::EditedWorld::new(source));
 
         // What players changed last time, and where they were standing. A
         // world that has never been played has no file and that is not an
