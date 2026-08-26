@@ -369,6 +369,8 @@ dependencies = [
  "dust-registry",
  "dust-world",
  "flate2",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

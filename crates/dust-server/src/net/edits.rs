@@ -162,6 +162,54 @@ impl EditedWorld {
         true
     }
 
+    /// Apply edits read from a save, without announcing any of them.
+    ///
+    /// Silent because nobody is connected yet: an announcement at boot would
+    /// go to a channel with no receivers, and a receiver that appeared later
+    /// would be told about a change already present in the first chunk it was
+    /// sent.
+    pub fn restore(&self, blocks: impl IntoIterator<Item = (Position, u32)>) -> usize {
+        let mut edits = self.edits.write().expect("the edit map is never poisoned");
+        let mut applied = 0;
+        for (position, state) in blocks {
+            let world = self.generated.height();
+            if position.y < world.min_y() || position.y >= world.min_y() + world.height() as i32 {
+                continue;
+            }
+            edits
+                .entry(column_of(position))
+                .or_default()
+                .insert(local_of(position), state);
+            applied += 1;
+        }
+        applied
+    }
+
+    /// Every changed block, for writing down.
+    ///
+    /// Ordered, so two saves of the same world produce the same file and a
+    /// diff between them is the changes rather than a reshuffle of a hash map.
+    pub fn snapshot(&self) -> Vec<(Position, u32)> {
+        let edits = self.edits.read().expect("the edit map is never poisoned");
+        let mut out: Vec<(Position, u32)> = edits
+            .iter()
+            .flat_map(|((cx, cz), column)| {
+                column.iter().map(move |((x, y, z), state)| {
+                    (
+                        Position {
+                            x: (cx << 4) + x,
+                            y: *y,
+                            z: (cz << 4) + z,
+                        },
+                        *state,
+                    )
+                })
+            })
+            .collect();
+        out.sort_by_key(|(p, _)| (p.x, p.y, p.z));
+        out
+    }
+
     /// How many blocks have been changed. For tests and for a status line.
     pub fn edit_count(&self) -> usize {
         self.edits
@@ -196,8 +244,45 @@ mod tests {
     use super::*;
 
     fn world() -> EditedWorld {
+        fresh_world()
+    }
+
+    /// A second name for the same builder, so a test that already has a
+    /// `world` binding can still make another one.
+    fn fresh_world() -> EditedWorld {
         let palette = super::super::world::Palette::resolve().expect("the block table");
         EditedWorld::new(FlatWorld::new(palette, 0, 64))
+    }
+
+    #[test]
+    fn a_snapshot_round_trips_through_restore_and_is_ordered() {
+        let world = world();
+        for (x, z) in [(5, 5), (-1, -1), (0, 0), (20, 3)] {
+            world.set_block(
+                Position {
+                    x,
+                    y: super::super::world::SURFACE_Y,
+                    z,
+                },
+                0,
+            );
+        }
+        let snapshot = world.snapshot();
+        assert_eq!(snapshot.len(), 4);
+        // Ordered, so two saves of one world are the same file and a diff
+        // between them is the changes rather than a reshuffled hash map.
+        let mut sorted = snapshot.clone();
+        sorted.sort_by_key(|(p, _)| (p.x, p.y, p.z));
+        assert_eq!(snapshot, sorted);
+
+        // And the positions come back as world coordinates, not local ones —
+        // the case that catches a column key folded in the wrong direction.
+        assert!(snapshot.iter().any(|(p, _)| p.x == -1 && p.z == -1));
+        assert!(snapshot.iter().any(|(p, _)| p.x == 20 && p.z == 3));
+
+        let fresh = fresh_world();
+        assert_eq!(fresh.restore(snapshot.clone()), 4);
+        assert_eq!(fresh.snapshot(), snapshot);
     }
 
     #[test]

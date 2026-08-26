@@ -436,6 +436,16 @@ pub struct Server {
     /// the server rather than in a local so that the failure paths and the
     /// happy path release it through the same code.
     listener: Option<crate::net::ListenerHandle>,
+    /// The world and the player positions, kept so the teardown can write them
+    /// down. `None` until phase 3 builds them.
+    saveable: Option<Saveable>,
+}
+
+/// What the teardown has to write out.
+struct Saveable {
+    world: crate::net::SharedWorld,
+    positions: crate::net::save::SharedPositions,
+    world_dir: PathBuf,
 }
 
 impl fmt::Debug for Server {
@@ -465,6 +475,7 @@ impl Server {
             stop_handle,
             tracker: Arc::new(ThreadTracker::default()),
             listener: None,
+            saveable: None,
         }
     }
 
@@ -517,7 +528,8 @@ impl Server {
         // ---- Phase 2: world directories --------------------------------
         if let Err(mut e) = self.start_world_dirs(&mut transcript) {
             let mut listener = self.listener.take();
-            self.teardown(completed, &mut transcript, 0, &mut listener);
+            let mut saveable = self.saveable.take();
+            self.teardown(completed, &mut transcript, 0, &mut listener, &mut saveable);
             e.attach(std::mem::take(&mut transcript));
             return Err(e);
         }
@@ -532,7 +544,8 @@ impl Server {
         // ---- Phase 3: bind and serve -----------------------------------
         if let Err(mut e) = self.start_network(&mut transcript) {
             let mut listener = self.listener.take();
-            self.teardown(completed, &mut transcript, 0, &mut listener);
+            let mut saveable = self.saveable.take();
+            self.teardown(completed, &mut transcript, 0, &mut listener, &mut saveable);
             e.attach(std::mem::take(&mut transcript));
             return Err(e);
         }
@@ -593,7 +606,14 @@ impl Server {
 
         // ---- Shutdown: exact reverse of everything completed ------------
         let mut listener = self.listener.take();
-        self.teardown(completed, &mut transcript, summary.ticks_run, &mut listener);
+        let mut saveable = self.saveable.take();
+        self.teardown(
+            completed,
+            &mut transcript,
+            summary.ticks_run,
+            &mut listener,
+            &mut saveable,
+        );
 
         // Release the watchdog first so a not-yet-fired one retires quietly;
         // one that already fired has already done its worst. The extra wake
@@ -784,6 +804,45 @@ impl Server {
             crate::net::world::FlatWorld::new(palette, plains, biomes.entries.len() as u32),
         ));
 
+        // What players changed last time, and where they were standing. A
+        // world that has never been played has no file and that is not an
+        // error; a file this build cannot read *is* one, because starting with
+        // an empty world beside a save that exists would quietly discard it on
+        // the next write.
+        let world_dir = self.options.world_dir.clone();
+        let positions: crate::net::save::SharedPositions = std::sync::Arc::default();
+        match crate::net::save::load(&world_dir) {
+            Ok(Some(saved)) => {
+                let (blocks, unknown) = crate::net::save::resolve(&saved.blocks);
+                let applied = world.restore(blocks);
+                *positions.lock().expect("not poisoned") = crate::net::save::positions(&saved);
+                self.options.logger.info(
+                    "dust::server",
+                    format!(
+                        "restored {applied} block change(s) and {} player position(s)",
+                        saved.players.len()
+                    ),
+                );
+                if !unknown.is_empty() {
+                    // Named, not counted. An operator who renamed a block or
+                    // changed Minecraft version needs to know *which* block
+                    // stopped existing, and a number tells them only that
+                    // something did.
+                    self.options.logger.warn(
+                        "dust::server",
+                        format!(
+                            "the save names {} block(s) this build has no entry for, and they \
+                             were dropped: {}",
+                            unknown.len(),
+                            unknown.join(", ")
+                        ),
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return Err(fail(format!("{e}"))),
+        }
+
         // Shared between the accept loop and every session on it: the accept
         // loop counts connections, and the sessions count the players inside
         // them, because only a session knows when somebody has actually
@@ -798,7 +857,7 @@ impl Server {
             status: crate::net::StatusPolicy::new(version, motd, max_players, favicon),
             conn: dust_net::io::ConnConfig::default(),
             auth: authority,
-            world,
+            world: std::sync::Arc::clone(&world),
             view_distance: VIEW_DISTANCE,
             overworld_dimension_type: overworld,
             blocks: crate::net::PlaceableBlocks {
@@ -806,6 +865,7 @@ impl Server {
                 placeable: palette.grass,
             },
             logger: self.options.logger.clone(),
+            positions: std::sync::Arc::clone(&positions),
             counters: std::sync::Arc::clone(&counters),
         });
 
@@ -827,6 +887,11 @@ impl Server {
         // address knows there is something accepting on it.
         let _ = self.shared.bound.set(bound);
         self.listener = Some(handle);
+        self.saveable = Some(Saveable {
+            world: std::sync::Arc::clone(&world),
+            positions: std::sync::Arc::clone(&positions),
+            world_dir,
+        });
         Ok(())
     }
 
@@ -880,6 +945,7 @@ impl Server {
         transcript: &mut Vec<TranscriptEntry>,
         ticks_run: u64,
         listener: &mut Option<crate::net::ListenerHandle>,
+        saveable: &mut Option<Saveable>,
     ) {
         for phase in completed.into_iter().rev() {
             // The listener is released *at the position the transcript claims
@@ -909,6 +975,12 @@ impl Server {
                     // list this function did not build.
                     None => "nothing was listening".to_owned(),
                 }
+            } else if phase == Phase::WorldDirs {
+                // The world is written *here*, after the listener is released
+                // and so after every session has stopped changing it. Writing
+                // it while connections were still live would save a world that
+                // was still moving, and the last edit would be the one lost.
+                self.save_world(saveable.take())
             } else {
                 phase.teardown_detail(ticks_run)
             };
@@ -917,6 +989,70 @@ impl Server {
                 direction: Direction::Stop,
                 detail,
             });
+        }
+    }
+
+    /// Write the world down, and say what happened either way.
+    ///
+    /// A failure is reported into the transcript rather than returned, because
+    /// this runs during teardown and there is nothing left to abort. It is
+    /// still loud: an operator whose disk filled needs to know the world did
+    /// not survive, and a silent failure here is the one that is discovered by
+    /// the blocks being gone.
+    fn save_world(&self, saveable: Option<Saveable>) -> String {
+        let Some(saveable) = saveable else {
+            // The bind failed, so the phase never completed and nothing was
+            // ever built to save.
+            return "directories left on disk".to_owned();
+        };
+
+        let blocks: Vec<crate::net::save::SavedBlock> = saveable
+            .world
+            .snapshot()
+            .into_iter()
+            .filter_map(|(position, state)| {
+                crate::net::save::name_of(state).map(|block| crate::net::save::SavedBlock {
+                    x: position.x,
+                    y: position.y,
+                    z: position.z,
+                    block: block.to_owned(),
+                })
+            })
+            .collect();
+        let players: Vec<crate::net::save::SavedPlayer> = {
+            let held = saveable.positions.lock().expect("not poisoned");
+            let mut players: Vec<_> = held
+                .iter()
+                .map(|(id, (x, y, z))| crate::net::save::SavedPlayer {
+                    id: id.clone(),
+                    x: *x,
+                    y: *y,
+                    z: *z,
+                })
+                .collect();
+            // Ordered, so two saves of one world are the same file.
+            players.sort_by(|a, b| a.id.cmp(&b.id));
+            players
+        };
+
+        let counts = format!(
+            "{} block change(s) and {} player position(s)",
+            blocks.len(),
+            players.len()
+        );
+        let save = crate::net::save::Save {
+            version: crate::net::save::SAVE_VERSION,
+            blocks,
+            players,
+        };
+        match crate::net::save::store(&saveable.world_dir, &save) {
+            Ok(()) => format!("saved {counts}"),
+            Err(e) => {
+                self.options
+                    .logger
+                    .error("dust::server", format!("the world could not be saved: {e}"));
+                format!("FAILED to save {counts}: {e}")
+            }
         }
     }
 
@@ -931,7 +1067,8 @@ impl Server {
         // No helper threads exist on this path: the watchdog spawns only
         // once the tick loop begins.
         let mut listener = self.listener.take();
-        self.teardown(completed, &mut transcript, 0, &mut listener);
+        let mut saveable = self.saveable.take();
+        self.teardown(completed, &mut transcript, 0, &mut listener, &mut saveable);
         ShutdownReport {
             interrupted: true,
             ticks_run: 0,

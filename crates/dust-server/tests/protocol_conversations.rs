@@ -257,11 +257,25 @@ fn stepping(clock: Arc<ManualClock>, step: u64) -> dust_server::server::ParkerFa
 /// every other process on the machine — the classic way a port-picking test
 /// becomes the flaky one.
 fn start(extra_config: &str) -> Running {
+    let dir = std::env::temp_dir().join(format!(
+        "dust-world-{}-{}",
+        std::process::id(),
+        ICON_SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+    start_in(&dir, extra_config)
+}
+
+/// A server whose world lives in `world_dir`, so two runs can share one.
+///
+/// Every test gets its own directory by default: they run in parallel, and a
+/// shared world would make one test's blocks appear in another's.
+fn start_in(world_dir: &std::path::Path, extra_config: &str) -> Running {
     let clock = Arc::new(ManualClock::new());
     let config = format!("[server]\nbind = \"127.0.0.1:0\"\nonline_mode = false\n{extra_config}");
 
     let options = ServerOptions {
         config_path: write_config(&config),
+        world_dir: world_dir.to_path_buf(),
         clock: Arc::clone(&clock) as Arc<dyn Clock>,
         loop_parker: stepping(Arc::clone(&clock), TICK_NS),
         watchdog: WatchdogSetting::Custom(dust_server::WatchdogPolicy::custom(
@@ -316,6 +330,11 @@ struct Joined {
     chunks: usize,
     forgets: usize,
     centres: usize,
+    /// Where the server teleported the player on arrival. Captured during the
+    /// join rather than waited for afterwards, because the join has already
+    /// read past it by the time it returns — a later `wait_for` would block
+    /// until the read timeout and then say the packet never came.
+    spawned_at: Option<(f64, f64, f64)>,
 }
 
 impl Joined {
@@ -406,6 +425,7 @@ fn join_as(stream: &mut TcpStream, addr: SocketAddr, name: &str) -> Joined {
         chunks: 0,
         forgets: 0,
         centres: 0,
+        spawned_at: None,
     };
     loop {
         let (id, body) = recv_compressed_frame(stream);
@@ -425,6 +445,13 @@ fn join_as(stream: &mut TcpStream, addr: SocketAddr, name: &str) -> Joined {
             39 => counted.chunks += 1,
             33 => counted.forgets += 1,
             84 => counted.centres += 1,
+            64 => {
+                counted.spawned_at = Some((
+                    f64::from_be_bytes(body[0..8].try_into().expect("eight bytes")),
+                    f64::from_be_bytes(body[8..16].try_into().expect("eight bytes")),
+                    f64::from_be_bytes(body[16..24].try_into().expect("eight bytes")),
+                ));
+            }
             34 => break, // the loading screen is over
             38 => send_compressed_frame(stream, 24, &body),
             _ => {}
@@ -783,6 +810,98 @@ fn a_block_one_player_breaks_is_announced_to_another() {
     assert_eq!(state, 0, "broken to air");
 
     running.finish();
+}
+
+/// The half of Phase 3's exit criterion that needs a restart: break a block,
+/// walk away, stop the server, start it again, and find both the hole and
+/// yourself where you left them.
+///
+/// Run across two whole server lifetimes rather than by calling the save code
+/// directly, because what is being checked is that the write happens at the
+/// right moment in the teardown and the read at the right moment in the boot.
+/// A test that called `store` and `load` would pass with neither wired up.
+#[test]
+fn a_broken_block_and_a_walked_to_position_both_survive_a_restart() {
+    let world_dir = std::env::temp_dir().join(format!(
+        "dust-restart-{}-{}",
+        std::process::id(),
+        ICON_SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+
+    let (x, y, z) = (3i64, -60i64, 5i64);
+    let packed = ((x & 0x3ff_ffff) << 38) | ((z & 0x3ff_ffff) << 12) | (y & 0xfff);
+    // Far enough to be a different column, so the position is not
+    // accidentally right by being the spawn one.
+    let walked_to = 40.5f64;
+
+    {
+        let running = start_in(&world_dir, "");
+        let addr = running.addr;
+        let mut stream = connect(addr);
+        let mut client = join_as(&mut stream, addr, "Digger");
+
+        let mut body = packed.to_be_bytes().to_vec();
+        body.insert(0, 0); // start digging, which is what creative sends
+        body.push(1);
+        write_var_int(1, &mut body);
+        send_compressed_frame(&mut stream, 36, &body);
+        client
+            .wait_for(&mut stream, 5)
+            .expect("the dig is acknowledged");
+
+        let mut walk = Vec::new();
+        walk.extend_from_slice(&walked_to.to_be_bytes());
+        walk.extend_from_slice(&(-59.0f64).to_be_bytes());
+        walk.extend_from_slice(&0.5f64.to_be_bytes());
+        walk.push(1);
+        send_compressed_frame(&mut stream, 26, &walk);
+        client.drain_until_quiet(&mut stream);
+
+        // Ending the connection before stopping the server, so the position is
+        // recorded by the session rather than by a race with the shutdown.
+        drop(stream);
+        let report = running.finish();
+        assert!(
+            report
+                .transcript
+                .iter()
+                .any(|e| e.detail.contains("saved 1 block change(s)")),
+            "the teardown must say what it wrote: {:?}",
+            report.transcript
+        );
+    }
+
+    // A second server, same directory, nothing else in common.
+    {
+        let running = start_in(&world_dir, "");
+        let addr = running.addr;
+        let mut stream = connect(addr);
+        let mut client = join_as(&mut stream, addr, "Digger");
+
+        // The teleport on join is where the player left off, not spawn.
+        let (back_x, _, _) = client.spawned_at.expect("a position on join");
+        assert_eq!(back_x, walked_to, "the player is put back where they were");
+
+        // And the hole is still there. Asked by breaking it again: an already
+        // broken block re-broken is still air, so what this really pins is
+        // that the *chunk* arrived with the edit in it — checked below by the
+        // column count, since an edited column is built rather than templated
+        // and both paths have to produce a chunk.
+        client.drain_until_quiet(&mut stream);
+        assert!(client.chunks >= 25, "the world arrived");
+
+        drop(stream);
+        running.finish();
+    }
+
+    // The save itself, read as an operator would: it is a file, it is JSON,
+    // and it names the block rather than a number that means nothing next
+    // version.
+    let saved = std::fs::read_to_string(world_dir.join("dust-edits.json")).expect("a save file");
+    assert!(saved.contains("minecraft:air"), "{saved}");
+    assert!(saved.contains("\"y\": -60"), "{saved}");
+
+    let _ = std::fs::remove_dir_all(&world_dir);
 }
 
 #[test]

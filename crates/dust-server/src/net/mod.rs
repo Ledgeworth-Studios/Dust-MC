@@ -44,6 +44,7 @@ pub mod edits;
 pub mod favicon;
 pub mod listen;
 pub mod play;
+pub mod save;
 pub mod session;
 pub mod status;
 pub mod view;

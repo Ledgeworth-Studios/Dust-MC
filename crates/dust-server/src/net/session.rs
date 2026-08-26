@@ -114,6 +114,13 @@ pub struct SessionContext {
     /// For the one thing this layer has to say that is not a packet: a session
     /// that fell behind on block changes.
     pub logger: crate::logging::Logger,
+    /// Where each player was when they last left, by profile id.
+    ///
+    /// Read on join and written on leave, so a reconnecting player lands where
+    /// they stood rather than at spawn. Shared rather than per-session for the
+    /// obvious reason: the session that knows the position is the one that is
+    /// ending.
+    pub positions: super::save::SharedPositions,
 }
 
 /// The block states a session can put into the world.
@@ -350,6 +357,7 @@ where
             return Ok(Served::LoginFailed { reason });
         }
     };
+    let profile_id = authenticated.profile_id;
 
     // Login Acknowledged has been received, so the connection is in
     // configuration. Every disconnect from here carries an NBT component, not
@@ -382,12 +390,9 @@ where
         }
     };
 
-    // Configuration finished, so both ends are in Play. There is no world to
-    // send, so the connection ends here — but it ends *in Play*, which is the
-    // state the next wave of work starts from rather than one it stopped short
-    // of.
+    // Configuration finished, so both ends are in Play.
     conn.transition(State::Play)?;
-    serve_play(&mut conn, ctx).await?;
+    serve_play(&mut conn, ctx, profile_id).await?;
     conn.disconnect();
     finish(conn, outcome).await
 }
@@ -396,11 +401,28 @@ where
 ///
 /// Returns when the connection ends, which today means when the client
 /// disconnects or a keep-alive goes unanswered.
-async fn serve_play<W>(conn: &mut Conn<W>, ctx: &SessionContext) -> Result<(), SessionError>
+async fn serve_play<W>(
+    conn: &mut Conn<W>,
+    ctx: &SessionContext,
+    profile_id: [u8; 16],
+) -> Result<(), SessionError>
 where
     W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let version = ctx.version;
+
+    // Where this player was when they last left, or spawn if this is the
+    // first time. Read before the join packet, because the join packet is not
+    // what carries a position — the teleport below is — and a player told the
+    // wrong one first would see themselves move.
+    let key = super::save::hyphenated(&profile_id);
+    let start = ctx
+        .positions
+        .lock()
+        .expect("the position map is never poisoned")
+        .get(&key)
+        .copied()
+        .unwrap_or(world::SPAWN);
 
     // Counted here rather than when the session ends, and held by a guard so
     // that every way out of this function — a disconnect, a timeout, a decode
@@ -424,7 +446,7 @@ where
     // throws them away.
     send_play(
         conn,
-        play_mod::position_packet(dust_world_spawn(), FIRST_TELEPORT_ID),
+        play_mod::position_packet(start, FIRST_TELEPORT_ID),
         version,
     )
     .await?;
@@ -439,7 +461,7 @@ where
     // it sends and every one it forgets goes through it, so the record cannot
     // drift from the client's actual contents.
     let mut view = View::default();
-    let centre = view::column_of(world::SPAWN.0, world::SPAWN.2);
+    let centre = view::column_of(start.0, start.2);
     stream(conn, ctx, &mut view, centre).await?;
 
     // The terrain is there; this is what tells the client to stop looking at
@@ -454,7 +476,17 @@ where
     )
     .await?;
 
-    play_loop(conn, ctx, view, &mut edits).await
+    // The loop updates `position` as the player moves. Read after it ends
+    // however it ended — a clean disconnect, a timeout, a decode error —
+    // because a position recorded only on a graceful exit is one that is right
+    // exactly when nobody needed it.
+    let mut position = start;
+    let result = play_loop(conn, ctx, view, &mut edits, &mut position).await;
+    ctx.positions
+        .lock()
+        .expect("the position map is never poisoned")
+        .insert(key, position);
+    result
 }
 
 /// Bring the client's loaded columns in line with a new centre.
@@ -510,24 +542,12 @@ where
     Ok(())
 }
 
-/// Read whatever the client sends, and prove the connection is alive.
-///
-/// A keep-alive every ten seconds, matching vanilla's cadence. The client
-/// returns the same eight bytes, and a client that stops returning them hits
-/// the connection's idle timeout — which is `dust-net`'s and already applies,
-/// so nothing here needs its own clock.
-///
-/// Everything the client sends is currently read and dropped. That is stated
-/// rather than hidden: movement, block placement and chat all arrive here and
-/// none of them does anything yet. What the loop *does* prove is that the
-/// packets decode — a client walking around a world sends a steady stream of
-/// position updates, and a decoder that got one wrong would fail here rather
-/// than the first time somebody built on it.
 async fn play_loop<W>(
     conn: &mut Conn<W>,
     ctx: &SessionContext,
     mut view: View,
     edits: &mut tokio::sync::broadcast::Receiver<Edit>,
+    position: &mut (f64, f64, f64),
 ) -> Result<(), SessionError>
 where
     W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -602,9 +622,11 @@ where
                     // fourth carries only a rotation, and a player turning on
                     // the spot has not changed which columns they can see.
                     Ok(play::serverbound::Packet::MovePlayerPos(m)) => {
+                        *position = (m.x, m.y, m.z);
                         moved(conn, ctx, &mut view, m.x, m.z).await?;
                     }
                     Ok(play::serverbound::Packet::MovePlayerPosRot(m)) => {
+                        *position = (m.x, m.y, m.z);
                         moved(conn, ctx, &mut view, m.x, m.z).await?;
                     }
                     // Digging. Only the finish counts: the start and the
@@ -723,10 +745,6 @@ const FIRST_TELEPORT_ID: i32 = 1;
 
 /// How often a keep-alive goes out. Vanilla's cadence.
 const KEEP_ALIVE_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
-
-fn dust_world_spawn() -> (f64, f64, f64) {
-    super::world::SPAWN
-}
 
 /// Encode one clientbound Play packet and queue it.
 async fn send_play<W, P>(
