@@ -1028,7 +1028,7 @@ impl Server {
             let mut players: Vec<_> = held
                 .iter()
                 .map(|(id, (x, y, z))| crate::net::save::SavedPlayer {
-                    id: id.clone(),
+                    id: crate::net::save::hyphenated(id),
                     x: *x,
                     y: *y,
                     z: *z,

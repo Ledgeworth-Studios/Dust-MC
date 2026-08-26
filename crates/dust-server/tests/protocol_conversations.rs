@@ -364,19 +364,41 @@ impl Joined {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("a read timeout");
         while let Some((got, body)) = try_recv_compressed_frame(stream) {
-            match got {
-                _ if got == id => return Some(body),
-                39 => self.chunks += 1,
-                33 => self.forgets += 1,
-                84 => self.centres += 1,
-                1 => self.spawned_entities += 1,
-                62 => self.player_infos += 1,
-                38 => send_compressed_frame(stream, 24, &body),
-                29 => panic!("the server disconnected while waiting for {id}"),
-                _ => {}
+            // Counted *before* the match on `id`, so the counters stay a
+            // complete record of everything this client has been told. The
+            // first version returned the awaited packet without counting it,
+            // and a test that both waited for a body and asserted how many
+            // bodies had arrived was then off by exactly one — with the
+            // assertion reading as though the packet had never come.
+            self.count(&body, got, stream);
+            if got == id {
+                return Some(body);
             }
         }
         None
+    }
+
+    /// Fold one packet into the counters, answering a keep-alive on the way.
+    fn count(&mut self, body: &[u8], id: i32, stream: &mut TcpStream) {
+        match id {
+            39 => self.chunks += 1,
+            33 => self.forgets += 1,
+            84 => self.centres += 1,
+            1 => self.spawned_entities += 1,
+            62 => self.player_infos += 1,
+            64 => {
+                self.spawned_at = Some((
+                    f64::from_be_bytes(body[0..8].try_into().expect("eight bytes")),
+                    f64::from_be_bytes(body[8..16].try_into().expect("eight bytes")),
+                    f64::from_be_bytes(body[16..24].try_into().expect("eight bytes")),
+                ));
+            }
+            // Answered so the connection survives a test that outlasts the
+            // keep-alive period.
+            38 => send_compressed_frame(stream, 24, body),
+            29 => panic!("the server disconnected"),
+            _ => {}
+        }
     }
 
     fn drain_until_quiet(&mut self, stream: &mut TcpStream) {
@@ -388,18 +410,7 @@ impl Joined {
             .set_read_timeout(Some(quiet))
             .expect("a read timeout");
         while let Some((id, body)) = try_recv_compressed_frame(stream) {
-            match id {
-                39 => self.chunks += 1,
-                33 => self.forgets += 1,
-                84 => self.centres += 1,
-                1 => self.spawned_entities += 1,
-                62 => self.player_infos += 1,
-                // A keep-alive is answered so the connection stays up through
-                // a walk that outlasts the ten-second period.
-                38 => send_compressed_frame(stream, 24, &body),
-                29 => panic!("the server disconnected mid-walk"),
-                _ => {}
-            }
+            self.count(&body, id, stream);
         }
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
@@ -876,7 +887,15 @@ fn a_broken_block_and_a_walked_to_position_both_survive_a_restart() {
         walk.extend_from_slice(&0.5f64.to_be_bytes());
         walk.push(1);
         send_compressed_frame(&mut stream, 26, &walk);
-        client.drain_until_quiet(&mut stream);
+        // Wait for the packet the move *causes*, not for the socket to go
+        // quiet. Silence proves only that nothing has arrived yet, and on a
+        // slow runner "yet" includes "before the server got to it" — this
+        // failed in CI and passed here for exactly that reason. Walking from
+        // x = 0.5 to x = 40.5 crosses into another column, so a recentre is
+        // the server saying it processed the move.
+        client
+            .wait_for(&mut stream, 84)
+            .expect("the move is processed");
 
         // Ending the connection before stopping the server, so the position is
         // recorded by the session rather than by a race with the shutdown.
@@ -939,7 +958,9 @@ fn two_players_see_each_other_arrive_move_and_leave() {
 
     let mut first_stream = connect(addr);
     let mut first = join_as(&mut first_stream, addr, "First");
-    // Nobody else is here yet, so the first player is told about nobody.
+    // Nobody else is here yet, so the first player is told about nobody. This
+    // one *is* a drain, because the claim is that nothing arrives — and there
+    // is no packet to wait for when the expected answer is silence.
     first.drain(&mut first_stream);
     assert_eq!(first.spawned_entities, 0, "an empty server has no bodies");
 
@@ -948,8 +969,12 @@ fn two_players_see_each_other_arrive_move_and_leave() {
     // The roster goes out *after* the loading-screen event, deliberately — an
     // entity announced before the client holds the column it stands in is one
     // the client files against nothing — so `join_as` has already returned by
-    // the time it arrives.
-    second.drain_until_quiet(&mut second_stream);
+    // the time it arrives. Waited for rather than drained: a drain stops at
+    // the first quiet moment, which on a slow machine can be before the server
+    // has said anything at all.
+    second
+        .wait_for(&mut second_stream, 1)
+        .expect("the second player is told about the first");
 
     // The second player is told about the first, on arrival, from the roster
     // snapshot rather than from the broadcast.
@@ -1002,11 +1027,18 @@ fn chat_and_the_join_and_leave_lines_reach_everybody() {
 
     let mut first_stream = connect(addr);
     let mut first = join_as(&mut first_stream, addr, "First");
-    first.drain_until_quiet(&mut first_stream);
+    // Its own join announcement, which is the last thing a lone player is
+    // sent — waited for rather than drained, so the assertions below start
+    // from a known point.
+    first
+        .wait_for(&mut first_stream, 108)
+        .expect("the first player's own join line");
 
     let mut second_stream = connect(addr);
     let mut second = join_as(&mut second_stream, addr, "Second");
-    second.drain_until_quiet(&mut second_stream);
+    second
+        .wait_for(&mut second_stream, 108)
+        .expect("the second player's own join line");
 
     // The first player is told the second arrived.
     let line = first

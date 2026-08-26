@@ -422,12 +422,11 @@ where
     // first time. Read before the join packet, because the join packet is not
     // what carries a position — the teleport below is — and a player told the
     // wrong one first would see themselves move.
-    let key = super::save::hyphenated(&profile_id);
     let start = ctx
         .positions
         .lock()
         .expect("the position map is never poisoned")
-        .get(&key)
+        .get(&profile_id)
         .copied()
         .unwrap_or(world::SPAWN);
 
@@ -507,11 +506,12 @@ where
         .await?;
     }
 
-    // The loop updates `position` as the player moves. Read after it ends
-    // however it ended — a clean disconnect, a timeout, a decode error —
-    // because a position recorded only on a graceful exit is one that is right
-    // exactly when nobody needed it.
-    let mut position = start;
+    // The loop records the position into the shared map as the player moves,
+    // not when the session ends. Recording it only at the end lost it in two
+    // real cases: a server stopped while somebody was connected read the map
+    // before that session had finished tearing down, and a process that died
+    // never wrote it at all. Twenty locks a second per player is the price of
+    // the map always being right.
     let result = play_loop(
         conn,
         ctx,
@@ -519,7 +519,8 @@ where
         &mut edits,
         &mut roster_changes,
         &me,
-        &mut position,
+        profile_id,
+        start,
     )
     .await;
 
@@ -529,10 +530,6 @@ where
     // roster no longer has is a line nobody can attribute.
     ctx.roster.say(SERVER_SPEAKING, super::chat::left(&me.name));
     ctx.roster.leave(me.entity_id);
-    ctx.positions
-        .lock()
-        .expect("the position map is never poisoned")
-        .insert(key, position);
     result
 }
 
@@ -596,11 +593,20 @@ async fn play_loop<W>(
     edits: &mut tokio::sync::broadcast::Receiver<Edit>,
     roster: &mut tokio::sync::broadcast::Receiver<super::players::RosterChange>,
     me: &super::players::Player,
-    position: &mut (f64, f64, f64),
+    profile_id: [u8; 16],
+    start: (f64, f64, f64),
 ) -> Result<(), SessionError>
 where
     W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let mut position = start;
+    // Recorded once on arrival too, so a player who joins and never moves is
+    // still somewhere the next boot knows about.
+    ctx.positions
+        .lock()
+        .expect("the position map is never poisoned")
+        .insert(profile_id, position);
+
     let mut next_id: i64 = 1;
     // `interval`'s first tick fires immediately, and that is kept rather than
     // skipped: one keep-alive right after the chunks proves the round trip
@@ -757,13 +763,15 @@ where
                     // fourth carries only a rotation, and a player turning on
                     // the spot has not changed which columns they can see.
                     Ok(play::serverbound::Packet::MovePlayerPos(m)) => {
-                        *position = (m.x, m.y, m.z);
+                        position = (m.x, m.y, m.z);
+                        record(ctx, profile_id, position);
                         ctx.roster
                             .moved(me.entity_id, m.x, m.y, m.z, me.yaw, me.pitch);
                         moved(conn, ctx, &mut view, m.x, m.z).await?;
                     }
                     Ok(play::serverbound::Packet::MovePlayerPosRot(m)) => {
-                        *position = (m.x, m.y, m.z);
+                        position = (m.x, m.y, m.z);
+                        record(ctx, profile_id, position);
                         ctx.roster
                             .moved(me.entity_id, m.x, m.y, m.z, m.yaw, m.pitch);
                         moved(conn, ctx, &mut view, m.x, m.z).await?;
@@ -899,6 +907,18 @@ fn offset(location: dust_protocol::types::Position, face: u8) -> dust_protocol::
         y: location.y + dy,
         z: location.z + dz,
     }
+}
+
+/// Put a player's position where a shutdown can find it.
+///
+/// Called on every movement packet. The lock is held for a hash lookup and a
+/// three-float write; anything longer here would be a lock every player
+/// contends for on every step.
+fn record(ctx: &SessionContext, profile_id: [u8; 16], position: (f64, f64, f64)) {
+    ctx.positions
+        .lock()
+        .expect("the position map is never poisoned")
+        .insert(profile_id, position);
 }
 
 /// The entity id chat carries when the server itself is speaking.
