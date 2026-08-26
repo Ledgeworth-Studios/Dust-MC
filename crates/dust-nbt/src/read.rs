@@ -16,6 +16,16 @@
 //! compounds is refused by a comparison against nine bytes of input rather than
 //! by an allocator returning null. That check lives in
 //! [`Reader::check_length`] and every length in the format goes through it.
+//!
+//! # Owned or borrowed
+//!
+//! This module produces owned documents: [`Tag`] trees that outlive their
+//! input, at one allocation per string and per container. When the caller's
+//! use of the document ends before its buffer's — the region-file shape of a
+//! read — [`borrow`] parses the same bytes into views over them instead,
+//! under the same limits and the same error taxonomy.
+
+pub mod borrow;
 
 use crate::error::{Error, Result};
 use crate::mutf8;

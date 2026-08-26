@@ -118,6 +118,29 @@ proptest! {
         let read_back = read::from_bytes_exact(&bytes).expect("reads").tag;
         prop_assert_eq!(read_back, parsed);
     }
+
+    /// The writer reserves its buffer from the tree itself, so a written
+    /// document fills its allocation exactly — no regrowth mid-write, and no
+    /// slack either. `len == capacity` is that claim made observable from
+    /// outside the crate: any drift between the sizer and the encoder shows
+    /// up here first.
+    #[test]
+    fn written_documents_fill_their_reservation_exactly(
+        name in any_root_name(),
+        tag in any_tag(),
+    ) {
+        let bytes = write::to_vec(&name, &tag).expect("a generated document writes");
+        prop_assert_eq!(bytes.capacity(), bytes.len(), "file form");
+
+        let network = write::to_vec_network(Some(&tag)).expect("writes");
+        prop_assert_eq!(network.capacity(), network.len(), "network form");
+
+        // And the absent-NBT spelling is its own single byte.
+        assert_eq!(
+            write::to_vec_network(None).map(|v| (v.len(), v.capacity())),
+            Ok((1, 1))
+        );
+    }
 }
 
 /// Deep nesting just under the limit, built iteratively — the recursive part

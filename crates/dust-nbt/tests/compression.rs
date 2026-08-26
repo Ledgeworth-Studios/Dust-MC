@@ -202,3 +202,253 @@ fn decompression_bombs_stop_at_the_limit() {
         assert!(compression::decompress(&small, scheme, 1024 * 1024).is_ok());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Streaming
+//
+// The streaming API must hold the buffer API's contract, not merely resemble
+// it: byte-for-byte agreement, the same completeness refusals, and the same
+// limit — met from either side of a read boundary. Its own extra surface,
+// reading from something that produces bytes over time, brings two failure
+// modes of its own that get pinned here too: sources that report spurious
+// interruptions mid-stream, and sources that fail for real halfway through.
+// ---------------------------------------------------------------------------
+
+/// Yield one byte per call, to force every buffering path through its slowest
+/// shape.
+struct OneByteAtATime<'a>(&'a [u8]);
+
+impl std::io::Read for OneByteAtATime<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.0.is_empty() || buf.is_empty() {
+            return Ok(0);
+        }
+        buf[0] = self.0[0];
+        self.0 = &self.0[1..];
+        Ok(1)
+    }
+}
+
+/// Report `ErrorKind::Interrupted` on every other call before yielding any
+/// data: the error every `Read` consumer is supposed to retry.
+struct Interrupting<'a> {
+    payload: &'a [u8],
+    calls: usize,
+    /// How many bytes were handed out before the failure was injected.
+    fail_after: Option<usize>,
+    given: usize,
+}
+
+impl<'a> Interrupting<'a> {
+    /// Interruptions throughout; the stream still completes.
+    fn always(payload: &'a [u8]) -> Self {
+        Self {
+            payload,
+            calls: 0,
+            fail_after: None,
+            given: 0,
+        }
+    }
+
+    /// A hard failure (`ErrorKind::Other`) once `at` bytes are past.
+    fn dying(payload: &'a [u8], at: usize) -> Self {
+        Self {
+            payload,
+            calls: 0,
+            fail_after: Some(at),
+            given: 0,
+        }
+    }
+}
+
+impl std::io::Read for Interrupting<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.calls += 1;
+        if let Some(at) = self.fail_after {
+            if self.given >= at {
+                return Err(std::io::Error::other("the reader died mid-payload"));
+            }
+        }
+        if self.calls % 2 == 0 && !self.payload.is_empty() {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        let n = buf.len().min(self.payload.len());
+        buf[..n].copy_from_slice(&self.payload[..n]);
+        self.payload = &self.payload[n..];
+        self.given += n;
+        Ok(n)
+    }
+}
+
+/// Whatever the scheme, streaming gives back exactly what the buffer API
+/// does — even when fed one byte at a time.
+#[test]
+fn streaming_matches_the_buffer_api_byte_for_byte() {
+    let plain = document();
+
+    for scheme in [Compression::Gzip, Compression::Zlib] {
+        let wrapped = compression::compress(&plain, scheme).expect("compresses");
+
+        let whole =
+            compression::decompress_stream(&wrapped[..], scheme, compression::DEFAULT_FILE_LIMIT)
+                .expect("streams");
+        assert_eq!(
+            compression::decompress(&wrapped, scheme, compression::DEFAULT_FILE_LIMIT)
+                .expect("buffers"),
+            whole,
+            "{scheme:?}: streaming and buffered disagree"
+        );
+
+        let dribbled = compression::decompress_stream(
+            OneByteAtATime(&wrapped),
+            scheme,
+            compression::DEFAULT_FILE_LIMIT,
+        )
+        .expect("streams one byte at a time");
+        assert_eq!(dribbled, plain, "{scheme:?} lost bytes in the dribble");
+    }
+
+    // `None` passes through, limit untouched by the wrapper's own bookkeeping.
+    let passthrough =
+        compression::decompress_stream(&plain[..], Compression::None, usize::MAX).expect("copies");
+    assert_eq!(passthrough, plain);
+}
+
+/// Truncation is an error when met incrementally too: half a stream never
+/// becomes a short, plausible document just because it arrived slowly.
+#[test]
+fn truncated_streams_are_refused_when_read_incrementally() {
+    let plain = document();
+    for scheme in [Compression::Gzip, Compression::Zlib] {
+        let wrapped = compression::compress(&plain, scheme).expect("compresses");
+        let truncated = &wrapped[..wrapped.len() / 2];
+        assert!(
+            matches!(
+                compression::decompress_stream(truncated, scheme, usize::MAX),
+                Err(CompressionError::Malformed { .. })
+            ),
+            "{scheme:?} accepted a truncated stream"
+        );
+    }
+}
+
+/// Spurious interruptions land mid-read by construction, and the stream still
+/// completes with the right bytes.
+#[test]
+fn interruptions_mid_read_are_retried_not_fatal() {
+    let plain = document();
+    for scheme in [Compression::Gzip, Compression::Zlib] {
+        let wrapped = compression::compress(&plain, scheme).expect("compresses");
+        let out =
+            compression::decompress_stream(Interrupting::always(&wrapped), scheme, usize::MAX)
+                .expect("interruptions are retried until they stop");
+        assert_eq!(
+            out, plain,
+            "{scheme:?} survived interruptions but lost bytes"
+        );
+    }
+}
+
+/// A source that fails for real halfway through yields `Malformed`, and the
+/// partial output it had produced goes with it — never half a chunk.
+#[test]
+fn a_source_that_fails_halfway_is_malformed_with_no_partial_document() {
+    let plain = document();
+    for scheme in [Compression::Gzip, Compression::Zlib] {
+        let wrapped = compression::compress(&plain, scheme).expect("compresses");
+        let dying = Interrupting::dying(&wrapped, wrapped.len() / 4);
+
+        match compression::decompress_stream(dying, scheme, usize::MAX) {
+            Err(CompressionError::Malformed {
+                scheme: named,
+                detail,
+            }) => {
+                assert_eq!(named, scheme);
+                assert!(
+                    detail.contains("mid-payload"),
+                    "detail names the cause: {detail}"
+                );
+            }
+            other => panic!("{scheme:?}: expected Malformed from a dead source, got {other:?}"),
+        }
+    }
+}
+
+/// The streaming bomb stops at the limit like the buffered one, whether the
+/// caller drains through [`compression::decompress_stream`] or reads by hand.
+#[test]
+fn streaming_bombs_stop_at_the_limit() {
+    let bomb_payload = vec![0u8; 64 * 1024 * 1024];
+
+    for scheme in [Compression::Gzip, Compression::Zlib] {
+        let bomb = compression::compress(&bomb_payload, scheme).expect("compresses");
+        match compression::decompress_stream(&bomb[..], scheme, 1024 * 1024) {
+            Err(CompressionError::TooLarge { limit }) => assert_eq!(limit, 1024 * 1024),
+            other => panic!("{scheme:?}: expected TooLarge streaming, got {other:?}"),
+        }
+
+        // By hand: deliveries stop at exactly the limit, then name it.
+        let mut reader = compression::StreamingDecompress::new(&bomb[..], scheme, 1024 * 1024);
+        let mut total = 0usize;
+        let mut chunk = [0u8; 256 * 1024];
+        loop {
+            match std::io::Read::read(&mut reader, &mut chunk) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(error) => {
+                    let inner = error
+                        .into_inner()
+                        .and_then(|inner| inner.downcast::<CompressionError>().ok())
+                        .map(|boxed| *boxed);
+                    assert_eq!(
+                        inner,
+                        Some(CompressionError::TooLarge { limit: 1024 * 1024 }),
+                        "{scheme:?}: the io error carries the crate's own"
+                    );
+                    break;
+                }
+            }
+            assert!(
+                total <= 1024 * 1024,
+                "{scheme:?} delivered {total} bytes against a 1 MiB limit"
+            );
+        }
+        assert_eq!(
+            total,
+            1024 * 1024,
+            "{scheme:?}: the last allowed bytes arrive"
+        );
+        assert_eq!(reader.produced(), 1024 * 1024);
+    }
+}
+
+/// Two documents where one was promised stay refused: a complete stream plus
+/// anything after it is malformed, as the buffer API has it.
+#[test]
+fn bytes_following_a_complete_stream_are_refused_when_streaming() {
+    let first = b"first document".to_vec();
+    let second = b"second document".to_vec();
+
+    for scheme in [Compression::Gzip, Compression::Zlib] {
+        let a = compression::compress(&first, scheme).expect("compresses");
+        let b = compression::compress(&second, scheme).expect("compresses");
+        let mut concatenated = a;
+        concatenated.extend_from_slice(&b);
+
+        assert!(
+            matches!(
+                compression::decompress_stream(&concatenated[..], scheme, usize::MAX),
+                Err(CompressionError::Malformed { .. })
+            ),
+            "{scheme:?} accepted a concatenation"
+        );
+    }
+
+    // And a single clean stream passes the same probe untouched.
+    let single = compression::compress(&first, Compression::Zlib).expect("compresses");
+    assert_eq!(
+        compression::decompress_stream(&single[..], Compression::Zlib, usize::MAX)
+            .expect("one stream is fine"),
+        first
+    );
+}

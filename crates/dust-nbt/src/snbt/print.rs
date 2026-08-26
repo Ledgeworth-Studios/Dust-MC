@@ -20,12 +20,96 @@
 //! * A string value picks its quote character by the rule in
 //!   `StringTag.quoteAndEscape`, reproduced in [`quote_and_escape`].
 //!
-//! What it does **not** reproduce is Java's float formatting; see the module
-//! documentation for `snbt`.
+//! What it does **not** reproduce by default is Java's float formatting; see
+//! the module documentation for `snbt`. [`PrintProfile::JAVA`] switches the
+//! float and double shapes over to Java's, under the terms documented on
+//! [`NumericStyle`].
 
 use std::fmt::Write as _;
 
 use crate::tag::{Compound, List, Tag};
+
+/// How a finite float or double is turned into digits.
+///
+/// The two styles produce different *text* for the same bits and never
+/// different bits: both are shortest-round-trip spellings, so either parses
+/// back to the value it printed. The choice is purely about which reader is
+/// staring at the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NumericStyle {
+    /// Rust's `{}` formatting: the shortest decimal that reads back as the
+    /// same number, spelled out in full — `59999968` for 5.9999968E7, however
+    /// many digits that takes. Never exponent notation.
+    ///
+    /// This is what this printer has always done, and it stays the default:
+    /// the output is stable, it re-parses through every SNBT grammar including
+    /// ours, and nothing downstream of Dust expects Java's spelling.
+    #[default]
+    Shortest,
+    /// The shapes of Java's `Double.toString` and `Float.toString`, which is
+    /// what `StringTagVisitor` prints through: decimal form exactly when the
+    /// magnitude sits in [10⁻³, 10⁷), scientific form as `M.MM…E±exp`
+    /// otherwise — with an upper case `E`, no `+`, no zero padding on the
+    /// exponent — and at least one digit after the point in either shape,
+    /// so `1.0E7` rather than `1E7`.
+    ///
+    /// # Reproduced
+    ///
+    /// * The decimal/scientific threshold itself: `0.001` stays decimal,
+    ///   `9999999.0` stays decimal, `1.0E7` goes scientific.
+    /// * The exponent spelling: `5.9999968E7`, not `5.9999968e+07`.
+    /// * The forced fraction: `100.0`, `1.0E23` — Java never prints a bare
+    ///   integer for a floating-point tag.
+    /// * `-0.0` keeps its sign, `NaN`/`Infinity` print as words (unchanged
+    ///   from [`NumericStyle::Shortest`]; see `write_non_finite`).
+    ///
+    /// # Approximated
+    ///
+    /// The *digits* are Rust's shortest-round-tripping decimals, not the
+    /// output of the JDK's Schubfach implementation. Throughout the normal
+    /// range the two agree digit for digit — both produce the fewest digits
+    /// that round-trip, broken towards the candidate closest to the value —
+    /// and the goldens in `tests/snbt.rs` pin the agreement on the values
+    /// where presentations historically diverge. At the subnormal edge they
+    /// can disagree: the JDK prints `4.9E-324` where the shortest spelling is
+    /// `5.0E-324`, because it prefers more digits that sit nearer the value's
+    /// neighbourhood than the single digit that round-trips. Both parse to
+    /// the identical bit pattern, so the differential property — everything
+    /// printed re-reads as what was printed — holds either way; only a byte
+    /// comparison against a JDK-produced literal can tell the difference, and
+    /// no consumer here makes one.
+    Java,
+}
+
+/// Presentation choices for the printer.
+///
+/// Everything the compact printer does except number shaping — quoting,
+/// suffixes, array prefixes — is fixed by the format and carries no options;
+/// the profile exists so that the one genuinely contested choice has a name
+/// and a place to live rather than growing into a boolean parameter list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrintProfile {
+    /// How finite floats and doubles become text.
+    pub numeric: NumericStyle,
+}
+
+impl PrintProfile {
+    /// Java's presentation, for text aimed at tools that diff or display it
+    /// next to vanilla's own output.
+    pub const JAVA: Self = Self {
+        numeric: NumericStyle::Java,
+    };
+}
+
+impl Default for PrintProfile {
+    /// The printer as it has always behaved. Deliberate: existing output does
+    /// not move because a new option appeared next to it.
+    fn default() -> Self {
+        Self {
+            numeric: NumericStyle::Shortest,
+        }
+    }
+}
 
 /// Print a tag as compact SNBT.
 ///
@@ -41,8 +125,20 @@ use crate::tag::{Compound, List, Tag};
 /// );
 /// ```
 pub fn to_string(tag: &Tag) -> String {
+    to_string_with(PrintProfile::default(), tag)
+}
+
+/// [`to_string`] under `profile`.
+///
+/// ```
+/// use dust_nbt::{snbt, PrintProfile, Tag};
+///
+/// let printed = snbt::to_string_with(PrintProfile::JAVA, &Tag::Double(5.9999968e7));
+/// assert_eq!(printed, "5.9999968E7d");
+/// ```
+pub fn to_string_with(profile: PrintProfile, tag: &Tag) -> String {
     let mut out = String::new();
-    write_tag(&mut out, tag);
+    write_tag(&mut out, profile, tag);
     out
 }
 
@@ -52,16 +148,21 @@ pub fn to_string(tag: &Tag) -> String {
 /// SNBT has nowhere to put one, so a caller converting between the two needs
 /// somewhere for it to go that is not silently the bin.
 pub fn to_string_named(name: &str, tag: &Tag) -> String {
+    to_string_named_with(PrintProfile::default(), name, tag)
+}
+
+/// [`to_string_named`] under `profile`.
+pub fn to_string_named_with(profile: PrintProfile, name: &str, tag: &Tag) -> String {
     let mut out = String::new();
     if !name.is_empty() {
         write_key(&mut out, name);
         out.push(':');
     }
-    write_tag(&mut out, tag);
+    write_tag(&mut out, profile, tag);
     out
 }
 
-fn write_tag(out: &mut String, tag: &Tag) {
+fn write_tag(out: &mut String, profile: PrintProfile, tag: &Tag) {
     match tag {
         Tag::Byte(v) => {
             let _ = write!(out, "{v}b");
@@ -77,17 +178,34 @@ fn write_tag(out: &mut String, tag: &Tag) {
         }
         Tag::Float(v) => {
             if !write_non_finite(out, f64::from(*v)) {
-                // Formatted as an `f32`, not promoted: `0.1f32` promoted to
-                // `f64` is 0.10000000149011612, and printing that is both
-                // hideous and unlike vanilla. Rust's `{}` for an `f32` gives
-                // the shortest decimal that reads back as the same `f32`.
-                let _ = write!(out, "{v}");
+                match profile.numeric {
+                    NumericStyle::Shortest => {
+                        // Formatted as an `f32`, not promoted: `0.1f32` promoted to
+                        // `f64` is 0.10000000149011612, and printing that is both
+                        // hideous and unlike vanilla. Rust's `{}` for an `f32` gives
+                        // the shortest decimal that reads back as the same `f32`.
+                        let _ = write!(out, "{v}");
+                    }
+                    NumericStyle::Java => {
+                        // The same digits `Float.toString` would have chosen —
+                        // both are the shortest spellings that round-trip through
+                        // `f32` — shaped into Java's decimal/scientific split.
+                        write_java_shaped(out, format!("{v:e}").as_str());
+                    }
+                }
             }
             out.push('f');
         }
         Tag::Double(v) => {
             if !write_non_finite(out, *v) {
-                let _ = write!(out, "{v}");
+                match profile.numeric {
+                    NumericStyle::Shortest => {
+                        let _ = write!(out, "{v}");
+                    }
+                    // See the `NumericStyle::Java` note: same digits as
+                    // `Double.toString`, Java's shapes.
+                    NumericStyle::Java => write_java_shaped(out, format!("{v:e}").as_str()),
+                }
             }
             out.push('d');
         }
@@ -105,8 +223,8 @@ fn write_tag(out: &mut String, tag: &Tag) {
             out.push(']');
         }
         Tag::String(text) => quote_and_escape(out, text),
-        Tag::List(list) => write_list(out, list),
-        Tag::Compound(compound) => write_compound(out, compound),
+        Tag::List(list) => write_list(out, profile, list),
+        Tag::Compound(compound) => write_compound(out, profile, compound),
         Tag::IntArray(values) => {
             out.push_str("[I;");
             for (index, value) in values.iter().enumerate() {
@@ -145,8 +263,9 @@ fn write_tag(out: &mut String, tag: &Tag) {
 /// See the `snbt` module documentation, and `tests/snbt.rs` for the test that
 /// pins the lossiness in place so it cannot be discovered by accident.
 ///
-/// Unlike Java this never uses exponent notation, so a very large double prints
-/// as a great many digits. Both forms read back as the same number.
+/// Unlike [`NumericStyle::Shortest`] this never happens without exponent
+/// notation under [`NumericStyle::Java`], whose very large doubles print as a
+/// handful of digits instead. Both forms read back as the same number.
 fn write_non_finite(out: &mut String, value: f64) -> bool {
     if value.is_nan() {
         out.push_str("NaN");
@@ -160,18 +279,110 @@ fn write_non_finite(out: &mut String, value: f64) -> bool {
     true
 }
 
-fn write_list(out: &mut String, list: &List) {
+/// Shape Rust's shortest decimal into Java's `toString` spelling, given the
+/// lower-exp form `{}` produces for a finite value: `[-]d[.ddd]e[-]dd`, one
+/// non-zero digit before the (optional) point.
+///
+/// The digits themselves are kept exactly as formatted — they are already the
+/// shortest ones that round-trip, which is what the JDK's own formatter aims
+/// for too. What changes is only where the point goes and whether the number
+/// is written out or exponentiated:
+///
+/// * Java keeps **decimal** form precisely when |v| lies in [10⁻³, 10⁷), that
+///   is, when the exponent sits in `-3..=6`. Outside the window: scientific.
+/// * Scientific is an upper case `E`, the exponent a plain signed integer —
+///   no `+`, no padding — and the mantissa always keeps at least one
+///   fractional digit: `1.0E7`, never `1E7` and never `1.0E+07`.
+/// * Decimal form always shows a point with something after it: `100.0`,
+///   `0.001`, `-0.0`.
+fn write_java_shaped(out: &mut String, lower_exp: &str) {
+    let bytes = lower_exp.as_bytes();
+    let mut at = 0;
+    if bytes[0] == b'-' {
+        out.push('-');
+        at += 1;
+    }
+    // The mantissa digits without the point. Rust guarantees the first is
+    // significant (non-zero) except for zero itself, which formats as `0e0`
+    // and falls through both branches below correctly.
+    let mut digits = String::with_capacity(bytes.len());
+    while bytes[at].is_ascii_digit() {
+        digits.push(bytes[at] as char);
+        at += 1;
+    }
+    if bytes[at] == b'.' {
+        at += 1;
+        while bytes[at].is_ascii_digit() {
+            digits.push(bytes[at] as char);
+            at += 1;
+        }
+    }
+    debug_assert_eq!(bytes[at], b'e');
+    at += 1;
+    let mut exponent = 0i32;
+    let negative_exponent = bytes[at] == b'-';
+    if negative_exponent {
+        at += 1;
+    }
+    while at < bytes.len() {
+        exponent = exponent * 10 + i32::from(bytes[at] - b'0');
+        at += 1;
+    }
+    if negative_exponent {
+        exponent = -exponent;
+    }
+
+    if (-3..=6).contains(&exponent) {
+        if exponent >= 0 {
+            let point = exponent as usize + 1;
+            if digits.len() > point {
+                // Digits to spare: the point lands inside them.
+                out.push_str(&digits[..point]);
+                out.push('.');
+                out.push_str(&digits[point..]);
+            } else {
+                // A whole number: pad out to the point, then Java's mandatory
+                // fraction of zero.
+                out.push_str(&digits);
+                for _ in digits.len()..point {
+                    out.push('0');
+                }
+                out.push_str(".0");
+            }
+        } else {
+            // Below one: `0.00…digits`, with the point that many places left
+            // of the first significant digit.
+            out.push_str("0.");
+            for _ in 0..(-exponent - 1) {
+                out.push('0');
+            }
+            out.push_str(&digits);
+        }
+    } else {
+        out.push(digits.as_bytes()[0] as char);
+        out.push('.');
+        if digits.len() > 1 {
+            out.push_str(&digits[1..]);
+        } else {
+            out.push('0');
+        }
+        out.push('E');
+        let _ = write!(out, "{exponent}");
+    }
+}
+
+fn write_list(out: &mut String, profile: PrintProfile, list: &List) {
     out.push('[');
     for (index, element) in list.iter().enumerate() {
         if index > 0 {
             out.push(',');
         }
-        write_tag(out, element);
+        write_tag(out, profile, element);
     }
     out.push(']');
 }
 
-fn write_compound(out: &mut String, compound: &Compound) {
+fn write_compound(out: &mut String, profile: PrintProfile, compound: &Compound) {
     out.push('{');
     for (index, (name, value)) in compound.iter().enumerate() {
         if index > 0 {
@@ -179,7 +390,7 @@ fn write_compound(out: &mut String, compound: &Compound) {
         }
         write_key(out, name);
         out.push(':');
-        write_tag(out, value);
+        write_tag(out, profile, value);
     }
     out.push('}');
 }

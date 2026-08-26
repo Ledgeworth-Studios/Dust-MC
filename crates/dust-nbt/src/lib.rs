@@ -12,7 +12,10 @@
 //! There are four things called NBT and this crate implements three of them.
 //!
 //! 1. **Java Edition file NBT.** Big-endian; the root tag carries a name. This
-//!    is [`read::from_bytes`] and [`write::to_vec`].
+//!    is [`read::from_bytes`] and [`write::to_vec`]. When the document's life
+//!    is bounded by its buffer's — a chunk read from a region slot —
+//!    [`read::borrow`] parses the same bytes into views over them instead,
+//!    with no per-element allocation.
 //! 2. **Java Edition network NBT, 1.20.2 and later.** Identical except that the
 //!    root's name is *absent* — not empty, absent. 1.21.1 uses this for every
 //!    piece of NBT on the wire. This is [`read::from_bytes_network`] and
@@ -21,7 +24,8 @@
 //!    merely unreliable but attacker-selectable.
 //! 3. **SNBT**, the textual form used by commands and `/data`:
 //!    `{Count:1b,id:"minecraft:stone"}`. This is [`snbt::parse`] and
-//!    [`snbt::to_string`].
+//!    [`snbt::to_string`], or [`snbt::to_string_with`] under an explicit
+//!    [`PrintProfile`] when the presentation matters.
 //!
 //! The fourth is **Bedrock Edition NBT**, which is little-endian, has a
 //! VarInt-length variant for network use, and is not implemented here at all.
@@ -89,7 +93,10 @@ pub mod snbt;
 pub mod tag;
 pub mod write;
 
+pub use read::borrow;
+
 pub use compression::Compression;
 pub use error::{Error, Result};
 pub use read::{Limits, Mode, Named};
+pub use snbt::{NumericStyle, PrintProfile};
 pub use tag::{Compound, List, ListError, Tag, TagType};

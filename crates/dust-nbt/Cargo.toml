@@ -32,6 +32,12 @@ proptest = { version = "1", default-features = false, features = ["std", "bit-se
 name = "synthetic"
 harness = false
 
+# Exact allocation counts through a wrapping global allocator; see the note at
+# the top of that bench for why counting beats timing here.
+[[bench]]
+name = "allocation"
+harness = false
+
 [lints.rust]
 # The stub of this crate opted out of the workspace `unsafe_code = "deny"` in
 # anticipation of a zero-copy reader that would need it. The implementation

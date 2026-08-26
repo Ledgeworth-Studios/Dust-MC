@@ -610,3 +610,107 @@ pub fn any_root_name() -> impl Strategy<Value = String> {
 pub fn any_text() -> impl Strategy<Value = String> {
     text()
 }
+
+/// A finite `f32`, edges included. For suites about *printable* numbers:
+/// everything here survives an SNBT round trip, which a NaN or an infinity
+/// does not.
+pub fn any_finite_float() -> BoxedStrategy<f32> {
+    float_value()
+        .prop_filter("must be finite to print losslessly", |v| v.is_finite())
+        .boxed()
+}
+
+/// A finite `f64`, edges included — see [`any_finite_float`].
+pub fn any_finite_double() -> BoxedStrategy<f64> {
+    double_value()
+        .prop_filter("must be finite to print losslessly", |v| v.is_finite())
+        .boxed()
+}
+
+// ---------------------------------------------------------------------------
+// Seeded mutation plumbing, shared by the hostile suite and the differential
+// tests for the borrowed reader.
+// ---------------------------------------------------------------------------
+
+/// SplitMix64: fifteen lines, no dependency, and every bit avalanche-mixed so
+/// successive draws decorrelate even from sequential seeds.
+pub struct SplitMix64(u64);
+
+impl SplitMix64 {
+    pub fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    pub fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    pub fn below(&mut self, bound: usize) -> usize {
+        (self.next_u64() % bound as u64) as usize
+    }
+}
+
+/// Documents worth mutating: shapes chosen to exercise every reader path —
+/// strings carrying the two-byte NUL, a typed empty list, NaN payloads,
+/// duplicate keys, arrays, and an emoji as a surrogate pair.
+pub fn corpus_documents() -> Vec<Vec<u8>> {
+    let mut compound = dust_nbt::Compound::new();
+    compound.insert("name", Tag::String("notch\u{0000}\u{1f600}".to_owned()));
+    compound.insert("floats", Tag::Float(f32::from_bits(0x7fc0_0001)));
+    compound.insert(
+        "empty",
+        Tag::List(dust_nbt::List::new(dust_nbt::TagType::Int)),
+    );
+    compound.insert("words", Tag::IntArray(vec![i32::MIN, -1, 0, 1, i32::MAX]));
+
+    let mut duplicated = dust_nbt::Compound::new();
+    duplicated.insert("id", Tag::String("first".to_owned()));
+    duplicated.insert("id", Tag::String("second".to_owned()));
+    compound.insert("dup", Tag::Compound(duplicated));
+
+    let named = vec![
+        ("root".to_owned(), Tag::Compound(compound.clone())),
+        (String::new(), Tag::ByteArray(vec![i8::MIN, 0, i8::MAX])),
+        ("tiny".to_owned(), Tag::Long(i64::MIN)),
+    ];
+    named
+        .into_iter()
+        .map(|(name, tag)| dust_nbt::write::to_vec(&name, &tag).expect("writes"))
+        .collect()
+}
+
+/// SNBT texts worth mutating, covering quoting, suffixes and arrays.
+pub fn corpus_texts() -> Vec<String> {
+    [
+        "{a:1b,b:'quoted \\' text',c:\"other\"}".to_owned(),
+        "[B;1b,2b,-3b]".to_owned(),
+        "{pos:[I;-1,2,-3],flag:true,name:0x}".to_owned(),
+        "{}".to_owned(),
+        "{e:1.5e3d,f:-.25,g:[]}".to_owned(),
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// Mutate `bytes` in place, one randomly-chosen edit.
+pub fn mutate(rng: &mut SplitMix64, bytes: &mut Vec<u8>) {
+    if bytes.is_empty() {
+        bytes.push(rng.below(256) as u8);
+        return;
+    }
+    let at = rng.below(bytes.len());
+    match rng.below(6) {
+        0 => bytes[at] ^= 1 << rng.below(8),
+        1 => bytes[at] = rng.below(256) as u8,
+        2 => {
+            bytes.remove(at);
+        }
+        3 => bytes.insert(at, bytes[at]),
+        4 => bytes.insert(at, rng.below(256) as u8),
+        _ => bytes.truncate(at),
+    }
+}

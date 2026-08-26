@@ -9,6 +9,18 @@
 //! Everything that can fail is checked *before* anything is appended, so a
 //! failed write leaves the buffer as it found it up to the tag that failed —
 //! not a half-written document with a plausible-looking prefix.
+//!
+//! # Sizing
+//!
+//! The entry points that allocate (`to_vec`, `to_vec_network`) reserve the
+//! document's exact size first, by walking the tree in [`encoded_size`]. A
+//! chunk-sized compound written without this grows its buffer a dozen times
+//! over, each regrowth a memcpy of everything so far; with it, one allocation
+//! serves. The walk is not a conservative guess refined later but an exact
+//! count, and that is forced by the string encoding: modified UTF-8 *expands*
+//! (a NUL doubles, an emoji goes from four bytes to six), so no cheap bound
+//! like `text.len()` is sound, and any sound bound has to walk every string —
+//! at which point walking the rest of the tree costs almost nothing more.
 
 use crate::error::{Error, Result};
 use crate::mutf8;
@@ -27,12 +39,14 @@ use crate::tag::{Compound, List, Tag, TagType};
 /// # fn main() -> Result<(), dust_nbt::Error> {
 /// let bytes = write::to_vec("", &Tag::Byte(-1))?;
 /// assert_eq!(bytes, vec![0x01, 0x00, 0x00, 0xff]);
+/// assert_eq!(bytes.len(), bytes.capacity(), "sized exactly, grown never");
 /// # Ok(())
 /// # }
 /// ```
 pub fn to_vec(name: &str, tag: &Tag) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(1024);
+    let mut out = Vec::with_capacity(document_size(name, tag));
     write_into(&mut out, name, tag)?;
+    debug_assert_eq!(out.len(), out.capacity());
     Ok(out)
 }
 
@@ -48,8 +62,12 @@ pub fn write_into(out: &mut Vec<u8>, name: &str, tag: &Tag) -> Result<()> {
 /// `None` writes the single byte `00`, which is how the protocol since 1.20.2
 /// spells "no NBT here".
 pub fn to_vec_network(tag: Option<&Tag>) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(1024);
+    let mut out = Vec::with_capacity(match tag {
+        None => 1,
+        Some(tag) => 1 + payload_size(tag),
+    });
     write_into_network(&mut out, tag)?;
+    debug_assert_eq!(out.len(), out.capacity());
     Ok(out)
 }
 
@@ -182,4 +200,51 @@ fn write_compound(out: &mut Vec<u8>, compound: &Compound) -> Result<()> {
     }
     out.push(TagType::End.id());
     Ok(())
+}
+
+/// The exact number of bytes a file-form document serialises to: root id, root
+/// name, root payload.
+///
+/// The sum walks the whole tree, which makes it exact rather than a bound —
+/// see the module note on why a cheap bound cannot be sound for strings. The
+/// arithmetic is plain because the terms are bounded by memory that already
+/// exists: a `Vec<i64>` of n elements occupies at least 8n bytes in the heap,
+/// so its encoded size can never exceed the space the tree itself takes.
+///
+/// A name whose encoded form would not fit the `u16` prefix counts here as if
+/// clamped to it. The document will be refused when written — there is no such
+/// document — and refusing it from a reservation of a few hundred kilobytes
+/// beats refusing it from a reservation of however large the caller's string
+/// happened to be.
+fn document_size(name: &str, tag: &Tag) -> usize {
+    let name_len = mutf8::encoded_len(name).min(mutf8::MAX_ENCODED_LEN);
+    1 + 2 + name_len + payload_size(tag)
+}
+
+/// The exact payload size of one tag, id byte excluded.
+fn payload_size(tag: &Tag) -> usize {
+    match tag {
+        Tag::Byte(_) => 1,
+        Tag::Short(_) => 2,
+        Tag::Int(_) | Tag::Float(_) => 4,
+        Tag::Long(_) | Tag::Double(_) => 8,
+        // Length prefix, then one byte per element.
+        Tag::ByteArray(values) => 4 + values.len(),
+        // Length prefix, then the encoded text.
+        Tag::String(text) => 2 + mutf8::encoded_len(text),
+        // Element type and count, then each element.
+        Tag::List(list) => 5 + list.iter().map(payload_size).sum::<usize>(),
+        // One terminating TAG_End, plus each field's id, name prefix, name
+        // and payload.
+        Tag::Compound(compound) => {
+            1 + compound
+                .iter()
+                .map(|(name, value)| {
+                    3 + mutf8::encoded_len(name).min(mutf8::MAX_ENCODED_LEN) + payload_size(value)
+                })
+                .sum::<usize>()
+        }
+        Tag::IntArray(values) => 4 + values.len() * 4,
+        Tag::LongArray(values) => 4 + values.len() * 8,
+    }
 }
