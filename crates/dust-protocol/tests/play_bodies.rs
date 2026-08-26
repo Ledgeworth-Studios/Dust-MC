@@ -537,3 +537,309 @@ fn play_definitions_claim_the_only_version_there_is() {
         )
     );
 }
+
+// ---------------------------------------------------------------------------
+// Wave-two field types: layouts the definitions lean on
+// ---------------------------------------------------------------------------
+
+fn simple_slot(item_id: i32) -> dust_protocol::types::Slot {
+    dust_protocol::types::Slot::Present {
+        count: 1,
+        item_id,
+        removed_components: vec![],
+    }
+}
+
+#[test]
+fn equipment_entries_continue_while_the_high_bit_stands() {
+    use dust_protocol::packets::play::containers::{
+        EquipmentEntries, EquipmentEntry, EquipmentSlot,
+    };
+    use dust_protocol::types::Slot;
+
+    let entries = EquipmentEntries(vec![
+        EquipmentEntry {
+            slot: EquipmentSlot::MainHand,
+            item: Slot::Empty,
+        },
+        EquipmentEntry {
+            slot: EquipmentSlot::Boots,
+            item: Slot::Empty,
+        },
+        EquipmentEntry {
+            slot: EquipmentSlot::Helmet,
+            item: simple_slot(9),
+        },
+    ]);
+    let mut writer = Writer::new();
+    entries.encode(&mut writer, v()).expect("encodes");
+    let bytes = writer.into_bytes();
+
+    // The first two slot bytes carry the continuation bit; the last does not.
+    // Empty slots are a single zero byte each, so the layout is fully visible.
+    assert_eq!(
+        bytes[0],
+        EquipmentSlot::MainHand.discriminant() as u8 | 0x80
+    );
+    assert_eq!(bytes[2], EquipmentSlot::Boots.discriminant() as u8 | 0x80);
+    assert_eq!(bytes[4], EquipmentSlot::Helmet.discriminant() as u8);
+    assert_eq!(
+        EquipmentEntries::decode(&mut Reader::new(&bytes), v()).expect("decodes"),
+        entries
+    );
+
+    // An equipment update with nothing on it is not a message worth sending;
+    // encoding one is refused rather than written as an empty frame.
+    assert!(matches!(
+        EquipmentEntries(vec![]).encode(&mut Writer::new(), v()),
+        Err(EncodeError::Unsupported { .. })
+    ));
+}
+
+#[test]
+fn the_stop_sound_flags_byte_selects_among_four_layouts() {
+    use dust_protocol::packets::play::sound::{SoundCategory, StopSoundBody};
+
+    for (body, flags, len) in [
+        (StopSoundBody::default(), 0u8, 1),
+        (
+            StopSoundBody {
+                source: Some(SoundCategory::Ambient),
+                name: None,
+            },
+            0x01,
+            2,
+        ),
+        (
+            StopSoundBody {
+                source: None,
+                name: Some(dust_protocol::types::Identifier::parse("dust:stop").expect("valid")),
+            },
+            0x02,
+            1 + 10,
+        ),
+        (
+            StopSoundBody {
+                source: Some(SoundCategory::Master),
+                name: Some(dust_protocol::types::Identifier::parse("dust:stop").expect("valid")),
+            },
+            0x03,
+            12,
+        ),
+    ] {
+        let mut writer = Writer::new();
+        body.encode(&mut writer, v()).expect("encodes");
+        assert_eq!(writer.as_bytes()[0], flags, "{body:?}");
+        assert_eq!(writer.len(), len, "{body:?}");
+        assert_eq!(
+            StopSoundBody::decode(&mut Reader::new(writer.as_bytes()), v()).expect("decodes"),
+            body
+        );
+    }
+
+    // A flag outside the table leaves the layout unknowable, so it is named
+    // and refused instead of half-read.
+    assert_eq!(
+        StopSoundBody::decode(&mut Reader::new(&[0x08]), v()),
+        Err(DecodeError::UnknownVariant {
+            name: "StopSoundBody",
+            value: 8
+        })
+    );
+}
+
+#[test]
+fn a_zero_column_map_patch_carries_no_rows_and_no_data() {
+    use dust_protocol::packets::play::map_item::MapPatch;
+
+    // "Icons only" is spelled as columns=0 followed by literally nothing.
+    let patch = MapPatch {
+        columns: 0,
+        rows: 9,
+        x: 9,
+        z: 9,
+        data: vec![9; 9],
+    };
+    let mut writer = Writer::new();
+    patch.encode(&mut writer, v()).expect("encodes");
+    assert_eq!(writer.len(), 1, "the ignored fields must not be written");
+    assert_eq!(
+        MapPatch::decode(&mut Reader::new(writer.as_bytes()), v()).expect("decodes"),
+        MapPatch {
+            columns: 0,
+            rows: 0,
+            x: 0,
+            z: 0,
+            data: vec![]
+        }
+    );
+
+    let mut trailing = writer;
+    trailing.write_slice(&[0xAA]);
+    let mut reader = Reader::new(trailing.as_bytes());
+    MapPatch::decode(&mut reader, v()).expect("decodes");
+    assert_eq!(reader.read_u8(), Ok(0xAA), "the next field survives intact");
+}
+
+#[test]
+fn boss_bar_actions_carry_exactly_their_own_fields() {
+    use dust_protocol::packets::play::boss_bar::{BossBarAction, BossBarColor, BossBarDivision};
+
+    // Remove is the uuid plus one varint and nothing else; add is everything.
+    let remove = BossBarAction::Remove;
+    let mut writer = Writer::new();
+    remove.encode(&mut writer, v()).expect("encodes");
+    assert_eq!(writer.len(), 1);
+    assert_eq!(
+        writer.as_bytes()[0],
+        1,
+        "actions travel as their own varints"
+    );
+
+    let style = BossBarAction::UpdateStyle {
+        color: BossBarColor::Yellow,
+        division: BossBarDivision::Notches20,
+    };
+    let mut writer = Writer::new();
+    style.encode(&mut writer, v()).expect("encodes");
+    assert_eq!(writer.len(), 3);
+
+    // An action id from a future version is refused by name rather than read
+    // as some other action. The bytes are hand-written because no encoder
+    // here produces them.
+    use dust_protocol::types::Decode as _;
+    assert!(matches!(
+        BossBarAction::decode(&mut Reader::new(&[6, 0xFF]), v()),
+        Err(DecodeError::UnknownVariant {
+            name: "BossBarAction",
+            value: 6
+        })
+    ));
+}
+
+use dust_protocol::types::ProtocolString;
+
+#[test]
+fn the_offset_entity_id_spells_none_as_zero_and_ids_shifted_by_one() {
+    use dust_protocol::packets::play::OffsetEntityId;
+
+    let mut writer = Writer::new();
+    OffsetEntityId(None)
+        .encode(&mut writer, v())
+        .expect("encodes");
+    assert_eq!(writer.as_bytes(), &[0], "none is the reserved zero");
+
+    let mut writer = Writer::new();
+    OffsetEntityId(Some(0))
+        .encode(&mut writer, v())
+        .expect("encodes");
+    // Entity zero is wire one: the shift is what keeps zero free.
+    assert_eq!(writer.as_bytes(), &[1]);
+    assert_eq!(
+        OffsetEntityId::decode(&mut Reader::new(writer.as_bytes()), v()).expect("decodes"),
+        OffsetEntityId(Some(0))
+    );
+
+    let mut writer = Writer::new();
+    OffsetEntityId(Some(i32::MAX - 1))
+        .encode(&mut writer, v())
+        .expect("encodes");
+    assert_eq!(
+        OffsetEntityId::decode(&mut Reader::new(writer.as_bytes()), v()).expect("decodes"),
+        OffsetEntityId(Some(i32::MAX - 1))
+    );
+}
+
+#[test]
+fn team_methods_carry_only_their_own_sections() {
+    use dust_protocol::packets::play::scoreboard::{
+        CollisionRule, NameTagVisibility, TeamBody, TeamInfo, TeamMethod,
+    };
+
+    // Remove-team is the method varint and nothing else.
+    let mut writer = Writer::new();
+    TeamBody {
+        method: TeamMethod::Remove,
+        info: None,
+        members: vec![],
+    }
+    .encode(&mut writer, v())
+    .expect("encodes");
+    assert_eq!(writer.len(), 1);
+
+    // A create without its descriptive fields would desynchronise the
+    // client's reader; it is refused rather than written hollow.
+    assert!(matches!(
+        TeamBody {
+            method: TeamMethod::Create,
+            info: None,
+            members: vec![],
+        }
+        .encode(&mut Writer::new(), v()),
+        Err(EncodeError::Unsupported { .. })
+    ));
+
+    let full = TeamBody {
+        method: TeamMethod::Create,
+        info: Some(TeamInfo {
+            display_name: dust_protocol::text::Component::text("Blue"),
+            friendly_flags: 0,
+            name_tag_visibility: NameTagVisibility::Always,
+            collision_rule: CollisionRule::Never,
+            colour: VarInt(11),
+            prefix: dust_protocol::text::Component::text(""),
+            suffix: dust_protocol::text::Component::text(""),
+        }),
+        members: vec![ProtocolString::new("jeb_").expect("fits")],
+    };
+    let mut writer = Writer::new();
+    full.encode(&mut writer, v()).expect("encodes");
+    assert_eq!(
+        TeamBody::decode(&mut Reader::new(writer.as_bytes()), v()).expect("decodes"),
+        full
+    );
+
+    // The visibility words are strings on this version, not enum ids.
+    let mut writer = Writer::new();
+    ProtocolString::new("hideForOtherTeams")
+        .expect("fits")
+        .encode(&mut writer, v())
+        .expect("encodes");
+    assert_eq!(writer.len(), 1 + 17);
+}
+
+#[test]
+fn objective_updates_treat_number_format_as_an_option_of_an_option() {
+    use dust_protocol::packets::play::containers::NumberFormat;
+    use dust_protocol::packets::play::scoreboard::{
+        ObjectiveMode, ObjectiveRenderType, UpdateObjectivesBody,
+    };
+
+    fn body(format: Option<Option<NumberFormat>>) -> UpdateObjectivesBody {
+        UpdateObjectivesBody {
+            mode: ObjectiveMode::Update,
+            display_name: Some(dust_protocol::text::Component::text("obj")),
+            render_type: Some(ObjectiveRenderType::Integer),
+            number_format: format,
+        }
+    }
+
+    // No boolean at all; absent boolean; present blank. Three different
+    // messages, each one byte longer than the last — the option-of-an-option
+    // is what keeps them distinct on the wire.
+    let mut previous_len = None;
+    for format in [None, Some(None), Some(Some(NumberFormat::Blank))] {
+        let mut writer = Writer::new();
+        body(format.clone())
+            .encode(&mut writer, v())
+            .expect("encodes");
+        match previous_len {
+            None => {}
+            Some(previous) => assert_eq!(writer.len(), previous + 1, "{format:?}"),
+        }
+        previous_len = Some(writer.len());
+        let back = UpdateObjectivesBody::decode(&mut Reader::new(writer.as_bytes()), v())
+            .expect("decodes");
+        assert_eq!(back, body(format), "format changed on the way round");
+    }
+}

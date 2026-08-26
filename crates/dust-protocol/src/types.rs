@@ -79,29 +79,37 @@ fixed_width! {
     f64 => read_f64 / write_f64,
 }
 
-/// A byte sequence of a length both sides know in advance.
+/// A fixed-arity field whose element count both sides know in advance — sign
+/// lines, or any future field with the same shape.
 ///
-/// Distinct from [`PrefixedBytes`], which carries a VarInt count. The chat
-/// signature is the reason this exists: it is *always* 256 bytes and is
-/// **not** length-prefixed, so wrapping it in a prefixed type writes four
-/// bytes vanilla never sends and desynchronises every field after it. The
-/// length lives in the type, where a reader cannot get it wrong.
-impl<const N: usize> Decode for [u8; N] {
+/// Distinct from [`Vec`], which carries a VarInt count. A field that is
+/// *always* four lines must not grow a prefix: wrapping it in a counted type
+/// writes bytes vanilla never sends and desynchronises every field after it.
+/// The count lives in the type, where a reader cannot get it wrong.
+impl<T: Decode, const N: usize> Decode for [T; N] {
     fn decode<R: WireRead + ?Sized>(
         input: &mut R,
-        _version: ProtocolVersion,
+        version: ProtocolVersion,
     ) -> Result<Self, DecodeError> {
-        input.read_array()
+        // Element by element; every element must decode or the array does
+        // not exist.
+        let mut out = std::array::from_fn(|_| None);
+        for slot in &mut out {
+            *slot = Some(T::decode(input, version)?);
+        }
+        Ok(out.map(Option::unwrap))
     }
 }
 
-impl<const N: usize> Encode for [u8; N] {
+impl<T: Encode, const N: usize> Encode for [T; N] {
     fn encode<W: WireWrite + ?Sized>(
         &self,
         out: &mut W,
-        _version: ProtocolVersion,
+        version: ProtocolVersion,
     ) -> Result<(), EncodeError> {
-        out.write_slice(self);
+        for value in self {
+            value.encode(out, version)?;
+        }
         Ok(())
     }
 }
