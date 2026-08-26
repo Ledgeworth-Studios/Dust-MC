@@ -431,6 +431,20 @@ impl<W: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<W> {
         if self.ended {
             return Err(self.take_failure().unwrap_or(ConnError::Closed));
         }
+        // Every error is terminal, and the type says so to later callers:
+        // after a timeout or a bad frame there is no operation this driver
+        // can still perform honestly.
+        match self.pull_until_frame().await {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => {
+                self.ended = true;
+                Err(error)
+            }
+        }
+    }
+
+    /// The read loop proper: decode what is buffered, pull what is missing.
+    async fn pull_until_frame(&mut self) -> Result<Option<Frame>, ConnError> {
         loop {
             if let Some(frame) = self.decoder.next_frame()? {
                 return Ok(Some(frame));
