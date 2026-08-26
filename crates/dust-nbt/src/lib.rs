@@ -12,7 +12,10 @@
 //! There are four things called NBT and this crate implements three of them.
 //!
 //! 1. **Java Edition file NBT.** Big-endian; the root tag carries a name. This
-//!    is [`read::from_bytes`] and [`write::to_vec`].
+//!    is [`read::from_bytes`] and [`write::to_vec`]. When the document's life
+//!    is bounded by its buffer's — a chunk read from a region slot —
+//!    [`read::borrow`] parses the same bytes into views over them instead,
+//!    with no per-element allocation.
 //! 2. **Java Edition network NBT, 1.20.2 and later.** Identical except that the
 //!    root's name is *absent* — not empty, absent. 1.21.1 uses this for every
 //!    piece of NBT on the wire. This is [`read::from_bytes_network`] and
@@ -88,6 +91,8 @@ pub mod read;
 pub mod snbt;
 pub mod tag;
 pub mod write;
+
+pub use read::borrow;
 
 pub use compression::Compression;
 pub use error::{Error, Result};
