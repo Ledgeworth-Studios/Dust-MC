@@ -126,6 +126,12 @@ impl ConfigValue for String {
     }
 }
 
+impl ConfigValue for crate::model::LogLevel {
+    fn render_default(&self) -> String {
+        format!("{self}")
+    }
+}
+
 impl<T: ConfigValue> ConfigValue for Option<T> {
     fn render_default(&self) -> String {
         match self {
@@ -319,6 +325,7 @@ impl DustConfig {
     /// server rather than the file.
     pub fn check(&self) -> Vec<Finding> {
         let mut findings = Vec::new();
+        self.server.check("server", &mut findings);
         self.worldgen.ores.check("worldgen.ores", &mut findings);
         findings
     }
@@ -373,5 +380,50 @@ mod tests {
         let round_tripped =
             DustConfig::from_toml_and_env(&text, "round-trip", []).expect("reparses");
         assert_eq!(original, round_tripped);
+    }
+
+    #[test]
+    fn a_zero_catchup_allowance_is_named_as_an_error() {
+        let err = DustConfig::from_toml_and_env("[server]\nmax_catchup_ticks = 0\n", "test", [])
+            .expect_err("a zero allowance surrenders every pass");
+        assert!(err.to_string().contains("max_catchup_ticks"), "{err}");
+    }
+
+    #[test]
+    fn a_zero_shutdown_timeout_is_named_as_an_error() {
+        let err =
+            DustConfig::from_toml_and_env("[server]\nshutdown_timeout_secs = 0\n", "test", [])
+                .expect_err("no grace fires the watchdog instantly");
+        assert!(err.to_string().contains("shutdown_timeout_secs"), "{err}");
+    }
+
+    #[test]
+    fn the_log_level_is_typed_and_not_a_free_string() {
+        let loaded = DustConfig::from_toml_and_env("[server]\nlog_level = \"debug\"\n", "test", [])
+            .expect("a known level loads");
+        assert_eq!(loaded.server.log_level, crate::model::LogLevel::Debug);
+        let err = DustConfig::from_toml_and_env("[server]\nlog_level = \"loud\"\n", "test", [])
+            .expect_err("an unknown level is a typo at parse time");
+        assert!(err.to_string().contains("log_level"), "{err}");
+    }
+
+    #[test]
+    fn an_environment_override_reaches_the_runtime_knobs() {
+        let config = DustConfig::from_toml_and_env(
+            "",
+            "test",
+            [
+                ("DUST__SERVER__MAX_CATCHUP_TICKS".to_owned(), "7".to_owned()),
+                (
+                    "DUST__SERVER__SHUTDOWN_TIMEOUT_SECS".to_owned(),
+                    "3".to_owned(),
+                ),
+                ("DUST__SERVER__LOG_LEVEL".to_owned(), "trace".to_owned()),
+            ],
+        )
+        .expect("valid");
+        assert_eq!(config.server.max_catchup_ticks, 7);
+        assert_eq!(config.server.shutdown_timeout_secs, 3);
+        assert_eq!(config.server.log_level, crate::model::LogLevel::Trace);
     }
 }

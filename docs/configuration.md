@@ -28,6 +28,9 @@ Listener, identity and the basics a server needs to answer a ping.
 | `motd` | `String` | `"A Dust server"` | hot | Message shown in the client's server list. |
 | `max_players` | `u32` | `20` | hot | Maximum concurrent players. This is the number shown in the server list, not a licence — the gateway may admit more across several backends. |
 | `online_mode` | `bool` | `true` | restart | Verify each joining player against Mojang's session servers. Turning this off means anyone may join under any name, and is only safe behind a proxy that does the check itself. |
+| `max_catchup_ticks` | `u32` | `20` | restart | The most ticks the server will try to repay after a stall, per pass of the tick loop. A stall longer than this is skipped past rather than caught up, which keeps a hiccup from becoming a death spiral. |
+| `shutdown_timeout_secs` | `u32` | `10` | restart | How long, in seconds, a shutdown may take after a stop request before the watchdog ends the process by force. Grace worth having is grace worth bounding. |
+| `log_level` | `LogLevel` | `info` | restart | The lowest severity the server logs: one of `error`, `warn`, `info`, `debug`, `trace`. Everything less severe than the chosen level is suppressed. |
 
 ## `[jvm]`
 
