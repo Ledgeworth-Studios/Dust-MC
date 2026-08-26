@@ -45,6 +45,7 @@ pub mod listen;
 pub mod play;
 pub mod session;
 pub mod status;
+pub mod view;
 pub mod world;
 
 /// Turn a packet into a frame without writing its id into its own body.

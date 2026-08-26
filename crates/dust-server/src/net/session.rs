@@ -48,6 +48,8 @@ use super::configure::{configure, Configured};
 use super::finish;
 use super::play as play_mod;
 use super::status::StatusPolicy;
+use super::view::{self, View};
+use super::world;
 use super::world::FlatWorld;
 use crate::to_frame;
 
@@ -377,7 +379,6 @@ where
     W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let version = ctx.version;
-    let world = &ctx.world;
 
     // Counted here rather than when the session ends, and held by a guard so
     // that every way out of this function — a disconnect, a timeout, a decode
@@ -406,21 +407,12 @@ where
     )
     .await?;
 
-    let centre = ChunkPos::new(0, 0);
-    send_play(
-        conn,
-        play::clientbound::SetCenterChunk {
-            chunk_x: VarInt(centre.x),
-            chunk_z: VarInt(centre.z),
-        },
-        version,
-    )
-    .await?;
-
-    for pos in play_mod::columns_around(centre, ctx.view_distance as i32) {
-        let chunk = world.chunk(pos);
-        send_play(conn, play_mod::chunk_packet(&chunk, version)?, version).await?;
-    }
+    // The view is the server's record of what this client holds. Every column
+    // it sends and every one it forgets goes through it, so the record cannot
+    // drift from the client's actual contents.
+    let mut view = View::default();
+    let centre = view::column_of(world::SPAWN.0, world::SPAWN.2);
+    stream(conn, ctx, &mut view, centre).await?;
 
     // The terrain is there; this is what tells the client to stop looking at
     // the loading screen and start rendering it.
@@ -434,7 +426,56 @@ where
     )
     .await?;
 
-    keep_alive_loop(conn, ctx).await
+    keep_alive_loop(conn, ctx, view).await
+}
+
+/// Bring the client's loaded columns in line with a new centre.
+///
+/// Recentre first, then send, then forget. The order matters at both ends: a
+/// client filing columns against a stale centre may discard them, and one told
+/// to forget a column before its replacement arrives has a hole in the world
+/// for as long as the round trip takes.
+async fn stream<W>(
+    conn: &mut Conn<W>,
+    ctx: &SessionContext,
+    view: &mut View,
+    centre: ChunkPos,
+) -> Result<(), SessionError>
+where
+    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let change = view.move_to(centre, ctx.view_distance as i32);
+    if change.recentre {
+        send_play(
+            conn,
+            play::clientbound::SetCenterChunk {
+                chunk_x: VarInt(centre.x),
+                chunk_z: VarInt(centre.z),
+            },
+            ctx.version,
+        )
+        .await?;
+    }
+    for pos in &change.send {
+        send_play(
+            conn,
+            play_mod::chunk_packet(ctx.world.column(), *pos, ctx.version)?,
+            ctx.version,
+        )
+        .await?;
+    }
+    for pos in &change.forget {
+        send_play(
+            conn,
+            play::clientbound::ForgetLevelChunk {
+                chunk_x: pos.x,
+                chunk_z: pos.z,
+            },
+            ctx.version,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Read whatever the client sends, and prove the connection is alive.
@@ -450,7 +491,11 @@ where
 /// packets decode — a client walking around a world sends a steady stream of
 /// position updates, and a decoder that got one wrong would fail here rather
 /// than the first time somebody built on it.
-async fn keep_alive_loop<W>(conn: &mut Conn<W>, ctx: &SessionContext) -> Result<(), SessionError>
+async fn keep_alive_loop<W>(
+    conn: &mut Conn<W>,
+    ctx: &SessionContext,
+    mut view: View,
+) -> Result<(), SessionError>
 where
     W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -478,6 +523,15 @@ where
                 // is the only place in the project where a real client's
                 // serverbound Play packets meet the generated definitions.
                 match play::serverbound::Packet::decode_body(frame.id, &mut reader, ctx.version) {
+                    // The three movement packets that carry a position. The
+                    // fourth carries only a rotation, and a player turning on
+                    // the spot has not changed which columns they can see.
+                    Ok(play::serverbound::Packet::MovePlayerPos(m)) => {
+                        moved(conn, ctx, &mut view, m.x, m.z).await?;
+                    }
+                    Ok(play::serverbound::Packet::MovePlayerPosRot(m)) => {
+                        moved(conn, ctx, &mut view, m.x, m.z).await?;
+                    }
                     Ok(_) => {}
                     // A packet this server has no definition for is not a
                     // reason to drop a player. The list of unclaimed Play
@@ -489,6 +543,27 @@ where
             }
         }
     }
+}
+
+/// Stream whatever a move to `(x, z)` requires.
+///
+/// Called for every position packet, which arrive twenty times a second, and
+/// almost all of them land in the column the player was already in — so the
+/// common path is one comparison inside [`View::move_to`] and no packets at
+/// all. The position is trusted as sent: nothing here validates movement, and
+/// an anti-cheat that did would live between this and the world rather than
+/// inside it.
+async fn moved<W>(
+    conn: &mut Conn<W>,
+    ctx: &SessionContext,
+    view: &mut View,
+    x: f64,
+    z: f64,
+) -> Result<(), SessionError>
+where
+    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    stream(conn, ctx, view, view::column_of(x, z)).await
 }
 
 /// The entity id the player is given.

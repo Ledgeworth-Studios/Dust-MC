@@ -130,8 +130,13 @@ pub fn position_packet(
 }
 
 /// Encode one column into a chunk packet.
+/// `pos` is passed rather than read off the chunk, because the chunk may be a
+/// template shared by every column in the world — see `world::FlatWorld`. A
+/// column's contents and a column's coordinates are separable here and the
+/// packet is where they meet.
 pub fn chunk_packet(
     chunk: &Chunk,
+    pos: ChunkPos,
     version: ProtocolVersion,
 ) -> Result<play::clientbound::LevelChunkWithLight, dust_protocol::wire::EncodeError> {
     let mut data = Writer::default();
@@ -141,8 +146,8 @@ pub fn chunk_packet(
 
     let section_count = chunk.sections().len();
     Ok(play::clientbound::LevelChunkWithLight {
-        chunk_x: chunk.pos().x,
-        chunk_z: chunk.pos().z,
+        chunk_x: pos.x,
+        chunk_z: pos.z,
         heightmaps: heightmaps_nbt(chunk),
         data: ChunkData(PrefixedBytes(data.into_bytes())),
         // No chests, no signs, no spawners in a flat world.

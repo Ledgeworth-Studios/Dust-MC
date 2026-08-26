@@ -306,6 +306,141 @@ fn connect(addr: SocketAddr) -> TcpStream {
     stream
 }
 
+/// A client that has reached Play, and what it has been told since.
+///
+/// Counters rather than a log of packets: the assertions are about how many
+/// columns crossed the wire, and keeping every chunk packet to count them
+/// later would be a hundred megabytes to answer a question three integers
+/// answer.
+struct Joined {
+    chunks: usize,
+    forgets: usize,
+    centres: usize,
+}
+
+impl Joined {
+    /// Read whatever is waiting, and stop when nothing is.
+    ///
+    /// A short read timeout is the stopping condition, which is a wall-clock
+    /// dependency and therefore worth naming: it is not a claim about how fast
+    /// the server is, only about the socket being empty *now*. The counts this
+    /// test asserts are cumulative, so a drain that stopped early is corrected
+    /// by the next one; only the final `drain_until_quiet` has to be complete,
+    /// and it waits longer for exactly that reason.
+    fn drain(&mut self, stream: &mut TcpStream) {
+        self.read_for(stream, Duration::from_millis(50));
+    }
+
+    fn drain_until_quiet(&mut self, stream: &mut TcpStream) {
+        self.read_for(stream, Duration::from_millis(750));
+    }
+
+    fn read_for(&mut self, stream: &mut TcpStream, quiet: Duration) {
+        stream
+            .set_read_timeout(Some(quiet))
+            .expect("a read timeout");
+        while let Some((id, body)) = try_recv_compressed_frame(stream) {
+            match id {
+                39 => self.chunks += 1,
+                33 => self.forgets += 1,
+                84 => self.centres += 1,
+                // A keep-alive is answered so the connection stays up through
+                // a walk that outlasts the ten-second period.
+                38 => send_compressed_frame(stream, 24, &body),
+                29 => panic!("the server disconnected mid-walk"),
+                _ => {}
+            }
+        }
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("a read timeout");
+    }
+}
+
+/// Run the whole join, ending with the client in Play and the arrival counted.
+///
+/// The sequence is asserted in its own test; here it is walked through so a
+/// later test can start from a joined player without repeating it.
+fn join(stream: &mut TcpStream, addr: SocketAddr) -> Joined {
+    handshake(stream, 767, addr, 2);
+    let mut body = Vec::new();
+    write_string("Walker", &mut body);
+    body.extend_from_slice(&[0u8; 16]);
+    send_frame(stream, 0x00, &body);
+
+    let (id, _) = recv_frame(stream);
+    assert_eq!(id, 0x03, "set_compression");
+    let (id, _) = recv_compressed_frame(stream);
+    assert_eq!(id, 0x02, "login_finished");
+    send_compressed_frame(stream, 0x03, &[]);
+
+    let mut counted = Joined {
+        chunks: 0,
+        forgets: 0,
+        centres: 0,
+    };
+    loop {
+        let (id, body) = recv_compressed_frame(stream);
+        match id {
+            0x0e => send_compressed_frame(stream, 0x07, &body),
+            0x03 => {
+                send_compressed_frame(stream, 0x03, &[]);
+                break;
+            }
+            _ => {}
+        }
+    }
+    // Play: the join packet, the position, then the columns and the event.
+    loop {
+        let (id, body) = recv_compressed_frame(stream);
+        match id {
+            39 => counted.chunks += 1,
+            33 => counted.forgets += 1,
+            84 => counted.centres += 1,
+            34 => break, // the loading screen is over
+            38 => send_compressed_frame(stream, 24, &body),
+            _ => {}
+        }
+    }
+    counted
+}
+
+/// One frame, or `None` if the socket went quiet inside its read timeout.
+fn try_recv_compressed_frame(stream: &mut TcpStream) -> Option<(i32, Vec<u8>)> {
+    let mut first = [0u8; 1];
+    match stream.read_exact(&mut first) {
+        Ok(()) => {}
+        Err(_) => return None,
+    }
+    // The length prefix, continued by hand because one byte of it is already
+    // read and a VarInt does not say up front how long it is.
+    let mut len = i32::from(first[0] & 0x7f);
+    let mut shift = 7;
+    let mut byte = first[0];
+    while byte & 0x80 != 0 {
+        let mut next = [0u8; 1];
+        stream.read_exact(&mut next).expect("a VarInt byte");
+        byte = next[0];
+        len |= i32::from(byte & 0x7f) << shift;
+        shift += 7;
+    }
+
+    let mut payload = vec![0u8; len as usize];
+    stream.read_exact(&mut payload).expect("the frame body");
+    let (uncompressed_len, rest) = read_var_int_from(&payload);
+    let inflated = if uncompressed_len == 0 {
+        rest.to_vec()
+    } else {
+        let mut out = Vec::new();
+        flate2::read::ZlibDecoder::new(rest)
+            .read_to_end(&mut out)
+            .expect("a zlib stream");
+        out
+    };
+    let (id, body) = read_var_int_from(&inflated);
+    Some((id, body.to_vec()))
+}
+
 // ---------------------------------------------------------------------------
 // The tests
 // ---------------------------------------------------------------------------
@@ -519,6 +654,64 @@ fn an_offline_login_runs_the_whole_configuration_exchange_and_reaches_play() {
         "the teardown must account for the player: {:?}",
         report.transcript
     );
+}
+
+/// Phase 3's exit criterion, in the part of it that exists: walk a long way
+/// and require the world to keep arriving.
+///
+/// The numbers are checked rather than the behaviour being watched. A view of
+/// radius two is a five-by-five square, so each chunk boundary crossed sends a
+/// five-column edge and forgets another — and one thousand blocks east crosses
+/// sixty-two of them. A server that stopped streaming, or that resent columns
+/// the client already held, would produce a different count and no other
+/// symptom.
+#[test]
+fn a_player_walking_a_thousand_blocks_is_streamed_the_world_as_they_go() {
+    let running = start("");
+    let addr = running.addr;
+    let mut stream = connect(addr);
+    let mut client = join(&mut stream, addr);
+
+    // Twenty-five columns on arrival, and one centre.
+    assert_eq!(client.chunks, 25, "the square at spawn");
+    assert_eq!(client.forgets, 0, "nothing to forget yet");
+    assert_eq!(client.centres, 1);
+
+    // Due east, one block at a time, reading whatever comes back. The reads are
+    // interleaved rather than saved to the end because the outbound queue is
+    // bounded: a client that sends a thousand packets without reading is a
+    // client the server is entitled to make wait.
+    let mut x = 0.5f64;
+    for step in 0..1000 {
+        x += 1.0;
+        let mut body = Vec::new();
+        body.extend_from_slice(&x.to_be_bytes());
+        body.extend_from_slice(&(-59.0f64).to_be_bytes());
+        body.extend_from_slice(&0.5f64.to_be_bytes());
+        body.push(1); // on_ground
+        send_compressed_frame(&mut stream, 26, &body);
+        if step % 16 == 0 {
+            client.drain(&mut stream);
+        }
+    }
+    client.drain_until_quiet(&mut stream);
+
+    // 1000 blocks east from x = 0.5 crosses into column 63, so sixty-two
+    // boundaries after the first. Each one is five columns each way.
+    assert_eq!(client.centres, 63, "one recentre per boundary crossed");
+    assert_eq!(
+        client.forgets, 310,
+        "five columns forgotten per crossing, and never one the client did \
+         not hold"
+    );
+    assert_eq!(
+        client.chunks,
+        25 + 310,
+        "the square at spawn plus five columns per crossing — a resend would \
+         push this above it and nothing else would show"
+    );
+
+    running.finish();
 }
 
 #[test]

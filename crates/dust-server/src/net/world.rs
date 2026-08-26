@@ -99,6 +99,25 @@ pub const SURFACE_Y: i32 = -60;
 pub const SPAWN: (f64, f64, f64) = (0.5, SURFACE_Y as f64 + 1.0, 0.5);
 
 /// One flat world.
+///
+/// # Why a template column rather than a generator call per chunk
+///
+/// Every column of a flat world is identical, so generating each one is doing
+/// the same work again — and that work is not cheap. `dust-world`'s bench puts
+/// generate-plus-light at **9.6 ms per overworld column in release**, almost
+/// all of it the sky-light seeding, which pushes a seed for every one of the
+/// ~97,000 cells above the terrain and walks them all. Twenty-five columns is
+/// a quarter of a second; a ten-chunk view distance would be four.
+///
+/// So the column is built and lit once, here, and the chunk packet is told
+/// which coordinates to put on it. That is correct for *this* world and is
+/// explicitly not a general answer: the moment two columns differ, the
+/// template goes and the cost comes back. What has to happen before then is
+/// vanilla's own refinement — sky light does not attenuate travelling straight
+/// down, so only the topmost open cell of each x/z needs seeding rather than
+/// the whole air column. `dust-world`'s propagation module notes that as
+/// deliberately deferred; this is the measurement that says when it stops
+/// being deferrable.
 #[derive(Debug, Clone)]
 pub struct FlatWorld {
     palette: Palette,
@@ -110,6 +129,8 @@ pub struct FlatWorld {
     biome: u32,
     block_registry_size: u32,
     biome_registry_size: u32,
+    /// Built and lit once at construction. See the type's own note.
+    template: Chunk,
 }
 
 impl FlatWorld {
@@ -118,26 +139,43 @@ impl FlatWorld {
     /// client built its mapping from the packet this server sent it and a
     /// second ordering here would name a different biome.
     pub fn new(palette: Palette, biome: u32, biome_registry_size: u32) -> Self {
-        Self {
+        let mut world = Self {
             opacity: OpacityModel::transparent_only([palette.air]),
             palette,
             height: WorldHeight::OVERWORLD,
             biome,
             block_registry_size: dust_registry::STATE_COUNT,
             biome_registry_size,
-        }
+            // Replaced immediately below. An empty placeholder rather than an
+            // Option, because a world without its column is not a state any
+            // caller should be able to observe.
+            template: Chunk::uniform(
+                ChunkPos::new(0, 0),
+                WorldHeight::OVERWORLD,
+                dust_registry::STATE_COUNT,
+                biome_registry_size,
+                palette.air,
+                biome,
+            ),
+        };
+        world.template = world.generate(ChunkPos::new(0, 0));
+        world
     }
 
     pub fn height(&self) -> WorldHeight {
         self.height
     }
 
-    /// Generate the column at `pos`.
+    /// The column every position in this world holds.
     ///
-    /// Every column is identical, so this is a fill and five row writes rather
-    /// than anything worth caching — and a cache would have to be invalidated
-    /// the day a block is placed, which is the next thing to happen here.
-    pub fn chunk(&self, pos: ChunkPos) -> Chunk {
+    /// A reference, not a copy: the caller sends it and does not keep it, and
+    /// the coordinates that make it a particular column live on the packet.
+    pub fn column(&self) -> &Chunk {
+        &self.template
+    }
+
+    /// Build the column this world is made of.
+    fn generate(&self, pos: ChunkPos) -> Chunk {
         let mut chunk = Chunk::uniform(
             pos,
             self.height,
