@@ -377,8 +377,10 @@ where
         Configured::UnknownContent => {
             // The client did not acknowledge the vanilla pack, so its
             // registries would have to carry their own contents, and Dust has
-            // none to send. Saying so beats sending three hundred entries with
-            // no definitions and leaving it in a world with no dimension types.
+            // none to send. Checked rather than assumed: serving the names
+            // anyway was tried against a client that acknowledges nothing, and
+            // it fails inside its own registry loader without ever reaching
+            // the world. See `configure`'s module documentation.
             refuse_in_configuration(
                 &mut conn,
                 ctx,

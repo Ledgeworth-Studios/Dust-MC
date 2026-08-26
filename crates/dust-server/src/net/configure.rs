@@ -32,8 +32,23 @@
 //! thing Dust can currently do. It has the names and not the contents, on
 //! purpose — see `dust_registry::synced`. So a client that does *not*
 //! acknowledge the core pack is told so and disconnected, rather than being
-//! sent a registry with no payloads it has no copy of, which would put it in a
-//! world with no dimension types and no way to know why.
+//! sent a registry with no payloads it has no copy of.
+//!
+//! **That refusal was checked rather than reasoned about.** Sending the names
+//! anyway to a client that acknowledged nothing was tried, against
+//! `mineflayer` — a third-party client that does not track packs and sends an
+//! empty list. It fails inside its own registry loader, reading `undefined`
+//! where a dimension type's contents should be, and never reaches the world.
+//! So the refusal stands, and it is not this server being stricter than it
+//! needs to be.
+//!
+//! It *is* a real limitation, and worth naming as one: **Dust cannot currently
+//! serve any client that does not claim `minecraft:core`**, which includes much
+//! of the bot and proxy ecosystem. Lifting it means shipping the actual
+//! contents of at least `dimension_type` and `worldgen/biome` — sixty-eight
+//! entries of JSON converted to NBT — which is a piece of work with a
+//! licensing question attached, since those contents are Mojang's rather than
+//! facts about an interface.
 //!
 //! # What is deliberately not sent yet, and what it costs
 //!
