@@ -3,3 +3,8 @@
 # changes. They are reviewed and moved into tests/ui/, never committed as-is.
 wip/
 .dust-extract/
+
+# A vanilla server run directory, wherever an operator happens to leave one.
+# The jars are Mojang's and the worlds are generated from them; both stay on
+# disk, neither is ever committed.
+.dust-vanilla/
