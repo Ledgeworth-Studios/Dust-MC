@@ -21,6 +21,11 @@ flate2.workspace = true
 # the test plumbing in `tests/support/mod.rs`.
 proptest = "1"
 
+# A stopwatch and nothing else; see the note at the top of the bench.
+[[bench]]
+name = "synthetic"
+harness = false
+
 [lints.rust]
 # The stub of this crate opted out of the workspace `unsafe_code = "deny"` in
 # anticipation of a zero-copy reader that would need it. The implementation
