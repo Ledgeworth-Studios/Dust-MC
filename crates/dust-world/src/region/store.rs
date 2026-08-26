@@ -135,6 +135,7 @@ pub struct MemoryStore {
 }
 
 impl MemoryStore {
+    /// An empty file that exists only in memory.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -149,11 +150,13 @@ impl MemoryStore {
         }
     }
 
+    /// The whole file's contents.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
 
+    /// The whole file's contents, taken.
     #[must_use]
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes

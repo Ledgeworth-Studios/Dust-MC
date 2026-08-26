@@ -40,7 +40,9 @@
 /// iterate as the keys themselves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SlabKey {
+    /// Which storage position the value occupies.
     slot: u32,
+    /// How many times that position has been vacated before this occupancy.
     generation: u32,
 }
 
@@ -76,13 +78,19 @@ pub enum SlabError {
     /// or the slot was freed and filled again since. Either way the key is
     /// dead, and the current generation says how far the slot has moved on.
     StaleGeneration {
+        /// The slot the key names, which exists but has moved on.
         slot: u32,
+        /// The generation the key expected.
         generation: u32,
+        /// The generation the slot now carries.
         current_generation: u32,
     },
     /// No such slot in this slab. A key past the end never referred to
     /// anything here.
-    Unallocated { slot: u32 },
+    Unallocated {
+        /// The slot that does not exist here.
+        slot: u32,
+    },
 }
 
 impl std::fmt::Display for SlabError {
@@ -153,6 +161,7 @@ impl<T> Slab<T> {
         self.occupied
     }
 
+    /// Whether no value is live.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.occupied == 0

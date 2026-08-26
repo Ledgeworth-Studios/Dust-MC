@@ -52,9 +52,13 @@ pub const fn ceil_log2(n: u32) -> u32 {
 /// Which of the four a palette is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PaletteKind {
+    /// One value, no packed array beside it.
     Single,
+    /// A short list indexed directly.
     Linear,
+    /// A longer list with a reverse index beside it.
     Hashed,
+    /// No list at all: packed indices are registry ids themselves.
     Global,
 }
 
@@ -110,9 +114,13 @@ pub struct Global {
 /// A palette in whichever strategy it is currently in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Palette {
+    /// One value and nothing else; see [`Single`].
     Single(Single),
+    /// A direct-indexed list; see [`Linear`].
     Linear(Linear),
+    /// An insertion-ordered list with a hash map beside it; see [`Hashed`].
     Hashed(Hashed),
+    /// The registry itself as the palette; see [`Global`].
     Global(Global),
 }
 
@@ -151,6 +159,7 @@ impl Palette {
         })
     }
 
+    /// Which of the four this currently is.
     #[must_use]
     pub const fn kind(&self) -> PaletteKind {
         match self {
@@ -185,6 +194,8 @@ impl Palette {
         }
     }
 
+    /// Whether the palette lists no values at all. Only a `Single` built
+    /// empty can say yes; every other tier exists to name something.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0

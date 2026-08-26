@@ -83,26 +83,32 @@ pub struct ChunkPayload {
 }
 
 impl ChunkPayload {
+    /// Wrap the decompressed bytes an [`NbtWriter`](crate::chunk::NbtWriter)
+    /// produced.
     #[must_use]
     pub const fn from_bytes(bytes: Vec<u8>) -> Self {
         Self { bytes }
     }
 
+    /// The decompressed payload, as compression wants it.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
 
+    /// The decompressed payload, taken.
     #[must_use]
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
 
+    /// How many bytes the payload holds.
     #[must_use]
     pub fn len(&self) -> usize {
         self.bytes.len()
     }
 
+    /// Whether the payload is empty, which no real chunk is.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
@@ -117,9 +123,11 @@ impl ChunkPayload {
 /// recompressing is both slower and lossy in file size.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawChunk {
+    /// The scheme byte, which decides how the payload is decoded.
     pub compression: Compression,
     /// Whether the bytes came from a `.mcc` file rather than from the region.
     pub external: bool,
+    /// The compressed bytes exactly as stored.
     pub data: Vec<u8>,
 }
 
@@ -297,16 +305,19 @@ impl<S: RegionStore> RegionFile<S> {
         None
     }
 
+    /// Which region file this is.
     #[must_use]
     pub const fn region(&self) -> RegionPos {
         self.region
     }
 
+    /// The location and timestamp tables, as they currently sit.
     #[must_use]
     pub const fn header(&self) -> &Header {
         &self.header
     }
 
+    /// The sector bookkeeping, as it currently sits.
     #[must_use]
     pub const fn allocator(&self) -> &SectorAllocator {
         &self.allocator

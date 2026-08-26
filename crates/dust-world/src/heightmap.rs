@@ -69,11 +69,13 @@ impl WorldHeight {
         height: 256,
     };
 
+    /// Describe a world running `height` rows from `min_y`.
     #[must_use]
     pub const fn new(min_y: i32, height: u32) -> Self {
         Self { min_y, height }
     }
 
+    /// The lowest y at which blocks exist in this world.
     #[must_use]
     pub const fn min_y(&self) -> i32 {
         self.min_y
@@ -206,16 +208,19 @@ impl Heightmap {
         })
     }
 
+    /// Which of the six maps this is.
     #[must_use]
     pub const fn kind(&self) -> HeightmapKind {
         self.kind
     }
 
+    /// The vertical shape of the world this map was built for.
     #[must_use]
     pub const fn world(&self) -> WorldHeight {
         self.world
     }
 
+    /// The packed columns, for callers that want the raw words.
     #[must_use]
     pub const fn storage(&self) -> &BitStorage {
         &self.storage
@@ -437,6 +442,7 @@ pub struct HeightmapSet {
 }
 
 impl HeightmapSet {
+    /// Six empty maps for one world.
     #[must_use]
     pub fn new(world: WorldHeight) -> Self {
         Self {
@@ -444,11 +450,13 @@ impl HeightmapSet {
         }
     }
 
+    /// One of the set, by kind.
     #[must_use]
     pub fn get(&self, kind: HeightmapKind) -> &Heightmap {
         &self.maps[Self::slot(kind)]
     }
 
+    /// One of the set, by kind, for writing.
     pub fn get_mut(&mut self, kind: HeightmapKind) -> &mut Heightmap {
         &mut self.maps[Self::slot(kind)]
     }

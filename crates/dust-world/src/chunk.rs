@@ -117,41 +117,49 @@ impl Section {
         }
     }
 
+    /// The section's block states.
     #[must_use]
     pub fn states(&self) -> &PalettedContainer {
         &self.states
     }
 
+    /// The section's block states, for writing.
     #[must_use]
     pub fn states_mut(&mut self) -> &mut PalettedContainer {
         &mut self.states
     }
 
+    /// The section's biomes.
     #[must_use]
     pub fn biomes(&self) -> &PalettedContainer {
         &self.biomes
     }
 
+    /// The section's biomes, for writing.
     #[must_use]
     pub fn biomes_mut(&mut self) -> &mut PalettedContainer {
         &mut self.biomes
     }
 
+    /// The section's sky light.
     #[must_use]
     pub fn sky_light(&self) -> &LightArray {
         &self.sky_light
     }
 
+    /// The section's sky light, for writing.
     #[must_use]
     pub fn sky_light_mut(&mut self) -> &mut LightArray {
         &mut self.sky_light
     }
 
+    /// The section's block light.
     #[must_use]
     pub fn block_light(&self) -> &LightArray {
         &self.block_light
     }
 
+    /// The section's block light, for writing.
     #[must_use]
     pub fn block_light_mut(&mut self) -> &mut LightArray {
         &mut self.block_light
@@ -177,6 +185,7 @@ pub struct BlockEntityHandle {
     /// The block state id of the block that owns this entity. The owner's
     /// identity decides how the eventual NBT payload is interpreted, so it
     /// rides along even before the payload itself does.
+    /// The state id of the block that owns this entity.
     pub block_state: u32,
 }
 
@@ -187,7 +196,10 @@ pub enum BlockEntityError {
     /// block entity; replacing one is remove-then-insert, so that both the
     /// old key's death and the new key's birth are visible to whoever held
     /// either.
-    PositionOccupied { position: BlockPos },
+    PositionOccupied {
+        /// The block that already carries a record.
+        position: BlockPos,
+    },
     /// The key does not name a live record: its slot never existed here, or
     /// its occupancy has been replaced since the key was issued.
     UnknownKey(SlabError),
@@ -366,11 +378,13 @@ impl Chunk {
         }
     }
 
+    /// The chunk column this is.
     #[must_use]
     pub const fn pos(&self) -> ChunkPos {
         self.pos
     }
 
+    /// The vertical shape of the world this chunk belongs to.
     #[must_use]
     pub const fn world(&self) -> WorldHeight {
         self.world
@@ -575,11 +589,13 @@ impl Chunk {
             .set_at(x >> 2, (row % 16) >> 2, z >> 2, biome)
     }
 
+    /// The chunk's six heightmaps.
     #[must_use]
     pub const fn heightmaps(&self) -> &HeightmapSet {
         &self.heightmaps
     }
 
+    /// The chunk's six heightmaps, for writing.
     #[must_use]
     pub const fn heightmaps_mut(&mut self) -> &mut HeightmapSet {
         &mut self.heightmaps
@@ -649,6 +665,11 @@ impl Chunk {
     /// The returned record is detached from its key: the key dies with the
     /// removal, and any other holder of it learns so through
     /// [`BlockEntityError::UnknownKey`].
+    /// Take a block entity's record away by key, returning it.
+    ///
+    /// # Panics
+    ///
+    /// Never; a dead key is [`BlockEntityError::UnknownKey`], not a panic.
     pub fn remove_block_entity(
         &mut self,
         key: SlabKey,

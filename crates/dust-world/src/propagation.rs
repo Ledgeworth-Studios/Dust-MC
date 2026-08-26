@@ -151,9 +151,17 @@ pub enum PropagationError {
     /// Whatever it rewrote before stopping was rewritten correctly, but
     /// nothing after the cap happened. Retry with more room, or investigate
     /// a graph that will not settle.
-    BudgetExhausted { spent: u64, budget: u64 },
+    BudgetExhausted {
+        /// The examinations the walk was allowed before it stopped.
+        spent: u64,
+        /// The cap that tripped, as given.
+        budget: u64,
+    },
     /// A seed brighter than the format can store. Nothing was written.
-    SeedTooBright { level: u8 },
+    SeedTooBright {
+        /// The level that was refused.
+        level: u8,
+    },
 }
 
 impl std::fmt::Display for PropagationError {

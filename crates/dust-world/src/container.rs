@@ -103,6 +103,8 @@ impl Strategy {
         1usize << (3 * self.size_bits)
     }
 
+    /// A container's shape is never empty; the method exists to keep
+    /// `len`/`is_empty` pairs honest.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         false
@@ -179,7 +181,9 @@ impl Strategy {
 /// A value that is not an id of the registry this container indexes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotInRegistry {
+    /// The id that was refused.
     pub value: u32,
+    /// How many ids the registry actually holds.
     pub registry_size: u32,
 }
 
@@ -205,26 +209,38 @@ pub enum ContainerError {
     /// A container with no palette entries maps nothing and cannot be read.
     EmptyPalette,
     /// More than one palette entry, and no packed array to index them with.
-    MissingData { entries: usize },
+    MissingData {
+        /// How many palette entries arrived without their packed array.
+        entries: usize,
+    },
     /// The packed array is the wrong length for the palette that came with it.
     Storage(BitStorageError),
     /// A packed index points past the end of the palette it came with.
     IndexNotInPalette {
+        /// Which cell held the dangling index.
         cell: usize,
+        /// The index that named nothing.
         index: u32,
+        /// How many entries the palette beside it lists.
         entries: usize,
     },
     /// The palette lists the same value twice, so two indices mean one block
     /// and every index after the repeat is off by one.
     DuplicateEntry {
+        /// The value listed twice.
         value: u32,
+        /// Where it was first listed.
         first: usize,
+        /// Where it was listed again.
         again: usize,
     },
     /// A palette entry is not an id of the registry the container indexes.
     NotInRegistry {
+        /// Which palette position holds the foreign id.
         position: usize,
+        /// The id that names nothing.
         value: u32,
+        /// How many ids the registry the container indexes holds.
         registry_size: u32,
     },
 }
@@ -497,6 +513,7 @@ impl PalettedContainer {
             && self.to_parts() == other.to_parts()
     }
 
+    /// Which shape and palette thresholds this container was built with.
     #[must_use]
     pub const fn strategy(&self) -> Strategy {
         self.strategy
@@ -514,21 +531,27 @@ impl PalettedContainer {
         self.registry_size
     }
 
+    /// How many cells the container holds.
     #[must_use]
     pub const fn len(&self) -> usize {
         self.strategy.len()
     }
 
+    /// A container always holds its full cube of cells; emptiness is not a
+    /// state it has.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         false
     }
 
+    /// The palette as it currently sits, history and dead entries included;
+    /// see the module documentation before comparing on it.
     #[must_use]
     pub const fn palette(&self) -> &Palette {
         &self.palette
     }
 
+    /// The packed index array as it currently sits, at the in-memory width.
     #[must_use]
     pub const fn storage(&self) -> &BitStorage {
         &self.storage

@@ -24,41 +24,52 @@
 //!   and block-entity handles in a generational slab. Its serialised form
 //!   crosses the region layer through the [`chunk::NbtWriter`] and
 //!   [`chunk::NbtReader`] traits.
+//! * [`slab`] — a generational slot array: stable keys over storage that
+//!   moves, typed errors for dead ones. Block entities live in one per
+//!   chunk; positions ride on the records because those cross files, while
+//!   keys never leave the process.
 //! * [`coords`] — chunk, region and block positions, and the shifts between
 //!   them.
 //!
 //! # What is not here, and where the seams are
 //!
-//! A chunk's payload inside a region file is compressed NBT, and there is no
-//! NBT crate on this branch — `dust-nbt` forked from an earlier base and will
-//! be merged by someone else's commit. The seam is explicit rather than
-//! improvised: [`region::ChunkPayload`] is an opaque run of decompressed
-//! bytes, [`chunk::Chunk`] is the in-memory shape it decodes into, and
-//! [`chunk::NbtWriter`] / [`chunk::NbtReader`] are the two functions between
-//! them, waiting for an implementation that owns real tags and
-//! Anvil-compatible field names. Nothing in this crate parses a tag, and no
-//! call site here changes when that implementation arrives.
+//! Everything listed above is checkable against itself, or against files a
+//! real server wrote. Four things are deliberately absent, each waiting on a
+//! dependency that does not exist yet, each behind a named seam rather than
+//! an improvised one:
 //!
-//! The line is drawn where it is because everything below it is checkable
-//! without knowing what a chunk says. A region file's header, sector runs,
-//! declared lengths and compression bytes can all be contradicted by the file
-//! itself, which is why every error in [`region::RegionError`] can name the
-//! chunk it is about and say what did not add up.
+//! * **Serialisation** belongs to `dust-nbt`, which forked from an earlier
+//!   base and will be merged by someone else's commit. A chunk's payload in
+//!   a region file is compressed NBT; [`region::ChunkPayload`] is the opaque
+//!   byte run, [`chunk::Chunk`] is the in-memory shape, and
+//!   [`chunk::NbtWriter`] / [`chunk::NbtReader`] are the two functions
+//!   between them. Nothing here parses a tag, and no call site changes when
+//!   real tags arrive.
+//! * **Meaning** belongs to `dust-registry`. The same seam three times over:
+//!   [`container::PalettedContainer`] indexes *a* registry and is told only
+//!   its size; [`heightmap::Heightmap`] takes the "does this state count"
+//!   predicate as a closure because all six maps differ in exactly that;
+//!   and which block states let light through is answered by whoever wires
+//!   [`propagation::LightGraph`], with
+//!   [`propagation::DefaultOpacity`] — everything opaque except an explicit
+//!   transparent set — standing in until then.
+//! * **A connected light engine.** [`propagation`] walks levels across any
+//!   graph it is handed, including sky seeding above heightmaps, but nothing
+//!   yet connects a chunk's blocks to its light arrays: that connection is
+//!   the `LightGraph` implementation, which needs the registry's opacity
+//!   table to be worth writing.
+//! * **Durability.** Region writes reach the operating system unsynced;
+//!   fsync policy belongs to whichever layer knows when a save is "done".
 //!
-//! The same seam appears three more times, for the same reason:
-//!
-//! * [`container::PalettedContainer`] indexes *a* registry and is told how many
-//!   ids it has. It never asks what a block is, so it does not depend on the
-//!   block table.
-//! * [`heightmap::Heightmap`] takes the "does this state count" predicate as a
-//!   parameter. There are six heightmaps and they differ only in that
-//!   predicate, all six need the block registry to answer it, and none of them
-//!   need it to store 256 numbers.
-//! * [`propagation::LightGraph`] is the light engine's version of the same
-//!   line: levels and opacity are asked, never interpreted. Which block
-//!   states let light through is registry work, and the default answer —
-//!   everything opaque except an explicit transparent set — lives beside the
-//!   walks as [`propagation::DefaultOpacity`] until that lands.
+//! The line is drawn where it is because everything on this side of it is
+//! checkable without knowing what a chunk means. A region file's header,
+//! sector runs, declared lengths and compression bytes can all be
+//! contradicted by the file itself, which is why every error in
+//! [`region::RegionError`] can name the chunk it is about and say what did
+//! not add up. The same standard holds for the newer modules: palettes are
+//! pinned against vanilla's promotion boundaries, heightmap packing against
+//! longs a real server wrote, light walks against a naive reference that
+//! cannot share their bugs.
 //!
 //! # What the guards in this crate do not catch
 //!
