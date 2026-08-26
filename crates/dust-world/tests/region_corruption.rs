@@ -462,3 +462,253 @@ fn every_damaged_entry_is_reported_and_not_just_the_first() {
     assert!(named.contains(&chunk(2, 2)), "{named:?}");
     assert!(named.contains(&chunk(3, 3)), "{named:?}");
 }
+
+// ---------------------------------------------------------------------------
+// The second shelf of mutations. Same rule as above -- a typed error that
+// names the chunk and never a panic -- aimed at the cases the first suite
+// did not build: offsets at the edges of what three bytes can say, runs that
+// grow into their neighbours, tables that disagree with each other, and
+// compressed streams damaged in their first bytes.
+// ---------------------------------------------------------------------------
+
+/// The location entry of `pos`, as the file currently says it.
+#[test]
+fn the_largest_offset_three_bytes_can_express_is_still_checked() {
+    // The offset field is three bytes; a reader that unpacked it into a u32
+    // and trusted it would compute sector 16_777_215 times 4096 and go
+    // looking there. The check is against the file's actual length, so the
+    // biggest possible lie is refused with the number in it.
+    let mut bytes = sound_region();
+    let target = chunk(0, 0);
+    set_location(&mut bytes, target, 0xff_ff_ff, 255);
+    let err = open_err(bytes);
+    names(&err, target);
+    match err {
+        RegionError::ChunkPastEnd {
+            first_sector,
+            sector_count,
+            file_sectors,
+            ..
+        } => {
+            assert_eq!(first_sector, 0xff_ff_ff);
+            assert_eq!(sector_count, 255);
+            assert!(
+                file_sectors < 100,
+                "the sound region is a handful of sectors, not {file_sectors}"
+            );
+        }
+        other => panic!("{other}"),
+    }
+    assert!(err.to_string().contains("16777215"), "{err}");
+}
+
+#[test]
+fn a_run_grown_by_one_sector_reaches_into_the_next_chunk() {
+    // Distinct from pointing a chunk somewhere random: the header is honest
+    // about where the run starts and lies only about how long it is, so the
+    // damage lands exactly on the boundary sector the neighbour owns. This
+    // is what an interrupted resize leaves behind.
+    let mut bytes = sound_region();
+    let small = chunk(0, 0);
+    let large = chunk(5, 7);
+    let (large_first, _) = location(&bytes, large);
+    let (small_first, small_count) = location(&bytes, small);
+    assert_eq!(
+        small_first + small_count,
+        large_first,
+        "the fixture: back to back"
+    );
+
+    set_location(&mut bytes, small, small_first, small_count + 1);
+    let err = open_err(bytes);
+    // The small chunk sits in an earlier slot, so it claims the stolen
+    // sector first and the error falls on the large one.
+    names(&err, large);
+    match err {
+        RegionError::OverlappingChunks { other, sector, .. } => {
+            assert_eq!(other, small);
+            assert_eq!(sector, large_first, "the shared boundary sector is named");
+        }
+        other => panic!("{other}"),
+    }
+}
+
+#[test]
+fn two_chunks_claiming_the_identical_run_are_refused_and_one_is_recoverable() {
+    // The laziest possible double allocation: both entries point at the same
+    // place. Strictly this is a refusal; through the lenient door exactly one
+    // of the twins is dropped and the survivor still reads, which is the
+    // difference between "restore from backup" and "delete one chunk".
+    let mut bytes = sound_region();
+    let original = chunk(0, 0);
+    let twin = chunk(9, 9);
+    let (first, count) = location(&bytes, original);
+    set_location(&mut bytes, twin, first, count);
+
+    let err = open_err(bytes.clone());
+    names(&err, twin);
+    match err {
+        RegionError::OverlappingChunks { other, sector, .. } => {
+            assert_eq!(other, original);
+            assert_eq!(sector, first);
+        }
+        other => panic!("{other}"),
+    }
+
+    let (mut file, damage) =
+        RegionFile::open_dropping_damage(MemoryStore::from_bytes(bytes), REGION)
+            .expect("the header itself is readable");
+    assert_eq!(damage.len(), 1);
+    names(&damage[0], twin);
+    assert_eq!(
+        file.chunk_count(),
+        2,
+        "the twin was dropped, the original kept"
+    );
+    assert_eq!(
+        file.read_chunk(original).expect("reads").map(|p| p.len()),
+        Some(b"the first chunk".repeat(200).len())
+    );
+}
+
+#[test]
+fn timestamp_damage_alone_does_not_make_a_file_unsound() {
+    // Timestamps are bookkeeping, not structure: nothing in a region file
+    // cross-checks them, so filling the table with garbage must open, read
+    // and preserve it byte for byte. A reader that validated them would
+    // refuse worlds whose clocks were simply wrong.
+    let mut bytes = sound_region();
+    for byte in &mut bytes[SECTOR_BYTES..2 * SECTOR_BYTES] {
+        *byte = 0xaa;
+    }
+    let mut file = RegionFile::open(MemoryStore::from_bytes(bytes), REGION).expect("opens");
+    assert_eq!(file.chunk_count(), 2);
+    assert_eq!(
+        file.read_chunk(chunk(0, 0)).expect("reads"),
+        Some(ChunkPayload::from_bytes(b"the first chunk".repeat(200)))
+    );
+    let garbage = i32::from_be_bytes([0xaa; 4]);
+    assert!(garbage.is_negative());
+    assert_eq!(
+        file.timestamp(chunk(0, 0)),
+        Some(garbage),
+        "the value comes back as it is stored, sign and all"
+    );
+
+    // And one deliberately impossible-looking stamp survives the same way.
+    let mut bytes = sound_region();
+    let at = SECTOR_BYTES + chunk(5, 7).header_slot() * 4;
+    bytes[at..at + 4].copy_from_slice(&(-1i32).to_be_bytes());
+    let file = RegionFile::open(MemoryStore::from_bytes(bytes), REGION).expect("opens");
+    assert_eq!(file.timestamp(chunk(5, 7)), Some(-1));
+}
+
+#[test]
+fn a_timestamp_without_a_location_is_not_a_chunk() {
+    // The tables disagreeing in one direction: the timestamp table remembers
+    // a write the location table no longer describes. Presence is decided by
+    // location alone, so the slot reads as empty and nothing counts it --
+    // including the chunk count.
+    let mut bytes = sound_region();
+    let ghost = chunk(3, 3);
+    let at = ghost.header_slot() * 4;
+    assert_eq!((bytes[at], bytes[at + 3]), (0, 0), "the slot starts absent");
+    let stamp_at = SECTOR_BYTES + at;
+    bytes[stamp_at..stamp_at + 4].copy_from_slice(&1_700_000_999i32.to_be_bytes());
+
+    let mut file =
+        RegionFile::open(MemoryStore::from_bytes(bytes), REGION).expect("a stamp alone is fine");
+    assert_eq!(file.chunk_count(), 2, "no phantom chunk was counted");
+    assert!(!file.contains(ghost));
+    assert_eq!(file.read_chunk(ghost).expect("absent, not broken"), None);
+    assert_eq!(
+        file.timestamp(ghost),
+        None,
+        "a timestamp without a chunk is not reported"
+    );
+}
+
+#[test]
+fn a_location_whose_timestamp_was_lost_is_still_a_chunk() {
+    // ...and in the other: a zeroed timestamp does not unmake a chunk whose
+    // sectors are described. The two tables are checked independently, which
+    // is why damaging either alone costs nothing.
+    let mut bytes = sound_region();
+    let target = chunk(5, 7);
+    let at = SECTOR_BYTES + target.header_slot() * 4;
+    bytes[at..at + 4].copy_from_slice(&0i32.to_be_bytes());
+
+    let mut file = RegionFile::open(MemoryStore::from_bytes(bytes), REGION).expect("opens");
+    assert_eq!(file.chunk_count(), 2);
+    assert_eq!(file.timestamp(target), Some(0));
+    assert_eq!(
+        file.read_chunk(target).expect("reads"),
+        Some(ChunkPayload::from_bytes(incompressible(20_000)))
+    );
+}
+
+#[test]
+fn a_zlib_payload_with_a_flipped_magic_byte_is_refused_by_scheme() {
+    // One byte, the first: zlib's header carries its own checksum, so the
+    // stream is rejected before a single payload byte is decoded. The error
+    // names the scheme because "corrupt" and "this world was written by
+    // something else" lead an operator to very different backups.
+    let mut bytes = sound_region();
+    let target = chunk(0, 0);
+    let (first, _) = location(&bytes, target);
+    bytes[first as usize * SECTOR_BYTES + 5] ^= 0xff;
+    let err = read_err(bytes, target);
+    names(&err, target);
+    assert!(matches!(err, RegionError::Decompress { .. }), "{err}");
+    assert!(err.to_string().contains("zlib"), "{err}");
+
+    // Flipping the same byte back restores the chunk bit for bit, so the
+    // mutation is proven to be the whole difference between sound and not.
+    let restored = {
+        let mut bytes = sound_region();
+        bytes[first as usize * SECTOR_BYTES + 5] ^= 0xff;
+        bytes[first as usize * SECTOR_BYTES + 5] ^= 0xff;
+        bytes
+    };
+    let mut file = RegionFile::open(MemoryStore::from_bytes(restored), REGION).expect("opens");
+    assert_eq!(
+        file.read_chunk(target).expect("reads"),
+        Some(ChunkPayload::from_bytes(b"the first chunk".repeat(200)))
+    );
+}
+
+#[test]
+fn a_gzip_payload_with_a_flipped_magic_byte_is_refused_by_scheme() {
+    // gzip's magic is 0x1f 0x8b, and the decoder checks it before anything
+    // else -- so this is the cheapest corruption to detect and the most
+    // important not to mislabel. The region is rebuilt with gzip rather than
+    // mutated, because zlib is what the rest of the suite writes.
+    let gzip_region = || -> Vec<u8> {
+        let mut file = RegionFile::open(MemoryStore::new(), REGION).expect("an empty store");
+        file.write_chunk(
+            chunk(0, 0),
+            &ChunkPayload::from_bytes(incompressible(3_000)),
+            Compression::Gzip,
+            7,
+        )
+        .expect("writes");
+        file.into_store().into_bytes()
+    };
+
+    let mut bytes = gzip_region();
+    let (first, _) = location(&bytes, chunk(0, 0));
+    bytes[first as usize * SECTOR_BYTES + 5] ^= 0xff;
+    let err = read_err(bytes, chunk(0, 0));
+    names(&err, chunk(0, 0));
+    assert!(matches!(err, RegionError::Decompress { .. }), "{err}");
+    assert!(err.to_string().contains("gzip"), "{err}");
+    assert!(!err.to_string().contains("zlib"), "{err}");
+
+    let intact = gzip_region();
+    let mut file = RegionFile::open(MemoryStore::from_bytes(intact), REGION).expect("opens");
+    let payload = file
+        .read_chunk(chunk(0, 0))
+        .expect("reads")
+        .expect("present");
+    assert_eq!(payload.len(), 3_000);
+}
