@@ -181,6 +181,20 @@ impl MemPack {
         }
     }
 
+    /// A pack whose files are given as raw bytes. The text builders cover
+    /// everything JSON-shaped; this one exists for the tests that are
+    /// precisely about bytes a text builder cannot write — invalid UTF-8,
+    /// hostile headers, truncated anything.
+    pub fn with_raw(id: &str, files: &[(&str, &[u8])]) -> Self {
+        Self {
+            id: id.to_owned(),
+            files: files
+                .iter()
+                .map(|(path, body)| ((*path).to_owned(), body.to_vec()))
+                .collect(),
+        }
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }
