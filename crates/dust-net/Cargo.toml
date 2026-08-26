@@ -79,6 +79,49 @@ rand = { version = "0.10", default-features = false, features = ["sys_rng"] }
 # so this is interoperability with a fixed wire format, not cryptography.
 sha1 = "0.11"
 
+# JSON for the two answers Mojang's session server can give: the profile in
+# `hasJoined`'s 200 and the error object in its failures. The bodies arrive
+# from outside the trust boundary, so they are parsed rather than string-matched
+# — a hand-rolled parser of attacker-shaped JSON is a vulnerability with extra
+# steps. `serde_json` is already in this workspace's dependency graph and its
+# licence audit, so nothing new enters either.
+serde_json = { version = "1", default-features = false, features = ["std"] }
+
+# Real TLS for the session-server call, behind the `tls` feature and off by
+# default: tests inject scripted transports and never touch a socket, and a
+# build that does not need the network stack should not compile one. The pieces
+# are chosen for the same licence gate every dependency here passes:
+#
+# * `tokio-rustls` (MIT/Apache-2.0) glues `rustls` to the async streams this
+#   crate already speaks. Its default provider is `aws-lc-rs`, whose C build
+#   wants cmake and an assembler; `ring` compiles with nothing but a C
+#   compiler, which is what CI has.
+# * `rustls-native-certs` (MIT/Apache-2.0/ISC) loads the operating system's
+#   root store. The usual alternative, `webpki-roots`, ships Mozilla's bundle
+#   under CDLA-Permissive-2.0, which the licence gate correctly refuses.
+[features]
+tls = [
+    "dep:tokio-rustls",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+]
+
+[dependencies.tokio-rustls]
+version = "0.26"
+default-features = false
+features = ["ring"]
+optional = true
+
+[dependencies.rustls]
+version = "0.23"
+default-features = false
+features = ["std", "ring", "tls12"]
+optional = true
+
+[dependencies.rustls-native-certs]
+version = "0.8"
+optional = true
+
 [dev-dependencies]
 # The tests build decompression bombs and hand-rolled malformed frames, which
 # means constructing zlib streams the encoder in this crate would never emit.

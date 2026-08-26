@@ -81,6 +81,7 @@ pub mod io;
 pub mod limits;
 pub mod login;
 pub mod metrics;
+pub mod session;
 pub mod state;
 pub mod testkeys;
 pub mod varint;
