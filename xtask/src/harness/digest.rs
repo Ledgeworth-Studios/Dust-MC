@@ -102,10 +102,22 @@ pub fn digest_chunk(root: &Node) -> Result<ChunkDigest, String> {
     }
     for section in sections {
         if let Some(states) = section.get("block_states") {
-            tally_palette(states, BLOCK_STATE_COUNT, MIN_BLOCK_BITS, &mut blocks)?;
+            tally_palette(
+                states,
+                BLOCK_STATE_COUNT,
+                MIN_BLOCK_BITS,
+                block_identity,
+                &mut blocks,
+            )?;
         }
         if let Some(biome_states) = section.get("biomes") {
-            tally_palette(biome_states, BIOME_CELL_COUNT, MIN_BIOME_BITS, &mut biomes)?;
+            tally_palette(
+                biome_states,
+                BIOME_CELL_COUNT,
+                MIN_BIOME_BITS,
+                biome_identity,
+                &mut biomes,
+            )?;
         }
     }
     // Uniform-height sections are overwhelmingly air above the surface; air
@@ -246,20 +258,22 @@ const MIN_BIOME_BITS: u32 = 1;
 const AIR: &str = "minecraft:air";
 
 /// Count how often each palette entry occurs in one section's packed data.
+///
+/// The two palette families spell their entries differently — blocks carry
+/// `Name` plus optional `Properties`, biomes are bare strings — so the
+/// caller supplies the canonicaliser.
 fn tally_palette(
     states: &Node,
     entry_count: usize,
     min_bits: u32,
+    identify: fn(&Node) -> Result<Vec<u8>, String>,
     into: &mut BTreeMap<Vec<u8>, u64>,
 ) -> Result<(), String> {
     let palette = states.get("palette").map(Node::list).unwrap_or(&[]);
     if palette.is_empty() {
         return Err("a block_states or biomes compound has an empty palette".to_owned());
     }
-    let identities: Vec<Vec<u8>> = palette
-        .iter()
-        .map(state_identity)
-        .collect::<Result<_, _>>()?;
+    let identities: Vec<Vec<u8>> = palette.iter().map(identify).collect::<Result<_, _>>()?;
 
     let counts: BTreeMap<usize, u64> = match states.get("data").and_then(Node::as_longs) {
         None => {
@@ -359,8 +373,9 @@ fn decode_packed(longs: &[i64], bits: u32, entry_count: usize) -> Result<Vec<u64
     Ok(out)
 }
 
-/// Canonical bytes naming one palette entry: id plus properties in key order.
-fn state_identity(entry: &Node) -> Result<Vec<u8>, String> {
+/// Canonical bytes naming one block palette entry: id plus properties in key
+/// order.
+fn block_identity(entry: &Node) -> Result<Vec<u8>, String> {
     let name = entry
         .get("Name")
         .and_then(Node::as_str)
@@ -386,6 +401,19 @@ fn state_identity(entry: &Node) -> Result<Vec<u8>, String> {
         out.extend_from_slice(&length_prefixed(value.as_bytes()));
     }
     Ok(out)
+}
+
+/// Canonical bytes naming one biome palette entry.
+///
+/// Biome palettes hold bare strings, not compounds — vanilla spells
+/// `"minecraft:river"` where blocks get `{"Name": ...}`. The identity keeps
+/// the same length-prefixed shape as the block one so the two digest spaces
+/// are built by one hasher over equally-shaped keys.
+fn biome_identity(entry: &Node) -> Result<Vec<u8>, String> {
+    entry
+        .as_str()
+        .map(|name| length_prefixed(name.as_bytes()))
+        .ok_or_else(|| "a biome palette entry is not a string".to_owned())
 }
 
 fn length_prefixed(bytes: &[u8]) -> Vec<u8> {
@@ -750,6 +778,46 @@ mod tests {
         assert_eq!(da.blocks, db.blocks, "multiset must be order-independent");
         assert_eq!(da.biomes, db.biomes);
         assert_eq!(da, db);
+    }
+
+    #[test]
+    fn biome_palettes_are_bare_strings_and_move_the_biome_digest() {
+        // Vanilla spells biome palettes as bare strings — not {Name}
+        // compounds like blocks — and reading one like the other stopped the
+        // very first real capture. The digest takes them as they are written.
+        let base = |biome: &str| {
+            let mut cells = vec![0u64];
+            cells.resize(64, 0);
+            n::comp(vec![
+                ("DataVersion", n::i(3953)),
+                ("Status", n::str("full")),
+                ("Heightmaps", n::comp(vec![])),
+                (
+                    "sections",
+                    n::list(vec![n::comp(vec![
+                        ("Y", n::b(-3)),
+                        (
+                            "block_states",
+                            n::comp(vec![("palette", n::list(vec![palette_entry(STONE, &[])]))]),
+                        ),
+                        (
+                            "biomes",
+                            n::comp(vec![
+                                ("palette", n::list(vec![n::str(biome)])),
+                                ("data", n::la(&pack(&cells, 1))),
+                            ]),
+                        ),
+                    ])]),
+                ),
+            ])
+        };
+        let river = digest_chunk(&base("minecraft:river")).expect("digests");
+        let desert = digest_chunk(&base("minecraft:desert")).expect("digests");
+        assert_ne!(
+            river.biomes, desert.biomes,
+            "a different biome moves its digest"
+        );
+        assert_eq!(river.blocks, desert.blocks, "blocks were identical");
     }
 
     #[test]
