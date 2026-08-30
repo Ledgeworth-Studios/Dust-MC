@@ -394,16 +394,22 @@ where
         },
         Configured::UnknownContent => {
             // The client did not acknowledge the vanilla pack, so its
-            // registries would have to carry their own contents, and Dust has
-            // none to send. Checked rather than assumed: serving the names
+            // registries have to carry their contents and no `[data] path`
+            // supplied any. Checked rather than assumed: serving the names
             // anyway was tried against a client that acknowledges nothing, and
             // it fails inside its own registry loader without ever reaching
             // the world. See `configure`'s module documentation.
+            //
+            // The message names the setting. Whoever reads it is running a bot
+            // or a proxy against a server they control, and "this server
+            // cannot serve you" without saying what would is a dead end for
+            // somebody who is one line of configuration away.
             refuse_in_configuration(
                 &mut conn,
                 ctx,
-                "This server can only serve clients that already have \
-                 Minecraft 1.21.1's own data.",
+                "This server has no copy of Minecraft's data, so it can only \
+                 serve clients that already have their own. Set [data] path in \
+                 dust.toml to admit clients that acknowledge no data packs.",
             )
             .await?;
             return finish(

@@ -89,6 +89,45 @@ const LIGHT_BUDGET: u64 = 4_000_000;
 /// plus four, which is where a vanilla superflat puts it.
 pub const SURFACE_Y: i32 = -60;
 
+/// Light one column, the way this server lights every column.
+///
+/// **One answer to "how does Dust light a column", reached from three places.**
+/// The flat world lights its template, the Anvil source lights what it reads,
+/// and `xtask harness light` lights a chunk to compare against vanilla's own —
+/// and if the third of those restated the opacity model or the budget, it
+/// would be measuring a lighting policy that no player ever sees.
+///
+/// # Errors
+///
+/// [`dust_world::propagation::PropagationError::BudgetExhausted`] if the walk
+/// runs past [`LIGHT_BUDGET`]. The partial result is consistent: the column is
+/// under-lit rather than corrupt.
+pub fn light_column(
+    chunk: &mut dust_world::chunk::Chunk,
+    opacity: &OpacityModel,
+    skirt: dust_world::column_light::Skirt,
+) -> Result<u64, dust_world::propagation::PropagationError> {
+    dust_world::column_light::ColumnSkyLight::seed_with_neighbours(
+        chunk,
+        opacity,
+        skirt,
+        dust_world::propagation::Budget::new(LIGHT_BUDGET),
+    )
+}
+
+/// The opacity model a world of `air` and nothing transparent has.
+///
+/// **Air and nothing else, which is wrong and is stated as wrong.** Vanilla
+/// gives water, glass, leaves and ice an opacity of one or two; every one of
+/// them is fifteen here, so sky light stops dead at the surface of an ocean
+/// and under a tree. It is not a shortcut: light emission and opacity are code
+/// constants in Minecraft, present in no `--reports` output and in no data
+/// pack, so there is nothing to extract yet. `xtask harness light` is what
+/// measures the cost of it against a world vanilla lit.
+pub fn opacity_of(air: u32) -> OpacityModel {
+    OpacityModel::transparent_only([air])
+}
+
 /// Where a player spawns in a *flat* world: the middle of a block, standing on
 /// the surface.
 ///
@@ -264,18 +303,14 @@ impl FlatWorld {
         // heightmaps are recomputed rather than written — this is the code
         // path that stops being trivial the day the terrain does, and a line
         // that has to be remembered later is a line that will not be.
+        let floors = dust_world::column_light::SkyFloor::of(&chunk);
         let skirt = dust_world::column_light::Skirt {
-            west: dust_world::column_light::SkyFloor::of(&chunk),
-            east: dust_world::column_light::SkyFloor::of(&chunk),
-            north: dust_world::column_light::SkyFloor::of(&chunk),
-            south: dust_world::column_light::SkyFloor::of(&chunk),
+            west: floors,
+            east: floors,
+            north: floors,
+            south: floors,
         };
-        let _ = dust_world::column_light::ColumnSkyLight::seed_with_neighbours(
-            &mut chunk,
-            &self.opacity,
-            skirt,
-            dust_world::propagation::Budget::new(LIGHT_BUDGET),
-        );
+        let _ = light_column(&mut chunk, &self.opacity, skirt);
         chunk
     }
 

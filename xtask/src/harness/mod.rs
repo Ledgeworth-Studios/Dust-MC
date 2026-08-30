@@ -59,6 +59,7 @@ pub mod cache;
 pub mod capture;
 pub mod compare;
 pub mod digest;
+pub mod light;
 mod nbt;
 mod properties;
 mod provision;
@@ -123,6 +124,12 @@ outside the repository (override with DUST_HARNESS_CACHE).
       the two servers write compounds and tags in different orders and a
       client builds a map and a set either way. Exit 0 if they agree, 1 if
       they do not, 2 if the run failed.
+
+  light --version <v> [--seed <n>] [--radius <r>]
+      Read a world Minecraft generated and lit, light the same chunks with
+      Dust's own engine, and compare the sky light cell by cell. Prints how
+      much agrees and what the disagreements are standing in. A measurement
+      and not a gate: exit 0 unless the run itself failed.
 ";
 
 /// Which verb was selected, with its parsed options.
@@ -134,6 +141,7 @@ enum Verb {
     Compare(compare::Options),
     Rewrite(rewrite::Options),
     Registries(registries::Options),
+    Light(light::Options),
 }
 
 /// Parse and run one harness verb.
@@ -166,6 +174,7 @@ pub fn dispatch(args: &[String]) -> Result<ExitCode, String> {
         Verb::Compare(options) => Ok(compare::run(&options)),
         Verb::Rewrite(options) => Ok(rewrite::run(&options)),
         Verb::Registries(options) => Ok(registries::run(&options)),
+        Verb::Light(options) => Ok(light::run(&options)),
     }
 }
 
@@ -181,9 +190,10 @@ fn parse(args: &[String]) -> Result<Verb, String> {
         "compare" => compare::parse(rest).map(Verb::Compare),
         "rewrite" => rewrite::parse(rest).map(Verb::Rewrite),
         "registries" => registries::parse(rest).map(Verb::Registries),
+        "light" => light::parse(rest).map(Verb::Light),
         other => Err(format!(
             "unknown harness verb `{other}`\n\nThe verbs are: provision, rcon, capture, \
-             compare, rewrite, registries."
+             compare, rewrite, registries, light."
         )),
     }
 }

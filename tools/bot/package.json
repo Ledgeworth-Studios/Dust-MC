@@ -1,0 +1,10 @@
+{
+  "name": "dust-bot-check",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Points mineflayer at a running Dust server and checks what it can see.",
+  "license": "GPL-3.0-or-later",
+  "dependencies": {
+    "mineflayer": "^4.20.0"
+  }
+}

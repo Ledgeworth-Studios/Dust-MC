@@ -149,6 +149,23 @@ A full cold run — download plus both generators plus every table — takes a f
 minutes, almost all of it inside Java. A warm run against the cache takes
 seconds.
 
+## Point a third-party client at it
+
+```
+cd tools/bot && npm install
+just bot 25565
+```
+
+`mineflayer` implements the client protocol independently and shares no code
+with this project, which is why it finds what a test suite agrees with itself
+about. `tools/bot/check.js` joins, checks that the dimension it was told about
+is the one it is in, that it has all sixty-four biomes, that it can read a
+block, and that a second bot's swing and crouch reach the first — six checks,
+exit 0 or 1. `tools/bot/README.md` has the list and what it has caught.
+
+It is deliberately outside `just verify`: it needs a server already running, an
+npm install and a `[data] path`, and `verify` is CI's list in CI's order.
+
 ## Differential testing
 
 Testing against vanilla is the highest-value test this project will have: run
@@ -163,6 +180,7 @@ cargo xtask harness capture --version 1.21.1 --seed 0 --radius 2
 cargo xtask harness compare captures/a captures/b
 cargo xtask harness rewrite --version 1.21.1 --seed 0 --radius 2
 cargo xtask harness registries --version 1.21.1
+cargo xtask harness light --version 1.21.1 --seed 0 --radius 2
 ```
 
 `provision` resolves the server jar through the same manifest-and-SHA-1 path
@@ -184,6 +202,24 @@ thirteen tag registries agree over all 6,362 ids. The eleventh registry,
 difference — Dust has no schema for it and says so in code, and the day one is
 added and is wrong, this goes red. Watched to fail: changing one field's type
 from `TAG_Double` to `TAG_Float` produced four findings naming the field.
+
+`light` puts a number on how close the sky light is. A chunk Minecraft wrote
+carries the light Minecraft computed, so the same chunks can be lit again with
+Dust's engine and compared cell by cell. On seed 0, twenty-five chunks, 2.46
+million cells: **99.419% agree, and every one of the 14,276 that do not is Dust
+being darker** — which is the direction both known gaps point in. What the
+shortfalls are standing in is the whole diagnosis: leaves, water, grass and
+seagrass, every one of them a block Minecraft gives a small opacity and Dust
+treats as a wall, because light emission and opacity are code constants in
+Minecraft and are in no report and no data pack.
+
+It is a measurement and not a gate — the number is expected to be short of a
+hundred per cent today, and a verb that failed for a known gap would be red
+every time it ran. Its first version lit each column against *itself* on all
+four sides, and that produced 805 over-lit cells that no gap explained; giving
+it the real neighbours removed every one. Separating over-lighting from
+under-lighting in the report is what made a harness shortcut visible instead of
+letting it hide inside a number that already looked good.
 
 `capture` boots the provisioned server headless, watches its own log for the
 readiness line, force-generates the square of chunks within `--radius` chunks

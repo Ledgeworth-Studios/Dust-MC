@@ -272,22 +272,14 @@ impl AnvilWorld {
                 // cache of what an engine would produce, and this server has
                 // its own engine; trusting the file would mean serving light
                 // that no code here can reproduce.
-                let opacity = dust_world::propagation::DefaultOpacity::transparent_only([self
-                    .fallback
-                    .palette()
-                    .air]);
+                let opacity = super::world::opacity_of(self.fallback.palette().air);
                 // This column's own floors go in the cache before its
                 // neighbours are asked for theirs: a column is almost always
                 // asked for beside the ones around it, so the pass that lights
                 // it pays for the four that follow.
                 self.remember(pos, SkyFloor::of(&chunk));
                 let skirt = self.skirt(pos);
-                let _ = dust_world::column_light::ColumnSkyLight::seed_with_neighbours(
-                    &mut chunk,
-                    &opacity,
-                    skirt,
-                    dust_world::propagation::Budget::new(4_000_000),
-                );
+                let _ = super::world::light_column(&mut chunk, &opacity, skirt);
                 chunk
             }
             // Off the edge of what was generated. See the module note: a plain
