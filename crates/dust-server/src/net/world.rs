@@ -117,13 +117,17 @@ pub fn light_column(
 
 /// The opacity model a world of `air` and nothing transparent has.
 ///
-/// **Air and nothing else, which is wrong and is stated as wrong.** Vanilla
-/// gives water, glass, leaves and ice an opacity of one or two; every one of
-/// them is fifteen here, so sky light stops dead at the surface of an ocean
-/// and under a tree. It is not a shortcut: light emission and opacity are code
-/// constants in Minecraft, present in no `--reports` output and in no data
-/// pack, so there is nothing to extract yet. `xtask harness light` is what
-/// measures the cost of it against a world vanilla lit.
+/// **Air and nothing else, which is wrong, is stated as wrong, and is the one
+/// place that changes when it stops being.** Vanilla gives water, glass,
+/// leaves and ice an opacity of one or two; every one of them is fifteen here,
+/// so sky light stops dead at the surface of an ocean and under a tree.
+///
+/// It is not a shortcut. Light emission and opacity are code constants in
+/// Minecraft, present in no `--reports` output and in no data pack, so there is
+/// nothing to extract yet — see decision record 0008, which costs the options
+/// and says why none has been taken. `xtask harness light` measures what the
+/// gap costs: 99.41% of cells agree with a world vanilla lit, and every
+/// disagreement is this.
 pub fn opacity_of(air: u32) -> OpacityModel {
     OpacityModel::transparent_only([air])
 }
