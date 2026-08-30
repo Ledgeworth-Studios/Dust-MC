@@ -28,42 +28,51 @@
 //! recognises. A vanilla client recognises `minecraft:core`, so a server whose
 //! content is vanilla's sends three hundred names and nothing else.
 //!
-//! That is not an optimisation Dust is taking advantage of; it is the only
-//! thing Dust can currently do. It has the names and not the contents, on
-//! purpose — see `dust_registry::synced`. So a client that does *not*
-//! acknowledge the core pack is told so and disconnected, rather than being
-//! sent a registry with no payloads it has no copy of.
+//! # A client that acknowledges nothing
 //!
-//! **That refusal was checked rather than reasoned about.** Sending the names
-//! anyway to a client that acknowledged nothing was tried, against
-//! `mineflayer` — a third-party client that does not track packs and sends an
-//! empty list. It fails inside its own registry loader, reading `undefined`
-//! where a dimension type's contents should be, and never reaches the world.
-//! So the refusal stands, and it is not this server being stricter than it
-//! needs to be.
+//! Sending names alone to a client that has no copy of the contents was tried,
+//! against `mineflayer` — a third-party client that does not track packs and
+//! answers with an empty list. It fails inside its own registry loader,
+//! reading `undefined` where a dimension type's contents should be, and never
+//! reaches the world. So names alone are not an option for such a client, and
+//! for a long time it was refused.
 //!
-//! It *is* a real limitation, and worth naming as one: **Dust cannot currently
-//! serve any client that does not claim `minecraft:core`**, which includes much
-//! of the bot and proxy ecosystem. Lifting it means shipping the actual
-//! contents of at least `dimension_type` and `worldgen/biome` — sixty-eight
-//! entries of JSON converted to NBT — which is a piece of work with a
-//! licensing question attached, since those contents are Mojang's rather than
-//! facts about an interface.
+//! It is now served, from the operator's own copy of Minecraft's data. Dust
+//! ships no Mojang content: `[data] path` points at a directory in the
+//! ordinary datapack layout, `crate::registries` reads the two registries a
+//! client cannot manage without — `dimension_type` and `worldgen/biome` — and
+//! those entries go out carrying their NBT while the other nine go out as
+//! names. See decision record 0007 for why the line falls there.
 //!
-//! # What is deliberately not sent yet, and what it costs
+//! With no `[data] path` set, the behaviour is what it was: such a client is
+//! disconnected, and the message names the setting that would admit it.
 //!
-//! **Tags.** Vanilla sends twenty-five kilobytes of them across thirteen
-//! registries. Dust has five of those registries extracted and sends none,
-//! because a partial tag set is worse than none: a client told that
-//! `minecraft:mineable/pickaxe` contains eleven blocks believes the other
-//! nine hundred are not mineable, whereas a client told nothing falls back to
-//! its own copy. Sending them is a Phase 4 job, and it is the first thing to
-//! do when block behaviour starts depending on tags.
+//! **Why the other nine registries are still names to such a client, and why
+//! that is not obviously wrong:** it was measured. `mineflayer` reaches the
+//! world with those two and no others. The remaining nine describe things a
+//! client can and does fall back on — chat types, damage types, paintings —
+//! and the moment one of them turns out to be load-bearing for some client,
+//! it gains a schema and joins the list. What decides that is a client
+//! failing, not a guess made here.
+//!
+//! # Tags
+//!
+//! All thirteen registries, every tag, flattened to ids —  25 kilobytes, and
+//! the same 6,362 memberships a real 1.21.1 server sends. It is all thirteen
+//! or none: a client told that `minecraft:mineable/pickaxe` contains eleven
+//! blocks believes the other nine hundred are not mineable, where a client
+//! told nothing falls back to its own copy. That is why nothing went out while
+//! five of the thirteen were extracted.
+//!
+//! Sent to *every* client, unlike the registry contents. Tags are not
+//! covered by the known-packs exchange — vanilla sends them whether or not the
+//! client acknowledged `minecraft:core`, and both captures show it.
 
 use dust_net::io::{Conn, ConnError};
-use dust_protocol::packets::common::{KnownPack, RegistryEntry};
+use dust_protocol::nbt::Nbt;
+use dust_protocol::packets::common::{self, KnownPack, RegistryEntry};
 use dust_protocol::packets::configuration;
-use dust_protocol::types::{Identifier, ProtocolString, RestOfPacket};
+use dust_protocol::types::{Identifier, ProtocolString, RestOfPacket, VarInt};
 use dust_protocol::wire::{Reader, WireWrite as _, Writer};
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -91,8 +100,8 @@ pub enum Configured {
     /// The client acknowledged, the registries went out, and both ends are in
     /// Play.
     Ready,
-    /// The client did not acknowledge the core pack, so its registries would
-    /// have to carry their contents and Dust has none to send.
+    /// The client did not acknowledge the core pack, so its registries have
+    /// to carry their contents and no `[data] path` supplied any.
     UnknownContent,
 }
 
@@ -182,13 +191,22 @@ where
         }
     };
 
-    if !acknowledged {
+    // A client that acknowledged the pack has the contents already and is sent
+    // names, exactly as vanilla does. One that did not needs them from
+    // somewhere, and the only somewhere is the operator's own data.
+    if !acknowledged && ctx.registry_contents.is_empty() {
         return Ok(Configured::UnknownContent);
     }
+    let contents = (!acknowledged).then_some(&ctx.registry_contents);
 
-    // The registries. Names only: the client has the contents, which is what
-    // acknowledging the pack said.
     for registry in dust_registry::synced::all() {
+        // `None` for this registry means names, which is right in both of the
+        // cases that produce it: the client has its own copy, or Dust has no
+        // schema for this one and the client has been observed not to need it.
+        let payloads = contents.and_then(|loaded| loaded.get(registry.name));
+        if !acknowledged && payloads.is_none() {
+            continue;
+        }
         let entries = registry
             .entries
             .iter()
@@ -198,7 +216,15 @@ where
                     // `None`, not an empty compound. The difference is "use
                     // your own copy" against "here is an empty definition", and
                     // the second gives a client a world with no biomes.
-                    data: None,
+                    // The wire form is a bare network NBT tag: a type
+                    // byte and a payload, with no root name. `to_vec_network`
+                    // is the writer that leaves the name off, and using the
+                    // named one here would put two bytes of empty string in
+                    // front of every entry and shift everything after it.
+                    data: payloads
+                        .and_then(|contents| contents.get(entry))
+                        .map(encode_entry)
+                        .transpose()?,
                 })
             })
             .collect::<Result<Vec<_>, SessionError>>()?;
@@ -212,6 +238,19 @@ where
         )
         .await?;
     }
+
+    // Tags, after the registries and before the finish, which is where
+    // vanilla puts them. They have to come after: a tag's entries are ids into
+    // a registry, and a client that has not built that registry's mapping yet
+    // has nothing to resolve them against.
+    send(
+        conn,
+        configuration::clientbound::UpdateTags {
+            registries: tag_registries()?,
+        },
+        version,
+    )
+    .await?;
 
     send(
         conn,
@@ -243,6 +282,51 @@ where
     }
 
     Ok(Configured::Ready)
+}
+
+/// Every tag of every registry, in the form `update_tags` carries.
+///
+/// Built per connection rather than once at boot, and that is a deliberate
+/// cost of about a millisecond: the ids of the five datapack registries come
+/// from the sync this session performed, and a table cached across sessions
+/// would outlive the thing that gave its numbers meaning. When a datapack can
+/// change a registry, this is the code that must already be per-session.
+fn tag_registries() -> Result<Vec<common::TagRegistry>, SessionError> {
+    dust_registry::tags::TagRegistry::ALL
+        .into_iter()
+        .map(|registry| {
+            let tags = dust_registry::tags::wire(registry)
+                .map_err(|e| SessionError::RegistryContents(e.to_string()))?
+                .into_iter()
+                .map(|tag| {
+                    Ok(common::Tag {
+                        name: identifier(tag.id)?,
+                        entries: tag
+                            .entries
+                            .into_iter()
+                            .map(|id| VarInt(id as i32))
+                            .collect(),
+                    })
+                })
+                .collect::<Result<Vec<_>, SessionError>>()?;
+            Ok(common::TagRegistry {
+                registry: identifier(registry.name())?,
+                tags,
+            })
+        })
+        .collect()
+}
+
+/// One registry entry's compound, as the bytes the packet carries.
+///
+/// The failure case is a compound too deep or too large for the NBT writer,
+/// which cannot come from either of the two schemas — but it arrives from a
+/// directory somebody else wrote, and "cannot happen" about a file on disk is
+/// not a claim worth betting a panic on.
+fn encode_entry(compound: &dust_nbt::Compound) -> Result<Nbt, SessionError> {
+    dust_nbt::write::to_vec_network(Some(&dust_nbt::Tag::Compound(compound.clone())))
+        .map(Nbt)
+        .map_err(|e| SessionError::RegistryContents(e.to_string()))
 }
 
 /// Parse a constant into an [`Identifier`], turning the impossible case into an

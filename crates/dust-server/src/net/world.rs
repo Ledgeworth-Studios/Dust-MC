@@ -89,14 +89,89 @@ const LIGHT_BUDGET: u64 = 4_000_000;
 /// plus four, which is where a vanilla superflat puts it.
 pub const SURFACE_Y: i32 = -60;
 
-/// Where a player spawns: the middle of a block, standing on the surface.
+/// Light one column, the way this server lights every column.
+///
+/// **One answer to "how does Dust light a column", reached from three places.**
+/// The flat world lights its template, the Anvil source lights what it reads,
+/// and `xtask harness light` lights a chunk to compare against vanilla's own —
+/// and if the third of those restated the opacity model or the budget, it
+/// would be measuring a lighting policy that no player ever sees.
+///
+/// # Errors
+///
+/// [`dust_world::propagation::PropagationError::BudgetExhausted`] if the walk
+/// runs past [`LIGHT_BUDGET`]. The partial result is consistent: the column is
+/// under-lit rather than corrupt.
+pub fn light_column(
+    chunk: &mut dust_world::chunk::Chunk,
+    opacity: &OpacityModel,
+    skirt: dust_world::column_light::Skirt,
+) -> Result<u64, dust_world::propagation::PropagationError> {
+    dust_world::column_light::ColumnSkyLight::seed_with_neighbours(
+        chunk,
+        opacity,
+        skirt,
+        dust_world::propagation::Budget::new(LIGHT_BUDGET),
+    )
+}
+
+/// The opacity model a world of `air` and nothing transparent has.
+///
+/// **Air and nothing else, which is wrong and is stated as wrong.** Vanilla
+/// gives water, glass, leaves and ice an opacity of one or two; every one of
+/// them is fifteen here, so sky light stops dead at the surface of an ocean
+/// and under a tree. It is not a shortcut: light emission and opacity are code
+/// constants in Minecraft, present in no `--reports` output and in no data
+/// pack, so there is nothing to extract yet. `xtask harness light` is what
+/// measures the cost of it against a world vanilla lit.
+pub fn opacity_of(air: u32) -> OpacityModel {
+    OpacityModel::transparent_only([air])
+}
+
+/// Where a player spawns in a *flat* world: the middle of a block, standing on
+/// the surface.
 ///
 /// The half-block offsets are not cosmetic. A client handed integer x and z
 /// spawns on a block *corner*, and the first physics tick pushes it off; a
 /// client handed a y equal to the surface spawns *inside* the grass and is
 /// ejected upward. Both look like the server sent a bad position, which it
 /// did.
+///
+/// A real world's surface is not at [`SURFACE_Y`], which is why
+/// [`spawn_in`] exists and this is only its fallback.
 pub const SPAWN: (f64, f64, f64) = (0.5, SURFACE_Y as f64 + 1.0, 0.5);
+
+/// Where a player spawns in the world this server is actually serving.
+///
+/// Same x and z as [`SPAWN`] — nothing here reads the world's own spawn point,
+/// which lives in `level.dat` beside the region directory rather than in it —
+/// but the **y comes from the column's own heightmap** instead of from a
+/// superflat's constant. Serving a world Minecraft generated with the flat
+/// world's y puts a player at bedrock level: underground, in the dark, inside
+/// stone, on a server that looks broken.
+///
+/// The heightmap is `MOTION_BLOCKING`, which is the row above the highest
+/// thing that stops a player falling. Under a tree that is the ground rather
+/// than the leaves; over an ocean it is the water's surface, because water
+/// blocks motion — checked against Minecraft's own seed 0, where spawn is
+/// ocean and this lands at y = 63 on the water rather than at y = 40 on the
+/// sea floor. Standing on water is wrong, and it is wrong in the way a server
+/// with no physics is wrong; what this replaces is the far larger error of
+/// spawning at bedrock in the dark.
+pub fn spawn_in(world: &crate::net::edits::EditedWorld) -> (f64, f64, f64) {
+    let column = world.chunk(dust_world::coords::ChunkPos::new(0, 0));
+    let surface = column
+        .heightmaps()
+        .get(dust_world::heightmap::HeightmapKind::MotionBlocking)
+        .first_available(0, 0);
+    let min_y = column.world().min_y();
+    let max_y = min_y + column.world().height() as i32;
+    // Clamped, because a heightmap is a claim about a column and this is a
+    // position a client will be teleported to. An empty column reports the
+    // world's floor, which is a legal answer and a fine place to stand.
+    let y = surface.clamp(min_y, max_y - 2);
+    (SPAWN.0, f64::from(y), SPAWN.2)
+}
 
 /// One flat world.
 ///
@@ -221,11 +296,21 @@ impl FlatWorld {
         // A budget failure here would leave the column under-lit rather than
         // corrupt, and the budget is far above what a column can need, so it
         // is reported to the caller rather than swallowed.
-        let _ = dust_world::column_light::ColumnSkyLight::seed(
-            &mut chunk,
-            &self.opacity,
-            dust_world::propagation::Budget::new(LIGHT_BUDGET),
-        );
+        //
+        // Lit with its neighbours, which here are itself: every column of a
+        // flat world is this one, so the skirt changes nothing and the answer
+        // is the same either way. It is used anyway for the same reason the
+        // heightmaps are recomputed rather than written — this is the code
+        // path that stops being trivial the day the terrain does, and a line
+        // that has to be remembered later is a line that will not be.
+        let floors = dust_world::column_light::SkyFloor::of(&chunk);
+        let skirt = dust_world::column_light::Skirt {
+            west: floors,
+            east: floors,
+            north: floors,
+            south: floors,
+        };
+        let _ = light_column(&mut chunk, &self.opacity, skirt);
         chunk
     }
 
@@ -236,4 +321,56 @@ impl FlatWorld {
     /// something it has no use for and no code to read.
     pub const NETWORK_HEIGHTMAPS: [HeightmapKind; 2] =
         [HeightmapKind::MotionBlocking, HeightmapKind::WorldSurface];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A flat world's spawn must not move.
+    ///
+    /// `spawn_in` reads the world instead of a constant, and the constant is
+    /// still what a flat world should answer with. Without this, deriving the
+    /// spawn could quietly shift every flat server's players by a block — and
+    /// a block is the difference between standing on the grass and standing
+    /// inside it.
+    #[test]
+    fn the_flat_world_still_spawns_exactly_where_the_constant_says() {
+        let palette = Palette::resolve().expect("the block table");
+        let world = crate::net::edits::EditedWorld::new(crate::net::source::Source::Flat(
+            Box::new(FlatWorld::new(palette, 0, 64)),
+        ));
+        assert_eq!(spawn_in(&world), SPAWN);
+    }
+
+    /// A player spawns on top of what is there, not inside it.
+    ///
+    /// Breaking the block a player would stand on lowers the spawn by one,
+    /// which is the property the whole function exists for: the y follows the
+    /// blocks. Asserted through the world rather than through a heightmap
+    /// directly, because an edit that did not reach the heightmap would look
+    /// correct to anything that asked the heightmap.
+    #[test]
+    fn the_spawn_follows_the_block_under_it() {
+        let palette = Palette::resolve().expect("the block table");
+        let air = palette.air;
+        let world = crate::net::edits::EditedWorld::new(crate::net::source::Source::Flat(
+            Box::new(FlatWorld::new(palette, 0, 64)),
+        ));
+        let before = spawn_in(&world);
+        world.set_block(
+            dust_protocol::types::Position {
+                x: 0,
+                y: SURFACE_Y,
+                z: 0,
+            },
+            air,
+        );
+        let after = spawn_in(&world);
+        assert_eq!(
+            after.1,
+            before.1 - 1.0,
+            "digging the surface block lowers the spawn"
+        );
+    }
 }

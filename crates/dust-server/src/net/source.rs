@@ -15,6 +15,22 @@
 //! distance of ten is four hundred of them, so caching them all is a design
 //! decision with a memory budget attached and not something to slip in.
 //!
+//! # What *is* cached is 256 integers per column
+//!
+//! Light does not stop at a chunk boundary, which means lighting a column
+//! needs to know where the sky reaches in the four columns around it. That is
+//! a [`SkyFloor`] — sixteen by sixteen integers, a kilobyte — and it is
+//! nothing like a chunk. So those are cached even though the chunks are not:
+//! at a view distance of ten the whole working set is four hundred kilobytes,
+//! and without it every column would read its four neighbours off disk to ask
+//! them one question.
+//!
+//! The cache is cleared wholesale when it grows past its cap rather than
+//! evicted a row at a time. The working set is the columns around the players,
+//! so a cache that has passed the cap is one whose contents are mostly
+//! nowhere anybody is standing, and the cost of being wrong is re-reading the
+//! current view once.
+//!
 //! # A missing column is not an error
 //!
 //! A real world is a disc of generated chunks in an infinite plane, and a
@@ -30,6 +46,7 @@ use std::sync::Mutex;
 
 use dust_world::anvil::{self, Ids, Names};
 use dust_world::chunk::Chunk;
+use dust_world::column_light::{Skirt, SkyFloor};
 use dust_world::coords::{ChunkPos, RegionPos};
 use dust_world::heightmap::WorldHeight;
 use dust_world::region::{FileStore, RegionFile};
@@ -70,9 +87,18 @@ impl Column<'_> {
 }
 
 /// Where the world comes from.
+///
+/// Both arms are boxed, so the enum is a pointer and a tag. Neither world is
+/// small — the Anvil one carries the open region files and the sky floors, the
+/// flat one a template column's worth of bookkeeping — and an unboxed enum is
+/// the size of its largest arm wherever it is stored. There is one of these
+/// per server, reached through an `Arc`, so the allocation happens once at
+/// boot and the indirection costs a pointer hop on a path that is about to
+/// read a region file. `Column` below is the opposite case and keeps its large
+/// variant unboxed for a stated reason.
 pub enum Source {
-    Flat(FlatWorld),
-    Anvil(AnvilWorld),
+    Flat(Box<FlatWorld>),
+    Anvil(Box<AnvilWorld>),
 }
 
 impl std::fmt::Debug for Source {
@@ -113,7 +139,18 @@ pub struct AnvilWorld {
     names: RegistryNames,
     height: WorldHeight,
     fallback: FlatWorld,
+    /// Where the sky reaches in each column read so far, for lighting the
+    /// columns beside it. See the module note for why this is cached when the
+    /// chunks are not.
+    sky_floors: Mutex<HashMap<(i32, i32), SkyFloor>>,
 }
+
+/// How many columns' sky floors are kept before the cache is emptied.
+///
+/// A kilobyte each, so this is four megabytes — several times a view distance
+/// of ten in every direction, which is the point: the cap is a bound on a
+/// walk that never comes back, not a limit on how much of one view fits.
+const SKY_FLOOR_CACHE_CAP: usize = 4096;
 
 impl std::fmt::Debug for AnvilWorld {
     /// The open region files are file handles and seek positions, and the name
@@ -150,6 +187,7 @@ impl AnvilWorld {
             names,
             height: fallback.height(),
             fallback,
+            sky_floors: Mutex::new(HashMap::new()),
         }
     }
 
@@ -164,6 +202,53 @@ impl AnvilWorld {
                     .is_some_and(|extension| extension == "mca")
             })
         })
+    }
+
+    /// Where the sky reaches in one column, read or remembered.
+    ///
+    /// A column the world does not contain answers with the flat fallback's
+    /// floors, because that is what Dust serves there — the skirt has to
+    /// describe the world a player will actually see, not the one on disk.
+    fn sky_floor(&self, pos: ChunkPos) -> SkyFloor {
+        if let Some(found) = self
+            .sky_floors
+            .lock()
+            .expect("the sky-floor cache is never poisoned")
+            .get(&(pos.x, pos.z))
+        {
+            return *found;
+        }
+        let floors = match self.read(pos) {
+            Some(mut chunk) => {
+                chunk.recompute_heightmaps(|_, state| state != self.fallback.palette().air);
+                SkyFloor::of(&chunk)
+            }
+            None => SkyFloor::of(self.fallback.column()),
+        };
+        self.remember(pos, floors);
+        floors
+    }
+
+    fn remember(&self, pos: ChunkPos, floors: SkyFloor) {
+        let mut cache = self
+            .sky_floors
+            .lock()
+            .expect("the sky-floor cache is never poisoned");
+        if cache.len() >= SKY_FLOOR_CACHE_CAP {
+            // Wholesale, not one row at a time. See the module note.
+            cache.clear();
+        }
+        cache.insert((pos.x, pos.z), floors);
+    }
+
+    /// The four columns around `pos`, as a boundary condition for its light.
+    fn skirt(&self, pos: ChunkPos) -> Skirt {
+        Skirt {
+            west: self.sky_floor(ChunkPos::new(pos.x - 1, pos.z)),
+            east: self.sky_floor(ChunkPos::new(pos.x + 1, pos.z)),
+            north: self.sky_floor(ChunkPos::new(pos.x, pos.z - 1)),
+            south: self.sky_floor(ChunkPos::new(pos.x, pos.z + 1)),
+        }
     }
 
     fn column(&self, pos: ChunkPos) -> Chunk {
@@ -187,15 +272,14 @@ impl AnvilWorld {
                 // cache of what an engine would produce, and this server has
                 // its own engine; trusting the file would mean serving light
                 // that no code here can reproduce.
-                let opacity = dust_world::propagation::DefaultOpacity::transparent_only([self
-                    .fallback
-                    .palette()
-                    .air]);
-                let _ = dust_world::column_light::ColumnSkyLight::seed(
-                    &mut chunk,
-                    &opacity,
-                    dust_world::propagation::Budget::new(4_000_000),
-                );
+                let opacity = super::world::opacity_of(self.fallback.palette().air);
+                // This column's own floors go in the cache before its
+                // neighbours are asked for theirs: a column is almost always
+                // asked for beside the ones around it, so the pass that lights
+                // it pays for the four that follow.
+                self.remember(pos, SkyFloor::of(&chunk));
+                let skirt = self.skirt(pos);
+                let _ = super::world::light_column(&mut chunk, &opacity, skirt);
                 chunk
             }
             // Off the edge of what was generated. See the module note: a plain

@@ -31,9 +31,12 @@
 //! the grass it is dark, which is what a cave will need and what a constant
 //! could never give.
 //!
-//! Two things it is not. Light does **not cross a chunk boundary** — each
-//! column is lit alone, so a terrain step at an edge leaves a seam — and there
-//! is **no block light at all**, because nothing in this world emits any. Both
+//! Light crosses a chunk boundary: a column is lit with the sky floors of the
+//! four columns around it as sources, so a terrain step at an edge no longer
+//! leaves a seam. What it does not yet do is carry light that has to travel
+//! *through* a neighbour — around the mouth of a cave three blocks into the
+//! next chunk — which under-lights rather than mis-lights. There is still
+//! **no block light at all**, because nothing in this world emits any. Both
 //! are stated in `dust_world::column_light`, and neither is the kind of gap
 //! that renders as a broken packet.
 
@@ -42,6 +45,7 @@ use dust_protocol::packets::play;
 use dust_protocol::packets::play::chunk::{
     ChunkData, LightArray, Section as WireSection, LIGHT_SECTION_BYTES,
 };
+use dust_protocol::packets::play::metadata;
 use dust_protocol::packets::play::{GameModeByte, Gamemode, PreviousGameMode, TeleportFlags};
 use dust_protocol::types::{BitSet, Identifier, PrefixedBytes, VarInt};
 use dust_protocol::wire::Writer;
@@ -376,6 +380,77 @@ pub fn move_player(
     }
 }
 
+/// Somebody else swung an arm.
+///
+/// The animation table is the protocol's: 0 is the main hand, 3 the off hand.
+/// A client sends `swing` with a *hand* and expects everybody else to be sent
+/// an `animate` with the matching animation, and mapping one to the other is
+/// this function's whole job — a server that relayed the hand number would
+/// make an off-hand swing look like leaving a nest egg.
+pub fn swing(entity_id: i32, off_hand: bool) -> play::clientbound::Animate {
+    play::clientbound::Animate {
+        entity_id: VarInt(entity_id),
+        animation: if off_hand {
+            SWING_OFF_HAND
+        } else {
+            SWING_MAIN_HAND
+        },
+    }
+}
+
+/// `ClientboundAnimatePacket.SWING_MAIN_HAND`.
+const SWING_MAIN_HAND: u8 = 0;
+/// `ClientboundAnimatePacket.SWING_OFF_HAND`. Not 1 — 1 is taking damage and
+/// 2 is waking up, which is why these are named rather than counted.
+const SWING_OFF_HAND: u8 = 3;
+
+/// Somebody else started or stopped crouching or running.
+///
+/// **Two slots, not one, and both are needed.** Index 0 is the shared entity
+/// flag byte, where bit 1 is crouching and bit 3 is sprinting; index 6 is the
+/// pose, which is what actually shortens the model and the hitbox. A client
+/// told only the flag renders a full-height player with a dimmed name tag, and
+/// one told only the pose renders a crouch that does not sneak.
+pub fn posture(
+    entity_id: i32,
+    sneaking: bool,
+    sprinting: bool,
+) -> play::clientbound::SetEntityData {
+    let mut flags = 0u8;
+    if sneaking {
+        flags |= ENTITY_FLAG_CROUCHING;
+    }
+    if sprinting {
+        flags |= ENTITY_FLAG_SPRINTING;
+    }
+    play::clientbound::SetEntityData {
+        entity_id: VarInt(entity_id),
+        entries: metadata::MetadataEntries(vec![
+            metadata::MetadataEntry {
+                index: ENTITY_FLAGS_INDEX,
+                value: metadata::MetadataValue::Byte(flags as i8),
+            },
+            metadata::MetadataEntry {
+                index: POSE_INDEX,
+                value: metadata::MetadataValue::Pose(if sneaking {
+                    metadata::Pose::Sneaking
+                } else {
+                    metadata::Pose::Standing
+                }),
+            },
+        ]),
+    }
+}
+
+/// `Entity.DATA_SHARED_FLAGS_ID`, slot 0 on every entity there is.
+const ENTITY_FLAGS_INDEX: u8 = 0;
+/// `Entity.DATA_POSE`, slot 6 on 1.21.1.
+const POSE_INDEX: u8 = 6;
+/// Bit 1 of the shared flags.
+const ENTITY_FLAG_CROUCHING: u8 = 0x02;
+/// Bit 3 of the shared flags.
+const ENTITY_FLAG_SPRINTING: u8 = 0x08;
+
 /// The head's yaw, which the body's does not imply.
 ///
 /// Living entities carry both: the head leads a turn and the body follows, and
@@ -450,6 +525,26 @@ pub fn default_spawn(at: (f64, f64, f64)) -> play::clientbound::SetDefaultSpawnP
             z: at.2.floor() as i32,
         },
         angle: 0.0,
+    }
+}
+
+/// Full health, a full hunger bar, and vanilla's starting saturation.
+///
+/// Nothing in this server damages anybody yet, so this is a constant rather
+/// than a reading — and it is sent anyway, because it is not only decoration.
+/// A vanilla client that is never told its health assumes it is alive and
+/// renders a full bar; `mineflayer` waits for this packet before it considers
+/// itself in the world at all, and without it a bot connects, receives its
+/// position and every chunk around it, and then sits in the loading state
+/// forever. Vanilla sends it on join, so Dust does.
+///
+/// Saturation is 5.0 and not 20.0: a fresh vanilla player has five, which is
+/// why sprinting starts eating into the hunger bar as soon as it does.
+pub fn full_health() -> play::clientbound::SetHealth {
+    play::clientbound::SetHealth {
+        health: 20.0,
+        food: VarInt(20),
+        food_saturation: 5.0,
     }
 }
 

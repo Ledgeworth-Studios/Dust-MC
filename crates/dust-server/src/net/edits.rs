@@ -260,9 +260,9 @@ mod tests {
     /// `world` binding can still make another one.
     fn fresh_world() -> EditedWorld {
         let palette = super::super::world::Palette::resolve().expect("the block table");
-        EditedWorld::new(Source::Flat(super::super::world::FlatWorld::new(
+        EditedWorld::new(Source::Flat(Box::new(super::super::world::FlatWorld::new(
             palette, 0, 64,
-        )))
+        ))))
     }
 
     #[test]

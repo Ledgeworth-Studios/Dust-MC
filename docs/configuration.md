@@ -70,3 +70,11 @@ left alone.
 | `vein_size` | `Option<f64>` | `unset` | hot, new chunks only | Vein-size multiplier for this ore: how many blocks a single vein tries to place. Independent of `frequency` — doubling the size at half the frequency leaves roughly the same amount of ore in bigger, rarer clumps. |
 | `min_y` | `Option<i32>` | `unset` | hot, new chunks only | Lowest Y this ore may generate at, replacing the world's own lower bound. Omit to leave the ore's natural depth range alone. |
 | `max_y` | `Option<i32>` | `unset` | hot, new chunks only | Highest Y this ore may generate at, replacing the world's own upper bound. Omit to leave the ore's natural depth range alone. |
+
+## `[data]`
+
+Where Minecraft's own data lives, for the parts of it Dust may not ship.
+
+| Setting | Type | Default | When | Meaning |
+| --- | --- | --- | --- | --- |
+| `path` | `Option<String>` | `unset` | restart | Directory holding Minecraft's data in the usual datapack layout — the one containing `minecraft/`, which is `data/` inside a datapack. Unset means Dust has no registry contents to send. |

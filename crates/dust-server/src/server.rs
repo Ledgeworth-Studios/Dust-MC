@@ -730,6 +730,7 @@ impl Server {
         let favicon_path = config.server.favicon.clone();
         let world_source = config.server.world_source.clone();
         let online_mode = config.server.online_mode;
+        let data_path = config.data.path.clone();
 
         let fail = |message: String| -> ServerError {
             ServerError::NetworkBind {
@@ -811,7 +812,7 @@ impl Server {
         // mistyped one otherwise produces a server that starts, serves flat
         // terrain, and never says why.
         let source = if world_source.is_empty() {
-            crate::net::source::Source::Flat(flat)
+            crate::net::source::Source::Flat(Box::new(flat))
         } else {
             let directory = std::path::PathBuf::from(&world_source);
             if !crate::net::source::AnvilWorld::is_region_directory(&directory) {
@@ -830,9 +831,9 @@ impl Server {
                 "dust::server",
                 format!("serving the world at {}", directory.display()),
             );
-            crate::net::source::Source::Anvil(crate::net::source::AnvilWorld::new(
+            crate::net::source::Source::Anvil(Box::new(crate::net::source::AnvilWorld::new(
                 directory, names, flat,
-            ))
+            )))
         };
 
         let world = std::sync::Arc::new(crate::net::edits::EditedWorld::new(source));
@@ -876,6 +877,36 @@ impl Server {
             Err(e) => return Err(fail(format!("{e}"))),
         }
 
+        // Minecraft's own registry contents, if the operator pointed at a
+        // copy. Loaded before the listener binds rather than on first use: a
+        // data directory with a mistake in it should stop a server starting,
+        // not surprise the first client that needs it half an hour later.
+        let registry_contents = match data_path.as_deref() {
+            None => crate::registries::Loaded::default(),
+            Some(path) => match crate::registries::load(path) {
+                Ok(loaded) => {
+                    for (registry, count) in loaded.summary() {
+                        self.options.logger.info(
+                            "dust::data",
+                            format!("{registry}: {count} entries from {path}"),
+                        );
+                    }
+                    loaded
+                }
+                Err(e) => return Err(fail(format!("[data] path = {path:?}: {e}"))),
+            },
+        };
+        if registry_contents.is_empty() {
+            // Said once at boot rather than once per refused client, and said
+            // as information rather than a warning: a server nobody points a
+            // bot at is not misconfigured.
+            self.options.logger.info(
+                "dust::data",
+                "no [data] path is set, so clients that acknowledge no data packs                  (most bots and proxies) cannot be served"
+                    .to_owned(),
+            );
+        }
+
         // Shared between the accept loop and every session on it: the accept
         // loop counts connections, and the sessions count the players inside
         // them, because only a session knows when somebody has actually
@@ -908,6 +939,7 @@ impl Server {
                 fail("the generated entity table has no minecraft:player".to_owned())
             })?,
             counters: std::sync::Arc::clone(&counters),
+            registry_contents,
         });
 
         let handle = listener

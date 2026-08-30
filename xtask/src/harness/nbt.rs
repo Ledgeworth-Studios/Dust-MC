@@ -115,6 +115,27 @@ pub fn read_root(bytes: &[u8]) -> Result<Node, String> {
     Ok(node)
 }
 
+/// Read one tag in *network* form: a type byte and a payload, with no name.
+///
+/// Since 1.20.2 the NBT that travels in a packet has no root name — the two
+/// bytes of empty string that a file carries are simply absent. Reading a
+/// network tag with the disk reader consumes the first two bytes of the
+/// payload as a name and everything after it is nonsense, which is a failure
+/// that looks like malformed data rather than like the wrong reader.
+///
+/// Returns the node and how many bytes it used, because a registry packet
+/// packs entries end to end and the caller has to know where the next one
+/// starts.
+pub fn read_network(bytes: &[u8]) -> Result<(Node, usize), String> {
+    let mut r = Reader { bytes, at: 0 };
+    let kind = r.u8("the network tag type")?;
+    if kind == tag::END {
+        return Ok((Node::Compound(Vec::new()), r.at));
+    }
+    let node = r.payload(kind, "a network tag")?;
+    Ok((node, r.at))
+}
+
 struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,

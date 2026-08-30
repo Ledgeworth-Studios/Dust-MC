@@ -59,12 +59,15 @@ pub mod cache;
 pub mod capture;
 pub mod compare;
 pub mod digest;
+pub mod light;
 mod nbt;
 mod properties;
 mod provision;
 mod rcon;
 mod region;
+pub mod registries;
 mod rewrite;
+mod wire;
 
 use std::process::ExitCode;
 
@@ -113,6 +116,20 @@ outside the repository (override with DUST_HARNESS_CACHE).
       — and a totals line. Exit codes: 0 identical, 1 they differ (a finding,
       not a failure), 2 the comparison could not run. Refuses sets from
       different seeds or different data versions outright.
+
+  registries --version <v> [--data <dir>] [--timeout <s>]
+      Boot Minecraft, boot Dust, and ask both what they tell a client that
+      acknowledges no data packs: the synced registries with their contents,
+      and the whole tag set. Compares registries as trees and tags as sets —
+      the two servers write compounds and tags in different orders and a
+      client builds a map and a set either way. Exit 0 if they agree, 1 if
+      they do not, 2 if the run failed.
+
+  light --version <v> [--seed <n>] [--radius <r>]
+      Read a world Minecraft generated and lit, light the same chunks with
+      Dust's own engine, and compare the sky light cell by cell. Prints how
+      much agrees and what the disagreements are standing in. A measurement
+      and not a gate: exit 0 unless the run itself failed.
 ";
 
 /// Which verb was selected, with its parsed options.
@@ -123,6 +140,8 @@ enum Verb {
     Capture(capture::Options),
     Compare(compare::Options),
     Rewrite(rewrite::Options),
+    Registries(registries::Options),
+    Light(light::Options),
 }
 
 /// Parse and run one harness verb.
@@ -154,6 +173,8 @@ pub fn dispatch(args: &[String]) -> Result<ExitCode, String> {
         // to be reported in one line with the table thrown away.
         Verb::Compare(options) => Ok(compare::run(&options)),
         Verb::Rewrite(options) => Ok(rewrite::run(&options)),
+        Verb::Registries(options) => Ok(registries::run(&options)),
+        Verb::Light(options) => Ok(light::run(&options)),
     }
 }
 
@@ -168,9 +189,11 @@ fn parse(args: &[String]) -> Result<Verb, String> {
         "capture" => capture::parse(rest).map(Verb::Capture),
         "compare" => compare::parse(rest).map(Verb::Compare),
         "rewrite" => rewrite::parse(rest).map(Verb::Rewrite),
+        "registries" => registries::parse(rest).map(Verb::Registries),
+        "light" => light::parse(rest).map(Verb::Light),
         other => Err(format!(
             "unknown harness verb `{other}`\n\nThe verbs are: provision, rcon, capture, \
-             compare, rewrite."
+             compare, rewrite, registries, light."
         )),
     }
 }

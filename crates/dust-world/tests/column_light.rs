@@ -400,3 +400,133 @@ mod heightmaps {
         assert_eq!(height(&chunk, 9, 9), top + 1);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Across a chunk boundary.
+//
+// The seam these cover is the one a player sees first: a terrain step at a
+// chunk edge, with the tall side's cliff face dark to the boundary and daylight
+// one block further on. Light does not stop at a chunk edge in Minecraft, and
+// it did stop at one here.
+// ---------------------------------------------------------------------------
+
+/// A column whose lid covers everything, so nothing in it sees the sky at all.
+fn sealed(lid_y: i32) -> Chunk {
+    column(lid_y)
+}
+
+fn skirt_open() -> dust_world::column_light::Skirt {
+    dust_world::column_light::Skirt::open(-64)
+}
+
+fn seed_with(chunk: &mut Chunk, skirt: dust_world::column_light::Skirt) {
+    let opacity = DefaultOpacity::transparent_only([AIR]);
+    ColumnSkyLight::seed_with_neighbours(chunk, &opacity, skirt, Budget::new(4_000_000))
+        .expect("within budget");
+}
+
+#[test]
+fn a_sealed_column_beside_open_sky_is_lit_from_the_side() {
+    // The column is under a lid and sees no sky of its own. Every one of its
+    // four neighbours is open, so daylight arrives across the boundary and
+    // fades inward — which is exactly what vanilla does and exactly what a
+    // column lit alone cannot do.
+    let lid_y = 0;
+    let mut chunk = sealed(lid_y);
+    seed_with(&mut chunk, skirt_open());
+
+    let under = lid_y - 1;
+    assert_eq!(
+        sky(&chunk, 0, under, 8),
+        14,
+        "one step in from the west edge"
+    );
+    assert_eq!(sky(&chunk, 1, under, 8), 13, "two steps in");
+    assert_eq!(sky(&chunk, 15, under, 8), 14, "and in from the east edge");
+    // Fifteen steps of attenuation from either side never reaches the middle
+    // at full strength, but it is not black either — which is the difference
+    // between a lit cliff face and a seam.
+    assert!(sky(&chunk, 7, under, 8) > 0, "the middle is not black");
+}
+
+#[test]
+fn without_the_skirt_the_same_column_is_black_to_the_edge() {
+    // The control. Same terrain, same walk, no boundary condition — and this
+    // is what the seam looked like.
+    let lid_y = 0;
+    let mut chunk = sealed(lid_y);
+    seed(&mut chunk);
+    assert_eq!(sky(&chunk, 0, lid_y - 1, 8), 0, "dark right up to the edge");
+    assert_eq!(sky(&chunk, 15, lid_y - 1, 8), 0);
+}
+
+#[test]
+fn a_neighbour_as_tall_as_the_column_lets_no_light_in() {
+    // The skirt is a boundary condition and not a source: a neighbour whose
+    // own terrain is as high as this column's lid has no sky below that lid to
+    // give away, and the result is the sealed room again. Without this, "add a
+    // skirt" would just be "light everything from the edges", which is the
+    // constant-fifteen bug wearing a different hat.
+    let lid_y = 0;
+    let mut chunk = sealed(lid_y);
+    let neighbour = sealed(lid_y);
+    // One neighbour's floors, used on all four sides.
+    let floors = dust_world::column_light::SkyFloor::of(&neighbour);
+    let skirt = dust_world::column_light::Skirt {
+        west: floors,
+        east: floors,
+        north: floors,
+        south: floors,
+    };
+    seed_with(&mut chunk, skirt);
+    assert_eq!(sky(&chunk, 0, lid_y - 1, 8), 0, "no sky next door either");
+    assert_eq!(sky(&chunk, 8, lid_y - 1, 8), 0);
+}
+
+#[test]
+fn the_skirt_changes_nothing_where_the_column_already_saw_the_sky() {
+    // The property that makes this safe to turn on everywhere: adding a
+    // boundary condition must not move any cell the column could already
+    // answer for itself. An open column's answer is the same either way, cell
+    // for cell, which is what says the ring is a source of light and not a
+    // second opinion about the column's own.
+    let world = WorldHeight::new(-64, 384);
+    let mut alone = Chunk::uniform(ChunkPos::new(0, 0), world, REGISTRY, BIOMES, AIR, 0);
+    for x in 0..16 {
+        for z in 0..16 {
+            // A staircase: every x/z column a different height, so the
+            // comparison covers a terrain that varies rather than a plane.
+            for y in world.min_y()..world.min_y() + 1 + (x as i32 % 5) {
+                alone.set_block(x, y, z, STONE);
+            }
+        }
+    }
+    alone.recompute_heightmaps(|_, state| state != AIR);
+    let mut skirted = alone.clone();
+    seed(&mut alone);
+    seed_with(&mut skirted, skirt_open());
+
+    for x in 0..16 {
+        for z in 0..16 {
+            for y in world.min_y()..world.min_y() + 40 {
+                assert_eq!(
+                    sky(&alone, x, y, z),
+                    sky(&skirted, x, y, z),
+                    "({x}, {y}, {z}) moved"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn an_absent_neighbour_is_open_sky_and_not_a_wall() {
+    // A column at the edge of what has been generated has no neighbour to ask.
+    // Treating that as a wall would put the seam back exactly where a player
+    // is most likely to be standing — at the frontier — so it is treated as
+    // open, which is what the generator will eventually put there.
+    let min_y = -64;
+    let open = dust_world::column_light::SkyFloor::open(min_y);
+    assert!(open.open_at(0, min_y, 0), "open all the way down");
+    assert!(open.open_at(15, 300, 15));
+}

@@ -75,3 +75,21 @@ vein_size = 2.5
 # nether_quartz, nether_gold, ancient_debris — plus anything a datapack adds,
 # written as `namespace:name`. A name this world does not have is an error at
 # startup naming the closest match, not a line that silently does nothing.
+
+# ---------------------------------------------------------------------------
+# Where Minecraft's own data lives.
+#
+# Dust ships none of Minecraft's content. It knows the *names* of every biome
+# and dimension type, because those are part of the protocol, but not what is
+# in them — a biome's colours and a dimension's height belong to Mojang and
+# come from the copy of Minecraft you already have.
+#
+# You only need this to serve clients that do not track data packs, which is
+# most bots and proxies (mineflayer among them). Ordinary Minecraft clients
+# have their own copy and are unaffected either way.
+#
+# Point it at a directory in the usual data pack layout — the one containing
+# `minecraft/`. Unpacking a server jar with `cargo xtask extract` produces one.
+# ---------------------------------------------------------------------------
+# [data]
+# path = "/path/to/minecraft/data"

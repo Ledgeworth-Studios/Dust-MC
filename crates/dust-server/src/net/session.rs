@@ -119,6 +119,17 @@ pub struct SessionContext {
     pub roster: super::players::SharedRoster,
     /// `minecraft:player`'s id in the entity-type registry, resolved at boot.
     pub player_entity_type: i32,
+    /// The contents of the registries Dust can serve, read at boot from
+    /// `[data] path`.
+    ///
+    /// Empty when no such path is set, which is the state that makes a client
+    /// acknowledging no data packs unservable. Held by value rather than
+    /// behind a lock: it is read on every join and written never — a reload
+    /// that changed it would be changing what a *joining* client is told, so
+    /// it is a restart-scoped setting and the type says so by not being
+    /// mutable.
+    pub registry_contents: crate::registries::Loaded,
+
     /// Where each player was when they last left, by profile id.
     ///
     /// Read on join and written on leave, so a reconnecting player lands where
@@ -191,6 +202,10 @@ pub enum SessionError {
         state: &'static str,
         packet: &'static str,
     },
+    /// A registry entry loaded from the operator's data would not encode as
+    /// NBT. Separate from `Encode` because the cause is a file rather than a
+    /// packet definition, and the operator can do something about it.
+    RegistryContents(String),
 }
 
 impl std::fmt::Display for SessionError {
@@ -201,6 +216,9 @@ impl std::fmt::Display for SessionError {
             Self::Encode(e) => write!(f, "encode: {e}"),
             Self::OutOfTurn { state, packet } => {
                 write!(f, "{packet} is not allowed in the {state} state")
+            }
+            Self::RegistryContents(detail) => {
+                write!(f, "a registry entry would not encode as NBT: {detail}")
             }
         }
     }
@@ -376,16 +394,22 @@ where
         },
         Configured::UnknownContent => {
             // The client did not acknowledge the vanilla pack, so its
-            // registries would have to carry their own contents, and Dust has
-            // none to send. Checked rather than assumed: serving the names
+            // registries have to carry their contents and no `[data] path`
+            // supplied any. Checked rather than assumed: serving the names
             // anyway was tried against a client that acknowledges nothing, and
             // it fails inside its own registry loader without ever reaching
             // the world. See `configure`'s module documentation.
+            //
+            // The message names the setting. Whoever reads it is running a bot
+            // or a proxy against a server they control, and "this server
+            // cannot serve you" without saying what would is a dead end for
+            // somebody who is one line of configuration away.
             refuse_in_configuration(
                 &mut conn,
                 ctx,
-                "This server can only serve clients that already have \
-                 Minecraft 1.21.1's own data.",
+                "This server has no copy of Minecraft's data, so it can only \
+                 serve clients that already have their own. Set [data] path in \
+                 dust.toml to admit clients that acknowledge no data packs.",
             )
             .await?;
             return finish(
@@ -424,13 +448,14 @@ where
     // first time. Read before the join packet, because the join packet is not
     // what carries a position — the teleport below is — and a player told the
     // wrong one first would see themselves move.
+    let spawn = world::spawn_in(&ctx.world);
     let start = ctx
         .positions
         .lock()
         .expect("the position map is never poisoned")
         .get(&profile_id)
         .copied()
-        .unwrap_or(world::SPAWN);
+        .unwrap_or(spawn);
 
     // Counted here rather than when the session ends, and held by a guard so
     // that every way out of this function — a disconnect, a timeout, a decode
@@ -454,7 +479,7 @@ where
     // does not grant it, and a client that is never sent this walks.
     send_play(conn, play_mod::abilities(true), version).await?;
     send_play(conn, play_mod::frozen_at_noon(), version).await?;
-    send_play(conn, play_mod::default_spawn(world::SPAWN), version).await?;
+    send_play(conn, play_mod::default_spawn(spawn), version).await?;
 
     // Before the chunks, not after: a client uses its position to decide which
     // columns it wants, and one told about columns before it knows where it is
@@ -490,6 +515,13 @@ where
         version,
     )
     .await?;
+
+    // Health, last, exactly where vanilla puts it — and the position in the
+    // order is load-bearing rather than tidy. `mineflayer` treats this packet
+    // as the moment it is in the world, so a server that sends it before the
+    // position has a bot that believes it spawned at the origin. Captured
+    // from vanilla's join burst, where it is the last packet sent.
+    send_play(conn, play_mod::full_health(), version).await?;
 
     // Join the roster *after* the world is on screen. The order matters the
     // same way the position does: an entity announced before the client has
@@ -715,6 +747,36 @@ where
                         .await?;
                         send_play(conn, play_mod::turn_head(entity_id, yaw), ctx.version).await?;
                     }
+                    // Swings and postures go to everybody but the player
+                    // who did them, like movement: their own client has
+                    // already animated the swing and is already crouching,
+                    // and being told again would fight its own prediction.
+                    Ok(RosterChange::Swung {
+                        entity_id,
+                        animation,
+                    }) if entity_id != me.entity_id => {
+                        send_play(
+                            conn,
+                            play::clientbound::Animate {
+                                entity_id: dust_protocol::types::VarInt(entity_id),
+                                animation,
+                            },
+                            ctx.version,
+                        )
+                        .await?;
+                    }
+                    Ok(RosterChange::Posture {
+                        entity_id,
+                        sneaking,
+                        sprinting,
+                    }) if entity_id != me.entity_id => {
+                        send_play(
+                            conn,
+                            play_mod::posture(entity_id, sneaking, sprinting),
+                            ctx.version,
+                        )
+                        .await?;
+                    }
                     // Chat reaches everybody, the speaker included — a player
                     // has to see their own words, and filtering them here
                     // would mean every session adding them back locally.
@@ -784,6 +846,35 @@ where
                         ctx.roster
                             .moved(me.entity_id, m.x, m.y, m.z, m.yaw, m.pitch);
                         moved(conn, ctx, &mut view, m.x, m.z).await?;
+                    }
+                    // An arm swing. Sent on every click, hit and miss
+                    // alike, and it is the only thing that makes another
+                    // player look like they are doing something rather than
+                    // sliding around with their arms down.
+                    Ok(play::serverbound::Packet::SwingArm(swing)) => {
+                        let packet = play_mod::swing(
+                            me.entity_id,
+                            swing.hand == dust_protocol::packets::play::Hand::Off,
+                        );
+                        ctx.roster.swung(me.entity_id, packet.animation);
+                    }
+                    // Crouching and running. The other seven actions this
+                    // packet carries are about horses, elytra and beds, none
+                    // of which exist here — and passing them to the roster
+                    // would put a metadata packet on every other player's wire
+                    // for something nothing models.
+                    Ok(play::serverbound::Packet::PlayerCommand(command)) => {
+                        use play::serverbound::PlayerCommandAction as Action;
+                        let (sneaking, sprinting) = match command.body.action_id {
+                            Action::StartSneaking => (Some(true), None),
+                            Action::StopSneaking => (Some(false), None),
+                            Action::StartSprinting => (None, Some(true)),
+                            Action::StopSprinting => (None, Some(false)),
+                            _ => (None, None),
+                        };
+                        if sneaking.is_some() || sprinting.is_some() {
+                            ctx.roster.posture(me.entity_id, sneaking, sprinting);
+                        }
                     }
                     Ok(play::serverbound::Packet::Chat(said)) => {
                         // The signature and the acknowledgement chain are

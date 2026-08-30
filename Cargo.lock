@@ -1246,6 +1246,7 @@ dependencies = [
  "dust-config",
  "dust-data",
  "dust-nbt",
+ "dust-registry",
  "dust-server",
  "dust-world",
  "flate2",

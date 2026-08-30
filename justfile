@@ -43,3 +43,16 @@ licenses:
 
 build:
     cargo build --workspace --all-features
+
+# Point a third-party client at a running server.
+#
+# NOT part of `verify`, and that is the one recipe here that is deliberately
+# outside it: this needs a server already running, an npm install, and a
+# `[data] path` in its configuration. `verify` is CI's list in CI's order and
+# a step CI cannot run has no business in it.
+#
+# It is still the first thing to run after any protocol change. mineflayer
+# shares no code with this project, which is why it finds what the test suite
+# agrees with itself about. See tools/bot/README.md.
+bot port="25565":
+    cd tools/bot && node check.js {{port}}

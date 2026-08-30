@@ -489,16 +489,29 @@ var_int_enum! {
 
 /// Everything after the entity id on a player command.
 ///
-/// The jump action carries how high; every other action leaves it out, and
-/// encoding an action that ignores the boost with one present is refused so
-/// a server cannot silently mis-read a command.
+/// # The boost is always on the wire
+///
+/// It reads as though it should be conditional — only the horse-jump actions
+/// mean anything by it — and this crate modelled it that way, as an
+/// `Option` present for those two actions and refused for the rest. **That was
+/// wrong, and a real 1.21.1 server said so.** Vanilla's reader takes three
+/// VarInts whatever the action; asked to accept two it disconnects with
+/// `Failed to decode packet 'serverbound/minecraft:player_command'`, and asked
+/// to accept three it carries on without complaint. So every sneak and every
+/// sprint a real client sends carries a zero here, and a decoder that stopped
+/// after the action left a byte in the frame and refused the packet.
+///
+/// The field is a plain `VarInt` now, because that is what the wire holds.
+/// Which actions give it a *meaning* is a separate question and
+/// [`PlayerCommandBody::meaningful_boost`] is where it is answered — a
+/// distinction worth keeping and not worth spending the packet's shape on.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlayerCommandBody {
     pub entity_id: VarInt,
     pub action_id: PlayerCommandAction,
-    /// Only when [`PlayerCommandAction::StartJumpWithHorse`] etc. ask for it;
-    /// `Some` otherwise is refused at encode time.
-    pub jump_boost: Option<VarInt>,
+    /// How high a horse jump is charged. Zero, and meaningless, for every
+    /// action that is not one — see the type's note.
+    pub jump_boost: VarInt,
 }
 
 var_int_enum! {
@@ -520,6 +533,18 @@ var_int_enum! {
 }
 
 impl PlayerCommandBody {
+    /// The boost, where the action is one that has one.
+    ///
+    /// `None` is "this action does not carry a height", not "the field was
+    /// absent" — the field is never absent. A caller that acted on the raw
+    /// value for a sneak would be acting on a zero somebody's client wrote
+    /// because the format demanded a number, not because they asked for
+    /// anything.
+    #[must_use]
+    pub fn meaningful_boost(&self) -> Option<i32> {
+        Self::asks_for_boost(self.action_id).then_some(self.jump_boost.0)
+    }
+
     fn asks_for_boost(action: PlayerCommandAction) -> bool {
         matches!(
             action,
@@ -535,11 +560,10 @@ impl crate::types::Decode for PlayerCommandBody {
     ) -> Result<Self, crate::wire::DecodeError> {
         let entity_id = VarInt::decode(input, version)?;
         let action_id = PlayerCommandAction::decode(input, version)?;
-        let jump_boost = if Self::asks_for_boost(action_id) {
-            Some(VarInt::decode(input, version)?)
-        } else {
-            None
-        };
+        // Unconditional. See the type's note: vanilla reads three VarInts
+        // whatever the action, and this read two until a real server refused
+        // the result.
+        let jump_boost = VarInt::decode(input, version)?;
         Ok(Self {
             entity_id,
             action_id,
@@ -556,22 +580,7 @@ impl crate::types::Encode for PlayerCommandBody {
     ) -> Result<(), crate::wire::EncodeError> {
         self.entity_id.encode(out, version)?;
         self.action_id.encode(out, version)?;
-        match (Self::asks_for_boost(self.action_id), self.jump_boost) {
-            (true, Some(boost)) => boost.encode(out, version)?,
-            (true, None) => {
-                return Err(crate::wire::EncodeError::Unsupported {
-                    field: "player command jump boost",
-                    why: "this action carries the boost height and none was given",
-                })
-            }
-            (false, Some(_)) => {
-                return Err(crate::wire::EncodeError::Unsupported {
-                    field: "player command jump boost",
-                    why: "this action takes no boost height and some was given",
-                })
-            }
-            (false, None) => {}
-        }
+        self.jump_boost.encode(out, version)?;
         Ok(())
     }
 }

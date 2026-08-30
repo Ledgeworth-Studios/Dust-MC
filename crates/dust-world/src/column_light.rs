@@ -6,21 +6,45 @@
 //! was left for: a column's sky-light arrays, plus an opacity model the caller
 //! supplies.
 //!
-//! # What "one column" costs, and why it is still the right first wiring
+//! # Across a chunk boundary
 //!
-//! A column knows nothing about its neighbours, so light does not cross a
-//! chunk boundary here: a cell at x = 15 is at the edge of the volume and the
-//! walk stops rather than stepping into the column next door. That is visible
-//! as a seam wherever terrain heights differ across a boundary, and it is not
-//! how a finished light engine behaves.
+//! A column on its own knows nothing about its neighbours, so light did not
+//! cross a chunk boundary: a cell at x = 15 was at the edge of the volume and
+//! the walk stopped rather than stepping into the column next door. That was
+//! visible as a seam wherever terrain heights differed across a boundary — a
+//! cliff face on the low side of a step stayed dark to the boundary and then
+//! jumped to daylight.
 //!
-//! It is still worth having, because the alternative — every chunk sent fully
-//! lit — is not a smaller lie, it is a total one. Sky light that follows the
-//! terrain is right everywhere except at the boundaries; sky light that is
-//! fifteen everywhere is right nowhere, and a cave lit like a meadow is a bug
-//! nobody can see until they walk into it. The multi-column version is the
-//! same walks over a graph whose `contains` spans more than one chunk, which
-//! is exactly the shape the trait was given for.
+//! [`ColumnSkyLight::seed_with_neighbours`] takes that away by giving the
+//! walk a **skirt**: the four surrounding columns' sky floors, used as light
+//! *sources* along the four faces. Where a neighbour is open to the sky and
+//! this column is not, the edge cell facing it is seeded with what a cell at
+//! fifteen offers across one step, and the walk carries it inward from there.
+//!
+//! The neighbours are sources and not extra cells of the volume, and that is
+//! not only the simpler of the two. A read-only ring inside the volume stores
+//! nothing, so it reads back dark however brightly it was just handed light —
+//! and a walk that steps along such a ring re-queues every cell of it on every
+//! visit and finishes only by running out of budget.
+//!
+//! **What the skirt is exact for, and what it is not.** Where a neighbouring
+//! column is open to the sky, the answer is vanilla's: that cell is fifteen in
+//! vanilla too, and one step in is fourteen either way. Where the light would
+//! have to travel *through* a neighbour first — around the mouth of a cave
+//! three blocks into the next chunk — the ring reports darkness and the
+//! result is under-lit. That is the same direction the seam erred in and a
+//! strict improvement on it, and it is the case the multi-column version
+//! exists for; the trait was given `contains` precisely so that version is a
+//! wider volume rather than a rewrite.
+//!
+//! The skirt costs the neighbours' *sky floors* and nothing else — 256
+//! integers per column, not a megabyte of blocks — which is what makes it
+//! affordable on the streaming path. Measured (`benches/skylight.rs`, idle
+//! machine): against neighbours shaped like itself, which is nearly every
+//! column of a real world, it is not distinguishable from lighting the column
+//! alone; against open sky on all four faces, which is the most it can ask
+//! for, it roughly doubles the lighting and stays under the cost of generating
+//! the column.
 
 use crate::chunk::Chunk;
 use crate::propagation::{raise, Budget, DefaultOpacity, LightGraph, PropagationError};
@@ -84,6 +108,34 @@ impl<'a> ColumnSkyLight<'a> {
         opacity: &'a DefaultOpacity,
         budget: Budget,
     ) -> Result<u64, PropagationError> {
+        Self::seed_inner(chunk, opacity, None, budget)
+    }
+
+    /// Fill this column's sky light with the four columns around it as a
+    /// boundary condition.
+    ///
+    /// This is what stops light from stopping at a chunk boundary. See the
+    /// module note for what the skirt is exact for and where it still
+    /// under-lights.
+    ///
+    /// # Errors
+    ///
+    /// As [`ColumnSkyLight::seed`].
+    pub fn seed_with_neighbours(
+        chunk: &'a mut Chunk,
+        opacity: &'a DefaultOpacity,
+        skirt: Skirt,
+        budget: Budget,
+    ) -> Result<u64, PropagationError> {
+        Self::seed_inner(chunk, opacity, Some(skirt), budget)
+    }
+
+    fn seed_inner(
+        chunk: &'a mut Chunk,
+        opacity: &'a DefaultOpacity,
+        skirt: Option<Skirt>,
+        budget: Budget,
+    ) -> Result<u64, PropagationError> {
         let min_y = chunk.world().min_y();
         let max_y = min_y + chunk.world().height() as i32;
 
@@ -127,7 +179,153 @@ impl<'a> ColumnSkyLight<'a> {
             }
         }
 
+        // What the four columns around this one shine in.
+        //
+        // The neighbour is not part of the volume: it is a *source*, and what
+        // reaches the edge cell facing it is what a cell at fifteen would
+        // offer across one step — `15 - (1 + opacity)`, which is `spread`'s
+        // own arithmetic and is written here as the same expression rather
+        // than a number, so the two cannot come to disagree about how much a
+        // step costs.
+        //
+        // Modelling the neighbour as a source rather than as extra cells of
+        // the volume is not only simpler. A read-only ring inside the volume
+        // stores nothing, so it reads back dark however brightly it was just
+        // handed light — and a walk that steps along such a ring re-queues
+        // every cell of it on every visit, and finishes only by exhausting its
+        // budget.
+        if let Some(skirt) = skirt {
+            for along in 0..16i32 {
+                for (rx, rz, ix, iz) in [
+                    (-1, along, 0, along),
+                    (16, along, 15, along),
+                    (along, -1, along, 0),
+                    (along, 16, along, 15),
+                ] {
+                    for y in min_y..max_y {
+                        // Only where the neighbour sees sky and this column
+                        // does not. A cell already lit by its own sky has
+                        // nothing to gain, and seeding it would be ninety
+                        // thousand queue entries to find that out.
+                        if !skirt.open_at(rx, y, rz) || open(ix, y, iz) {
+                            continue;
+                        }
+                        let offered = 15_u8.saturating_sub(1 + graph.opacity(ix, y, iz));
+                        if offered > 0 {
+                            seeds.push((ix, y, iz, offered));
+                        }
+                    }
+                }
+            }
+        }
+
         raise(&mut graph, &seeds, budget)
+    }
+}
+
+/// Where the sky reaches down to, in each of a column's 256 x/z positions.
+///
+/// The lowest y with nothing motion-blocking above it, clamped into the
+/// world. Two things use it: the column's own fill, and — as a
+/// [`Skirt`] — the ring of cells just outside a *neighbouring* column, which
+/// is how light crosses a chunk boundary without carrying a megabyte of
+/// blocks across it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SkyFloor {
+    floors: [[i32; 16]; 16],
+}
+
+impl SkyFloor {
+    /// Read a column's sky floors out of its heightmaps.
+    ///
+    /// From [`HeightmapKind::MotionBlocking`](crate::heightmap::HeightmapKind)
+    /// rather than the surface map, for the same reason the fill uses it: a
+    /// cell under a leaf block is not in direct sky light in vanilla either.
+    #[must_use]
+    pub fn of(chunk: &Chunk) -> Self {
+        let min_y = chunk.world().min_y();
+        let max_y = min_y + chunk.world().height() as i32;
+        let mut floors = [[0i32; 16]; 16];
+        for (x, row) in floors.iter_mut().enumerate() {
+            for (z, floor) in row.iter_mut().enumerate() {
+                *floor = chunk
+                    .heightmaps()
+                    .get(SKY_HEIGHTMAP)
+                    .first_available(x as u32, z as u32)
+                    .clamp(min_y, max_y);
+            }
+        }
+        Self { floors }
+    }
+
+    /// A column with no terrain at all: open sky to the world's floor.
+    ///
+    /// What an absent neighbour is treated as. It is the right default and not
+    /// a convenient one: a column that has not been generated is not a wall,
+    /// and treating it as one would put the seam back exactly where the skirt
+    /// removes it — at the edge of what a player has explored.
+    #[must_use]
+    pub fn open(min_y: i32) -> Self {
+        Self {
+            floors: [[min_y; 16]; 16],
+        }
+    }
+
+    /// Whether the sky reaches this cell of the column.
+    #[must_use]
+    pub fn open_at(&self, x: u32, y: i32, z: u32) -> bool {
+        y >= self.floors[x as usize][z as usize]
+    }
+}
+
+/// The four columns around one, as a boundary condition for its light.
+///
+/// Four and not eight. A diagonal neighbour touches the column only along an
+/// edge, and light steps face to face — a cell at (0, y, 0) has no neighbour
+/// at (-1, y, -1), so a corner column has nothing to contribute that its two
+/// shared sides do not already carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Skirt {
+    /// The column at x - 1.
+    pub west: SkyFloor,
+    /// The column at x + 1.
+    pub east: SkyFloor,
+    /// The column at z - 1.
+    pub north: SkyFloor,
+    /// The column at z + 1.
+    pub south: SkyFloor,
+}
+
+impl Skirt {
+    /// A skirt of columns with no terrain — open sky on every side.
+    #[must_use]
+    pub fn open(min_y: i32) -> Self {
+        let open = SkyFloor::open(min_y);
+        Self {
+            west: open,
+            east: open,
+            north: open,
+            south: open,
+        }
+    }
+
+    /// Whether the sky reaches a cell just outside the column, given in the
+    /// *column's* coordinates.
+    ///
+    /// `x` or `z` is -1 or 16; the other is inside `0..16`. A cell outside on
+    /// both axes is a corner, which touches the column along an edge and never
+    /// face to face — see the type's note — so this answers `false` for one
+    /// rather than reaching for a column it was not given.
+    #[must_use]
+    fn open_at(&self, x: i32, y: i32, z: i32) -> bool {
+        let inside = |v: i32| (0..16).contains(&v);
+        match (x, z) {
+            (-1, z) if inside(z) => self.west.open_at(15, y, z as u32),
+            (16, z) if inside(z) => self.east.open_at(0, y, z as u32),
+            (x, -1) if inside(x) => self.north.open_at(x as u32, y, 15),
+            (x, 16) if inside(x) => self.south.open_at(x as u32, y, 0),
+            _ => false,
+        }
     }
 }
 

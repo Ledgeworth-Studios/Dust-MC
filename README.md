@@ -7,13 +7,30 @@ Dust is being built from nothing and is not finished — but you can play on it.
 ## Status
 
 **Two people can connect, walk around a shared world, break and place blocks,
-see each other doing it, and talk.** What they change is still there after a
-restart, and so is where they were standing.
+see each other doing it, and talk.** They see each other swing and crouch, what
+they change is still there after a restart, and so is where they were standing.
 
 `dust server` binds `[server].bind`, answers the server-list ping with the MOTD,
 player count and favicon from `dust.toml`, runs login in either offline or
 online mode, syncs the eleven datapack registries a 1.21.1 client needs, streams
 chunks as players move, and keeps the connection up.
+
+**Tags go out, all thirteen registries of them** — 514 tags flattened to
+6,362 registry ids, which is exactly what a real 1.21.1 server sends, compared
+tag by tag and id by id against one. Nothing went out while five of the
+thirteen were extracted, because a partial tag set is worse than none: a client
+told `minecraft:mineable/pickaxe` holds eleven blocks believes the other nine
+hundred are not mineable, where a client told nothing falls back to its own
+copy.
+
+**`mineflayer` joins it.** That matters more than it sounds: a client that does
+not track data packs has no copy of the registry contents to fall back on, and
+until now Dust had none to send it, so most of the bot and proxy ecosystem was
+refused at configuration. Point `[data].path` at a copy of Minecraft's data —
+the one the operator already has, since none of it is shipped here — and Dust
+sends the two registries such a client cannot manage without. See decision
+record [0007](docs/decisions/0007-registry-contents.md) for where the line
+between a protocol fact and Mojang's content falls, and why it falls there.
 
 **It can serve a world Minecraft made, and hand one back.** Point
 `[server].world_source` at a region directory and Dust reads the columns out of
@@ -33,7 +50,9 @@ section codec, the chunk packet, the light engine.
 **Not yet**, and each of these is stated where the code for it would go: no
 physics, block updates, drops, tool checks or reach validation, so a player may
 break bedrock from across the map; no inventory, so there is one placeable
-block; no tags; no light across chunk boundaries and no block light; no plugins;
+block; no block light, and sky light that crosses a chunk boundary from a
+neighbour open to the sky but not from one it would have to travel through; no
+plugins;
 and the running server still saves its own edits in its own format beside a
 world rather than back into it — writing Anvil works, but a chunk's block
 entities and scheduled ticks survive a round trip by being *copied*, not because
@@ -63,10 +82,18 @@ convention including a wrong one.
 
 And the formats are **captured from a running Minecraft 1.21.1 server** rather
 than read off a wiki: the configuration order, the eleven registries and their
-entry counts, the offline-mode UUID derivation, and a chunk section decoded
-field by field until its 18,779 bytes were consumed exactly.
+entry counts, the NBT type of every field in a dimension type and a biome, the
+offline-mode UUID derivation, and a chunk section decoded field by field until
+its 18,779 bytes were consumed exactly.
 
 Doing that found three defects in an afternoon, each with passing tests over it:
+
+- **A player command was one VarInt short.** The jump boost reads as though it
+  should be conditional — only the horse-jump actions mean anything by it — and
+  the packet was modelled that way. Vanilla reads three VarInts whatever the
+  action: sent two it disconnects naming the packet, sent three it carries on.
+  Every sneak and every sprint a real client sends carries a zero there, so
+  Dust refused all of them.
 
 - **Login Start's shape was inverted.** The transport expected an optional
   profile id behind a presence flag — true in 1.20.2–1.20.4, wrong since
@@ -122,6 +149,23 @@ A full cold run — download plus both generators plus every table — takes a f
 minutes, almost all of it inside Java. A warm run against the cache takes
 seconds.
 
+## Point a third-party client at it
+
+```
+cd tools/bot && npm install
+just bot 25565
+```
+
+`mineflayer` implements the client protocol independently and shares no code
+with this project, which is why it finds what a test suite agrees with itself
+about. `tools/bot/check.js` joins, checks that the dimension it was told about
+is the one it is in, that it has all sixty-four biomes, that it can read a
+block, and that a second bot's swing and crouch reach the first — six checks,
+exit 0 or 1. `tools/bot/README.md` has the list and what it has caught.
+
+It is deliberately outside `just verify`: it needs a server already running, an
+npm install and a `[data] path`, and `verify` is CI's list in CI's order.
+
 ## Differential testing
 
 Testing against vanilla is the highest-value test this project will have: run
@@ -135,6 +179,8 @@ cargo xtask harness provision --version 1.21.1 --seed 0 --yes
 cargo xtask harness capture --version 1.21.1 --seed 0 --radius 2
 cargo xtask harness compare captures/a captures/b
 cargo xtask harness rewrite --version 1.21.1 --seed 0 --radius 2
+cargo xtask harness registries --version 1.21.1
+cargo xtask harness light --version 1.21.1 --seed 0 --radius 2
 ```
 
 `provision` resolves the server jar through the same manifest-and-SHA-1 path
@@ -144,6 +190,44 @@ only with `--yes` — accepts Minecraft's EULA on your behalf by writing
 `eula.txt`. Without that flag the file is left unwritten and vanilla refuses
 to boot until you have read the EULA and chosen; agreeing to a licence is an
 act, and the flag keeps it visible in your shell history where it belongs.
+
+`registries` is the same idea one layer up, over the protocol rather than the
+world. It boots Minecraft, boots Dust in the same process as the command, and
+points one hand-written client — its own VarInts, its own zlib, sharing no code
+with either server — at both, acknowledging no data packs so that both send the
+registries' *contents* rather than their names. As of 2026-08-30 it reports no
+differences: ten registries agree entry for entry and field for field, and all
+thirteen tag registries agree over all 6,362 ids. The eleventh registry,
+`minecraft:enchantment`, is listed as a stated omission rather than a
+difference — Dust has no schema for it and says so in code, and the day one is
+added and is wrong, this goes red. Watched to fail: changing one field's type
+from `TAG_Double` to `TAG_Float` produced four findings naming the field.
+
+`light` puts a number on how close the sky light is. A chunk Minecraft wrote
+carries the light Minecraft computed, so the same chunks can be lit again with
+Dust's engine and compared cell by cell. On seed 0 it reads **99.41%** at radius
+2, 4 and 6 alike, and **every single one of the disagreements is Dust being
+darker** — which is the direction both known gaps point in. What the shortfalls
+are standing in is the whole diagnosis: leaves, water, grass and seagrass, every
+one of them a block Minecraft gives a small opacity and Dust treats as a wall,
+because light emission and opacity are code constants in Minecraft and are in no
+report and no data pack.
+
+It is a measurement and not a gate — the number is expected to be short of a
+hundred per cent today, and a verb that failed for a known gap would be red
+every time it ran.
+
+**Getting it there took three corrections and every one was the harness rather
+than the engine.** It lit each column against *itself* on all four sides: 805
+over-lit cells. It compared chunks vanilla had not finished lighting, which a
+world holds around whatever was force-generated: 167,000 more, and the
+agreement fell to 98.1% with no change to the engine. And it took sky floors
+from *neighbours* vanilla had not finished, so Dust was told there was open sky
+where the finished world has terrain: the last thirty-two, every one within a
+step of a chunk edge. Separating over-lighting from under-lighting in the report
+is what made all three visible instead of letting them hide inside a number that
+already looked good — both known gaps under-light, so an over-lit cell is
+always a third thing.
 
 `capture` boots the provisioned server headless, watches its own log for the
 readiness line, force-generates the square of chunks within `--radius` chunks

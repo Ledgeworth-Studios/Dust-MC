@@ -319,6 +319,14 @@ pub fn run(options: &Options, workspace_root: &Path) -> Result<(), String> {
     // blocks domain itself was selected: parsing both reports costs
     // milliseconds, and every domain's cross-checks are worth more than the
     // branch it would take to skip them.
+    // The datapack registries, for the same reason: the tags domain checks
+    // five of its thirteen registries against these names, and a tags run that
+    // could not is a tags run that would emit unchecked rows.
+    let mut synced_registries = None;
+    if wants_data {
+        synced_registries = Some(synced::parse(context.data()?)?);
+    }
+
     let mut blocks = None;
     let mut registries = None;
     if wants_reports {
@@ -366,6 +374,7 @@ pub fn run(options: &Options, workspace_root: &Path) -> Result<(), String> {
             Domain::Tags => tags_domain(
                 blocks.as_ref().expect("parsed above"),
                 registries.as_ref().expect("parsed above"),
+                synced_registries.as_ref().expect("parsed above"),
                 &context,
             )?,
             Domain::Synced => synced_domain(&context)?,
@@ -643,9 +652,10 @@ fn recipes_domain(flat: &registries::Registries, context: &Context) -> Result<Ou
 fn tags_domain(
     parsed_blocks: &blocks::Blocks,
     flat: &registries::Registries,
+    synced: &[synced::SyncedRegistry],
     context: &Context,
 ) -> Result<Outcome, String> {
-    let parsed = tags::parse(&context.data()?.join("data"), flat, parsed_blocks)?;
+    let parsed = tags::parse(&context.data()?.join("data"), flat, parsed_blocks, synced)?;
 
     let per_registry = |registry: &str| -> usize {
         parsed
@@ -655,15 +665,15 @@ fn tags_domain(
             .count()
     };
     println!(
-        "read {} tags across the five registries (block {}, item {}, fluid {}, \
-         entity_type {}, game_event {})",
-        parsed.tags.len(),
-        per_registry("minecraft:block"),
-        per_registry("minecraft:item"),
-        per_registry("minecraft:fluid"),
-        per_registry("minecraft:entity_type"),
-        per_registry("minecraft:game_event")
+        "read {} tags across the thirteen registries:",
+        parsed.tags.len()
     );
+    for (registry, expected) in tags::CAPTURED {
+        println!(
+            "  {registry:<34} {:>4}   (a real 1.21.1 server sent {expected})",
+            per_registry(registry)
+        );
+    }
     println!(
         "  every one of the {} plain memberships was checked against its registry's \
          extracted table",

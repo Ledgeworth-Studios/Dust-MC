@@ -25,6 +25,12 @@ flate2.workspace = true
 # `harness::region` stay the throwaway independent readers they were, because
 # the whole value of the comparison is that the judge was not built here.
 dust-nbt.workspace = true
+
+# `harness light` names the block a disagreeing light cell is standing in.
+# That is presentation and not judgement: the *comparison* is between what
+# Minecraft wrote and what Dust's own engine produced, and this table only
+# turns a state id into a word somebody can read.
+dust-registry.workspace = true
 dust-server.workspace = true
 dust-world.workspace = true
 serde.workspace = true
