@@ -15,11 +15,15 @@ player count and favicon from `dust.toml`, runs login in either offline or
 online mode, syncs the eleven datapack registries a 1.21.1 client needs, streams
 chunks as players move, and keeps the connection up.
 
-**It can serve a world Minecraft made.** Point `[server].world_source` at a
-region directory and Dust reads the columns out of it — blocks, their
-properties, biomes — and streams them. Without one it generates a superflat and
-does not pretend otherwise: worldgen is Phase 6, and a column a real world does
-not contain falls back to the flat one, because a world is a disc in an infinite
+**It can serve a world Minecraft made, and hand one back.** Point
+`[server].world_source` at a region directory and Dust reads the columns out of
+it — blocks, their properties, biomes, heightmaps — and streams them. It also
+writes Anvil: `cargo xtask harness rewrite` puts every chunk of a real world
+through Dust's reader and writer and then boots a vanilla server on the result,
+which reads back the world it started as and says nothing about it that it did
+not say about its own. Without a world source Dust generates a superflat and does
+not pretend otherwise: worldgen is Phase 6, and a column a real world does not
+contain falls back to the flat one, because a world is a disc in an infinite
 plane and a player can walk off the edge of it.
 
 What exists either way is the whole path from the socket to the block table —
@@ -30,10 +34,11 @@ section codec, the chunk packet, the light engine.
 physics, block updates, drops, tool checks or reach validation, so a player may
 break bedrock from across the map; no inventory, so there is one placeable
 block; no tags; no light across chunk boundaries and no block light; no plugins;
-and **Anvil is read-only** — Dust opens a world Minecraft wrote and saves its own
-changes in its own format beside it, because writing Anvil means answering
-questions there is no way to check the answers to, and a writer that guessed
-would produce worlds that open until the day one does not.
+and the running server still saves its own edits in its own format beside a
+world rather than back into it — writing Anvil works, but a chunk's block
+entities and scheduled ticks survive a round trip by being *copied*, not because
+Dust models them, and a server that edited a chest would be writing a record it
+does not understand.
 
 ## Try it
 
@@ -121,14 +126,15 @@ seconds.
 
 Testing against vanilla is the highest-value test this project will have: run
 the real server and Dust over identical inputs and let Mojang's implementation
-argue with ours. The groundwork for that is the harness — three verbs that
-provision a vanilla server, fingerprint a world it generates, and compare
-fingerprints:
+argue with ours. The harness provisions a vanilla server,
+fingerprints a world it generates, compares fingerprints — and puts Dust's own
+code in the loop:
 
 ```
 cargo xtask harness provision --version 1.21.1 --seed 0 --yes
 cargo xtask harness capture --version 1.21.1 --seed 0 --radius 2
 cargo xtask harness compare captures/a captures/b
+cargo xtask harness rewrite --version 1.21.1 --seed 0 --radius 2
 ```
 
 `provision` resolves the server jar through the same manifest-and-SHA-1 path
@@ -159,6 +165,35 @@ identical
 
 Its exit codes are for scripts: **0** when identical, **1** when they differ
 (a finding, not a failure), **2** when the comparison could not run at all.
+
+`rewrite` is Phase 2's exit criterion made runnable. It copies the provisioned
+world, rewrites every chunk through Dust's Anvil reader and writer, boots vanilla
+on the copy, and compares what vanilla read back against the capture of the world
+it started as. It found a defect on its first run that nothing in the test suite
+could have: the reader had never read `Heightmaps` at all, which is invisible
+in-process because the one caller that serves chunks recomputes them first.
+
+**The digest is not the whole check.** Vanilla does not fail on a chunk it
+cannot read — it logs, discards it and regenerates it from the seed, so the
+server boots, the capture completes, and nothing in the digests says anything
+went wrong. Measured, by scrambling 200 bytes of one chunk and leaving its
+header intact: vanilla logged four errors about it and then printed
+`Done (4.392s)!` and ran.
+
+So the criterion's other words are checked separately: everything vanilla says
+is kept, and the transcript of the run over Dust's world is diffed against the
+transcript of the run over vanilla's own. Anything new is a finding — a diff
+rather than a list of known-bad strings, because a list can only fail on what
+whoever wrote it already thought of.
+
+The two checks overlap more than expected in that experiment: the regenerated
+chunk digested differently as well, because regenerating one chunk into a world
+whose neighbours are already finished loses the decoration those neighbours
+would have contributed. Where they do *not* overlap is the failure this writer
+can actually cause. A digest covers blocks, biomes and heightmaps and nothing
+else, so a carried block entity whose block Dust has since broken — a record
+vanilla drops and logs about, with every block still exactly where it was —
+is visible only in the transcript.
 
 Two honesty notes. First, what is seed-stable: terrain, biomes, ore and
 structure placement are stable for a fixed seed and version, and that is

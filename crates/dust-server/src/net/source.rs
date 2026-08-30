@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use dust_world::anvil::{self, Names};
+use dust_world::anvil::{self, Ids, Names};
 use dust_world::chunk::Chunk;
 use dust_world::coords::{ChunkPos, RegionPos};
 use dust_world::heightmap::WorldHeight;
@@ -169,11 +169,24 @@ impl AnvilWorld {
     fn column(&self, pos: ChunkPos) -> Chunk {
         match self.read(pos) {
             Some(mut chunk) => {
+                // The file's heightmaps are replaced with this server's, for
+                // serving. `anvil::read` loads what the file carried — see its
+                // docs for why it does not throw them away — and this is the
+                // caller that has a reason to overwrite them: the client is
+                // sent WORLD_SURFACE and MOTION_BLOCKING, and they have to
+                // agree with the blocks in the packet beside them rather than
+                // with whatever produced the file.
+                //
+                // The predicate is "not air" for all six, which is **not**
+                // vanilla's rule for three of the four it writes. That is a
+                // known approximation and the reason a save must not go
+                // through here: `harness rewrite` reads and writes without
+                // this step, so a round trip keeps the file's own answers.
+                chunk.recompute_heightmaps(|_, state| state != self.fallback.palette().air);
                 // Light is computed, not read. A chunk's stored light is a
                 // cache of what an engine would produce, and this server has
                 // its own engine; trusting the file would mean serving light
                 // that no code here can reproduce.
-                chunk.recompute_heightmaps(|_, state| state != self.fallback.palette().air);
                 let opacity = dust_world::propagation::DefaultOpacity::transparent_only([self
                     .fallback
                     .palette()
@@ -222,6 +235,14 @@ impl AnvilWorld {
 /// using the wrong ones would render a plains as whatever is at that index.
 pub struct RegistryNames {
     biomes: HashMap<&'static str, u32>,
+    /// The same table read the other way, for [`Ids`]. Built beside the
+    /// forward one from the same iteration rather than searched on demand: a
+    /// write walks every palette entry of every section, and a linear scan of
+    /// sixty-four biomes per entry is a cost with no reason to exist.
+    ///
+    /// Two maps over one source is not two sources. What would be is building
+    /// this from a second call to `synced::by_name`, which is why it is not.
+    biome_names: Vec<&'static str>,
 }
 
 impl RegistryNames {
@@ -237,6 +258,7 @@ impl RegistryNames {
                 .enumerate()
                 .map(|(id, name)| (*name, id as u32))
                 .collect(),
+            biome_names: synced.entries.to_vec(),
         })
     }
 }
@@ -274,5 +296,30 @@ impl Names for RegistryNames {
 
     fn biome_registry_size(&self) -> u32 {
         self.biomes.len() as u32
+    }
+}
+
+impl Ids for RegistryNames {
+    /// Name a block *state*, with every property that distinguishes it.
+    ///
+    /// The inverse of [`Names::block`], and deliberately not its exact mirror.
+    /// The reader *skips* a property it does not understand, because a world
+    /// written by a newer Minecraft carries fields this build cannot model and
+    /// refusing a chunk over one would make a world unopenable for a detail
+    /// nobody can see. The writer has no such case to be lenient about: every
+    /// id it is handed came from this same table, so an id with no name is not
+    /// a version gap, it is a caller holding a number that means nothing. That
+    /// stops the write.
+    ///
+    /// A block with no properties returns an empty vector and the file omits
+    /// the `Properties` compound, which is what vanilla writes and what the
+    /// reader expects to find missing.
+    fn block_name(&self, id: u32) -> Option<(&str, Vec<(&str, &str)>)> {
+        let state = dust_registry::BlockState::from_id(id)?;
+        Some((state.block().name(), state.properties()))
+    }
+
+    fn biome_name(&self, id: u32) -> Option<&str> {
+        self.biome_names.get(id as usize).copied()
     }
 }

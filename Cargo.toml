@@ -25,6 +25,7 @@ dust-net = { path = "crates/dust-net" }
 dust-plugin = { path = "crates/dust-plugin" }
 dust-protocol = { path = "crates/dust-protocol" }
 dust-registry = { path = "crates/dust-registry" }
+dust-server = { path = "crates/dust-server" }
 dust-sim = { path = "crates/dust-sim" }
 dust-world = { path = "crates/dust-world" }
 
