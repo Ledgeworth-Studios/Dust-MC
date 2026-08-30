@@ -1,4 +1,4 @@
-# D8 — Block opacity and light emission
+# D8 — The block constants Minecraft keeps in code
 
 **Status:** Open, with the options costed and the cost of the gap measured.
 Decided when somebody chooses a source; nothing is blocked on it that is not
@@ -92,6 +92,22 @@ decision rather than a commit.
 The measurement is the input. This record consumes it, exactly as D4 waits on
 Phase 10's.
 
+## The same wall, one block over: sounds
+
+Placing a block should make a noise for everybody else. Captured from a real
+1.21.1 server — a bot placing stone — it sends `sound_effect` with a sound
+registry id, category `block`, the block's centre in eighths of a block, volume
+1.0, pitch 0.8 and a seed.
+
+Every part of that is reachable except the one that matters: **which sound**.
+Minecraft holds a `SoundType` per block in code, exactly like the opacity and
+the emission, so a server without it can either say nothing or play the same
+noise for glass and gravel. Dust says nothing.
+
+That is worth recording here rather than in its own file because it is not a
+second decision. It is the same decision, and whichever way it goes, it goes the
+same way for all three.
+
 ## Consequences of leaving it
 
 - **No block light at all.** Torches, lava and glowstone light nothing, and
@@ -101,8 +117,12 @@ Phase 10's.
 - **Sky light stops at the surface of an ocean and under a tree**, which is
   visible to a player and is nearly all of the shortfall. On an ocean spawn it
   is 3.5% of every cell in view.
-- **`opacity_of` is the one place this is decided**, and it says so. Whichever
-  option is taken changes that function and nothing else.
+- **No sound when a block is placed**, for the reason above. Breaking one is
+  fine — the break effect carries the block's *state* and the client picks the
+  sound itself, which is why that could be built and this cannot.
+- **`opacity_of` is the one place this is decided** for light, and it says so.
+  Whichever option is taken changes that function, the emission model beside it,
+  and a block-to-sound table, and nothing else.
 
 ## Related
 

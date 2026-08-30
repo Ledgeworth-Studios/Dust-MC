@@ -340,6 +340,8 @@ struct Joined {
     player_infos: usize,
     /// World effects — block-break particles and the like.
     level_events: usize,
+    /// Entity metadata updates: how somebody is standing.
+    postures: usize,
     /// Where the server teleported the player on arrival. Captured during the
     /// join rather than waited for afterwards, because the join has already
     /// read past it by the time it returns — a later `wait_for` would block
@@ -396,6 +398,7 @@ impl Joined {
             1 => self.spawned_entities += 1,
             62 => self.player_infos += 1,
             40 => self.level_events += 1,
+            88 => self.postures += 1,
             64 => {
                 self.spawned_at = Some((
                     f64::from_be_bytes(body[0..8].try_into().expect("eight bytes")),
@@ -475,6 +478,7 @@ fn join_as(stream: &mut TcpStream, addr: SocketAddr, name: &str) -> Joined {
         spawned_entities: 0,
         player_infos: 0,
         level_events: 0,
+        postures: 0,
         spawned_at: None,
     };
     loop {
@@ -501,6 +505,7 @@ fn join_as(stream: &mut TcpStream, addr: SocketAddr, name: &str) -> Joined {
             1 => counted.spawned_entities += 1,
             62 => counted.player_infos += 1,
             40 => counted.level_events += 1,
+            88 => counted.postures += 1,
             64 => {
                 counted.spawned_at = Some((
                     f64::from_be_bytes(body[0..8].try_into().expect("eight bytes")),
@@ -1855,5 +1860,59 @@ fn a_block_one_player_breaks_is_seen_breaking_by_another() {
 
     drop(breaker_stream);
     drop(watcher_stream);
+    running.finish();
+}
+
+/// Somebody already crouching is crouching to whoever arrives next.
+///
+/// A spawned player stands upright until something says otherwise, so a player
+/// who started sneaking before this one connected would be upright to them and
+/// crouching to everybody else — two clients rendering the same player
+/// differently. It is the reason the roster keeps the posture rather than the
+/// session that owns it.
+#[test]
+fn a_player_already_crouching_is_crouching_to_whoever_arrives_next() {
+    let running = start("");
+    let addr = running.addr;
+
+    // An observer connected *first*, whose metadata packet is what proves the
+    // server has acted on the crouch. Without it there is nothing to wait for
+    // — the posture is not echoed to the player who struck it — and the test
+    // would be sleeping and hoping, which is the habit this file's own notes
+    // are about.
+    let mut observer_stream = connect(addr);
+    let mut observer = join_as(&mut observer_stream, addr, "Observer");
+
+    let mut sneaker_stream = connect(addr);
+    let _sneaker = join_as(&mut sneaker_stream, addr, "Sneaker");
+    observer
+        .wait_for(&mut observer_stream, 1)
+        .expect("the observer is told the sneaker arrived");
+
+    // Start sneaking. The entity id in the body is the client's own claim and
+    // the server uses the session's, so any value does here.
+    let mut sneak = Vec::new();
+    write_var_int(1, &mut sneak);
+    write_var_int(0, &mut sneak); // StartSneaking
+    write_var_int(0, &mut sneak); // the jump boost, which is always present
+    send_compressed_frame(&mut sneaker_stream, 37, &sneak);
+    observer
+        .wait_for(&mut observer_stream, 88)
+        .expect("the observer sees the crouch, which is what says the server acted");
+
+    // Only now does the third player arrive.
+    let mut watcher_stream = connect(addr);
+    let mut watcher = join_as(&mut watcher_stream, addr, "Watcher");
+    watcher.drain_until_quiet(&mut watcher_stream);
+
+    assert_eq!(watcher.spawned_entities, 2, "the observer and the sneaker");
+    assert_eq!(
+        watcher.postures, 1,
+        "one posture, for the one player who is not standing upright"
+    );
+
+    drop(watcher_stream);
+    drop(sneaker_stream);
+    drop(observer_stream);
     running.finish();
 }
