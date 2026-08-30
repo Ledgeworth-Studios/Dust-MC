@@ -20,6 +20,26 @@ use dust_server::server::{
 };
 use dust_server::stop::{Parker, StepParker, StopHandle};
 
+/// A world directory of this test's own.
+///
+/// `ServerOptions::default()` names `world`, which is *relative* — so every
+/// test in this file that took the default shared one directory under the
+/// crate root, and they run in parallel. Two servers saving into and removing
+/// the same directory produce "the world could not be saved: No such file or
+/// directory", which is a boot or a shutdown failing for a reason that has
+/// nothing to do with what the test was checking.
+///
+/// Same shape as the bind below, and the same answer: give each run its own,
+/// from one place nobody has to remember.
+fn test_world_dir() -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "dust-server-lifecycle-world-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst),
+    ))
+}
+
 /// A unique temp file per call, always with a listener that cannot collide.
 ///
 /// The bind is applied *here* rather than left to each caller, because one
@@ -97,6 +117,7 @@ fn start(config_text: &str, extras: Vec<Box<dyn TickParticipant>>) -> Running {
     let clock = Arc::new(ManualClock::new());
     let options = ServerOptions {
         config_path: write_config(&with_test_bind(config_text)),
+        world_dir: test_world_dir(),
         clock: Arc::clone(&clock) as Arc<dyn Clock>,
         loop_parker: stepping(clock, TICK_NS),
         watchdog: WatchdogSetting::Custom(dust_server::WatchdogPolicy::custom(
@@ -222,6 +243,7 @@ fn a_stalled_loop_honours_the_configured_catchup_cap() {
     let clock = Arc::new(ManualClock::new());
     let options = ServerOptions {
         config_path: write_config("[server]\nmax_catchup_ticks = 3\n"),
+        world_dir: test_world_dir(),
         clock: Arc::clone(&clock) as Arc<dyn Clock>,
         loop_parker: stepping(clock, 600 * TICK_NS),
         watchdog: WatchdogSetting::Disabled,

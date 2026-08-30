@@ -686,6 +686,22 @@ where
                                 ctx.version,
                             )
                             .await?;
+                            // And, if a player broke it, what it looked like
+                            // breaking. Not to the player who dug: their own
+                            // client played the effect before the server heard
+                            // about the dig, and telling them again plays it
+                            // twice. Vanilla leaves them out for the same
+                            // reason.
+                            if let Some(broke) = edit.broke {
+                                if broke.by != me.entity_id {
+                                    send_play(
+                                        conn,
+                                        play_mod::block_broken(edit.position, broke.previous),
+                                        ctx.version,
+                                    )
+                                    .await?;
+                                }
+                            }
                         }
                     }
                     // The sender is gone: the server is stopping, and this
@@ -916,7 +932,12 @@ where
                     Ok(play::serverbound::Packet::PlayerAction(action)) => {
                         use play::serverbound::PlayerActionKind::{FinishDigging, StartDigging};
                         if matches!(action.status, StartDigging | FinishDigging) {
-                            ctx.world.set_block(action.location, ctx.blocks.air);
+                            // Through `break_block` and not `set_block`: the
+                            // other players are shown the block breaking, and
+                            // the particles and the sound come from what was
+                            // there rather than from the air left behind.
+                            ctx.world
+                                .break_block(action.location, ctx.blocks.air, me.entity_id);
                         }
                         // The sequence number is acknowledged whatever
                         // happened. The client predicted the change locally

@@ -7,8 +7,9 @@ Dust is being built from nothing and is not finished — but you can play on it.
 ## Status
 
 **Two people can connect, walk around a shared world, break and place blocks,
-see each other doing it, and talk.** They see each other swing and crouch, what
-they change is still there after a restart, and so is where they were standing.
+see each other doing it, and talk.** They see each other swing, crouch and break
+blocks — particles and sound, out of the block that broke — and what they change
+is still there after a restart, along with where they were standing.
 
 `dust server` binds `[server].bind`, answers the server-list ping with the MOTD,
 player count and favicon from `dust.toml`, runs login in either offline or
@@ -161,11 +162,13 @@ just bot 25565
 with this project, which is why it finds what a test suite agrees with itself
 about. `tools/bot/check.js` joins, checks that the dimension it was told about
 is the one it is in, that it has all sixty-four biomes, that it can read a
-block, and that a second bot's swing and crouch reach the first — six checks,
-exit 0 or 1. `tools/bot/README.md` has the list and what it has caught.
+block, and that a second bot's swing, crouch and block-break reach the first —
+seven checks, exit 0 or 1. `tools/bot/README.md` has the list and what it has caught.
 
 It is deliberately outside `just verify`: it needs a server already running, an
-npm install and a `[data] path`, and `verify` is CI's list in CI's order.
+npm install and a `[data] path`, and `verify` is CI's list in CI's order. It has
+already earned its keep: the break check caught the dig path firing twice, the
+second one breaking air and sending a puff of particles made of nothing.
 
 ## Differential testing
 

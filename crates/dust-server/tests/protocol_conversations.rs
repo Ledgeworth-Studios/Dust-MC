@@ -338,6 +338,8 @@ struct Joined {
     spawned_entities: usize,
     /// Tab-list rows it has been given.
     player_infos: usize,
+    /// World effects — block-break particles and the like.
+    level_events: usize,
     /// Where the server teleported the player on arrival. Captured during the
     /// join rather than waited for afterwards, because the join has already
     /// read past it by the time it returns — a later `wait_for` would block
@@ -393,6 +395,7 @@ impl Joined {
             84 => self.centres += 1,
             1 => self.spawned_entities += 1,
             62 => self.player_infos += 1,
+            40 => self.level_events += 1,
             64 => {
                 self.spawned_at = Some((
                     f64::from_be_bytes(body[0..8].try_into().expect("eight bytes")),
@@ -471,6 +474,7 @@ fn join_as(stream: &mut TcpStream, addr: SocketAddr, name: &str) -> Joined {
         chunk_bodies: Vec::new(),
         spawned_entities: 0,
         player_infos: 0,
+        level_events: 0,
         spawned_at: None,
     };
     loop {
@@ -496,6 +500,7 @@ fn join_as(stream: &mut TcpStream, addr: SocketAddr, name: &str) -> Joined {
             84 => counted.centres += 1,
             1 => counted.spawned_entities += 1,
             62 => counted.player_infos += 1,
+            40 => counted.level_events += 1,
             64 => {
                 counted.spawned_at = Some((
                     f64::from_be_bytes(body[0..8].try_into().expect("eight bytes")),
@@ -1762,4 +1767,93 @@ fn a_swing_and_a_crouch_reach_the_other_player() {
 /// bug waiting for somebody in a hurry.
 fn write_var_int_arg(out: &mut Vec<u8>, value: i32) {
     write_var_int(value, out);
+}
+
+/// What one player breaks, the others watch break.
+///
+/// The block change already reached them; what did not was the *effect* — the
+/// particles and the dig sound, which a client makes out of the state that was
+/// there rather than out of the air left behind. A server that sent only the
+/// change leaves everybody else watching blocks vanish in silence.
+///
+/// Captured from a real 1.21.1 server before it was written: two bots, one
+/// digging, and the other is sent `world_event` with effect 2001, `data` the
+/// broken block's state id, and `global` false. The digger is sent nothing —
+/// its own client played the effect before the server heard about the dig.
+#[test]
+fn a_block_one_player_breaks_is_seen_breaking_by_another() {
+    let running = start("");
+    let addr = running.addr;
+
+    let mut watcher_stream = connect(addr);
+    let mut watcher = join_as(&mut watcher_stream, addr, "Watcher");
+    let mut breaker_stream = connect(addr);
+    let mut breaker = join_as(&mut breaker_stream, addr, "Breaker");
+
+    // The surface block at the spawn column, packed the way the protocol packs
+    // a position, by hand for the same reason the test above does it by hand.
+    let (x, y, z) = (7i64, -60i64, 9i64);
+    let packed = ((x & 0x3ff_ffff) << 38) | ((z & 0x3ff_ffff) << 12) | (y & 0xfff);
+    let mut body = packed.to_be_bytes().to_vec();
+    body.insert(0, 0); // status: start digging
+    body.push(1); // face
+    write_var_int(1, &mut body); // sequence
+    send_compressed_frame(&mut breaker_stream, 36, &body);
+
+    // The change first, then the effect. That order is not cosmetic: a client
+    // told a block broke before it knows the block changed has nothing to
+    // break.
+    let update = watcher
+        .wait_for(&mut watcher_stream, 9)
+        .expect("the watcher is told the block changed");
+    assert_eq!(
+        i64::from_be_bytes(update[..8].try_into().expect("eight bytes")),
+        packed
+    );
+
+    let effect = watcher
+        .wait_for(&mut watcher_stream, 40)
+        .expect("and is shown it breaking");
+    assert_eq!(
+        i32::from_be_bytes(effect[0..4].try_into().expect("four bytes")),
+        2001,
+        "PARTICLES_DESTROY_BLOCK"
+    );
+    assert_eq!(
+        i64::from_be_bytes(effect[4..12].try_into().expect("eight bytes")),
+        packed,
+        "at the block that broke"
+    );
+    let data = i32::from_be_bytes(effect[12..16].try_into().expect("four bytes"));
+    assert!(
+        data > 0,
+        "the data is the *broken* block's state id, not the air left behind"
+    );
+    assert_eq!(effect[16], 0, "a local effect, not a global one");
+
+    // A second dig at the same block says nothing at all. A creative client
+    // sends `start_digging` and a mining one sends `finish_digging` too, so a
+    // single dig arrives twice — and the second one has air to break. Setting
+    // air twice was idempotent and invisible until the effect went out with
+    // it, as a silent puff made of nothing.
+    send_compressed_frame(&mut breaker_stream, 36, &body);
+    watcher.drain_until_quiet(&mut watcher_stream);
+    assert_eq!(
+        watcher.level_events, 1,
+        "the second dig broke air, which is not breaking anything"
+    );
+
+    // And the breaker is told the change and not the effect. Checked by
+    // draining what actually arrived rather than by waiting for silence: a
+    // wait for a packet that never comes takes the read timeout and then says
+    // nothing useful, and this way the assertion names what did arrive.
+    breaker.drain_until_quiet(&mut breaker_stream);
+    assert_eq!(
+        breaker.level_events, 0,
+        "the digger's own client already played it"
+    );
+
+    drop(breaker_stream);
+    drop(watcher_stream);
+    running.finish();
 }

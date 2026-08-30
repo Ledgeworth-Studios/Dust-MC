@@ -42,6 +42,10 @@ a failure rather than as a crash.
 6. A **second bot's crouch** reaches the first, as both the entity flag and the
    pose — the two are separate and a client told only one renders a player
    half-doing it.
+7. A **second bot breaking a block** reaches the first as a `world_event`, with
+   the *broken* block's state in it rather than the air left behind — the
+   client makes the particles and the sound out of that, and the air's id gives
+   a silent puff of nothing.
 
 ## Why the dependency is not in the licence gate
 

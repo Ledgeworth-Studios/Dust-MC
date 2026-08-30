@@ -380,6 +380,34 @@ pub fn move_player(
     }
 }
 
+/// Somebody else broke a block: the particles and the sound.
+///
+/// The `data` field is the **broken** block's state id, not the air left
+/// behind — that is what the client makes the particle texture and the dig
+/// sound out of, and sending the air's id gives a silent puff of nothing.
+/// Captured from a real 1.21.1 server, which sends
+/// `world_event effectId=2001 data=<state> global=false` to every player
+/// except the one who dug.
+///
+/// `global` is false: this is a local effect with distance falloff, unlike the
+/// handful of events — a wither spawning, the dragon dying — that every player
+/// on the server hears wherever they are.
+pub fn block_broken(
+    position: dust_protocol::types::Position,
+    previous: u32,
+) -> play::clientbound::LevelEvent {
+    play::clientbound::LevelEvent {
+        event: PARTICLES_DESTROY_BLOCK,
+        position,
+        data: previous as i32,
+        global: false,
+    }
+}
+
+/// Vanilla's `LevelEvent.PARTICLES_DESTROY_BLOCK`. Named because 2001 beside a
+/// state id is a number nobody can check.
+const PARTICLES_DESTROY_BLOCK: i32 = 2001;
+
 /// Somebody else swung an arm.
 ///
 /// The animation table is the protocol's: 0 is the main hand, 3 the off hand.
