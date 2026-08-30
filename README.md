@@ -51,8 +51,9 @@ section codec, the chunk packet, the light engine.
 physics, block updates, drops, tool checks or reach validation, so a player may
 break bedrock from across the map; no inventory, so there is one placeable
 block; no block light, and sky light that crosses a chunk boundary from a
-neighbour open to the sky but not from one it would have to travel through; no
-plugins;
+neighbour open to the sky but not from one it would have to travel through —
+both waiting on data rather than on effort, and costed in decision record
+[0008](docs/decisions/0008-block-opacity-and-light-emission.md); no plugins;
 and the running server still saves its own edits in its own format beside a
 world rather than back into it — writing Anvil works, but a chunk's block
 entities and scheduled ticks survive a round trip by being *copied*, not because
