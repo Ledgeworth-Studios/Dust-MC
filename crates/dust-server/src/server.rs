@@ -812,7 +812,7 @@ impl Server {
         // mistyped one otherwise produces a server that starts, serves flat
         // terrain, and never says why.
         let source = if world_source.is_empty() {
-            crate::net::source::Source::Flat(flat)
+            crate::net::source::Source::Flat(Box::new(flat))
         } else {
             let directory = std::path::PathBuf::from(&world_source);
             if !crate::net::source::AnvilWorld::is_region_directory(&directory) {
@@ -831,9 +831,9 @@ impl Server {
                 "dust::server",
                 format!("serving the world at {}", directory.display()),
             );
-            crate::net::source::Source::Anvil(crate::net::source::AnvilWorld::new(
+            crate::net::source::Source::Anvil(Box::new(crate::net::source::AnvilWorld::new(
                 directory, names, flat,
-            ))
+            )))
         };
 
         let world = std::sync::Arc::new(crate::net::edits::EditedWorld::new(source));

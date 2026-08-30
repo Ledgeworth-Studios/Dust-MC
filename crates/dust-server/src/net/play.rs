@@ -31,9 +31,12 @@
 //! the grass it is dark, which is what a cave will need and what a constant
 //! could never give.
 //!
-//! Two things it is not. Light does **not cross a chunk boundary** — each
-//! column is lit alone, so a terrain step at an edge leaves a seam — and there
-//! is **no block light at all**, because nothing in this world emits any. Both
+//! Light crosses a chunk boundary: a column is lit with the sky floors of the
+//! four columns around it as sources, so a terrain step at an edge no longer
+//! leaves a seam. What it does not yet do is carry light that has to travel
+//! *through* a neighbour — around the mouth of a cave three blocks into the
+//! next chunk — which under-lights rather than mis-lights. There is still
+//! **no block light at all**, because nothing in this world emits any. Both
 //! are stated in `dust_world::column_light`, and neither is the kind of gap
 //! that renders as a broken packet.
 

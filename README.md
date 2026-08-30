@@ -50,7 +50,9 @@ section codec, the chunk packet, the light engine.
 **Not yet**, and each of these is stated where the code for it would go: no
 physics, block updates, drops, tool checks or reach validation, so a player may
 break bedrock from across the map; no inventory, so there is one placeable
-block; no tags; no light across chunk boundaries and no block light; no plugins;
+block; no block light, and sky light that crosses a chunk boundary from a
+neighbour open to the sky but not from one it would have to travel through; no
+plugins;
 and the running server still saves its own edits in its own format beside a
 world rather than back into it — writing Anvil works, but a chunk's block
 entities and scheduled ticks survive a round trip by being *copied*, not because

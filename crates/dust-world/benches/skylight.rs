@@ -9,9 +9,22 @@
 //! Generation and lighting are timed apart, because together they answer no
 //! question: a reader wanting to know whether lighting is affordable cannot
 //! subtract a number that was never printed.
+//!
+//! **Run it on an idle machine.** Twenty rounds is enough to separate numbers
+//! that differ by a factor and not enough to separate ones that differ by a
+//! third, and the same line read 1.4 ms on a quiet laptop and 6.0 ms on one
+//! that was also compiling. A reading taken beside a build is not a control.
+//!
+//! What it says as of 2026-08-30, on an idle machine: generating an overworld
+//! column is about 0.5 ms and lighting it about 0.9 ms. Lighting it against
+//! neighbours shaped like itself — which is nearly every column of a real
+//! world — is not distinguishable from lighting it alone; lighting it against
+//! a cliff of open sky on all four sides, which is the most a skirt can ask
+//! for, roughly doubles the lighting and leaves it under the cost of
+//! generation.
 
 use dust_world::chunk::Chunk;
-use dust_world::column_light::ColumnSkyLight;
+use dust_world::column_light::{ColumnSkyLight, Skirt, SkyFloor};
 use dust_world::coords::ChunkPos;
 use dust_world::heightmap::{HeightmapKind, WorldHeight};
 use dust_world::propagation::{seed_skylight, Budget, DefaultOpacity, LightGraph};
@@ -104,6 +117,39 @@ fn main() {
     time("overworld column, whole-region seeding ", ROUNDS, || {
         let mut chunk = generate(world);
         seed_every_open_cell(&mut chunk, &opacity);
+        std::hint::black_box(chunk);
+    });
+
+    // What crossing a chunk boundary costs. The neighbours here are a cliff —
+    // open sky right down to the world's floor beside a column that is solid
+    // to the surface — which is the *most* a skirt can ask for: every cell of
+    // all four faces below the surface is a seed. Real terrain steps a few
+    // blocks and seeds a few dozen.
+    let cliff = Skirt::open(world.min_y());
+    time("overworld column, lit against a cliff  ", ROUNDS, || {
+        let mut chunk = generate(world);
+        ColumnSkyLight::seed_with_neighbours(&mut chunk, &opacity, cliff, Budget::new(400_000_000))
+            .expect("budget");
+        std::hint::black_box(chunk);
+    });
+
+    // And against neighbours shaped like itself, which is what almost every
+    // column in a real world has: the skirt finds nothing to add, and the
+    // difference from the line above is the cost of asking.
+    let flat = {
+        let column = generate(world);
+        let floors = SkyFloor::of(&column);
+        Skirt {
+            west: floors,
+            east: floors,
+            north: floors,
+            south: floors,
+        }
+    };
+    time("overworld column, lit against its like ", ROUNDS, || {
+        let mut chunk = generate(world);
+        ColumnSkyLight::seed_with_neighbours(&mut chunk, &opacity, flat, Budget::new(400_000_000))
+            .expect("budget");
         std::hint::black_box(chunk);
     });
 }

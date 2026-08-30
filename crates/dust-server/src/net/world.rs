@@ -221,9 +221,23 @@ impl FlatWorld {
         // A budget failure here would leave the column under-lit rather than
         // corrupt, and the budget is far above what a column can need, so it
         // is reported to the caller rather than swallowed.
-        let _ = dust_world::column_light::ColumnSkyLight::seed(
+        //
+        // Lit with its neighbours, which here are itself: every column of a
+        // flat world is this one, so the skirt changes nothing and the answer
+        // is the same either way. It is used anyway for the same reason the
+        // heightmaps are recomputed rather than written — this is the code
+        // path that stops being trivial the day the terrain does, and a line
+        // that has to be remembered later is a line that will not be.
+        let skirt = dust_world::column_light::Skirt {
+            west: dust_world::column_light::SkyFloor::of(&chunk),
+            east: dust_world::column_light::SkyFloor::of(&chunk),
+            north: dust_world::column_light::SkyFloor::of(&chunk),
+            south: dust_world::column_light::SkyFloor::of(&chunk),
+        };
+        let _ = dust_world::column_light::ColumnSkyLight::seed_with_neighbours(
             &mut chunk,
             &self.opacity,
+            skirt,
             dust_world::propagation::Budget::new(LIGHT_BUDGET),
         );
         chunk
