@@ -107,6 +107,18 @@ impl Block {
         (0..generated::blocks::BLOCKS.len() as u16).map(Self)
     }
 
+    /// This block's id in `minecraft:block`, which is what a block tag on the
+    /// wire carries.
+    ///
+    /// It is the row's position in the generated table and not a stored
+    /// number, because the two would be a second answer to one question. The
+    /// extraction checks that the block report's ids and the state order agree
+    /// before leaving `minecraft:block` out of the registry table entirely —
+    /// see `check_block_ids_match_state_order` — so the position *is* the id.
+    pub fn protocol_id(self) -> u32 {
+        u32::from(self.0)
+    }
+
     fn def(self) -> &'static BlockDef {
         Self::def_at(self.0)
     }

@@ -15,6 +15,14 @@ player count and favicon from `dust.toml`, runs login in either offline or
 online mode, syncs the eleven datapack registries a 1.21.1 client needs, streams
 chunks as players move, and keeps the connection up.
 
+**Tags go out, all thirteen registries of them** — 514 tags flattened to
+6,362 registry ids, which is exactly what a real 1.21.1 server sends, compared
+tag by tag and id by id against one. Nothing went out while five of the
+thirteen were extracted, because a partial tag set is worse than none: a client
+told `minecraft:mineable/pickaxe` holds eleven blocks believes the other nine
+hundred are not mineable, where a client told nothing falls back to its own
+copy.
+
 **`mineflayer` joins it.** That matters more than it sounds: a client that does
 not track data packs has no copy of the registry contents to fall back on, and
 until now Dust had none to send it, so most of the bot and proxy ecosystem was

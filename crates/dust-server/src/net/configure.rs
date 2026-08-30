@@ -55,21 +55,24 @@
 //! it gains a schema and joins the list. What decides that is a client
 //! failing, not a guess made here.
 //!
-//! # What is deliberately not sent yet, and what it costs
+//! # Tags
 //!
-//! **Tags.** Vanilla sends twenty-five kilobytes of them across thirteen
-//! registries. Dust has five of those registries extracted and sends none,
-//! because a partial tag set is worse than none: a client told that
-//! `minecraft:mineable/pickaxe` contains eleven blocks believes the other
-//! nine hundred are not mineable, whereas a client told nothing falls back to
-//! its own copy. Sending them is a Phase 4 job, and it is the first thing to
-//! do when block behaviour starts depending on tags.
+//! All thirteen registries, every tag, flattened to ids —  25 kilobytes, and
+//! the same 6,362 memberships a real 1.21.1 server sends. It is all thirteen
+//! or none: a client told that `minecraft:mineable/pickaxe` contains eleven
+//! blocks believes the other nine hundred are not mineable, where a client
+//! told nothing falls back to its own copy. That is why nothing went out while
+//! five of the thirteen were extracted.
+//!
+//! Sent to *every* client, unlike the registry contents. Tags are not
+//! covered by the known-packs exchange — vanilla sends them whether or not the
+//! client acknowledged `minecraft:core`, and both captures show it.
 
 use dust_net::io::{Conn, ConnError};
 use dust_protocol::nbt::Nbt;
-use dust_protocol::packets::common::{KnownPack, RegistryEntry};
+use dust_protocol::packets::common::{self, KnownPack, RegistryEntry};
 use dust_protocol::packets::configuration;
-use dust_protocol::types::{Identifier, ProtocolString, RestOfPacket};
+use dust_protocol::types::{Identifier, ProtocolString, RestOfPacket, VarInt};
 use dust_protocol::wire::{Reader, WireWrite as _, Writer};
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -236,6 +239,19 @@ where
         .await?;
     }
 
+    // Tags, after the registries and before the finish, which is where
+    // vanilla puts them. They have to come after: a tag's entries are ids into
+    // a registry, and a client that has not built that registry's mapping yet
+    // has nothing to resolve them against.
+    send(
+        conn,
+        configuration::clientbound::UpdateTags {
+            registries: tag_registries()?,
+        },
+        version,
+    )
+    .await?;
+
     send(
         conn,
         configuration::clientbound::FinishConfiguration {},
@@ -266,6 +282,39 @@ where
     }
 
     Ok(Configured::Ready)
+}
+
+/// Every tag of every registry, in the form `update_tags` carries.
+///
+/// Built per connection rather than once at boot, and that is a deliberate
+/// cost of about a millisecond: the ids of the five datapack registries come
+/// from the sync this session performed, and a table cached across sessions
+/// would outlive the thing that gave its numbers meaning. When a datapack can
+/// change a registry, this is the code that must already be per-session.
+fn tag_registries() -> Result<Vec<common::TagRegistry>, SessionError> {
+    dust_registry::tags::TagRegistry::ALL
+        .into_iter()
+        .map(|registry| {
+            let tags = dust_registry::tags::wire(registry)
+                .map_err(|e| SessionError::RegistryContents(e.to_string()))?
+                .into_iter()
+                .map(|tag| {
+                    Ok(common::Tag {
+                        name: identifier(tag.id)?,
+                        entries: tag
+                            .entries
+                            .into_iter()
+                            .map(|id| VarInt(id as i32))
+                            .collect(),
+                    })
+                })
+                .collect::<Result<Vec<_>, SessionError>>()?;
+            Ok(common::TagRegistry {
+                registry: identifier(registry.name())?,
+                tags,
+            })
+        })
+        .collect()
 }
 
 /// One registry entry's compound, as the bytes the packet carries.

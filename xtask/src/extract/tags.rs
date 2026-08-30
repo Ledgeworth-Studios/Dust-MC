@@ -507,26 +507,6 @@ mod tests {
             sample_tag("minecraft:block", "minecraft:aquarium_blocks", &[]),
             sample_tag("minecraft:item", "minecraft:arrows", &[]),
         ];
-        // Against the wire, before anything is written. A registry short by one
-        // tag is a client told a group is smaller than it is, which is invisible
-        // until somebody's pickaxe stops working on one block in nine hundred.
-        for (registry, expected) in CAPTURED {
-            let found = tags.iter().filter(|t| t.registry == *registry).count();
-            if found != *expected {
-                return Err(format!(
-                    "{registry} extracted {found} tags; a real 1.21.1 server sent {expected}. \
-                 Either this is not 1.21.1's data pack or the walk missed a tree."
-                ));
-            }
-        }
-        if tags.len() != CAPTURED.iter().map(|(_, n)| n).sum::<usize>() {
-            return Err(format!(
-                "{} tags in total, against the {} a real server sent",
-                tags.len(),
-                CAPTURED.iter().map(|(_, n)| n).sum::<usize>()
-            ));
-        }
-
         tags.sort_by(|a, b| (&a.registry, &a.id).cmp(&(&b.registry, &b.id)));
         let order: Vec<&str> = tags.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(

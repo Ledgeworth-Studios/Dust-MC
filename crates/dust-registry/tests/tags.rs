@@ -141,10 +141,13 @@ fn every_membership_resolves_through_the_public_tables() {
             memberships += 1;
         }
     }
-    // 3,038 entries were read; both `sand` tags listed `suspicious_sand`
-    // twice and a tag is a set, so the table holds two fewer.
+    // 3,809 entries were read across the thirteen directories; both `sand`
+    // tags listed `suspicious_sand` twice and a tag is a set, so the table
+    // holds two fewer. This is the *stored* count — plain members plus `#`
+    // references — and not what goes on the wire; see
+    // `the_flattened_membership_counts_are_the_ones_a_real_server_sent`.
     assert_eq!(
-        memberships, 3036,
+        memberships, 3807,
         "the number of memberships moved without anybody noticing"
     );
 
@@ -213,19 +216,141 @@ fn the_named_facts_about_vanilla_tags_are_still_true() {
 }
 
 #[test]
-fn the_five_registries_are_exactly_the_five_taken() {
-    assert_eq!(TagRegistry::ALL.len(), 5);
-    let block_count = tags::by_registry(TagRegistry::Block).count();
-    assert_eq!(block_count, 184);
-    assert_eq!(tags::by_registry(TagRegistry::Item).count(), 147);
-    assert_eq!(tags::by_registry(TagRegistry::Fluid).count(), 2);
-    assert_eq!(tags::by_registry(TagRegistry::EntityType).count(), 34);
-    assert_eq!(tags::by_registry(TagRegistry::GameEvent).count(), 5);
-    assert_eq!(TAGS.len(), 372);
+fn the_thirteen_registries_are_exactly_the_thirteen_taken() {
+    // The per-registry counts live in
+    // `the_thirteen_registries_and_their_counts_are_the_ones_a_real_server_sent`,
+    // against the capture. What is left here is the total and the shape: every
+    // registry the enum names holds at least one tag, so a variant added
+    // without an extraction behind it fails rather than reads as empty.
+    assert_eq!(TagRegistry::ALL.len(), 13);
+    for registry in TagRegistry::ALL {
+        assert!(
+            tags::by_registry(registry).count() > 0,
+            "{} names no tags",
+            registry.name()
+        );
+    }
+    assert_eq!(TAGS.len(), 514);
 }
 
 #[test]
 fn the_table_says_which_version_it_came_from() {
     assert_eq!(DATA_VERSION, "1.21.1");
     assert_eq!(dust_registry::generated::tags::DATA_VERSION, DATA_VERSION);
+}
+
+/// The memberships a real 1.21.1 server put on the wire, per registry.
+///
+/// The stored form is not the wire form: a tag file may name another tag, and
+/// the client is sent a flat list of ids. Vanilla's own files carry 3,655
+/// plain members and 154 references between them; flattened, that is the 6,362
+/// below. **This is the check that says the flattening is right**, and it is
+/// the only one available — a resolver tested against its own idea of what a
+/// reference means would agree with itself under any definition.
+const CAPTURED_ENTRIES: &[(&str, usize)] = &[
+    ("minecraft:block", 3289),
+    ("minecraft:entity_type", 252),
+    ("minecraft:worldgen/biome", 554),
+    ("minecraft:game_event", 119),
+    ("minecraft:item", 1512),
+    ("minecraft:point_of_interest_type", 30),
+    ("minecraft:enchantment", 301),
+    ("minecraft:fluid", 4),
+    ("minecraft:damage_type", 176),
+    ("minecraft:banner_pattern", 42),
+    ("minecraft:cat_variant", 21),
+    ("minecraft:instrument", 16),
+    ("minecraft:painting_variant", 46),
+];
+
+#[test]
+fn the_flattened_membership_counts_are_the_ones_a_real_server_sent() {
+    let mut total = 0;
+    for (registry, (name, expected)) in TagRegistry::ALL.into_iter().zip(CAPTURED_ENTRIES) {
+        assert_eq!(&registry.name(), name);
+        let wire = tags::wire(registry).expect("every tag resolves");
+        let found: usize = wire.iter().map(|tag| tag.entries.len()).sum();
+        assert_eq!(found, *expected, "{name} flattened memberships");
+        total += found;
+    }
+    assert_eq!(
+        total, 6362,
+        "the whole packet, as it was counted off the wire"
+    );
+}
+
+#[test]
+fn a_reference_becomes_the_ids_it_points_at() {
+    // `minecraft:logs` is four other tags and no plain member at all. On the
+    // wire it is every log, which is what makes an axe work on all of them.
+    let stored = tags::from_id(TagRegistry::Block, "minecraft:logs").expect("a vanilla tag");
+    assert!(
+        stored.members.iter().all(|m| m.starts_with('#')),
+        "minecraft:logs is references and nothing else"
+    );
+    let wire = tags::wire(TagRegistry::Block).expect("resolves");
+    let logs = wire
+        .iter()
+        .find(|tag| tag.id == "minecraft:logs")
+        .expect("still there");
+    assert!(logs.entries.len() > stored.members.len());
+    let oak = Block::from_name("minecraft:oak_log").expect("a block");
+    assert!(logs.entries.contains(&oak.protocol_id()));
+}
+
+#[test]
+fn the_ids_of_every_tag_are_ascending_and_unique() {
+    // The client builds a set, and two tags reaching one member through
+    // different references is ordinary — `logs` and `logs_that_burn` overlap.
+    for registry in TagRegistry::ALL {
+        for tag in tags::wire(registry).expect("resolves") {
+            assert!(
+                tag.entries.windows(2).all(|pair| pair[0] < pair[1]),
+                "{} repeats or misorders an id",
+                tag.id
+            );
+        }
+    }
+}
+
+#[test]
+fn a_biome_tag_numbers_its_members_the_way_the_sync_does() {
+    // The load-bearing one. A chunk's biome container and a biome tag both
+    // carry ids, and both have to mean the same thing — the position in the
+    // registry the server synced. Taken from anywhere else, the client would
+    // have two meanings for one number.
+    let wire = tags::wire(TagRegistry::Biome).expect("resolves");
+    let overworld = wire
+        .iter()
+        .find(|tag| tag.id == "minecraft:is_overworld")
+        .expect("a vanilla biome tag");
+    let biomes = dust_registry::synced::by_name("minecraft:worldgen/biome").expect("synced");
+    let plains = biomes.id_of("minecraft:plains").expect("plains is a biome") as u32;
+    assert!(overworld.entries.contains(&plains));
+    for id in &overworld.entries {
+        assert!(
+            (*id as usize) < biomes.entries.len(),
+            "{id} is past the end of the synced registry"
+        );
+    }
+}
+
+#[test]
+fn the_wire_order_is_the_same_every_time() {
+    // The client builds a set and does not care, but two builds of this server
+    // that disagreed about the order would produce a diff nobody could read
+    // and a capture nobody could compare. Vanilla's own order is its map's,
+    // which is why the byte streams are the same length and not the same
+    // bytes — the contents were compared as sets against a real server and
+    // matched exactly, all 514 tags and all 6,362 ids.
+    for registry in TagRegistry::ALL {
+        let once = tags::wire(registry).expect("resolves");
+        let twice = tags::wire(registry).expect("resolves");
+        assert_eq!(once, twice);
+        assert!(
+            once.windows(2).all(|pair| pair[0].id < pair[1].id),
+            "{} is not in id order",
+            registry.name()
+        );
+    }
 }

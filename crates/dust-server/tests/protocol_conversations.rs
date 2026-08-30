@@ -650,16 +650,45 @@ fn an_offline_login_runs_the_whole_configuration_exchange_and_reaches_play() {
     // Echoed back verbatim, which is what a client that has the pack does.
     send_compressed_frame(&mut stream, 0x07, &body);
 
-    // Eleven registries, names only. The entry payloads are absent because the
-    // pack was acknowledged, and absent is not the same as empty: an empty
-    // definition would put the client in a world with no dimension types.
+    // Eleven registries, names only, and then the tags. The entry payloads are
+    // absent because the pack was acknowledged, and absent is not the same as
+    // empty: an empty definition would put the client in a world with no
+    // dimension types.
     let mut seen = Vec::new();
+    let mut tag_registries: Vec<(String, i32, i32)> = Vec::new();
     loop {
         let (id, body) = recv_compressed_frame(&mut stream);
         if id == 0x03 {
             break; // finish_configuration
         }
-        assert_eq!(id, 0x07, "only registry_data comes between");
+        if id == 0x0d {
+            // update_tags, after the registries and before the finish, which
+            // is where vanilla puts it. Read whole rather than skipped: a tag
+            // is ids into a registry, and this is the only place the entries
+            // are counted by something that did not build them.
+            let (registries, mut rest) = read_var_int_from(&body);
+            for _ in 0..registries {
+                let (registry, after) = read_string_at(rest);
+                let registry = registry.to_owned();
+                let (tags, after) = read_var_int_from(after);
+                rest = after;
+                let mut entries = 0;
+                for _ in 0..tags {
+                    let (_name, after) = read_string_at(rest);
+                    let (count, after) = read_var_int_from(after);
+                    rest = after;
+                    for _ in 0..count {
+                        let (_id, after) = read_var_int_from(rest);
+                        rest = after;
+                    }
+                    entries += count;
+                }
+                tag_registries.push((registry, tags, entries));
+            }
+            assert!(rest.is_empty(), "update_tags had trailing bytes");
+            continue;
+        }
+        assert_eq!(id, 0x07, "only registry_data and update_tags come between");
         let (registry, rest) = read_string_at(&body);
         let registry = registry.to_owned();
         let (count, mut rest) = read_var_int_from(rest);
@@ -671,6 +700,30 @@ fn an_offline_login_runs_the_whole_configuration_exchange_and_reaches_play() {
         assert!(rest.is_empty(), "{registry} had trailing bytes");
         seen.push((registry, count));
     }
+
+    // The thirteen tag registries, their tag counts and their flattened
+    // membership counts, exactly as a real 1.21.1 server sent them: 514 tags
+    // and 6,362 ids in 25,200 bytes. Read here by a client that shares no code
+    // with the server, so this is the numbers meeting the wire and not the
+    // generated table agreeing with itself.
+    assert_eq!(
+        tag_registries,
+        vec![
+            ("minecraft:block".to_owned(), 184, 3289),
+            ("minecraft:entity_type".to_owned(), 34, 252),
+            ("minecraft:worldgen/biome".to_owned(), 70, 554),
+            ("minecraft:game_event".to_owned(), 5, 119),
+            ("minecraft:item".to_owned(), 147, 1512),
+            ("minecraft:point_of_interest_type".to_owned(), 3, 30),
+            ("minecraft:enchantment".to_owned(), 22, 301),
+            ("minecraft:fluid".to_owned(), 2, 4),
+            ("minecraft:damage_type".to_owned(), 32, 176),
+            ("minecraft:banner_pattern".to_owned(), 9, 42),
+            ("minecraft:cat_variant".to_owned(), 2, 21),
+            ("minecraft:instrument".to_owned(), 3, 16),
+            ("minecraft:painting_variant".to_owned(), 1, 46),
+        ]
+    );
 
     // The eleven and their counts, as the real server sent them.
     assert_eq!(
@@ -759,6 +812,18 @@ fn an_offline_login_runs_the_whole_configuration_exchange_and_reaches_play() {
         event[0], 13,
         "game event 13 is what ends the loading screen; without it the terrain \
          arrives and the client keeps waiting"
+    );
+
+    // Health, which vanilla sends last in the join burst and Dust sends in
+    // the same place. Not decoration: a client may treat this packet as the
+    // moment it is in the world, and one sent before the position leaves such
+    // a client believing it spawned at the origin.
+    let (id, health) = recv_compressed_frame(&mut stream);
+    assert_eq!(id, 93, "set_health");
+    assert_eq!(
+        f32::from_be_bytes([health[0], health[1], health[2], health[3]]),
+        20.0,
+        "full health"
     );
 
     // A player is told about their own arrival, as on every server since
