@@ -99,7 +99,14 @@ pub const BRAND: &str = "Dust";
 pub enum Configured {
     /// The client acknowledged, the registries went out, and both ends are in
     /// Play.
-    Ready,
+    Ready {
+        /// How far the client asked to see, if it said. A *request*, and the
+        /// server serves the smaller of this and its own setting: a client
+        /// asking for thirty-two on a server configured for eight gets eight,
+        /// and one asking for two gets two and is spared 285 columns it does
+        /// not want.
+        view_distance: Option<u32>,
+    },
     /// The client did not acknowledge the core pack, so its registries have
     /// to carry their contents and no `[data] path` supplied any.
     UnknownContent,
@@ -164,6 +171,7 @@ where
     // client sends `client_information` during configuration and may send it
     // before or after the pack answer, so this reads until the answer arrives
     // rather than assuming it is next.
+    let mut requested_view_distance = None;
     let acknowledged = loop {
         let Some(frame) = conn.next_frame().await? else {
             return Err(SessionError::Conn(ConnError::Closed));
@@ -177,10 +185,18 @@ where
                         && pack.version.as_str() == pack_version
                 });
             }
-            // Language, view distance, chat settings, skin parts. Nothing here
-            // acts on them yet; they are read so the frame is consumed and the
-            // stream stays in step.
-            configuration::serverbound::Packet::ClientInformation(_) => {}
+            // Language, chat settings, skin parts — read so the frame is
+            // consumed and the stream stays in step. The view distance is the
+            // one field acted on, and it is kept rather than used here because
+            // what consumes it is the join, several packets later.
+            //
+            // A client may send this again during play to change its settings.
+            // That is not handled: the distance a player is served is settled
+            // at the join, and re-streaming on a settings change is work with
+            // nothing behind it until there is a per-tick budget to do it in.
+            configuration::serverbound::Packet::ClientInformation(info) => {
+                requested_view_distance = u32::try_from(info.view_distance).ok();
+            }
             configuration::serverbound::Packet::CustomPayload(_) => {}
             other => {
                 return Err(SessionError::OutOfTurn {
@@ -268,8 +284,13 @@ where
         let mut reader = Reader::new(&frame.body);
         match configuration::serverbound::Packet::decode_body(frame.id, &mut reader, version)? {
             configuration::serverbound::Packet::FinishConfiguration(_) => break,
-            configuration::serverbound::Packet::ClientInformation(_)
-            | configuration::serverbound::Packet::CustomPayload(_)
+            // A client that sends its settings *after* the pack answer is as
+            // ordinary as one that sends them before, and the first loop above
+            // may never have seen them.
+            configuration::serverbound::Packet::ClientInformation(info) => {
+                requested_view_distance = u32::try_from(info.view_distance).ok();
+            }
+            configuration::serverbound::Packet::CustomPayload(_)
             | configuration::serverbound::Packet::Pong(_)
             | configuration::serverbound::Packet::KeepAlive(_) => {}
             other => {
@@ -281,7 +302,9 @@ where
         }
     }
 
-    Ok(Configured::Ready)
+    Ok(Configured::Ready {
+        view_distance: requested_view_distance,
+    })
 }
 
 /// Every tag of every registry, in the form `update_tags` carries.

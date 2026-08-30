@@ -13,6 +13,12 @@ motd = "A Dust server"
 max_players = 20
 online_mode = true
 
+# How far players can see, in chunks. The whole square goes out in one burst
+# when somebody joins — 289 columns at 8, 25 at 2 — so this is the setting to
+# lower on a small machine. A client that asks for less than this gets what it
+# asked for; one that asks for more gets this.
+view_distance = 8
+
 # After a stall (a slow disk, a paused laptop) the tick loop repays at most
 # this many ticks per pass and skips past anything longer. Twenty is one
 # second of game time: shorter stalls catch up smoothly, longer ones are

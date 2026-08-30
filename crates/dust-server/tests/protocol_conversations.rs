@@ -271,7 +271,20 @@ fn start(extra_config: &str) -> Running {
 /// shared world would make one test's blocks appear in another's.
 fn start_in(world_dir: &std::path::Path, extra_config: &str) -> Running {
     let clock = Arc::new(ManualClock::new());
-    let config = format!("[server]\nbind = \"127.0.0.1:0\"\nonline_mode = false\n{extra_config}");
+    // A view distance of two, said out loud — unless the caller named one, in
+    // which case theirs stands and a second key would be a TOML error rather
+    // than an override. The default is eight, which is 289 columns per join: a
+    // megabyte of packets and a second of lighting, multiplied by every test in
+    // this file. Two is twenty-five, which is what the assertions below count,
+    // and a test that counts twenty-five columns should be the thing that asked
+    // for them.
+    let distance = if extra_config.contains("view_distance") {
+        ""
+    } else {
+        "view_distance = 2\n"
+    };
+    let config =
+        format!("[server]\nbind = \"127.0.0.1:0\"\nonline_mode = false\n{distance}{extra_config}");
 
     let options = ServerOptions {
         config_path: write_config(&config),
@@ -458,6 +471,29 @@ fn join(stream: &mut TcpStream, addr: SocketAddr) -> Joined {
 
 /// Join under a chosen name, so two clients in one test are two players.
 fn join_as(stream: &mut TcpStream, addr: SocketAddr, name: &str) -> Joined {
+    join_inner(stream, addr, name, None)
+}
+
+/// Join, telling the server how far this client wants to see.
+///
+/// The settings packet is written by hand like every other packet in this
+/// file: a client that built it out of the server's own definitions would
+/// agree with the server about a layout neither of them checked.
+fn join_asking_for_view_distance(
+    stream: &mut TcpStream,
+    addr: SocketAddr,
+    name: &str,
+    view_distance: u8,
+) -> Joined {
+    join_inner(stream, addr, name, Some(view_distance))
+}
+
+fn join_inner(
+    stream: &mut TcpStream,
+    addr: SocketAddr,
+    name: &str,
+    view_distance: Option<u8>,
+) -> Joined {
     handshake(stream, 767, addr, 2);
     let mut body = Vec::new();
     write_string(name, &mut body);
@@ -481,6 +517,20 @@ fn join_as(stream: &mut TcpStream, addr: SocketAddr, name: &str) -> Joined {
         postures: 0,
         spawned_at: None,
     };
+    if let Some(distance) = view_distance {
+        // `client_information`: locale, view distance, chat mode, colours,
+        // skin parts, main hand, text filtering, server listings.
+        let mut settings = Vec::new();
+        write_string("en_gb", &mut settings);
+        settings.push(distance);
+        write_var_int(0, &mut settings); // chat mode: enabled
+        settings.push(1); // chat colours
+        settings.push(0x7f); // every skin part
+        write_var_int(1, &mut settings); // main hand: right
+        settings.push(0); // text filtering off
+        settings.push(1); // allow server listings
+        send_compressed_frame(stream, 0x00, &settings);
+    }
     loop {
         let (id, body) = recv_compressed_frame(stream);
         match id {
@@ -1914,5 +1964,43 @@ fn a_player_already_crouching_is_crouching_to_whoever_arrives_next() {
     drop(watcher_stream);
     drop(sneaker_stream);
     drop(observer_stream);
+    running.finish();
+}
+
+/// A client that asks for less than the server offers is served less.
+///
+/// The view distance is a ceiling on the server and a *request* from the
+/// client, and the smaller of the two wins. A client asking for two on a
+/// server set to eight is spared 264 columns it would throw away; a client
+/// asking for thirty-two on the same server still gets eight.
+///
+/// Asserted by counting columns rather than by reading a field: what the join
+/// packet advertises and what the streaming actually sends are two answers to
+/// one question, and only the second is the one a player sees.
+#[test]
+fn a_client_asking_for_a_shorter_view_is_given_the_shorter_one() {
+    // The server offers four — 81 columns — and the client will ask for one,
+    // which is nine.
+    let running = start("view_distance = 4\n");
+    let addr = running.addr;
+    let mut stream = connect(addr);
+    let joined = join_asking_for_view_distance(&mut stream, addr, "Nearsighted", 1);
+    assert_eq!(
+        joined.chunks, 9,
+        "three by three, which is what the client asked for"
+    );
+    drop(stream);
+    running.finish();
+}
+
+/// A client that asks for more than the server offers is held to the server's.
+#[test]
+fn a_client_asking_for_a_longer_view_is_held_to_the_server_s() {
+    let running = start("view_distance = 2\n");
+    let addr = running.addr;
+    let mut stream = connect(addr);
+    let joined = join_asking_for_view_distance(&mut stream, addr, "Farsighted", 32);
+    assert_eq!(joined.chunks, 25, "five by five, which is the server's");
+    drop(stream);
     running.finish();
 }

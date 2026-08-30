@@ -14,7 +14,9 @@ is still there after a restart, along with where they were standing.
 `dust server` binds `[server].bind`, answers the server-list ping with the MOTD,
 player count and favicon from `dust.toml`, runs login in either offline or
 online mode, syncs the eleven datapack registries a 1.21.1 client needs, streams
-chunks as players move, and keeps the connection up.
+chunks as players move out to `[server].view_distance`, and keeps the connection
+up. That distance is a ceiling: the client asks for one of its own during
+configuration and is served the smaller of the two.
 
 **Tags go out, all thirteen registries of them** — 514 tags flattened to
 6,362 registry ids, which is exactly what a real 1.21.1 server sends, compared

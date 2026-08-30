@@ -61,6 +61,16 @@ pub struct ServerConfig {
     #[config(restart)]
     pub shutdown_timeout_secs: u32,
 
+    /// How many columns out from a player are streamed, in every direction. A
+    /// view distance of 8 sends 289 columns on join and 2 sends 25, and the
+    /// join sends them in one burst: measured against a real world in release,
+    /// 25 columns take about half a second of streaming and 289 about two, so
+    /// the difference is roughly five milliseconds a column. The client asks
+    /// for a distance of its own and is served the smaller of the two, so this
+    /// is a ceiling rather than a demand.
+    #[config(restart)]
+    pub view_distance: u32,
+
     /// The lowest severity the server logs: one of `error`, `warn`, `info`,
     /// `debug`, `trace`. Everything less severe than the chosen level is
     /// suppressed.
@@ -90,6 +100,14 @@ impl Default for ServerConfig {
             online_mode: true,
             max_catchup_ticks: 20,
             shutdown_timeout_secs: 10,
+            // Eight, which is what a great many servers run and what a
+            // client sees as a reasonable distance. Not vanilla's ten: a join
+            // sends every column in one burst here, and 289 of them is already
+            // a second of work on a slow machine where 441 is nearly two. The
+            // number goes up when the streaming has a per-tick budget, which
+            // is Phase 17's, and the setting is the thing that will not have
+            // to be invented then.
+            view_distance: 8,
             log_level: LogLevel::default(),
             world_source: String::new(),
             favicon: String::new(),
@@ -116,6 +134,21 @@ impl ServerConfig {
             findings.push(Finding::error(
                 format!("{path}.shutdown_timeout_secs"),
                 "must be at least 1; at 0 seconds nothing graceful can finish",
+            ));
+        }
+        if self.view_distance == 0 {
+            findings.push(Finding::error(
+                format!("{path}.view_distance"),
+                "must be at least 1; at 0 a player is sent the column they are                  standing in and nothing else, and the world ends at the chunk                  border",
+            ));
+        }
+        // A ceiling rather than a taste. 32 is vanilla's own maximum and 65x65
+        // columns is already four thousand in one burst; past it the number is
+        // not a view distance, it is a way to make a join never finish.
+        if self.view_distance > 32 {
+            findings.push(Finding::error(
+                format!("{path}.view_distance"),
+                "must be at most 32, which is Minecraft's own maximum; beyond                  that a join sends more columns than it can finish",
             ));
         }
     }
