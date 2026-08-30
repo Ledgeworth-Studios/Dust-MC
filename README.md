@@ -206,13 +206,20 @@ from `TAG_Double` to `TAG_Float` produced four findings naming the field.
 
 `light` puts a number on how close the sky light is. A chunk Minecraft wrote
 carries the light Minecraft computed, so the same chunks can be lit again with
-Dust's engine and compared cell by cell. On seed 0 it reads **99.41%** at radius
-2, 4 and 6 alike, and **every single one of the disagreements is Dust being
-darker** — which is the direction both known gaps point in. What the shortfalls
-are standing in is the whole diagnosis: leaves, water, grass and seagrass, every
-one of them a block Minecraft gives a small opacity and Dust treats as a wall,
-because light emission and opacity are code constants in Minecraft and are in no
-report and no data pack.
+Dust's engine and compared cell by cell.
+
+**The percentage turns out to be a property of the world rather than of the
+engine, which is worth knowing before quoting it.** Seed 0 reads 99.4%; seed 1
+reads 96.4% with the same server, because it spawns in deep ocean and 168,428 of
+its 169,480 shortfalls are water — an even 12,544 cells at each level from
+fourteen downwards, one per column per level, the water column marching down.
+
+What is invariant is the shape. On both seeds and at every radius, **every
+single disagreement is Dust being darker** — the direction both known gaps point
+in — and the shortfalls are one block list: water, leaves, grass, seagrass,
+kelp. Every one a block Minecraft gives an opacity of one or two and Dust treats
+as a wall, because light emission and opacity are code constants in Minecraft
+and are in no report and no data pack.
 
 It is a measurement and not a gate — the number is expected to be short of a
 hundred per cent today, and a verb that failed for a known gap would be red

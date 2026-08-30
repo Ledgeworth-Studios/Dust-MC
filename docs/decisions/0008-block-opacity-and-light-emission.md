@@ -24,22 +24,27 @@ piece of data nobody can currently get.
 light Minecraft computed into its own region files, lights the same chunks with
 Dust's engine, and compares cell by cell.
 
-**99.41% of cells agree, at radius 2, 4 and 6 alike, and every single one of
-the disagreements is Dust being darker.** What the shortfalls are standing in is
-the diagnosis rather than a guess:
+**Every single disagreement is Dust being darker** — the direction both known
+gaps point in — and the shortfalls are one block list:
 
 ```text
-minecraft:oak_leaves      the largest share
-minecraft:water           the next
-minecraft:birch_leaves
-minecraft:air             the cells those shadows fall into
-minecraft:short_grass, seagrass, flowers
+seed 0, radius 2/4/6      99.4% agree     oak leaves, water, birch leaves,
+                                          short grass, seagrass, flowers
+seed 1, radius 2/3        96.4% agree     water (168,428 of 169,480),
+                                          seagrass, kelp
 ```
 
-Every one of them a block Minecraft gives an opacity of one or two and Dust
-treats as a wall. So the cost of this decision is known to three decimal places
-and its cause is named block by block, which is an unusually good position from
-which to not have decided something.
+**The percentage is a property of the world and not of the engine**, and that
+matters for how this decision is argued. Seed 1 spawns in deep ocean, so its
+shortfall is an even 12,544 cells at each level from fourteen downwards — one
+per column per level, the water column marching down — and the server is the
+same server that reads 99.4% on seed 0. What is invariant is the *shape*: one
+direction, one block list, every one a block Minecraft gives an opacity of one
+or two.
+
+So the cost of this decision is known block by block, and its size is known to
+depend on how much water and foliage a world has. That is an unusually good
+position from which to not have decided something.
 
 ## Options
 
@@ -94,7 +99,8 @@ Phase 10's.
   the same walks vanilla does. It is waiting on emission values and nothing
   else.
 - **Sky light stops at the surface of an ocean and under a tree**, which is
-  visible to a player and is the largest share of the 0.59%.
+  visible to a player and is nearly all of the shortfall. On an ocean spawn it
+  is 3.5% of every cell in view.
 - **`opacity_of` is the one place this is decided**, and it says so. Whichever
   option is taken changes that function and nothing else.
 
