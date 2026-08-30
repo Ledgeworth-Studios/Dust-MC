@@ -79,6 +79,7 @@ pub mod histogram;
 pub mod logging;
 pub mod net;
 pub mod participant;
+pub mod registries;
 pub mod server;
 pub mod stop;
 pub mod tasks;

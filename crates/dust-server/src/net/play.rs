@@ -453,6 +453,26 @@ pub fn default_spawn(at: (f64, f64, f64)) -> play::clientbound::SetDefaultSpawnP
     }
 }
 
+/// Full health, a full hunger bar, and vanilla's starting saturation.
+///
+/// Nothing in this server damages anybody yet, so this is a constant rather
+/// than a reading — and it is sent anyway, because it is not only decoration.
+/// A vanilla client that is never told its health assumes it is alive and
+/// renders a full bar; `mineflayer` waits for this packet before it considers
+/// itself in the world at all, and without it a bot connects, receives its
+/// position and every chunk around it, and then sits in the loading state
+/// forever. Vanilla sends it on join, so Dust does.
+///
+/// Saturation is 5.0 and not 20.0: a fresh vanilla player has five, which is
+/// why sprinting starts eating into the hunger bar as soon as it does.
+pub fn full_health() -> play::clientbound::SetHealth {
+    play::clientbound::SetHealth {
+        health: 20.0,
+        food: VarInt(20),
+        food_saturation: 5.0,
+    }
+}
+
 /// The world clock.
 ///
 /// Two numbers, and they mean different things. `world_age` only ever counts

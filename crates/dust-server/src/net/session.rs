@@ -119,6 +119,17 @@ pub struct SessionContext {
     pub roster: super::players::SharedRoster,
     /// `minecraft:player`'s id in the entity-type registry, resolved at boot.
     pub player_entity_type: i32,
+    /// The contents of the registries Dust can serve, read at boot from
+    /// `[data] path`.
+    ///
+    /// Empty when no such path is set, which is the state that makes a client
+    /// acknowledging no data packs unservable. Held by value rather than
+    /// behind a lock: it is read on every join and written never — a reload
+    /// that changed it would be changing what a *joining* client is told, so
+    /// it is a restart-scoped setting and the type says so by not being
+    /// mutable.
+    pub registry_contents: crate::registries::Loaded,
+
     /// Where each player was when they last left, by profile id.
     ///
     /// Read on join and written on leave, so a reconnecting player lands where
@@ -191,6 +202,10 @@ pub enum SessionError {
         state: &'static str,
         packet: &'static str,
     },
+    /// A registry entry loaded from the operator's data would not encode as
+    /// NBT. Separate from `Encode` because the cause is a file rather than a
+    /// packet definition, and the operator can do something about it.
+    RegistryContents(String),
 }
 
 impl std::fmt::Display for SessionError {
@@ -201,6 +216,9 @@ impl std::fmt::Display for SessionError {
             Self::Encode(e) => write!(f, "encode: {e}"),
             Self::OutOfTurn { state, packet } => {
                 write!(f, "{packet} is not allowed in the {state} state")
+            }
+            Self::RegistryContents(detail) => {
+                write!(f, "a registry entry would not encode as NBT: {detail}")
             }
         }
     }
@@ -490,6 +508,13 @@ where
         version,
     )
     .await?;
+
+    // Health, last, exactly where vanilla puts it — and the position in the
+    // order is load-bearing rather than tidy. `mineflayer` treats this packet
+    // as the moment it is in the world, so a server that sends it before the
+    // position has a bot that believes it spawned at the origin. Captured
+    // from vanilla's join burst, where it is the last packet sent.
+    send_play(conn, play_mod::full_health(), version).await?;
 
     // Join the roster *after* the world is on screen. The order matters the
     // same way the position does: an entity announced before the client has

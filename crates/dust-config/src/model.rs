@@ -22,6 +22,10 @@ pub struct DustConfig {
     /// World generation: the engine, and Dust's knobs over it.
     #[config(section)]
     pub worldgen: WorldgenConfig,
+
+    /// Where Minecraft's own data lives, for the parts of it Dust may not ship.
+    #[config(section)]
+    pub data: DataConfig,
 }
 
 /// Listener, identity and the basics a server needs to answer a ping.
@@ -180,4 +184,25 @@ pub struct WorldgenConfig {
     /// How common each ore is, and where it generates.
     #[config(section)]
     pub ores: OresConfig,
+}
+
+/// Where Minecraft's own data lives.
+///
+/// Dust ships no Mojang content. The names of the datapack registries are
+/// facts about a protocol and are generated into the build; the *contents* of
+/// an entry — a biome's colours, a dimension's height — are Mojang's, and they
+/// come from a copy the operator already has. Decision record 0007 has the
+/// reasoning and record 0006 has the precedent.
+///
+/// Leaving this unset costs one thing and only one: a client that acknowledges
+/// no data packs cannot be served, because it has no copy of its own to fall
+/// back on. Vanilla clients acknowledge `minecraft:core` and are unaffected.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, ConfigSection)]
+#[serde(default, deny_unknown_fields)]
+pub struct DataConfig {
+    /// Directory holding Minecraft's data in the usual datapack layout — the
+    /// one containing `minecraft/`, which is `data/` inside a datapack. Unset
+    /// means Dust has no registry contents to send.
+    #[config(restart)]
+    pub path: Option<String>,
 }

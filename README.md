@@ -15,6 +15,15 @@ player count and favicon from `dust.toml`, runs login in either offline or
 online mode, syncs the eleven datapack registries a 1.21.1 client needs, streams
 chunks as players move, and keeps the connection up.
 
+**`mineflayer` joins it.** That matters more than it sounds: a client that does
+not track data packs has no copy of the registry contents to fall back on, and
+until now Dust had none to send it, so most of the bot and proxy ecosystem was
+refused at configuration. Point `[data].path` at a copy of Minecraft's data —
+the one the operator already has, since none of it is shipped here — and Dust
+sends the two registries such a client cannot manage without. See decision
+record [0007](docs/decisions/0007-registry-contents.md) for where the line
+between a protocol fact and Mojang's content falls, and why it falls there.
+
 **It can serve a world Minecraft made, and hand one back.** Point
 `[server].world_source` at a region directory and Dust reads the columns out of
 it — blocks, their properties, biomes, heightmaps — and streams them. It also
@@ -63,8 +72,9 @@ convention including a wrong one.
 
 And the formats are **captured from a running Minecraft 1.21.1 server** rather
 than read off a wiki: the configuration order, the eleven registries and their
-entry counts, the offline-mode UUID derivation, and a chunk section decoded
-field by field until its 18,779 bytes were consumed exactly.
+entry counts, the NBT type of every field in a dimension type and a biome, the
+offline-mode UUID derivation, and a chunk section decoded field by field until
+its 18,779 bytes were consumed exactly.
 
 Doing that found three defects in an afternoon, each with passing tests over it:
 
