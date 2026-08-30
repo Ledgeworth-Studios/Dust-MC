@@ -46,16 +46,29 @@
 //! than vanilla is a third thing and is counted separately: it means light
 //! arriving where vanilla says none does, which neither gap explains.
 //!
-//! **The number is stable across radii, and getting it there took two skips.**
-//! On seed 0 it reads 99.42% at radius 2, 4, 5 and 6 alike. It did not at
-//! first: at radius 5 it read 98.1% with 167,000 over-lit cells, because a
-//! world holds partly-generated chunks around whatever was forced and vanilla
-//! only lights a chunk once it reaches `full`. Comparing against light vanilla
-//! had not finished computing measures nothing, so those are skipped and the
-//! count is printed. A column missing a neighbour is skipped for the same
-//! reason. What survives at radius 4 is thirty-two over-lit cells in eight
-//! million, all air, all by one or two — a residual neither gap accounts for
-//! and small enough to be reported rather than explained away.
+//! **There are no over-lit cells, at any radius, and getting to that took
+//! three corrections — every one of them to this harness rather than to the
+//! engine.** On seed 0 it reads 99.41% at radius 2, 4 and 6 alike, and every
+//! one of the disagreements is Dust being darker.
+//!
+//! 1. It lit each column against *itself* on all four sides. A column lower
+//!    than its neighbour was told the neighbour was as low as it, so light
+//!    came in from a side vanilla says is a wall: 805 over-lit cells.
+//! 2. It compared chunks vanilla had not finished. A world holds
+//!    partly-generated chunks around whatever was forced, and vanilla lights a
+//!    chunk when it reaches `full`: 167,000 more, and the agreement fell to
+//!    98.1% with no change to the engine.
+//! 3. It took sky floors from *neighbours* vanilla had not finished. A
+//!    neighbour below `full` has different blocks than the ones vanilla lit
+//!    against, so Dust was told there was open sky where the finished world
+//!    has terrain: the last thirty-two, every one within a step of a chunk
+//!    edge, in a fading gradient, each exactly one brighter than vanilla.
+//!
+//! Every one was caught by the same thing — the report separates over-lighting
+//! from under-lighting, and both known gaps under-light — and the last was
+//! found by printing the coordinates and seeing that all thirty-two sat on an
+//! edge. A single "0.6% disagree" line would have hidden all three inside a
+//! number that already looked good.
 //!
 //! # Exit codes
 //!
@@ -238,9 +251,20 @@ fn measure(options: &Options) -> Result<(), String> {
             if floors.contains_key(&(nx, nz)) {
                 continue;
             }
-            // A neighbour outside the generated world has no floors to
-            // give, and a column with one is skipped below rather than lit
-            // against a guess.
+            // Only from a neighbour vanilla finished. **A neighbour below
+            // `full` has different blocks than the ones vanilla lit against**,
+            // so its sky floor is a different world's — and the column beside
+            // it comes out brighter than vanilla, because Dust is told there
+            // is open sky where the finished world has terrain. That is what
+            // the last thirty-two over-lit cells were: every one of them
+            // within a step of a chunk edge, in a fading gradient, each
+            // exactly one brighter than vanilla.
+            //
+            // A column with a neighbour missing from this map is skipped
+            // below rather than lit against a guess.
+            if !is_full(&region_dir, nx, nz)? {
+                continue;
+            }
             if let Ok(chunk) = dust_chunk(&region_dir, nx, nz, height, &names, air) {
                 floors.insert((nx, nz), SkyFloor::of(&chunk));
             }
@@ -303,6 +327,18 @@ fn measure(options: &Options) -> Result<(), String> {
 
     report(&tally);
     Ok(())
+}
+
+/// Whether vanilla finished generating — and therefore lighting — this chunk.
+///
+/// `digest::scan` refuses a chunk below `full` for the same reason: what is
+/// stored under it is a partial answer that looks like a complete one.
+fn is_full(region_dir: &Path, x: i32, z: i32) -> Result<bool, String> {
+    let Some(root) = read(region_dir, x, z)? else {
+        return Ok(false);
+    };
+    let status = root.get("Status").and_then(nbt::Node::as_str);
+    Ok(matches!(status, Some("minecraft:full" | "full")))
 }
 
 fn read(region_dir: &Path, x: i32, z: i32) -> Result<Option<nbt::Node>, String> {
@@ -482,6 +518,15 @@ fn compare(
                     *tally.darker.entry(want - got).or_default() += 1;
                     *tally.darker_blocks.entry(name).or_default() += 1;
                 } else {
+                    if std::env::var_os("DUST_LIGHT_TRACE").is_some() {
+                        let pos = chunk.pos();
+                        eprintln!(
+                            "over-lit: chunk {},{} local ({x},{y},{z}) vanilla={want} dust={got}                              edge={}",
+                            pos.x,
+                            pos.z,
+                            x == 0 || x == 15 || z == 0 || z == 15
+                        );
+                    }
                     *tally.brighter.entry(got - want).or_default() += 1;
                     *tally.brighter_blocks.entry(name).or_default() += 1;
                 }
