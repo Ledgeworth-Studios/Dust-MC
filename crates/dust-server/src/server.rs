@@ -1263,6 +1263,16 @@ mod tests {
     use std::io::Write;
     use std::sync::Mutex;
 
+    /// A world directory of this run's own; see the note where it is used.
+    fn test_world_dir() -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "dust-server-unit-world-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst),
+        ))
+    }
+
     /// A unique temp file per call: tests run in parallel in one process, and
     /// two of them sharing a config path would share a fate.
     fn write_config(text: &str) -> PathBuf {
@@ -1341,6 +1351,13 @@ mod tests {
         let config_path = write_config(&with_test_bind(config_text));
         let mut options = ServerOptions {
             config_path: config_path.clone(),
+            // A directory of this run's own. The default is `world`, which is
+            // *relative*, so every test that took it shared one directory
+            // under the crate root — and they run in parallel. Two servers
+            // saving into and removing the same one produce "the world could
+            // not be saved: No such file or directory", which is a shutdown
+            // failing for a reason unrelated to what the test was checking.
+            world_dir: test_world_dir(),
             clock: Arc::clone(&clock) as Arc<dyn Clock>,
             // The tick loop parks by advancing virtual time; the watchdog
             // deliberately keeps the default condvar park. A stepper would
@@ -1361,17 +1378,32 @@ mod tests {
         (run, server)
     }
 
-    /// Wait for progress without sleeping: bounded cooperative spinning,
-    /// panicking loudly if the server never gets there.
+    /// Wait for the loop to run `minimum` ticks, or give up after a deadline.
+    ///
+    /// **In seconds and not in iterations**, for the same reason its sibling in
+    /// `tests/lifecycle.rs` is: this spun ten million times on `yield_now`,
+    /// which measures patience in yields — and a yield costs almost nothing on
+    /// an idle machine and a scheduling quantum on a busy one. A wait that is
+    /// shortest when nothing else is running is a wait that fails on exactly
+    /// the machine where nothing else is wrong.
+    ///
+    /// Thirty seconds is patience with the OS scheduler and not tolerance for
+    /// a slow loop: the loop under test parks on a virtual clock and does no
+    /// real work, so a healthy one is done in milliseconds. Sleeping rather
+    /// than spinning, because this thread has nothing to do until the loop has
+    /// run and a spin denies it the core it is waiting on.
     fn wait_until_ticks(metrics: &LiveMetrics, minimum: u64) {
-        for _ in 0..10_000_000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
             if metrics.ticks_observed() >= minimum {
                 return;
             }
-            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         panic!(
-            "the server never reached {minimum} tick(s); stuck at {}",
+            "the server never reached {minimum} tick(s) in 30s; stuck at {}. A boot that \
+             failed leaves this at zero — read the log this test captured, or the error the \
+             run thread returned.",
             metrics.ticks_observed()
         );
     }

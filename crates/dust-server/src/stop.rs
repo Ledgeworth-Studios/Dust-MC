@@ -545,11 +545,20 @@ mod tests {
         // Arm, then wait for the watcher to march virtual time past grace on
         // its own — each of its parks steps 250 ms, five cross the line.
         assert!(stop_handle.request_stop());
-        for _ in 0..1_000_000 {
-            if watcher_fired.load(Ordering::SeqCst) {
+
+        // **Wait for the firing, not for the flag.** `watch_dog` sets `fired`
+        // and *then* calls the action, so a test that waited on the flag and
+        // read the list could win that race and see an empty one — which it
+        // did, roughly one run in three. The list is what the assertions are
+        // about, so the list is what to wait for.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            if !firings.lock().unwrap().is_empty() {
                 break;
             }
-            thread::yield_now();
+            // Sleeping rather than yielding: a wait counted in yields is
+            // shortest on an idle machine, which is where it then fails.
+            thread::sleep(std::time::Duration::from_millis(1));
         }
         assert!(
             watcher_fired.load(Ordering::SeqCst),

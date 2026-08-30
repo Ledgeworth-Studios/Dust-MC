@@ -67,15 +67,20 @@ async function main () {
   const under = watcher.blockAt(watcher.entity.position.offset(0, -1, 0))
   check('it can read the block under its feet', Boolean(under && under.name), under && under.name)
 
-  // Two things another player does that change no block and no position, and
-  // that a server can therefore drop without anything else noticing.
+  // Three things another player does that a server can drop without anything
+  // else noticing: two that change no block and no position at all, and one
+  // that changes a block but whose *effect* is a separate packet.
   let sawSwing = false
   let sawCrouch = false
+  let sawBreakEffect = null
   watcher._client.on('animation', () => { sawSwing = true })
   watcher._client.on('entity_metadata', p => {
     const flags = (p.metadata || []).find(m => m.key === 0)
     const pose = (p.metadata || []).find(m => m.key === 6)
     if (flags && pose && (flags.value & 0x02) && pose.value === 5) sawCrouch = true
+  })
+  watcher._client.on('world_event', p => {
+    if (p.effectId === 2001) sawBreakEffect = p
   })
 
   const actor = await spawned('Actor')
@@ -83,10 +88,27 @@ async function main () {
   actor.swingArm('right')
   await wait(500)
   actor.setControlState('sneak', true)
+  await wait(500)
+
+  // Breaking the block underfoot. `dig` waits for the server to confirm; the
+  // server answers a start-digging as a finished break, which is what a
+  // creative client sends and what this server honours.
+  const target = actor.blockAt(actor.entity.position.offset(0, -1, 0))
+  if (target) {
+    try { await actor.dig(target) } catch (e) { /* the effect is the check */ }
+  }
   await wait(SETTLE_MS)
 
   check('one player sees another swing', sawSwing)
   check('one player sees another crouch', sawCrouch, 'entity flag and pose together')
+  // The data is the *broken* block's state, not the air left behind — the
+  // client makes the particles and the sound out of it, and the air's id gives
+  // a silent puff of nothing.
+  check(
+    'one player sees another break a block',
+    Boolean(sawBreakEffect) && sawBreakEffect.data > 0,
+    sawBreakEffect ? `effect 2001, state ${sawBreakEffect.data}` : 'no world_event arrived'
+  )
 
   try { actor.quit() } catch (e) { /* already gone */ }
   try { watcher.quit() } catch (e) { /* already gone */ }

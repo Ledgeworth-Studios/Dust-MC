@@ -50,6 +50,25 @@ type ColumnEdits = HashMap<(i32, i32, i32), u32>;
 pub struct Edit {
     pub position: Position,
     pub state: u32,
+    /// Set when a player broke a block, so everybody else can be shown it
+    /// breaking. `None` for a placement, for a restore from the save file, and
+    /// for anything the server does on its own.
+    pub broke: Option<Broke>,
+}
+
+/// A block a player broke: what was there, and who took it.
+///
+/// Both halves are needed by the one packet that consumes this. The state is
+/// what the client makes the particles and the sound out of — it is the
+/// *broken* block's, not the air left behind — and the entity id is who to
+/// leave out, because their own client played the effect before the server
+/// heard about the dig and telling them again plays it twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Broke {
+    /// The block state that was there.
+    pub previous: u32,
+    /// The player who broke it.
+    pub by: i32,
 }
 
 /// How many block changes a slow session may fall behind before it is told it
@@ -154,6 +173,25 @@ impl EditedWorld {
     /// one refusal here — a client is entitled to ask about y = 1000 and this
     /// is not the place to be surprised by it.
     pub fn set_block(&self, position: Position, state: u32) -> bool {
+        if !self.set_block_quietly(position, state) {
+            return false;
+        }
+        // Errors when nobody is listening, which is the ordinary state of a
+        // server with no players and not a failure.
+        let _ = self.announce.send(Edit {
+            position,
+            state,
+            broke: None,
+        });
+        true
+    }
+
+    /// The write half of [`EditedWorld::set_block`], without the announcement.
+    ///
+    /// Split out so the two announcing callers cannot drift on what "change a
+    /// block" means — the height check and the map insert are one answer, and
+    /// only the sentence sent about it differs.
+    fn set_block_quietly(&self, position: Position, state: u32) -> bool {
         let world = self.generated.flat().height();
         if position.y < world.min_y() || position.y >= world.min_y() + world.height() as i32 {
             return false;
@@ -165,9 +203,48 @@ impl EditedWorld {
                 .or_default()
                 .insert(local_of(position), state);
         }
-        // Errors when nobody is listening, which is the ordinary state of a
-        // server with no players and not a failure.
-        let _ = self.announce.send(Edit { position, state });
+        true
+    }
+
+    /// Break a block on a player's behalf, and tell everyone what broke.
+    ///
+    /// The same change as [`EditedWorld::set_block`] to air, plus the one
+    /// thing that call cannot carry: what was there. A client makes the
+    /// particles and the sound out of the *broken* block's state, so an
+    /// announcement that only said "this is air now" leaves the other players
+    /// watching blocks vanish in silence.
+    ///
+    /// **Breaking air is not breaking anything, and saying so is the point.**
+    /// A creative client sends `start_digging` and a client that mines through
+    /// sends `finish_digging` too, and this server honours both — so a single
+    /// dig arrives twice. Setting air twice is idempotent and nothing noticed
+    /// while the only announcement was the change; the moment the *effect* went
+    /// out it became a second puff of particles made out of the air left
+    /// behind, which is a silent one. Found by `tools/bot/check.js`, which saw
+    /// effect 2001 carrying state 0.
+    ///
+    /// Reads the previous state under no lock the write also holds, which is a
+    /// race worth naming: two players breaking the same block in the same
+    /// instant can both read it unbroken and both announce it breaking. The
+    /// world ends in the right state either way and the cost is one duplicate
+    /// puff, which is a better trade than a lock every dig contends for.
+    pub fn break_block(&self, position: Position, air: u32, by: i32) -> bool {
+        let previous = self.block_at(position);
+        if !self.set_block_quietly(position, air) {
+            return false;
+        }
+        if previous == air {
+            // Nothing changed, so nobody is told anything. Not even the block
+            // update: a client that already holds air there would apply air to
+            // air, and the packet is the same size whether it says something
+            // or not.
+            return true;
+        }
+        let _ = self.announce.send(Edit {
+            position,
+            state: air,
+            broke: Some(Broke { previous, by }),
+        });
         true
     }
 
@@ -390,8 +467,57 @@ mod tests {
             edit,
             Edit {
                 position: here,
-                state: 0
+                state: 0,
+                // `set_block` is what the server itself does; only a player
+                // breaking something carries the block that broke.
+                broke: None,
             }
+        );
+    }
+
+    #[test]
+    fn a_break_carries_what_broke_and_who_broke_it() {
+        let world = world();
+        let mut listener = world.subscribe();
+        let here = Position {
+            x: 2,
+            y: super::super::world::SURFACE_Y,
+            z: 2,
+        };
+        let before = world.block_at(here);
+        assert!(before != 0, "the surface is not air to begin with");
+
+        assert!(world.break_block(here, 0, 7));
+        let edit = listener.try_recv().expect("the break was announced");
+        assert_eq!(edit.position, here);
+        assert_eq!(edit.state, 0, "broken to air");
+        assert_eq!(
+            edit.broke,
+            Some(Broke {
+                previous: before,
+                by: 7
+            }),
+            "the block that broke, not the air left behind"
+        );
+    }
+
+    #[test]
+    fn breaking_air_announces_nothing() {
+        // A creative client sends `start_digging` and a mining one sends
+        // `finish_digging` too, so one dig arrives twice. The second has air
+        // to break, and an effect made out of air is a silent puff of nothing.
+        let world = world();
+        let here = Position {
+            x: 3,
+            y: super::super::world::SURFACE_Y,
+            z: 3,
+        };
+        assert!(world.break_block(here, 0, 7));
+        let mut listener = world.subscribe();
+        assert!(world.break_block(here, 0, 7), "still a legal position");
+        assert!(
+            listener.try_recv().is_err(),
+            "nothing changed, so nobody is told anything"
         );
     }
 
