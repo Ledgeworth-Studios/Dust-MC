@@ -400,7 +400,7 @@ fn tail_of(recent: &VecDeque<String>) -> String {
 /// accepting commands. Matching two fragments rather than one makes a
 /// coincidental match of either alone unlikely; both have been stable across
 /// every modern release.
-fn startup_complete(line: &str) -> bool {
+pub(super) fn startup_complete(line: &str) -> bool {
     line.contains("Done (") && line.contains("! For help")
 }
 
@@ -490,7 +490,7 @@ fn pending_chunks(region_dir: &Path, expected: &[(i32, i32)]) -> Vec<(i32, i32)>
 }
 
 /// Flush the save and ask the server to stop.
-fn flush_and_stop(deadline: Instant) -> Result<(), String> {
+pub(super) fn flush_and_stop(deadline: Instant) -> Result<(), String> {
     rcon_with_retries(deadline, &mut |client: &mut rcon::Client| {
         let saved = client.exec_delimited("save-all flush")?;
         println!("save-all: {}", saved.trim());
@@ -535,7 +535,10 @@ fn attempt_rcon(
 }
 
 /// Wait for the process to leave, killing it if it overstays.
-fn wait_for_exit(child: &mut std::process::Child, deadline: Instant) -> Result<(), String> {
+pub(super) fn wait_for_exit(
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> Result<(), String> {
     loop {
         match child.try_wait() {
             Ok(Some(_status)) => return Ok(()),
@@ -552,7 +555,7 @@ fn wait_for_exit(child: &mut std::process::Child, deadline: Instant) -> Result<(
 }
 
 /// The JVM invocation: flags first, then the jar, headless.
-fn java_command(jar: &Path) -> (&'static str, Vec<String>) {
+pub(super) fn java_command(jar: &Path) -> (&'static str, Vec<String>) {
     let mut args: Vec<String> = jvm_flags().iter().map(|s| (*s).to_owned()).collect();
     args.push("-jar".to_owned());
     args.push(jar.display().to_string());

@@ -155,6 +155,7 @@ cargo xtask harness provision --version 1.21.1 --seed 0 --yes
 cargo xtask harness capture --version 1.21.1 --seed 0 --radius 2
 cargo xtask harness compare captures/a captures/b
 cargo xtask harness rewrite --version 1.21.1 --seed 0 --radius 2
+cargo xtask harness registries --version 1.21.1
 ```
 
 `provision` resolves the server jar through the same manifest-and-SHA-1 path
@@ -164,6 +165,18 @@ only with `--yes` — accepts Minecraft's EULA on your behalf by writing
 `eula.txt`. Without that flag the file is left unwritten and vanilla refuses
 to boot until you have read the EULA and chosen; agreeing to a licence is an
 act, and the flag keeps it visible in your shell history where it belongs.
+
+`registries` is the same idea one layer up, over the protocol rather than the
+world. It boots Minecraft, boots Dust in the same process as the command, and
+points one hand-written client — its own VarInts, its own zlib, sharing no code
+with either server — at both, acknowledging no data packs so that both send the
+registries' *contents* rather than their names. As of 2026-08-30 it reports no
+differences: ten registries agree entry for entry and field for field, and all
+thirteen tag registries agree over all 6,362 ids. The eleventh registry,
+`minecraft:enchantment`, is listed as a stated omission rather than a
+difference — Dust has no schema for it and says so in code, and the day one is
+added and is wrong, this goes red. Watched to fail: changing one field's type
+from `TAG_Double` to `TAG_Float` produced four findings naming the field.
 
 `capture` boots the provisioned server headless, watches its own log for the
 readiness line, force-generates the square of chunks within `--radius` chunks
