@@ -843,3 +843,63 @@ fn objective_updates_treat_number_format_as_an_option_of_an_option() {
         assert_eq!(back, body(format), "format changed on the way round");
     }
 }
+
+/// A player command is three VarInts, whatever the action.
+///
+/// It reads as though the boost should be conditional — only the horse-jump
+/// actions mean anything by it — and this crate modelled it that way until a
+/// real 1.21.1 server was asked. Sent two VarInts, vanilla disconnects with
+/// `Failed to decode packet 'serverbound/minecraft:player_command'`; sent
+/// three, it carries on. So every sneak and every sprint a real client sends
+/// carries a zero here.
+///
+/// The lengths are written out rather than compared to each other: what makes
+/// this test worth having is that a sneak and a horse jump are *the same size*
+/// on the wire, and a test that only checked they round-tripped would have
+/// passed under the wrong model too.
+#[test]
+fn every_player_command_carries_a_jump_boost_even_when_it_means_nothing() {
+    use dust_protocol::packets::play::serverbound::{PlayerCommandAction, PlayerCommandBody};
+
+    let sneak = PlayerCommandBody {
+        entity_id: VarInt(1),
+        action_id: PlayerCommandAction::StartSneaking,
+        jump_boost: VarInt(0),
+    };
+    let jump = PlayerCommandBody {
+        entity_id: VarInt(1),
+        action_id: PlayerCommandAction::StartJumpWithHorse,
+        jump_boost: VarInt(0),
+    };
+
+    for body in [&sneak, &jump] {
+        let mut writer = Writer::new();
+        body.encode(&mut writer, v()).expect("encodes");
+        assert_eq!(
+            writer.len(),
+            3,
+            "entity id, action, boost — three VarInts for {:?}",
+            body.action_id
+        );
+        let back =
+            PlayerCommandBody::decode(&mut Reader::new(writer.as_bytes()), v()).expect("decodes");
+        assert_eq!(&back, body);
+    }
+
+    // Two VarInts is what the old model wrote for a sneak, and it is short by
+    // one — the decode runs off the end rather than succeeding with a byte to
+    // spare, which is the failure vanilla reported.
+    let mut short = Writer::new();
+    VarInt(1).encode(&mut short, v()).expect("encodes");
+    VarInt(0).encode(&mut short, v()).expect("encodes");
+    assert!(
+        PlayerCommandBody::decode(&mut Reader::new(short.as_bytes()), v()).is_err(),
+        "two VarInts is not a player command"
+    );
+
+    // The *meaning* is still conditional, and that is where the distinction
+    // lives now: a caller acting on a sneak's boost would be acting on a zero
+    // the format demanded rather than on anything a player asked for.
+    assert_eq!(sneak.meaningful_boost(), None);
+    assert_eq!(jump.meaningful_boost(), Some(0));
+}

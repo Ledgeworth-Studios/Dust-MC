@@ -45,6 +45,7 @@ use dust_protocol::packets::play;
 use dust_protocol::packets::play::chunk::{
     ChunkData, LightArray, Section as WireSection, LIGHT_SECTION_BYTES,
 };
+use dust_protocol::packets::play::metadata;
 use dust_protocol::packets::play::{GameModeByte, Gamemode, PreviousGameMode, TeleportFlags};
 use dust_protocol::types::{BitSet, Identifier, PrefixedBytes, VarInt};
 use dust_protocol::wire::Writer;
@@ -378,6 +379,77 @@ pub fn move_player(
         on_ground: true,
     }
 }
+
+/// Somebody else swung an arm.
+///
+/// The animation table is the protocol's: 0 is the main hand, 3 the off hand.
+/// A client sends `swing` with a *hand* and expects everybody else to be sent
+/// an `animate` with the matching animation, and mapping one to the other is
+/// this function's whole job — a server that relayed the hand number would
+/// make an off-hand swing look like leaving a nest egg.
+pub fn swing(entity_id: i32, off_hand: bool) -> play::clientbound::Animate {
+    play::clientbound::Animate {
+        entity_id: VarInt(entity_id),
+        animation: if off_hand {
+            SWING_OFF_HAND
+        } else {
+            SWING_MAIN_HAND
+        },
+    }
+}
+
+/// `ClientboundAnimatePacket.SWING_MAIN_HAND`.
+const SWING_MAIN_HAND: u8 = 0;
+/// `ClientboundAnimatePacket.SWING_OFF_HAND`. Not 1 — 1 is taking damage and
+/// 2 is waking up, which is why these are named rather than counted.
+const SWING_OFF_HAND: u8 = 3;
+
+/// Somebody else started or stopped crouching or running.
+///
+/// **Two slots, not one, and both are needed.** Index 0 is the shared entity
+/// flag byte, where bit 1 is crouching and bit 3 is sprinting; index 6 is the
+/// pose, which is what actually shortens the model and the hitbox. A client
+/// told only the flag renders a full-height player with a dimmed name tag, and
+/// one told only the pose renders a crouch that does not sneak.
+pub fn posture(
+    entity_id: i32,
+    sneaking: bool,
+    sprinting: bool,
+) -> play::clientbound::SetEntityData {
+    let mut flags = 0u8;
+    if sneaking {
+        flags |= ENTITY_FLAG_CROUCHING;
+    }
+    if sprinting {
+        flags |= ENTITY_FLAG_SPRINTING;
+    }
+    play::clientbound::SetEntityData {
+        entity_id: VarInt(entity_id),
+        entries: metadata::MetadataEntries(vec![
+            metadata::MetadataEntry {
+                index: ENTITY_FLAGS_INDEX,
+                value: metadata::MetadataValue::Byte(flags as i8),
+            },
+            metadata::MetadataEntry {
+                index: POSE_INDEX,
+                value: metadata::MetadataValue::Pose(if sneaking {
+                    metadata::Pose::Sneaking
+                } else {
+                    metadata::Pose::Standing
+                }),
+            },
+        ]),
+    }
+}
+
+/// `Entity.DATA_SHARED_FLAGS_ID`, slot 0 on every entity there is.
+const ENTITY_FLAGS_INDEX: u8 = 0;
+/// `Entity.DATA_POSE`, slot 6 on 1.21.1.
+const POSE_INDEX: u8 = 6;
+/// Bit 1 of the shared flags.
+const ENTITY_FLAG_CROUCHING: u8 = 0x02;
+/// Bit 3 of the shared flags.
+const ENTITY_FLAG_SPRINTING: u8 = 0x08;
 
 /// The head's yaw, which the body's does not imply.
 ///

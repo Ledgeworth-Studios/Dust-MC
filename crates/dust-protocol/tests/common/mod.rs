@@ -1517,7 +1517,7 @@ fn play_frames(out: &mut Vec<Frame>) {
             body: dust_protocol::packets::play::serverbound::PlayerCommandBody {
                 entity_id: VarInt(1),
                 action_id: dust_protocol::packets::play::serverbound::PlayerCommandAction::StartJumpWithHorse,
-                jump_boost: Some(VarInt(42)),
+                jump_boost: VarInt(42),
             },
         }
     ));

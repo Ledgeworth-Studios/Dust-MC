@@ -740,6 +740,36 @@ where
                         .await?;
                         send_play(conn, play_mod::turn_head(entity_id, yaw), ctx.version).await?;
                     }
+                    // Swings and postures go to everybody but the player
+                    // who did them, like movement: their own client has
+                    // already animated the swing and is already crouching,
+                    // and being told again would fight its own prediction.
+                    Ok(RosterChange::Swung {
+                        entity_id,
+                        animation,
+                    }) if entity_id != me.entity_id => {
+                        send_play(
+                            conn,
+                            play::clientbound::Animate {
+                                entity_id: dust_protocol::types::VarInt(entity_id),
+                                animation,
+                            },
+                            ctx.version,
+                        )
+                        .await?;
+                    }
+                    Ok(RosterChange::Posture {
+                        entity_id,
+                        sneaking,
+                        sprinting,
+                    }) if entity_id != me.entity_id => {
+                        send_play(
+                            conn,
+                            play_mod::posture(entity_id, sneaking, sprinting),
+                            ctx.version,
+                        )
+                        .await?;
+                    }
                     // Chat reaches everybody, the speaker included — a player
                     // has to see their own words, and filtering them here
                     // would mean every session adding them back locally.
@@ -809,6 +839,35 @@ where
                         ctx.roster
                             .moved(me.entity_id, m.x, m.y, m.z, m.yaw, m.pitch);
                         moved(conn, ctx, &mut view, m.x, m.z).await?;
+                    }
+                    // An arm swing. Sent on every click, hit and miss
+                    // alike, and it is the only thing that makes another
+                    // player look like they are doing something rather than
+                    // sliding around with their arms down.
+                    Ok(play::serverbound::Packet::SwingArm(swing)) => {
+                        let packet = play_mod::swing(
+                            me.entity_id,
+                            swing.hand == dust_protocol::packets::play::Hand::Off,
+                        );
+                        ctx.roster.swung(me.entity_id, packet.animation);
+                    }
+                    // Crouching and running. The other seven actions this
+                    // packet carries are about horses, elytra and beds, none
+                    // of which exist here — and passing them to the roster
+                    // would put a metadata packet on every other player's wire
+                    // for something nothing models.
+                    Ok(play::serverbound::Packet::PlayerCommand(command)) => {
+                        use play::serverbound::PlayerCommandAction as Action;
+                        let (sneaking, sprinting) = match command.body.action_id {
+                            Action::StartSneaking => (Some(true), None),
+                            Action::StopSneaking => (Some(false), None),
+                            Action::StartSprinting => (None, Some(true)),
+                            Action::StopSprinting => (None, Some(false)),
+                            _ => (None, None),
+                        };
+                        if sneaking.is_some() || sprinting.is_some() {
+                            ctx.roster.posture(me.entity_id, sneaking, sprinting);
+                        }
                     }
                     Ok(play::serverbound::Packet::Chat(said)) => {
                         // The signature and the acknowledgement chain are

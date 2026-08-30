@@ -1658,3 +1658,95 @@ fn a_block_state_is_resolved_from_its_properties_and_not_just_its_name() {
     // a named error rather than a default.
     assert_eq!(names.block("minecraft:not_a_block", &[]), None);
 }
+
+/// A player who swings and crouches is one the others can see doing it.
+///
+/// Both were decoded and dropped, which meant another player mined, placed and
+/// sneaked with their arms down and standing to full height. Neither changes a
+/// block or a position, which is exactly why they are worth a test: nothing
+/// else in the suite would notice them go missing.
+#[test]
+fn a_swing_and_a_crouch_reach_the_other_player() {
+    let running = start("");
+    let addr = running.addr;
+
+    let mut first_stream = connect(addr);
+    let mut first = join_as(&mut first_stream, addr, "First");
+    first.drain(&mut first_stream);
+
+    let mut second_stream = connect(addr);
+    let _second = join_as(&mut second_stream, addr, "Second");
+    first
+        .wait_for(&mut first_stream, 1)
+        .expect("the first player is told the second arrived");
+
+    // Swing, main hand. Serverbound `swing` is id 54 in play on 1.21.1 and its
+    // whole body is the hand as a VarInt.
+    send_compressed_frame(&mut second_stream, 54, &[0]);
+    // `animate` is clientbound id 3 in play on 1.21.1, from the generated
+    // table. Written out rather than looked up: a test that asked the server's
+    // own table which id to expect would agree with it whatever it said.
+    let animate = first
+        .wait_for(&mut first_stream, 3)
+        .expect("the first player sees the swing");
+    let (entity, rest) = read_var_int_from(&animate);
+    assert!(entity > 0, "somebody's entity id");
+    assert_eq!(rest, [0], "animation 0 is the main-hand swing");
+
+    // Off hand, which is animation 3 and not 1 — 1 is taking damage, and a
+    // server that relayed the hand number would show a hurt player.
+    send_compressed_frame(&mut second_stream, 54, &[1]);
+    let animate = first
+        .wait_for(&mut first_stream, 3)
+        .expect("the first player sees the off-hand swing");
+    let (_, rest) = read_var_int_from(&animate);
+    assert_eq!(rest, [3], "animation 3 is the off-hand swing");
+
+    // Start sneaking. Serverbound `player_command` is id 37: entity id, then
+    // the action, then the jump boost.
+    let mut sneak = Vec::new();
+    write_var_int_arg(&mut sneak, entity);
+    write_var_int_arg(&mut sneak, 0); // StartSneaking
+    write_var_int_arg(&mut sneak, 0); // no jump boost
+    send_compressed_frame(&mut second_stream, 37, &sneak);
+
+    let metadata = first
+        .wait_for(&mut first_stream, 88)
+        .expect("the first player is told the second is crouching");
+    let (subject, rest) = read_var_int_from(&metadata);
+    assert_eq!(subject, entity, "about the player who crouched");
+    // Two slots and a terminator: the shared flag byte, then the pose. Both
+    // are needed — the flag alone dims a name tag on a player standing at full
+    // height, and the pose alone crouches somebody who is not sneaking.
+    assert_eq!(rest[0], 0, "slot 0, the shared entity flags");
+    assert_eq!(rest[1], 0, "serializer 0, a byte");
+    assert_eq!(rest[2] & 0x02, 0x02, "bit 1 is crouching");
+    assert_eq!(rest[3], 6, "slot 6, the pose");
+    assert_eq!(rest[4], 21, "serializer 21, a pose");
+    assert_eq!(rest[5], 5, "pose 5 is sneaking");
+    assert_eq!(rest[6], 0xFF, "and the metadata terminator");
+
+    // Stopping sneaking says so rather than saying nothing.
+    let mut stand = Vec::new();
+    write_var_int_arg(&mut stand, entity);
+    write_var_int_arg(&mut stand, 1); // StopSneaking
+    write_var_int_arg(&mut stand, 0);
+    send_compressed_frame(&mut second_stream, 37, &stand);
+    let metadata = first
+        .wait_for(&mut first_stream, 88)
+        .expect("and told when they stand up again");
+    let (_, rest) = read_var_int_from(&metadata);
+    assert_eq!(rest[2] & 0x02, 0, "the crouch bit is off");
+    assert_eq!(rest[5], 0, "pose 0 is standing");
+
+    drop(second_stream);
+    drop(first_stream);
+    running.finish();
+}
+
+/// `write_var_int` with the arguments the other way round, because every call
+/// beside it reads `(buffer, value)` and one that reads `(value, buffer)` is a
+/// bug waiting for somebody in a hurry.
+fn write_var_int_arg(out: &mut Vec<u8>, value: i32) {
+    write_var_int(value, out);
+}

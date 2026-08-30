@@ -7,8 +7,8 @@ Dust is being built from nothing and is not finished — but you can play on it.
 ## Status
 
 **Two people can connect, walk around a shared world, break and place blocks,
-see each other doing it, and talk.** What they change is still there after a
-restart, and so is where they were standing.
+see each other doing it, and talk.** They see each other swing and crouch, what
+they change is still there after a restart, and so is where they were standing.
 
 `dust server` binds `[server].bind`, answers the server-list ping with the MOTD,
 player count and favicon from `dust.toml`, runs login in either offline or
@@ -87,6 +87,13 @@ offline-mode UUID derivation, and a chunk section decoded field by field until
 its 18,779 bytes were consumed exactly.
 
 Doing that found three defects in an afternoon, each with passing tests over it:
+
+- **A player command was one VarInt short.** The jump boost reads as though it
+  should be conditional — only the horse-jump actions mean anything by it — and
+  the packet was modelled that way. Vanilla reads three VarInts whatever the
+  action: sent two it disconnects naming the packet, sent three it carries on.
+  Every sneak and every sprint a real client sends carries a zero there, so
+  Dust refused all of them.
 
 - **Login Start's shape was inverted.** The transport expected an optional
   profile id behind a presence flag — true in 1.20.2–1.20.4, wrong since

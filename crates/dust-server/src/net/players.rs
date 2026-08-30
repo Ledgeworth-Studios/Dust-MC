@@ -59,6 +59,12 @@ pub struct Player {
     pub z: f64,
     pub yaw: f32,
     pub pitch: f32,
+    /// Crouching. Held on the roster rather than in the session that owns the
+    /// player, because a player who joins after somebody started sneaking has
+    /// to be told about it, and the only place that knows is here.
+    pub sneaking: bool,
+    /// Running. Same reasoning as [`Player::sneaking`].
+    pub sprinting: bool,
 }
 
 /// Something that happened to the roster.
@@ -76,6 +82,26 @@ pub enum RosterChange {
         z: f64,
         yaw: f32,
         pitch: f32,
+    },
+    /// A player swung an arm.
+    ///
+    /// Carried as an event and not as state, because it *is* an event: there
+    /// is no "currently swinging" for a joining player to be told about, only
+    /// an animation that happened once.
+    Swung {
+        entity_id: i32,
+        /// Which arm, as the protocol's animation table numbers it.
+        animation: u8,
+    },
+    /// A player started or stopped crouching or running.
+    ///
+    /// Both are one packet's worth of change and both land in the same
+    /// metadata update, so they travel together rather than as two events a
+    /// receiver would have to combine.
+    Posture {
+        entity_id: i32,
+        sneaking: bool,
+        sprinting: bool,
     },
     /// Something to put in everybody's chat log.
     ///
@@ -135,6 +161,8 @@ impl Roster {
             y: at.1,
             z: at.2,
             yaw: 0.0,
+            sneaking: false,
+            sprinting: false,
             pitch: 0.0,
         };
 
@@ -197,6 +225,41 @@ impl Roster {
             yaw,
             pitch,
         });
+    }
+
+    /// A player swung an arm. Nothing is stored; see [`RosterChange::Swung`].
+    pub fn swung(&self, entity_id: i32, animation: u8) {
+        let _ = self.changes.send(RosterChange::Swung {
+            entity_id,
+            animation,
+        });
+    }
+
+    /// A player started or stopped crouching or running.
+    ///
+    /// Nothing is sent when neither actually changed. A client sends
+    /// `player_command` for several things this does not model, and one that
+    /// left the posture alone would otherwise put a metadata packet on every
+    /// other player's wire for a horse nobody is riding.
+    pub fn posture(&self, entity_id: i32, sneaking: Option<bool>, sprinting: Option<bool>) {
+        let changed = {
+            let mut players = self.players.lock().expect("the roster is never poisoned");
+            let Some(player) = players.get_mut(&entity_id) else {
+                return;
+            };
+            let before = (player.sneaking, player.sprinting);
+            player.sneaking = sneaking.unwrap_or(player.sneaking);
+            player.sprinting = sprinting.unwrap_or(player.sprinting);
+            let after = (player.sneaking, player.sprinting);
+            (before != after).then_some(after)
+        };
+        if let Some((sneaking, sprinting)) = changed {
+            let _ = self.changes.send(RosterChange::Posture {
+                entity_id,
+                sneaking,
+                sprinting,
+            });
+        }
     }
 
     /// Put a line in everybody's chat log.
