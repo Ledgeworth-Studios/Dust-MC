@@ -545,6 +545,23 @@ where
             version,
         )
         .await?;
+        // And how they are standing. A spawned player is standing upright
+        // until something says otherwise, so somebody who started crouching
+        // before this player arrived would be upright to them and crouching to
+        // everybody else — two clients rendering the same player differently,
+        // which is the reason the roster keeps this rather than the session
+        // that owns them.
+        //
+        // Only when it is not the default: a metadata packet per player per
+        // join, saying nothing, is a packet per player per join.
+        if other.sneaking || other.sprinting {
+            send_play(
+                conn,
+                play_mod::posture(other.entity_id, other.sneaking, other.sprinting),
+                version,
+            )
+            .await?;
+        }
     }
 
     // The loop records the position into the shared map as the player moves,
