@@ -46,10 +46,24 @@
 //! than vanilla is a third thing and is counted separately: it means light
 //! arriving where vanilla says none does, which neither gap explains.
 //!
-//! **There are no over-lit cells, at any radius, and getting to that took
-//! three corrections — every one of them to this harness rather than to the
-//! engine.** On seed 0 it reads 99.41% at radius 2, 4 and 6 alike, and every
-//! one of the disagreements is Dust being darker.
+//! # The percentage is a property of the world, not of the engine
+//!
+//! Seed 0 reads **99.4%**. Seed 1 reads **96.4%**, and the engine is the same
+//! engine: seed 1 spawns in deep ocean, and 168,428 of its 169,480 shortfalls
+//! are water — an even 12,544 cells at each level from 14 downwards, which is
+//! one cell per column per level, the water column marching down. A single
+//! headline number would be a number about whichever world somebody captured.
+//!
+//! **What is invariant is the shape, and that is what to read.** Every
+//! disagreement, on both seeds and at every radius, is Dust being *darker*; and
+//! the shortfalls are one block list — water, leaves, grass, seagrass, kelp —
+//! every one a block Minecraft gives an opacity of one or two. That is the
+//! claim the verb supports. The percentage is how much of *this* world is made
+//! of them.
+//!
+//! **There are no over-lit cells, at any radius or either seed, and getting to
+//! that took three corrections — every one of them to this harness rather than
+//! to the engine.**
 //!
 //! 1. It lit each column against *itself* on all four sides. A column lower
 //!    than its neighbour was told the neighbour was as low as it, so light
@@ -69,6 +83,10 @@
 //! found by printing the coordinates and seeing that all thirty-two sat on an
 //! edge. A single "0.6% disagree" line would have hidden all three inside a
 //! number that already looked good.
+//!
+//! Which is the same reason to run it on more than one seed: the first one
+//! agreed 99.4% and the second 96.4%, and nothing about the server had
+//! changed.
 //!
 //! # Exit codes
 //!
@@ -578,6 +596,14 @@ fn report(tally: &Tally) {
         println!(
             "every one of them is Dust being darker, which is the direction both \
              known gaps point in"
+        );
+        // Said every time, because the percentage above is the first thing
+        // anybody will quote and it is a fact about the world rather than
+        // about the engine: seed 0 reads 99.4% and seed 1, which spawns in
+        // deep ocean, reads 96.4% with the same server.
+        println!(
+            "the percentage is how much of *this* world is made of those blocks; \
+             run another seed before quoting it"
         );
     }
 
