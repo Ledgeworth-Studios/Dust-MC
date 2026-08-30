@@ -92,7 +92,12 @@ pub struct SessionContext {
     /// The world a joining player is put into, with whatever players have
     /// changed in it.
     pub world: SharedWorld,
-    /// How many columns out from the player are streamed on join.
+    /// The furthest this server will stream, in columns.
+    ///
+    /// A ceiling and not the answer: a client asks for a distance of its own
+    /// during configuration and is served the smaller of the two, so what a
+    /// given session actually uses is decided per connection and lives in its
+    /// [`View`](super::view::View).
     pub view_distance: u32,
     /// `minecraft:overworld`'s id in the dimension-type registry, as it was
     /// synced during configuration.
@@ -387,11 +392,24 @@ where
     // configuration. Every disconnect from here carries an NBT component, not
     // login's JSON: the two states spell one idea differently, and the wrong
     // one is a packet that travels and renders nothing.
+    let mut view_distance = ctx.view_distance;
     let outcome = match configure(&mut conn, ctx).await? {
-        Configured::Ready => Served::LoggedIn {
-            username: authenticated.username,
-            profile_id: authenticated.profile_id,
-        },
+        Configured::Ready {
+            view_distance: asked,
+        } => {
+            // The smaller of what the client asked for and what this server
+            // will serve. A request and not a demand in either direction: a
+            // client asking for thirty-two on a server set to eight gets
+            // eight, and one asking for two is spared the columns it would
+            // throw away.
+            if let Some(asked) = asked.filter(|asked| *asked > 0) {
+                view_distance = view_distance.min(asked);
+            }
+            Served::LoggedIn {
+                username: authenticated.username,
+                profile_id: authenticated.profile_id,
+            }
+        }
         Configured::UnknownContent => {
             // The client did not acknowledge the vanilla pack, so its
             // registries have to carry their contents and no `[data] path`
@@ -424,7 +442,7 @@ where
 
     // Configuration finished, so both ends are in Play.
     conn.transition(State::Play)?;
-    serve_play(&mut conn, ctx, profile_id, &username).await?;
+    serve_play(&mut conn, ctx, profile_id, &username, view_distance).await?;
     conn.disconnect();
     finish(conn, outcome).await
 }
@@ -438,6 +456,7 @@ async fn serve_play<W>(
     ctx: &SessionContext,
     profile_id: [u8; 16],
     username: &str,
+    view_distance: u32,
 ) -> Result<(), SessionError>
 where
     W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -467,7 +486,7 @@ where
         play_mod::login_packet(
             ENTITY_ID,
             ctx.status.max_players(),
-            ctx.view_distance,
+            view_distance,
             ctx.overworld_dimension_type,
         )?,
         version,
@@ -500,7 +519,7 @@ where
     // The view is the server's record of what this client holds. Every column
     // it sends and every one it forgets goes through it, so the record cannot
     // drift from the client's actual contents.
-    let mut view = View::default();
+    let mut view = View::with_radius(view_distance);
     let centre = view::column_of(start.0, start.2);
     stream(conn, ctx, &mut view, centre).await?;
 
@@ -606,7 +625,7 @@ async fn stream<W>(
 where
     W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let change = view.move_to(centre, ctx.view_distance as i32);
+    let change = view.move_to(centre);
     if change.recentre {
         send_play(
             conn,

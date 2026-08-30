@@ -30,6 +30,14 @@ use dust_world::coords::ChunkPos;
 pub struct View {
     loaded: BTreeSet<(i32, i32)>,
     centre: Option<ChunkPos>,
+    /// How far this view reaches, in columns.
+    ///
+    /// Held here rather than passed to every [`View::move_to`], because a view
+    /// that could be moved at a radius other than the one it was built for is
+    /// a view that can disagree with itself about what it holds — the
+    /// `loaded` set would then describe a shape no single radius produces, and
+    /// the columns to forget would be wrong forever after.
+    radius: i32,
 }
 
 /// What moving to a new centre requires.
@@ -49,16 +57,38 @@ pub struct ViewChange {
 }
 
 impl View {
-    /// Move the view to `centre` at `radius`, and say what that costs.
+    /// An empty view that reaches `radius` columns in every direction.
+    #[must_use]
+    pub fn with_radius(radius: u32) -> Self {
+        Self {
+            loaded: BTreeSet::new(),
+            centre: None,
+            // Clamped rather than cast: the configuration bounds this to 32
+            // and the client's request is bounded by the configuration, so a
+            // value that needed clamping would be a bug elsewhere — and the
+            // one number this must never be is negative, because the loops
+            // below would then produce an empty view that forgets everything.
+            radius: i32::try_from(radius.clamp(1, 32)).expect("clamped to 1..=32"),
+        }
+    }
+
+    /// How far this view reaches.
+    #[must_use]
+    pub fn radius(&self) -> i32 {
+        self.radius
+    }
+
+    /// Move the view to `centre`, and say what that costs.
     ///
     /// Idempotent: calling it twice with the same centre returns an empty
     /// change the second time. That is what makes it safe to call on every
     /// movement packet, which arrive twenty times a second and almost never
     /// cross a chunk boundary.
-    pub fn move_to(&mut self, centre: ChunkPos, radius: i32) -> ViewChange {
+    pub fn move_to(&mut self, centre: ChunkPos) -> ViewChange {
         let recentre = self.centre != Some(centre);
         self.centre = Some(centre);
 
+        let radius = self.radius;
         let mut wanted = BTreeSet::new();
         for dx in -radius..=radius {
             for dz in -radius..=radius {
@@ -132,8 +162,8 @@ mod tests {
 
     #[test]
     fn the_first_move_sends_the_whole_square_and_forgets_nothing() {
-        let mut view = View::default();
-        let change = view.move_to(ChunkPos::new(0, 0), 2);
+        let mut view = View::with_radius(2);
+        let change = view.move_to(ChunkPos::new(0, 0));
         assert_eq!(change.send.len(), 25, "(2*2+1)^2");
         assert!(change.forget.is_empty());
         assert!(change.recentre);
@@ -142,8 +172,8 @@ mod tests {
 
     #[test]
     fn the_nearest_column_is_sent_first() {
-        let mut view = View::default();
-        let change = view.move_to(ChunkPos::new(0, 0), 2);
+        let mut view = View::with_radius(2);
+        let change = view.move_to(ChunkPos::new(0, 0));
         assert_eq!(change.send[0], ChunkPos::new(0, 0), "the one underfoot");
         let last = change.send.last().expect("not empty");
         assert_eq!(
@@ -155,18 +185,18 @@ mod tests {
 
     #[test]
     fn staying_still_costs_nothing() {
-        let mut view = View::default();
-        view.move_to(ChunkPos::new(0, 0), 2);
-        let change = view.move_to(ChunkPos::new(0, 0), 2);
+        let mut view = View::with_radius(2);
+        view.move_to(ChunkPos::new(0, 0));
+        let change = view.move_to(ChunkPos::new(0, 0));
         assert_eq!(change, ViewChange::default());
         assert!(!change.recentre);
     }
 
     #[test]
     fn one_step_sends_and_forgets_one_edge_each() {
-        let mut view = View::default();
-        view.move_to(ChunkPos::new(0, 0), 2);
-        let change = view.move_to(ChunkPos::new(1, 0), 2);
+        let mut view = View::with_radius(2);
+        view.move_to(ChunkPos::new(0, 0));
+        let change = view.move_to(ChunkPos::new(1, 0));
         // A five-by-five square stepping one east gains a column of five and
         // loses a column of five. Anything else means the set and the square
         // disagree.
@@ -179,9 +209,9 @@ mod tests {
 
     #[test]
     fn a_jump_beyond_the_view_replaces_everything() {
-        let mut view = View::default();
-        view.move_to(ChunkPos::new(0, 0), 2);
-        let change = view.move_to(ChunkPos::new(100, 100), 2);
+        let mut view = View::with_radius(2);
+        view.move_to(ChunkPos::new(0, 0));
+        let change = view.move_to(ChunkPos::new(100, 100));
         assert_eq!(change.send.len(), 25);
         assert_eq!(change.forget.len(), 25, "nothing overlaps");
     }
@@ -192,10 +222,10 @@ mod tests {
         // client is told about is one it does not already hold. Sending a
         // column twice is invisible on the wire and costs a chunk packet each
         // time; over a thousand blocks it is a hundred of them.
-        let mut view = View::default();
+        let mut view = View::with_radius(2);
         let mut held: BTreeSet<(i32, i32)> = BTreeSet::new();
         for x in 0..64 {
-            let change = view.move_to(ChunkPos::new(x, 0), 3);
+            let change = view.move_to(ChunkPos::new(x, 0));
             for pos in &change.forget {
                 assert!(
                     held.remove(&(pos.x, pos.z)),

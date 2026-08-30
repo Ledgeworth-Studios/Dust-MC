@@ -730,6 +730,7 @@ impl Server {
         let favicon_path = config.server.favicon.clone();
         let world_source = config.server.world_source.clone();
         let online_mode = config.server.online_mode;
+        let view_distance = config.server.view_distance;
         let data_path = config.data.path.clone();
 
         let fail = |message: String| -> ServerError {
@@ -926,7 +927,7 @@ impl Server {
             conn: dust_net::io::ConnConfig::default(),
             auth: authority,
             world: std::sync::Arc::clone(&world),
-            view_distance: VIEW_DISTANCE,
+            view_distance,
             overworld_dimension_type: overworld,
             blocks: crate::net::PlaceableBlocks {
                 air: palette.air,
@@ -1171,14 +1172,6 @@ impl Server {
         }
     }
 }
-
-/// How many columns out from a joining player are streamed.
-///
-/// Two, which is twenty-five columns: enough to stand on and look at, small
-/// enough that a join is one burst rather than a stream. It is not
-/// `[server].view_distance` because there is no such setting yet — adding one
-/// before there is a streaming loop to honour it would be a knob that lies.
-const VIEW_DISTANCE: u32 = 2;
 
 /// Resolve a `host:port` bind string to the address the real listener will
 /// take.
