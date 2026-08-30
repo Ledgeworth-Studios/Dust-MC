@@ -43,8 +43,19 @@
 //!   and under-lights where the light would have to travel *through* one.
 //!
 //! Both under-light rather than over-light, so a cell where Dust is *brighter*
-//! than vanilla is a third thing and is counted separately. It would mean
-//! light arriving where vanilla says none does, which no known gap explains.
+//! than vanilla is a third thing and is counted separately: it means light
+//! arriving where vanilla says none does, which neither gap explains.
+//!
+//! **The number is stable across radii, and getting it there took two skips.**
+//! On seed 0 it reads 99.42% at radius 2, 4, 5 and 6 alike. It did not at
+//! first: at radius 5 it read 98.1% with 167,000 over-lit cells, because a
+//! world holds partly-generated chunks around whatever was forced and vanilla
+//! only lights a chunk once it reaches `full`. Comparing against light vanilla
+//! had not finished computing measures nothing, so those are skipped and the
+//! count is printed. A column missing a neighbour is skipped for the same
+//! reason. What survives at radius 4 is thirty-two over-lit cells in eight
+//! million, all air, all by one or two — a residual neither gap accounts for
+//! and small enough to be reported rather than explained away.
 //!
 //! # Exit codes
 //!
@@ -227,9 +238,9 @@ fn measure(options: &Options) -> Result<(), String> {
             if floors.contains_key(&(nx, nz)) {
                 continue;
             }
-            // A neighbour outside the generated world has no floors to give.
-            // Left out rather than invented: `skirt_for` falls back to open
-            // sky, which is what Dust itself does at the edge of a world.
+            // A neighbour outside the generated world has no floors to
+            // give, and a column with one is skipped below rather than lit
+            // against a guess.
             if let Ok(chunk) = dust_chunk(&region_dir, nx, nz, height, &names, air) {
                 floors.insert((nx, nz), SkyFloor::of(&chunk));
             }
@@ -237,10 +248,34 @@ fn measure(options: &Options) -> Result<(), String> {
     }
 
     let mut tally = Tally::default();
+    let mut skipped = 0usize;
     for &(x, z) in &expected {
+        // A column whose neighbours are not all generated cannot be lit the
+        // way the server would light it, so comparing it measures the
+        // harness's fallback rather than the engine.
+        if [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)]
+            .iter()
+            .any(|key| !floors.contains_key(key))
+        {
+            skipped += 1;
+            continue;
+        }
         let Some(root) = read(&region_dir, x, z)? else {
             return Err(format!("chunk {x},{z} has never been generated"));
         };
+        // Vanilla lights a chunk when it reaches `full`, and a world holds
+        // partly-generated chunks around whatever was forced — spawn chunks
+        // that got as far as `surface` and stopped. **This was found by
+        // widening the radius**: at radius 2, where `harness capture` forces
+        // every chunk to `full`, every disagreement was Dust being darker; at
+        // radius 5 the agreement fell from 99.4% to 98.1% and 167,000 cells
+        // came back *brighter*, and the engine had not changed. Comparing
+        // against light vanilla had not finished computing measures nothing.
+        let status = root.get("Status").and_then(nbt::Node::as_str).unwrap_or("");
+        if status != "minecraft:full" && status != "full" {
+            skipped += 1;
+            continue;
+        }
         let vanilla = vanilla_light(&root, height)
             .map_err(|e| format!("chunk {x},{z}: reading Minecraft's light: {e}"))?;
 
@@ -249,6 +284,21 @@ fn measure(options: &Options) -> Result<(), String> {
         let dust = dust_light(&mut chunk, skirt, height);
 
         compare(&chunk, &vanilla, &dust, height, &mut tally);
+    }
+
+    if skipped > 0 {
+        // Said, not swallowed. A run that quietly compared a hundred chunks
+        // when it was asked about a hundred and sixty-nine would be reporting
+        // a percentage of something the caller did not name.
+        println!(
+            "{skipped} chunk(s) skipped: not generated to `full`, or missing a \
+             neighbour — vanilla's own light for those is unfinished"
+        );
+    }
+    if tally.cells == 0 {
+        return Err(
+            "every chunk was skipped; capture a wider world or ask for a smaller radius".to_owned(),
+        );
     }
 
     report(&tally);

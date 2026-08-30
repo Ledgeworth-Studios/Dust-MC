@@ -205,21 +205,28 @@ from `TAG_Double` to `TAG_Float` produced four findings naming the field.
 
 `light` puts a number on how close the sky light is. A chunk Minecraft wrote
 carries the light Minecraft computed, so the same chunks can be lit again with
-Dust's engine and compared cell by cell. On seed 0, twenty-five chunks, 2.46
-million cells: **99.419% agree, and every one of the 14,276 that do not is Dust
-being darker** — which is the direction both known gaps point in. What the
-shortfalls are standing in is the whole diagnosis: leaves, water, grass and
-seagrass, every one of them a block Minecraft gives a small opacity and Dust
-treats as a wall, because light emission and opacity are code constants in
-Minecraft and are in no report and no data pack.
+Dust's engine and compared cell by cell. On seed 0 it reads **99.42%**, and at
+radius 2, 4, 5 and 6 alike — eleven million cells at the widest. Nearly every
+disagreement is Dust being darker, which is the direction both known gaps point
+in, and what the shortfalls are standing in is the whole diagnosis: leaves,
+water, grass and seagrass, every one of them a block Minecraft gives a small
+opacity and Dust treats as a wall, because light emission and opacity are code
+constants in Minecraft and are in no report and no data pack.
 
 It is a measurement and not a gate — the number is expected to be short of a
 hundred per cent today, and a verb that failed for a known gap would be red
-every time it ran. Its first version lit each column against *itself* on all
-four sides, and that produced 805 over-lit cells that no gap explained; giving
-it the real neighbours removed every one. Separating over-lighting from
-under-lighting in the report is what made a harness shortcut visible instead of
-letting it hide inside a number that already looked good.
+every time it ran.
+
+**Getting that number to mean anything took two corrections, and both were the
+harness's fault rather than the engine's.** Its first version lit each column
+against *itself* on all four sides, which produced 805 over-lit cells no gap
+explained; giving it the real neighbours removed every one. Then widening the
+radius dropped it to 98.1% with 167,000 over-lit cells — a world holds
+partly-generated chunks around whatever was forced, and vanilla only lights a
+chunk once it reaches `full`. Skipping those, and saying how many were skipped,
+restored it. Separating over-lighting from under-lighting in the report is what
+made both visible instead of letting them hide inside a number that already
+looked good; what survives is thirty-two over-lit cells in eight million.
 
 `capture` boots the provisioned server headless, watches its own log for the
 readiness line, force-generates the square of chunks within `--radius` chunks
