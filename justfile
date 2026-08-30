@@ -56,3 +56,12 @@ build:
 # agrees with itself about. See tools/bot/README.md.
 bot port="25565":
     cd tools/bot && node check.js {{port}}
+
+# The long one: a bot that stays, flies a square, digs and talks for a while,
+# and says whether anything ended or went quiet. Phase 3's exit criterion asks
+# for ten minutes, which is the default.
+#
+# Outside `verify` for the same reasons `bot` is, plus one of its own: ten
+# minutes is not a pull-request gate.
+soak port="25565" minutes="10":
+    cd tools/bot && node soak.js {{port}} {{minutes}}
