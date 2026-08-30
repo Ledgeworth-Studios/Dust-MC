@@ -493,10 +493,22 @@ mod tests {
     }
 
     #[test]
-    fn the_five_taken_directories_map_to_the_five_registries() {
-        assert_eq!(TAKEN.len(), 5);
+    fn the_thirteen_taken_directories_map_to_the_thirteen_registries() {
+        assert_eq!(TAKEN.len(), 13);
+        assert_eq!(TAKEN.len(), CAPTURED.len());
+        for ((_, registry, _), (captured, _)) in TAKEN.iter().zip(CAPTURED) {
+            assert_eq!(registry, captured, "the two tables list the same thirteen");
+        }
         assert_eq!(registry_for("block"), Some("minecraft:block"));
         assert_eq!(registry_for("entity_type"), Some("minecraft:entity_type"));
+        assert_eq!(
+            registry_for("worldgen/biome"),
+            Some("minecraft:worldgen/biome"),
+            "the one registry two directories deep"
+        );
+        // `worldgen` on its own is a *prefix* of a taken directory and not one
+        // itself, which is exactly the ambiguity the table-driven walk exists
+        // to resolve.
         assert_eq!(registry_for("worldgen"), None);
     }
 

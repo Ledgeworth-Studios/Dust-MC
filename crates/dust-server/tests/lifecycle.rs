@@ -20,7 +20,15 @@ use dust_server::server::{
 };
 use dust_server::stop::{Parker, StepParker, StopHandle};
 
-/// A unique temp file per call: tests run in parallel in one process.
+/// A unique temp file per call, always with a listener that cannot collide.
+///
+/// The bind is applied *here* rather than left to each caller, because one
+/// caller forgot. `[server].bind` defaults to `0.0.0.0:25565`, so a test that
+/// omitted it took the well-known Minecraft port — and on a machine already
+/// running something there (another server, a container) the boot failed and
+/// the test reported "never reached 12 ticks", which describes the symptom and
+/// points nowhere. A rule every caller has to remember is a rule one of them
+/// will not.
 fn write_config(text: &str) -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
@@ -28,7 +36,7 @@ fn write_config(text: &str) -> PathBuf {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::SeqCst),
     ));
-    std::fs::write(&path, text).expect("write the temp config");
+    std::fs::write(&path, with_test_bind(text)).expect("write the temp config");
     path
 }
 
@@ -224,7 +232,7 @@ fn a_stalled_loop_honours_the_configured_catchup_cap() {
     let stop = server.stop_handle();
     let worker = std::thread::spawn(move || server.run());
 
-    wait_for_ticks(&metrics, 12);
+    wait_for_ticks(&metrics, 12, &worker);
     assert!(stop.request_stop());
     let report = worker.join().expect("finishes").expect("clean");
 
@@ -241,14 +249,44 @@ fn a_stalled_loop_honours_the_configured_catchup_cap() {
     assert!(report.overall_timing.window_samples > 0, "timing survived");
 }
 
-fn wait_for_ticks(metrics: &LiveMetrics, minimum: u64) {
-    for _ in 0..50_000_000 {
+/// Wait until the loop has run `minimum` ticks, giving up when the server
+/// thread has ended or the deadline passes.
+///
+/// **It watches the worker, and that is the part worth keeping.** Waiting on a
+/// counter alone means waiting on a server that may already have failed to
+/// start, and the report is then "never reached 12 ticks" — which describes
+/// the symptom and points nowhere. A server that could not bind its port ends
+/// its thread immediately; noticing that turns a timeout into an accurate
+/// failure in milliseconds.
+///
+/// The deadline is in seconds rather than in iterations for a related reason.
+/// The earlier version spun fifty million times calling `yield_now`, which
+/// measures patience in yields — and a yield costs almost nothing on an idle
+/// machine and a scheduling quantum on a busy one, so the wait was *shortest*
+/// when nothing else was running. Thirty seconds is patience with the OS
+/// scheduler and not tolerance for a slow loop: the loop under test parks on a
+/// virtual clock and does no real work, so a healthy one is done in
+/// milliseconds.
+fn wait_for_ticks<T>(metrics: &LiveMetrics, minimum: u64, worker: &std::thread::JoinHandle<T>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
         if metrics.ticks_observed() >= minimum {
             return;
         }
-        std::thread::yield_now();
+        assert!(
+            !worker.is_finished(),
+            "the server stopped after {} tick(s) without reaching {minimum}; \
+             it most likely never started — join the worker for the error",
+            metrics.ticks_observed()
+        );
+        // Sleeping rather than yielding: this thread has nothing to do until
+        // the loop has run, and a spin denies it the core it is waiting on.
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    panic!("never reached {minimum} ticks");
+    panic!(
+        "never reached {minimum} ticks in 30s; the loop ran {}",
+        metrics.ticks_observed()
+    );
 }
 
 #[test]
