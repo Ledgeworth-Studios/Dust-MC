@@ -21,15 +21,79 @@ fn contains_member(tag: &tags::TagDef, member: &str) -> bool {
         tags::from_id(tag.registry, referenced).is_some()
     } else {
         match tag.registry {
+            // The four with a dedicated type in this crate.
             TagRegistry::Block => Block::from_name(member).is_some(),
             TagRegistry::Item => Item::from_name(member).is_some(),
             TagRegistry::Fluid => Fluid::from_name(member).is_some(),
             TagRegistry::EntityType => EntityType::from_name(member).is_some(),
-            TagRegistry::GameEvent => Registry::from_name("minecraft:game_event")
+            // Code registries: a protocol id compiled into the game, so the
+            // registry report is the table.
+            TagRegistry::GameEvent
+            | TagRegistry::PointOfInterestType
+            | TagRegistry::CatVariant
+            | TagRegistry::Instrument => Registry::from_name(tag.registry.name())
                 .and_then(|r| r.entry_id(member))
+                .is_some(),
+            // Datapack registries: no protocol id at all, so the table is the
+            // synced names — which is also where the id in the packet comes
+            // from, so a membership and an id cannot disagree about what
+            // exists.
+            TagRegistry::Biome
+            | TagRegistry::Enchantment
+            | TagRegistry::DamageType
+            | TagRegistry::BannerPattern
+            | TagRegistry::PaintingVariant => dust_registry::synced::by_name(tag.registry.name())
+                .and_then(|r| r.id_of(member))
                 .is_some(),
         }
     }
+}
+
+/// The thirteen registries and their tag counts, as a real 1.21.1 server sent
+/// them in one 25,200-byte `update_tags`.
+///
+/// A fixture off the wire rather than a computation over `TAGS`, for the usual
+/// reason: a table built from the wrong directory agrees with itself perfectly.
+const CAPTURED: &[(&str, usize)] = &[
+    ("minecraft:block", 184),
+    ("minecraft:entity_type", 34),
+    ("minecraft:worldgen/biome", 70),
+    ("minecraft:game_event", 5),
+    ("minecraft:item", 147),
+    ("minecraft:point_of_interest_type", 3),
+    ("minecraft:enchantment", 22),
+    ("minecraft:fluid", 2),
+    ("minecraft:damage_type", 32),
+    ("minecraft:banner_pattern", 9),
+    ("minecraft:cat_variant", 2),
+    ("minecraft:instrument", 3),
+    ("minecraft:painting_variant", 1),
+];
+
+#[test]
+fn the_thirteen_registries_and_their_counts_are_the_ones_a_real_server_sent() {
+    assert_eq!(
+        TagRegistry::ALL.len(),
+        CAPTURED.len(),
+        "thirteen registries"
+    );
+    for (registry, (name, count)) in TagRegistry::ALL.into_iter().zip(CAPTURED) {
+        assert_eq!(&registry.name(), name, "in the order the server sent them");
+        assert_eq!(
+            tags::by_registry(registry).count(),
+            *count,
+            "{name} tag count against the capture"
+        );
+    }
+    assert_eq!(TAGS.len(), CAPTURED.iter().map(|(_, n)| n).sum::<usize>());
+}
+
+#[test]
+fn every_registry_name_round_trips() {
+    for registry in TagRegistry::ALL {
+        assert_eq!(TagRegistry::from_name(registry.name()), Some(registry));
+    }
+    assert_eq!(TagRegistry::from_name("minecraft:not_a_registry"), None);
 }
 
 #[test]

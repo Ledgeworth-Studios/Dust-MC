@@ -8,15 +8,30 @@
 //! membership: which ids a vanilla tag names, and which references it makes to
 //! other tags.
 //!
-//! # The five directories, and the one left out
+//! # The thirteen directories, and why it is exactly thirteen
 //!
-//! Block, item, fluid, entity-type and game-event tags are extracted because
-//! those are the registries Dust already holds tables for — a tag directory
-//! over an unknown registry could not be checked against anything. Everything
-//! else under `tags/` (`worldgen`, `damage_type`, `enchantment` and friends)
-//! is reported as seen-but-not-taken on every run: extending the set is adding
-//! a row to [`TAKEN`] and nothing else, precisely so it happens as a decision
-//! rather than an accident.
+//! A running 1.21.1 server sends `update_tags` for thirteen registries, and it
+//! was counted off the wire rather than off a list: 13 registries, 514 tags,
+//! 6,362 memberships, 25,200 bytes consumed exactly. Those thirteen are what
+//! is taken here.
+//!
+//! It was five for a while, and the five were the registries Dust held tables
+//! for — a tag directory over an unknown registry cannot be checked against
+//! anything, and rows nobody checked are rows that agree with themselves. The
+//! other eight became checkable in two steps: `point_of_interest_type`,
+//! `cat_variant` and `instrument` are ordinary code registries and were in the
+//! registry report the whole time, and `worldgen/biome`, `damage_type`,
+//! `banner_pattern`, `painting_variant` and `enchantment` are *datapack*
+//! registries whose names arrived with the `synced` extraction. So every one
+//! of the thirteen is still checked against a table extracted separately, and
+//! [`TAKEN`] still refuses a directory it has no table for rather than
+//! emitting unchecked rows.
+//!
+//! **Why all thirteen and not the easy ones.** A partial tag set is worse than
+//! none. A client told that `minecraft:mineable/pickaxe` holds eleven blocks
+//! believes the other nine hundred are not mineable; a client told nothing
+//! falls back to its own copy. That rule is why none were sent while five were
+//! extracted, and it is why the answer had to be all of them.
 //!
 //! # Every membership is checked, not sampled
 //!
@@ -42,22 +57,96 @@ use serde_json::Value;
 use super::blocks::Blocks;
 use super::registries::Registries;
 
-/// The tag directories taken, paired with the registry each is checked
-/// against.
-const TAKEN: &[(&str, &str)] = &[
-    ("block", "minecraft:block"),
-    ("item", "minecraft:item"),
-    ("fluid", "minecraft:fluid"),
-    ("entity_type", "minecraft:entity_type"),
-    ("game_event", "minecraft:game_event"),
+/// Where a tag directory's members are checked against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// The block report — `minecraft:block` alone, which has its own report
+    /// and is deliberately absent from the registry one.
+    BlockReport,
+    /// `reports/registries.json`: a registry with a protocol id compiled into
+    /// the game.
+    RegistryReport,
+    /// The data pack's own directories, read by [`super::synced`]: a datapack
+    /// registry has no protocol id and its entries are addressed by name.
+    DataPack,
+}
+
+/// The tag directories taken, the registry each groups, and where that
+/// registry's names come from.
+///
+/// The order is the order a real 1.21.1 server sent them in, captured off the
+/// wire. It is not load-bearing for the client — each registry names itself in
+/// the packet — but a table in an order somebody chose is a table two people
+/// can disagree about, and this one has an answer.
+const TAKEN: &[(&str, &str, Source)] = &[
+    ("block", "minecraft:block", Source::BlockReport),
+    (
+        "entity_type",
+        "minecraft:entity_type",
+        Source::RegistryReport,
+    ),
+    (
+        "worldgen/biome",
+        "minecraft:worldgen/biome",
+        Source::DataPack,
+    ),
+    ("game_event", "minecraft:game_event", Source::RegistryReport),
+    ("item", "minecraft:item", Source::RegistryReport),
+    (
+        "point_of_interest_type",
+        "minecraft:point_of_interest_type",
+        Source::RegistryReport,
+    ),
+    ("enchantment", "minecraft:enchantment", Source::DataPack),
+    ("fluid", "minecraft:fluid", Source::RegistryReport),
+    ("damage_type", "minecraft:damage_type", Source::DataPack),
+    (
+        "banner_pattern",
+        "minecraft:banner_pattern",
+        Source::DataPack,
+    ),
+    (
+        "cat_variant",
+        "minecraft:cat_variant",
+        Source::RegistryReport,
+    ),
+    ("instrument", "minecraft:instrument", Source::RegistryReport),
+    (
+        "painting_variant",
+        "minecraft:painting_variant",
+        Source::DataPack,
+    ),
 ];
 
 fn registry_for(directory: &str) -> Option<&'static str> {
     TAKEN
         .iter()
-        .find(|(dir, _)| *dir == directory)
-        .map(|(_, registry)| *registry)
+        .find(|(dir, _, _)| *dir == directory)
+        .map(|(_, registry, _)| *registry)
 }
+
+/// Every registry taken, with the tag count a real 1.21.1 server sent for it.
+///
+/// A fixture read off the wire, not a computation over this extraction: a
+/// table built from the wrong directory would agree with itself perfectly.
+/// The whole packet was 25,200 bytes, 13 registries, 514 tags and 6,362
+/// memberships, and every byte of it was consumed by a reader that shares no
+/// code with this one.
+pub const CAPTURED: &[(&str, usize)] = &[
+    ("minecraft:block", 184),
+    ("minecraft:entity_type", 34),
+    ("minecraft:worldgen/biome", 70),
+    ("minecraft:game_event", 5),
+    ("minecraft:item", 147),
+    ("minecraft:point_of_interest_type", 3),
+    ("minecraft:enchantment", 22),
+    ("minecraft:fluid", 2),
+    ("minecraft:damage_type", 32),
+    ("minecraft:banner_pattern", 9),
+    ("minecraft:cat_variant", 2),
+    ("minecraft:instrument", 3),
+    ("minecraft:painting_variant", 1),
+];
 
 /// One tag, as the generated table holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,25 +178,52 @@ pub struct Tags {
     pub duplicates_collapsed: usize,
 }
 
-/// Read the five tag directories out of every namespace in the tree.
-pub fn parse(data_root: &Path, registries: &Registries, blocks: &Blocks) -> Result<Tags, String> {
-    // Membership lookups, built once: block names come from the block report,
-    // everything else from the registry report.
+/// Read the thirteen tag directories out of every namespace in the tree.
+///
+/// `synced` is the datapack registries as [`super::synced::parse`] read them.
+/// Five of the thirteen group registries that have no protocol id at all, so
+/// their member names cannot come from the registry report and have to come
+/// from the same place the sync packet's names do — which also means a
+/// membership and an id in the sync packet cannot disagree about what exists.
+pub fn parse(
+    data_root: &Path,
+    registries: &Registries,
+    blocks: &Blocks,
+    synced: &[super::synced::SyncedRegistry],
+) -> Result<Tags, String> {
+    // Membership lookups, built once, each from the source `TAKEN` names for
+    // it. Three sources rather than one because the registries genuinely live
+    // in three places, and a lookup that fell back between them would make a
+    // typo in one report resolve against another.
     let mut known: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    let block_names: BTreeSet<&str> = blocks.blocks.iter().map(|b| b.name.as_str()).collect();
-    known.insert("minecraft:block", block_names);
-    for (_, registry_name) in TAKEN {
-        if *registry_name == "minecraft:block" {
-            continue;
-        }
-        let Some(registry) = registries
-            .registries
-            .iter()
-            .find(|r| r.name == *registry_name)
-        else {
-            return Err(format!("the registry report has no {registry_name}"));
+    for (_, registry_name, source) in TAKEN {
+        let names: BTreeSet<&str> = match source {
+            Source::BlockReport => blocks.blocks.iter().map(|b| b.name.as_str()).collect(),
+            Source::RegistryReport => {
+                let Some(registry) = registries
+                    .registries
+                    .iter()
+                    .find(|r| r.name == *registry_name)
+                else {
+                    return Err(format!("the registry report has no {registry_name}"));
+                };
+                registry.entries.iter().map(|e| e.name.as_str()).collect()
+            }
+            Source::DataPack => {
+                let Some(registry) = synced.iter().find(|r| r.name == *registry_name) else {
+                    return Err(format!(
+                        "the datapack registries have no {registry_name}; the `synced` \
+                         extraction must run before this one"
+                    ));
+                };
+                registry.entries.iter().map(String::as_str).collect()
+            }
         };
-        let names: BTreeSet<&str> = registry.entries.iter().map(|e| e.name.as_str()).collect();
+        if names.is_empty() {
+            return Err(format!(
+                "{registry_name} extracted no names to check against"
+            ));
+        }
         known.insert(*registry_name, names);
     }
 
@@ -126,23 +242,21 @@ pub fn parse(data_root: &Path, registries: &Registries, blocks: &Blocks) -> Resu
         if !root.is_dir() {
             continue;
         }
-        for entry in std::fs::read_dir(&root)
-            .map_err(|e| format!("could not read {}: {e}", root.display()))?
-        {
-            let entry = entry.map_err(|e| format!("could not read {}: {e}", root.display()))?;
-            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+        // Driven by the table rather than by a directory walk, because
+        // `worldgen/biome` is a registry two directories deep and a walk
+        // cannot tell that from a registry `worldgen` holding names beginning
+        // `biome/`. The same ambiguity `dust_data::registry` resolves by
+        // longest prefix; here the list is short enough to be the list.
+        // Anything under `tags/` the table does not name is reported below.
+        for (directory, registry_name, _) in TAKEN {
+            let dir = root.join(directory);
+            if !dir.is_dir() {
                 continue;
             }
-            let directory = entry.file_name().to_string_lossy().into_owned();
-            let Some(registry_name) = registry_for(&directory) else {
-                skipped_directories.insert(directory);
-                continue;
-            };
-
-            for path in json_files(&entry.path())? {
+            for path in json_files(&dir)? {
                 let relative = path
-                    .strip_prefix(entry.path())
-                    .map_err(|_| format!("{} escaped {}", path.display(), entry.path().display()))?
+                    .strip_prefix(&dir)
+                    .map_err(|_| format!("{} escaped {}", path.display(), dir.display()))?
                     .with_extension("");
                 let text = std::fs::read(&path)
                     .map_err(|e| format!("could not read {}: {e}", path.display()))?;
@@ -181,7 +295,7 @@ pub fn parse(data_root: &Path, registries: &Registries, blocks: &Blocks) -> Resu
                             format!("{namespace}:{referenced}")
                         };
                         pending_references.insert(
-                            (registry_name.to_owned(), target.clone()),
+                            ((*registry_name).to_owned(), target.clone()),
                             path.display().to_string(),
                         );
                         memberships += 1;
@@ -226,9 +340,55 @@ pub fn parse(data_root: &Path, registries: &Registries, blocks: &Blocks) -> Resu
         }
     }
 
+    // What is under `tags/` that the table does not name. Reported rather
+    // than swallowed: a fourteenth registry in a future version should arrive
+    // as a line somebody reads, not as tags that quietly go unsent.
+    for namespace in list_namespaces(data_root)? {
+        let root = data_root.join(&namespace).join("tags");
+        if !root.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&root)
+            .map_err(|e| format!("could not read {}: {e}", root.display()))?
+        {
+            let entry = entry.map_err(|e| format!("could not read {}: {e}", root.display()))?;
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let directory = entry.file_name().to_string_lossy().into_owned();
+            if registry_for(&directory).is_some() {
+                continue;
+            }
+            // A directory that is only a *prefix* of a taken one — `worldgen`,
+            // which holds `worldgen/biome` — is looked into rather than
+            // reported whole, so `worldgen/structure` is still noticed.
+            let prefix = format!("{directory}/");
+            let nested: Vec<&str> = TAKEN
+                .iter()
+                .filter_map(|(dir, _, _)| dir.strip_prefix(&prefix))
+                .collect();
+            if nested.is_empty() {
+                skipped_directories.insert(directory);
+                continue;
+            }
+            for inner in std::fs::read_dir(entry.path())
+                .map_err(|e| format!("could not read {}: {e}", entry.path().display()))?
+            {
+                let inner = inner.map_err(|e| format!("could not read a nested tag dir: {e}"))?;
+                if !inner.file_type().is_ok_and(|t| t.is_dir()) {
+                    continue;
+                }
+                let name = inner.file_name().to_string_lossy().into_owned();
+                if !nested.contains(&name.as_str()) {
+                    skipped_directories.insert(format!("{directory}/{name}"));
+                }
+            }
+        }
+    }
+
     if tags.is_empty() {
         return Err(format!(
-            "{} holds no tags in the five directories this extraction takes. This is not \\
+            "{} holds no tags in the thirteen directories this extraction takes. This is not \\
              the data pack Minecraft's `--server` generator writes.",
             data_root.display()
         ));
@@ -247,6 +407,26 @@ pub fn parse(data_root: &Path, registries: &Registries, blocks: &Blocks) -> Resu
             ));
         }
     }
+    // Against the wire, before anything is written. A registry short by one
+    // tag is a client told a group is smaller than it is, which is invisible
+    // until somebody's pickaxe stops working on one block in nine hundred.
+    for (registry, expected) in CAPTURED {
+        let found = tags.iter().filter(|t| t.registry == *registry).count();
+        if found != *expected {
+            return Err(format!(
+                "{registry} extracted {found} tags; a real 1.21.1 server sent {expected}. \
+                 Either this is not 1.21.1's data pack or the walk missed a tree."
+            ));
+        }
+    }
+    if tags.len() != CAPTURED.iter().map(|(_, n)| n).sum::<usize>() {
+        return Err(format!(
+            "{} tags in total, against the {} a real server sent",
+            tags.len(),
+            CAPTURED.iter().map(|(_, n)| n).sum::<usize>()
+        ));
+    }
+
     tags.sort_by(|a, b| (&a.registry, &a.id).cmp(&(&b.registry, &b.id)));
 
     Ok(Tags {
@@ -327,6 +507,26 @@ mod tests {
             sample_tag("minecraft:block", "minecraft:aquarium_blocks", &[]),
             sample_tag("minecraft:item", "minecraft:arrows", &[]),
         ];
+        // Against the wire, before anything is written. A registry short by one
+        // tag is a client told a group is smaller than it is, which is invisible
+        // until somebody's pickaxe stops working on one block in nine hundred.
+        for (registry, expected) in CAPTURED {
+            let found = tags.iter().filter(|t| t.registry == *registry).count();
+            if found != *expected {
+                return Err(format!(
+                    "{registry} extracted {found} tags; a real 1.21.1 server sent {expected}. \
+                 Either this is not 1.21.1's data pack or the walk missed a tree."
+                ));
+            }
+        }
+        if tags.len() != CAPTURED.iter().map(|(_, n)| n).sum::<usize>() {
+            return Err(format!(
+                "{} tags in total, against the {} a real server sent",
+                tags.len(),
+                CAPTURED.iter().map(|(_, n)| n).sum::<usize>()
+            ));
+        }
+
         tags.sort_by(|a, b| (&a.registry, &a.id).cmp(&(&b.registry, &b.id)));
         let order: Vec<&str> = tags.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(

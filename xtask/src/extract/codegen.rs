@@ -1814,6 +1814,27 @@ pub fn loot(data: &LootTables, version: &str) -> String {
 /// are binary searches. References keep their `#` and are stored fully
 /// namespaced — vanilla writes them relative to the defining namespace, which
 /// is a spelling, not an identity.
+/// The `TagRegistry` variant a registry id spells.
+///
+/// Derived rather than listed, so adding a fourteenth registry to `TAKEN` is
+/// one edit and not two that can disagree. `dust_registry::tags` has the enum
+/// and a test that every variant's `name()` round-trips through here.
+fn tag_registry_variant(registry: &str) -> Option<String> {
+    let bare = registry.strip_prefix("minecraft:")?;
+    // `worldgen/biome` is the one nested registry; its variant is the leaf,
+    // because `WorldgenBiome` would name a directory rather than a thing.
+    let leaf = bare.rsplit('/').next()?;
+    let mut out = String::with_capacity(leaf.len());
+    for word in leaf.split('_') {
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 pub fn tags(data: &Tags, version: &str) -> Result<String, String> {
     let mut out = String::with_capacity(384 * 1024);
 
@@ -1838,18 +1859,12 @@ pub fn tags(data: &Tags, version: &str) -> Result<String, String> {
 
     let _ = writeln!(
         out,
-        "/// Every tag of the five registries, sorted by (registry, id)."
+        "/// Every tag of the thirteen registries, sorted by (registry, id)."
     );
     let _ = writeln!(out, "pub static TAGS: &[TagDef] = &[");
     for tag in &data.tags {
-        let variant = match tag.registry {
-            "minecraft:block" => "Block",
-            "minecraft:item" => "Item",
-            "minecraft:fluid" => "Fluid",
-            "minecraft:entity_type" => "EntityType",
-            "minecraft:game_event" => "GameEvent",
-            other => return Err(format!("a tag carries unknown registry {other}")),
-        };
+        let variant = tag_registry_variant(tag.registry)
+            .ok_or_else(|| format!("a tag carries unknown registry {}", tag.registry))?;
         let members: Vec<String> = tag.members.iter().map(|m| format!("{m:?}")).collect();
         let _ = writeln!(
             out,

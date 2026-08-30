@@ -25,9 +25,12 @@ use crate::generated::tags::TAGS;
 
 /// Which registry a tag groups.
 ///
-/// Five, because those are the registries the extraction can check members
-/// against. A sixth directory in a future version stops the extractor rather
-/// than arriving as unchecked rows.
+/// Thirteen, which is what a real 1.21.1 server sends `update_tags` for —
+/// counted off the wire, not off a list. Every one of them is checked at
+/// extraction against a table extracted separately: the block report, the
+/// registry report, or the datapack registry names. A fourteenth directory in
+/// a future version stops the extractor rather than arriving as unchecked
+/// rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TagRegistry {
     Block,
@@ -35,16 +38,36 @@ pub enum TagRegistry {
     Fluid,
     EntityType,
     GameEvent,
+    Biome,
+    PointOfInterestType,
+    Enchantment,
+    DamageType,
+    BannerPattern,
+    CatVariant,
+    Instrument,
+    PaintingVariant,
 }
 
 impl TagRegistry {
-    /// Every registry the baseline groups, in generated order.
-    pub const ALL: [Self; 5] = [
+    /// Every registry the baseline groups.
+    ///
+    /// In the order a real server sent them. Nothing on the wire depends on
+    /// it — each registry names itself in the packet — but an order somebody
+    /// chose is one two people can disagree about, and this one has an answer.
+    pub const ALL: [Self; 13] = [
         Self::Block,
-        Self::Item,
-        Self::Fluid,
         Self::EntityType,
+        Self::Biome,
         Self::GameEvent,
+        Self::Item,
+        Self::PointOfInterestType,
+        Self::Enchantment,
+        Self::Fluid,
+        Self::DamageType,
+        Self::BannerPattern,
+        Self::CatVariant,
+        Self::Instrument,
+        Self::PaintingVariant,
     ];
 
     /// The registry id this tag groups, which is also how the generated rows
@@ -56,7 +79,20 @@ impl TagRegistry {
             Self::Fluid => "minecraft:fluid",
             Self::EntityType => "minecraft:entity_type",
             Self::GameEvent => "minecraft:game_event",
+            Self::Biome => "minecraft:worldgen/biome",
+            Self::PointOfInterestType => "minecraft:point_of_interest_type",
+            Self::Enchantment => "minecraft:enchantment",
+            Self::DamageType => "minecraft:damage_type",
+            Self::BannerPattern => "minecraft:banner_pattern",
+            Self::CatVariant => "minecraft:cat_variant",
+            Self::Instrument => "minecraft:instrument",
+            Self::PaintingVariant => "minecraft:painting_variant",
         }
+    }
+
+    /// The registry with this id, or `None` if tags do not group it.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.name() == name)
     }
 }
 
