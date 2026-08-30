@@ -1369,6 +1369,19 @@ fn a_world_minecraft_generated_is_served_to_a_client() {
     let client = join_as(&mut stream, addr, "Explorer");
     assert_eq!(client.chunks, 25, "the columns arrived");
 
+    // And the player is standing on the world's surface rather than at a
+    // superflat's. This was `SURFACE_Y + 1` — bedrock level — for every world
+    // Dust served, which put a player underground in the dark on a server that
+    // looked broken. Asserted as a range and not a number: the y depends on
+    // the world somebody pointed this at, and what is being claimed is that it
+    // came from the terrain and not from a constant.
+    let (_, y, _) = client.spawned_at.expect("the join teleport carries one");
+    assert!(
+        y > -40.0,
+        "spawned at y = {y}, which is a superflat's surface and not a real \
+         world's"
+    );
+
     // A flat column has one section with anything in it and twenty-three of
     // air. A generated one has terrain up through the surface, so several
     // sections carry a palette of more than one block.

@@ -442,13 +442,14 @@ where
     // first time. Read before the join packet, because the join packet is not
     // what carries a position — the teleport below is — and a player told the
     // wrong one first would see themselves move.
+    let spawn = world::spawn_in(&ctx.world);
     let start = ctx
         .positions
         .lock()
         .expect("the position map is never poisoned")
         .get(&profile_id)
         .copied()
-        .unwrap_or(world::SPAWN);
+        .unwrap_or(spawn);
 
     // Counted here rather than when the session ends, and held by a guard so
     // that every way out of this function — a disconnect, a timeout, a decode
@@ -472,7 +473,7 @@ where
     // does not grant it, and a client that is never sent this walks.
     send_play(conn, play_mod::abilities(true), version).await?;
     send_play(conn, play_mod::frozen_at_noon(), version).await?;
-    send_play(conn, play_mod::default_spawn(world::SPAWN), version).await?;
+    send_play(conn, play_mod::default_spawn(spawn), version).await?;
 
     // Before the chunks, not after: a client uses its position to decide which
     // columns it wants, and one told about columns before it knows where it is
