@@ -95,9 +95,11 @@ it is right.**
      `[data] path` — without one a server places blocks in silence and this
      check says so rather than reporting a protocol fault;
    - it is the **sound that block makes**, resolved through minecraft-data's own
-     table rather than Dust's. There is no inventory, so the block that goes
-     down is the world's surface block whatever the client holds — grass, and
-     grass sounds like `block.grass.place`;
+     table rather than Dust's. The block is whatever check 10 put in the bot's
+     hand — cobblestone, which sounds like `block.stone.place` — so this check
+     and the one below it fail together if the held item never arrives, and
+     that is deliberate: a sound that is right about a block the server placed
+     by accident is not a sound that is right;
    - it plays **where the block went**, which is the check that matters most and
      the one nothing on either side of the wire can do. That packet's position
      is in *eighths of a block* and its field is called `x`. A server that wrote

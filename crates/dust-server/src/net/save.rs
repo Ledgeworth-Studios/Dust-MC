@@ -185,11 +185,20 @@ pub fn resolve(blocks: &[SavedBlock]) -> (Vec<(Position, u32)>, Vec<String>) {
 /// The name to write down for a block state.
 ///
 /// The block's name, not the state's: a state carries property values — which
-/// way a stair faces — and this save format does not keep them. That is a real
-/// loss and it is bounded by what can currently be placed, which is one block
-/// with no properties. It is named here so the day placing gains properties,
-/// this is the function that has to grow rather than the bug that has to be
-/// found.
+/// way a stair faces — and this save format does not keep them.
+///
+/// **It is still lossless, and the reason it is has changed.** It used to be
+/// that one block could be placed and that block had no properties. Now any of
+/// the 925 blocks Minecraft has an item for can go down — stairs, logs, slabs,
+/// every one of them property-carrying — and what keeps this honest is that
+/// they all go down in their **default** state, because `held_block` has no
+/// placement context to compute another one from.
+///
+/// So the day that gains a context is the day this becomes a real loss: a
+/// player's stairs would come back from a restart all facing north. This is the
+/// function that has to grow then, and the growth is a property map beside the
+/// name plus a save version bump, so that an older build refuses the file
+/// rather than silently flattening a world.
 pub fn name_of(state: u32) -> Option<&'static str> {
     dust_registry::BlockState::from_id(state).map(|s| s.block().name())
 }

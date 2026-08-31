@@ -102,8 +102,9 @@ physics, block updates, drops or tool checks, and nothing that validates
 last claimed; no inventory beyond the nine hotbar slots a
 creative client writes, so nothing is stored and nothing is carried between
 sessions; no placement *context*, so a block goes down in its default state
-rather than facing the way the player stood, and eight layers of snow are
-replaced where Minecraft would refuse; light that
+rather than facing the way the player stood, a block placed into water
+replaces it rather than waterlogging, and eight layers of snow are replaced
+where Minecraft would refuse; light that
 crosses a chunk boundary — sky light from a neighbour it would have to travel
 *through*, and any light at all from a torch on the far side of one — which is
 an engine gap and not a data one, and is now the *only* thing between a served
