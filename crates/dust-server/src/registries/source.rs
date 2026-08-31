@@ -53,6 +53,10 @@ impl Contents {
     }
 
     /// Whether nothing was read.
+    ///
+    /// Nothing calls it. It is here because `len` is, and a type with a length
+    /// and no emptiness test is a lint — and the honest way to satisfy that
+    /// lint is the method, not an `allow`.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

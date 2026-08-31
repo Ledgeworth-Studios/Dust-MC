@@ -53,11 +53,13 @@ section codec, the chunk packet, the light engine.
 **Not yet**, and each of these is stated where the code for it would go: no
 physics, block updates, drops, tool checks or reach validation, so a player may
 break bedrock from across the map; no inventory, so there is one placeable
-block; no block light, sky light that crosses a chunk boundary from a neighbour
-open to the sky but not from one it would have to travel through, and no sound
-when a block is placed — all three waiting on the same data rather than on
-effort, and costed in decision record
-[0008](docs/decisions/0008-block-opacity-and-light-emission.md); no plugins;
+block; no block light and no sound when a block is placed, both waiting on the
+same data rather than on effort and costed in decision record
+[0008](docs/decisions/0008-block-opacity-and-light-emission.md); sky light that
+crosses a chunk boundary from a neighbour open to the sky but not from one it
+would have to travel through, which is an engine gap and not a data one — the
+propagation trait was given `contains` so the wider version is a bigger volume
+rather than a rewrite; no plugins;
 and the running server still saves its own edits in its own format beside a
 world rather than back into it — writing Anvil works, but a chunk's block
 entities and scheduled ticks survive a round trip by being *copied*, not because

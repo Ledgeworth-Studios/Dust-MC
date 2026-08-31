@@ -183,8 +183,10 @@ pub fn spawn_in(world: &crate::net::edits::EditedWorld) -> (f64, f64, f64) {
 ///
 /// Every column of a flat world is identical, so generating each one is doing
 /// the same work again. `dust-world`'s bench puts an overworld column at
-/// **0.36 ms to build and 0.65 ms to light**, in release — a millisecond
-/// apiece, and twenty-five of them on a join.
+/// **about 0.5 ms to build and 0.9 ms to light**, in release on an idle
+/// machine — and 289 of them on a join at the default view distance. Run that
+/// bench on an idle machine or not at all: the same line read 1.4 ms on a quiet
+/// laptop and 6.0 ms on one that was also compiling.
 ///
 /// So the column is built and lit once, here, and the chunk packet is told
 /// which coordinates to put on it. That is correct for *this* world and is

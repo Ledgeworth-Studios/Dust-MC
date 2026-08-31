@@ -72,12 +72,6 @@ impl View {
         }
     }
 
-    /// How far this view reaches.
-    #[must_use]
-    pub fn radius(&self) -> i32 {
-        self.radius
-    }
-
     /// Move the view to `centre`, and say what that costs.
     ///
     /// Idempotent: calling it twice with the same centre returns an empty
