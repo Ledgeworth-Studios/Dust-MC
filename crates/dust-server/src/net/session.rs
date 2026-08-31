@@ -125,7 +125,7 @@ pub struct SessionContext {
     /// Shared with the accept loop. A session counts the player inside it,
     /// because only a session knows when one has arrived and when it has left.
     pub counters: std::sync::Arc<super::listen::Counters>,
-    /// Air, and the one block a player can place.
+    /// Air, and the block a right-click falls back to.
     ///
     /// Resolved at boot alongside the world's own palette rather than looked
     /// up per click: `Block::from_name` is a scan over the whole block table,
@@ -181,10 +181,12 @@ pub struct SessionContext {
 pub struct PlaceableBlocks {
     /// What breaking a block leaves behind.
     pub air: u32,
-    /// What placing one puts down.
+    /// What a right-click puts down when nothing better is known.
     ///
-    /// One block, because there is no inventory and what a player is holding
-    /// is not knowable here yet. Stated rather than dressed up as a choice.
+    /// It was the *only* thing a player could place until the item table
+    /// arrived; now it is the fallback for the three ways that lookup comes up
+    /// empty — no `dust-items.tsv` beside the data, an empty hand, or an item
+    /// that places no block. See [`held_block`].
     pub placeable: u32,
 }
 
