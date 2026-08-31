@@ -16,21 +16,30 @@ import java.util.function.Predicate;
 /**
  * Prints, for every block state Minecraft has, the constants that exist only
  * as Java code: how much light entering the state costs, how much it emits,
- * whether it occludes, and which of the six heightmaps count it.
+ * whether it occludes, which of the six heightmaps count it, and the sound it
+ * makes when somebody puts it down.
  *
  * None of it is in any `--reports` output or any data pack, which is decision
- * record 0008 for the light values and 0010 for the heightmap predicates. This asks the game.
+ * record 0008 for the light values and the sound group, and 0010 for the
+ * heightmap predicates. This asks the game.
  *
  * Nothing here names a Minecraft class: every identifier comes from the
  * properties file the extractor wrote from Mojang's published mappings, so a
  * version that renames the world changes that file and not this one.
  *
  * The output is tab-separated with a **named header**, and the names are load
- * bearing: `state_id`, `opacity`, `emission`, `occlude`, then one column per
- * heightmap under the serialization key Minecraft itself gives it. A reader
- * that matched columns by position would silently change meaning the day a
- * column was inserted; one that reads the header can also say which columns a
- * table it has been handed does not have.
+ * bearing: `state_id`, `opacity`, `emission`, `occlude`, `place_sound`,
+ * `sound_volume`, `sound_pitch`, then one column per heightmap under the
+ * serialization key Minecraft itself gives it. A reader that matched columns by
+ * position would silently change meaning the day a column was inserted; one
+ * that reads the header can also say which columns a table it has been handed
+ * does not have.
+ *
+ * `place_sound` is the sound event's **name** and not its registry id, for the
+ * same reason the heightmap columns are keyed by serialization key: a name is
+ * something the Rust side already knows independently, out of its own generated
+ * `minecraft:sound_event` table, so the two meet on a string rather than on a
+ * position one of them had to be told.
  */
 public final class BlockOracle {
 
@@ -55,6 +64,7 @@ public final class BlockOracle {
             names.type("block_getter.class"),
             names.type("blockpos.class"));
         Method canOcclude = names.method("blockstate.class", "blockstate.can_occlude");
+        SoundGroups sounds = new SoundGroups(names);
 
         // The level Minecraft itself passes where there is no world, and the
         // origin. `getLightBlock` takes both and, for every vanilla block,
@@ -68,7 +78,8 @@ public final class BlockOracle {
         Method getId = names.method("idmapper.class", "idmapper.get_id", Object.class);
         int written = 0;
         try (BufferedWriter out = Files.newBufferedWriter(Path.of(args[1]))) {
-            StringBuilder header = new StringBuilder("# state_id\topacity\temission\tocclude");
+            StringBuilder header = new StringBuilder(
+                "# state_id\topacity\temission\tocclude\tplace_sound\tsound_volume\tsound_pitch");
             for (Heightmap heightmap : heightmaps) {
                 header.append('\t').append(heightmap.key);
             }
@@ -78,11 +89,15 @@ public final class BlockOracle {
                 int opacity = (int) getLightBlock.invoke(state, emptyLevel, origin);
                 int emission = lightEmission.getInt(state);
                 boolean occludes = (boolean) canOcclude.invoke(state);
+                SoundGroup sound = sounds.of(state);
                 StringBuilder row = new StringBuilder();
                 row.append(id).append('\t')
                    .append(opacity).append('\t')
                    .append(emission).append('\t')
-                   .append(occludes ? 1 : 0);
+                   .append(occludes ? 1 : 0).append('\t')
+                   .append(sound.placeSound).append('\t')
+                   .append(sound.volume).append('\t')
+                   .append(sound.pitch);
                 for (Heightmap heightmap : heightmaps) {
                     row.append('\t').append(heightmap.counts.test(state) ? 1 : 0);
                 }
@@ -92,6 +107,7 @@ public final class BlockOracle {
         }
         System.out.println("states=" + written);
         System.out.println("heightmaps=" + heightmaps.size());
+        System.out.println("sound_groups=" + sounds.seen());
     }
 
     /** One heightmap: the name a chunk's NBT calls it, and what it counts. */
@@ -146,6 +162,61 @@ public final class BlockOracle {
             names.method("bootstrap.class", "bootstrap.boot").invoke(null);
         } finally {
             System.setOut(out);
+        }
+    }
+
+    /** One block sound group: what placing it sounds like, and how loud. */
+    private record SoundGroup(String placeSound, float volume, float pitch) {}
+
+    /**
+     * A block state's sound group, resolved once per distinct group.
+     *
+     * Minecraft has a few dozen `SoundType` instances and tens of thousands of
+     * block states, and every state shares one of them by identity. The cache
+     * is keyed on that identity, so the count it reports is the number of
+     * *distinct* groups the game handed out — which is the check worth having
+     * here for the same reason the per-heightmap counts are: a field that
+     * resolved to the wrong member would answer the same thing for every state,
+     * and one group covering twenty-eight thousand states says so in one line.
+     */
+    private static final class SoundGroups {
+        private final Method getSoundType;
+        private final Field volume;
+        private final Field pitch;
+        private final Field placeSound;
+        private final Method getLocation;
+        private final java.util.IdentityHashMap<Object, SoundGroup> cache =
+            new java.util.IdentityHashMap<>();
+
+        SoundGroups(Names names) throws Exception {
+            this.getSoundType = names.method("blockstate.class", "blockstate.get_sound_type");
+            this.volume = names.field("soundtype.class", "soundtype.volume");
+            this.pitch = names.field("soundtype.class", "soundtype.pitch");
+            this.placeSound = names.field("soundtype.class", "soundtype.place_sound");
+            this.getLocation = names.method("soundevent.class", "soundevent.get_location");
+        }
+
+        SoundGroup of(Object state) throws Exception {
+            Object type = getSoundType.invoke(state);
+            SoundGroup known = cache.get(type);
+            if (known != null) {
+                return known;
+            }
+            Object event = placeSound.get(type);
+            // `ResourceLocation.toString()` is `namespace:path`, which is the
+            // spelling the Rust side's own registry table uses. Nothing here
+            // reaches into the location's fields: its `toString` is the format,
+            // and reassembling it from parts would be a second opinion about
+            // a string Minecraft already renders.
+            String name = getLocation.invoke(event).toString();
+            SoundGroup group = new SoundGroup(
+                name, volume.getFloat(type), pitch.getFloat(type));
+            cache.put(type, group);
+            return group;
+        }
+
+        int seen() {
+            return cache.size();
         }
     }
 }

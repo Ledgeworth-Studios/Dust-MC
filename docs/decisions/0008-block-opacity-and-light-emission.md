@@ -339,10 +339,50 @@ the moment somebody has just produced one.
 Nothing about this ships a Mojang value. The repository holds the question, the
 oracle that asks it, and the reader for the answer.
 
-**What is left:** block light and block-place sounds, which are the same two
-paragraphs below and are now waiting on code rather than on data — the table
-already carries emission for 1,588 of 26,684 states. Sky light is done: a server
-with a table lights an ocean world exactly as Minecraft does.
+**What is left:** nothing this record opened. Sky light is done, block light is
+done, and the block-place sound is done — the last of them by the section
+directly below, which is the same route carrying a third kind of constant.
+
+## And the sound a block makes going down (2026-08-31)
+
+`SoundType` is the same shape of problem as `getLightBlock`: a value handed to a
+block's properties in Java, in no report, no data pack and nothing the
+generators emit. It reaches a server the same way — three more columns in the
+same file, off the same object, through the same oracle — and the route needed
+no argument because this record already made it.
+
+**Two things in it are decisions and not applications of one.**
+
+**The column holds the sound's name, not its id.** `minecraft:block.stone.place`
+rather than 1366. An id is a *position* in the sound registry of whichever
+Minecraft the extractor ran against, and a table carried over a version bump
+would have handed the server a number that is in range, resolves, and is a
+different sound. A name is a string `dust-registry`'s own generated
+`minecraft:sound_event` table already holds independently, so the two sides meet
+on something each of them knows — exactly what the heightmap columns already do
+with their serialization keys, and exactly why `BLOCK_STATE_REGISTRY` was chosen
+over the `Blocks` class at the top of this record. All 109 of 1.21.1's names
+resolve; one that did not would be named, and would be the version skew rather
+than a quiet substitution.
+
+**The table holds the group's own volume and pitch, unscaled.** Vanilla plays a
+placement at `(volume + 1) / 2` and `pitch * 0.8`; a step off the same group
+scales differently. A table that had already applied the placement's arithmetic
+could not serve the step, and the day a step sound is wanted the file an
+operator extracted a year ago would be the wrong file. The scaling belongs to
+the caller and is written where the caller is.
+
+**A sound is not a light level and the check is weaker, which is worth saying
+out loud.** The opacity column has a real guard: every light level fits in a
+nibble, so a value above fifteen is proof the oracle read the wrong Java member.
+Volume and pitch have no such ceiling — `sound_volume` and `sound_pitch` are
+refused if they are not finite numbers under ten, which catches a misaligned
+read and does not catch reading `pitch` where `volume` was meant. What does
+catch that is the distinct-group count: 112 sound groups over 26,684 states,
+109 of them distinct once volume and pitch are counted in, and a `SoundType`
+field resolved to the wrong member answers the same thing for every state. The
+extractor refuses a table that reports one group, for the same reason it refuses
+one with no heightmap columns.
 
 ## What is still consequent
 
@@ -364,12 +404,16 @@ with a table lights an ocean world exactly as Minecraft does.
   with no table, and that is now a configuration state rather than a property of
   Dust: 3.5% of every cell in view on an ocean spawn without one, and nothing at
   all with one.
-- **No sound when a block is placed**, for the reason above. Breaking one is
-  fine — the break effect carries the block's *state* and the client picks the
-  sound itself, which is why that could be built and this cannot.
+- **A placed block makes a sound — built, 2026-08-31.** Breaking one always
+  could: the break effect carries the block's *state* and the client picks the
+  sound itself. A placement has no such packet, so the sound has to be named,
+  and naming it needed the table. A server with no table places blocks in
+  silence, which is what every server did before this and is a refusal to invent
+  what a block sounds like rather than a guess at it — every block would have
+  been stone.
 - **`opacity_of` is the one place this is decided** for light, and it says so.
-  It now takes the table; what is still to be written is the emission model
-  beside it and a block-to-sound table, and nothing else.
+  It takes the table, the emission model beside it takes the table, and
+  `net::play::block_placed` is the third and last reader this record opened.
 
 ## Related
 

@@ -432,6 +432,50 @@ pub fn block_broken(
 /// state id is a number nobody can check.
 const PARTICLES_DESTROY_BLOCK: i32 = 2001;
 
+/// Somebody else put a block down: the sound it made.
+///
+/// No particles — a placement has none, which is why this is a sound packet
+/// where a break is a level event. The level event carries a state id and lets
+/// the client work out both; a placement's sound has to be named.
+///
+/// `None` when the constants table has no sound for the state, which covers
+/// both a server with no table at all and a table written before the columns
+/// existed. Silence is the same thing that happened before this function, and
+/// it is a better answer than a guessed sound: every block on Dust would have
+/// been stone.
+///
+/// # What the arithmetic is
+///
+/// Vanilla's `BlockItem.place` ends in
+/// `level.playSound(player, pos, sound, BLOCKS, (volume + 1) / 2, pitch * 0.8)`,
+/// and `Level.playSound(Player, BlockPos, …)` offsets to the block's centre.
+/// The halving and the 0.8 are the *placement's*, not the sound group's —
+/// a step off the same group scales differently — which is why the table holds
+/// the group's own numbers and this applies the placement to them.
+///
+/// The seed picks among a sound event's samples, and it arrives from the edit
+/// rather than being drawn here: two players watching one block go down are
+/// watching one event, and a seed drawn per session would give them different
+/// samples of it.
+pub fn block_placed(
+    position: dust_protocol::types::Position,
+    state: u32,
+    seed: i64,
+    constants: Option<&dust_registry::BlockConstants>,
+) -> Option<play::clientbound::Sound> {
+    let sound = constants?.place_sound(state)?;
+    Some(play::clientbound::Sound {
+        sound: play::sound::SoundId::Id(VarInt(i32::try_from(sound.sound).ok()?)),
+        category: play::sound::SoundCategory::Block,
+        position_x: play::sound::eighths(f64::from(position.x) + 0.5),
+        position_y: play::sound::eighths(f64::from(position.y) + 0.5),
+        position_z: play::sound::eighths(f64::from(position.z) + 0.5),
+        volume: (sound.volume + 1.0) / 2.0,
+        pitch: sound.pitch * 0.8,
+        seed,
+    })
+}
+
 /// Somebody else swung an arm.
 ///
 /// The animation table is the protocol's: 0 is the main hand, 3 the off hand.
@@ -614,5 +658,86 @@ pub fn frozen_at_noon() -> play::clientbound::SetTime {
     play::clientbound::SetTime {
         world_age: 0,
         time_of_day: -NOON,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dust_protocol::types::Position;
+
+    /// A constants table where every state places `minecraft:block.stone.place`
+    /// at the volume and pitch given.
+    ///
+    /// Written out rather than read from a file: what the oracle produces is
+    /// Mojang's data and none of it is committed, which is decision record
+    /// 0008 and the rule every reader in this workspace is tested under. What
+    /// this fixture can say is that the arithmetic between the table and the
+    /// packet is vanilla's.
+    fn constants(volume: f32, pitch: f32) -> dust_registry::BlockConstants {
+        let mut text = String::from(
+            "# state_id\topacity\temission\tocclude\tplace_sound\tsound_volume\tsound_pitch\n",
+        );
+        for state in 0..dust_registry::STATE_COUNT {
+            text.push_str(&format!(
+                "{state}\t0\t0\t1\tminecraft:block.stone.place\t{volume}\t{pitch}\n"
+            ));
+        }
+        dust_registry::BlockConstants::parse(&text).expect("a complete table")
+    }
+
+    #[test]
+    fn a_placement_sound_carries_vanillas_arithmetic() {
+        // `BlockItem.place` plays the group at `(volume + 1) / 2` and
+        // `pitch * 0.8`, from the block's centre. Every one of those three is
+        // a thing a reader would otherwise have to take on trust, and the
+        // centre offset is the one that is silent when it is wrong.
+        let table = constants(0.3, 1.5);
+        let sound = block_placed(
+            Position {
+                x: 10,
+                y: 70,
+                z: -3,
+            },
+            1,
+            42,
+            Some(&table),
+        )
+        .expect("the table has a sound for every state");
+
+        assert_eq!(sound.category, play::sound::SoundCategory::Block);
+        assert_eq!(sound.seed, 42, "the edit's seed, not one drawn here");
+        assert!((sound.volume - 0.65).abs() < f32::EPSILON, "{sound:?}");
+        assert!((sound.pitch - 1.2).abs() < 1e-6, "{sound:?}");
+
+        // Eighths of a block, from the centre: 10 -> 10.5 -> 84.
+        assert_eq!(sound.position_x, 84);
+        assert_eq!(sound.position_y, 564);
+        assert_eq!(sound.position_z, -20);
+    }
+
+    #[test]
+    fn the_sound_is_named_by_this_builds_own_registry_id() {
+        let table = constants(1.0, 1.0);
+        let sound = block_placed(Position { x: 0, y: 0, z: 0 }, 1, 0, Some(&table))
+            .expect("a sound for state 1");
+        let events = dust_registry::Registry::from_name("minecraft:sound_event")
+            .expect("the registry is generated");
+        let expected = events
+            .entry_id("minecraft:block.stone.place")
+            .expect("a real sound event");
+        assert_eq!(
+            sound.sound,
+            play::sound::SoundId::Id(VarInt(expected as i32)),
+            "the id form, and the id this build gives that name"
+        );
+    }
+
+    #[test]
+    fn a_server_with_no_constants_table_places_blocks_in_silence() {
+        // The state a server without a `[data] path` is in, and the state
+        // every server was in before this existed. Silence rather than a
+        // guessed sound: guessing makes every block on the server stone.
+        assert!(block_placed(Position { x: 0, y: 0, z: 0 }, 1, 0, None).is_none());
     }
 }

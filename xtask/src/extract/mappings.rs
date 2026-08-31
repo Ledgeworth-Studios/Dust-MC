@@ -342,6 +342,55 @@ pub const LIGHT_ORACLE: &[Wanted<'static>] = &[
         method: "isOpaque",
         parameters: &[],
     },
+    // The block sound group. Same kind of thing again — a `SoundType` handed
+    // to a block's properties in Java, in no report and no data pack — and the
+    // one a server needs in order to make a noise when somebody puts a block
+    // down. Decision record 0008's own account of it is the section dated
+    // 2026-08-31. Read per state through `getSoundType`, because that is the
+    // method the game itself calls and a block whose sound depended on its
+    // state would be one a per-block table could not describe.
+    Wanted::Method {
+        key: "blockstate.get_sound_type",
+        class: BLOCK_STATE_BASE,
+        method: "getSoundType",
+        parameters: &[],
+    },
+    Wanted::Class {
+        key: "soundtype.class",
+        class: SOUND_TYPE,
+    },
+    // The fields rather than the accessors, for the reason `lightEmission` is
+    // read as a field: no arguments, nothing to resolve an overload against.
+    Wanted::Field {
+        key: "soundtype.volume",
+        class: SOUND_TYPE,
+        field: "volume",
+    },
+    Wanted::Field {
+        key: "soundtype.pitch",
+        class: SOUND_TYPE,
+        field: "pitch",
+    },
+    Wanted::Field {
+        key: "soundtype.place_sound",
+        class: SOUND_TYPE,
+        field: "placeSound",
+    },
+    Wanted::Class {
+        key: "soundevent.class",
+        class: SOUND_EVENT,
+    },
+    // The sound's **name**, not its registry id. The id is a position in a
+    // registry this oracle would have to walk to find, and the name is a string
+    // `dust-registry`'s own generated `minecraft:sound_event` table already
+    // holds — so the two sides meet on something each knows independently,
+    // exactly as the heightmap columns meet on a serialization key.
+    Wanted::Method {
+        key: "soundevent.get_location",
+        class: SOUND_EVENT,
+        method: "getLocation",
+        parameters: &[],
+    },
 ];
 
 const BLOCK_STATE_BASE: &str =
@@ -352,6 +401,8 @@ const EMPTY_BLOCK_GETTER: &str = "net.minecraft.world.level.EmptyBlockGetter";
 const ID_MAPPER: &str = "net.minecraft.core.IdMapper";
 const SHARED_CONSTANTS: &str = "net.minecraft.SharedConstants";
 const HEIGHTMAP_TYPES: &str = "net.minecraft.world.level.levelgen.Heightmap$Types";
+const SOUND_TYPE: &str = "net.minecraft.world.level.block.SoundType";
+const SOUND_EVENT: &str = "net.minecraft.sounds.SoundEvent";
 
 /// Resolve a list of wanted names into a properties file for the Java side.
 ///

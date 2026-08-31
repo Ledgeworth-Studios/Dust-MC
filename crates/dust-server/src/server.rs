@@ -827,10 +827,23 @@ impl Server {
                 "dust::data",
                 format!(
                     "block constants: Minecraft's own answers for {} block states, \
-                     {} of them emitting, and {} heightmap predicate(s)",
+                     {} of them emitting, {} heightmap predicate(s), and {}",
                     table.len(),
                     table.emitting(),
-                    table.flags().count()
+                    table.flags().count(),
+                    // Named apart from the rest because the answer is not
+                    // always yes: a table extracted before the sound columns
+                    // existed is still a whole table and still lights the world
+                    // correctly, and the operator whose blocks go down in
+                    // silence needs to be told which of the two things is
+                    // missing — the file, or three columns of it.
+                    if table.has_place_sounds() {
+                        format!("{} block sound group(s)", table.sound_groups())
+                    } else {
+                        "no place sounds, so a placed block is silent; re-run \
+                         `cargo xtask extract --only constants` for those"
+                            .to_owned()
+                    }
                 ),
             ),
             // Information and not a warning, said once at boot. A server with
@@ -841,13 +854,17 @@ impl Server {
                 "dust::data",
                 format!(
                     "no {} under [data] path, so a served world's sky light treats \
-                     every block but air as a wall and its sky floor sits above \
-                     the grass: measured at 0.6% of cells inland and 3.5% over ocean",
+                     every block but air as a wall, its sky floor sits above the \
+                     grass, and a placed block makes no sound: the light is \
+                     measured at 0.6% of cells inland and 3.5% over ocean",
                     crate::registries::constants::FILE
                 ),
             ),
         }
         let opacity = crate::net::world::opacity_of(palette.air, constants.as_ref());
+        // Shared rather than moved: the world lights and heightmaps with this
+        // table, and a session reads the sound a placed block makes out of the
+        // same one. Two readers of one file, not two copies of it.
         let constants = constants.map(std::sync::Arc::new);
 
         // Where columns come from. An empty setting means the flat world; a
@@ -896,7 +913,11 @@ impl Server {
                 },
             );
             crate::net::source::Source::Anvil(Box::new(crate::net::source::AnvilWorld::new(
-                directory, names, flat, opacity, constants,
+                directory,
+                names,
+                flat,
+                opacity,
+                constants.clone(),
             )))
         };
 
@@ -1004,6 +1025,7 @@ impl Server {
                 fail("the generated entity table has no minecraft:player".to_owned())
             })?,
             counters: std::sync::Arc::clone(&counters),
+            constants,
             registry_contents,
         });
 
