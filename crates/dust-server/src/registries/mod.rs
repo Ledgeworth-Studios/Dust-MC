@@ -31,11 +31,11 @@
 //! what this module owns, and a second reader of one setting in a second place
 //! is how two answers to one question start.
 
+pub mod constants;
 pub mod convert;
-pub mod light;
 pub mod schema;
 pub mod source;
 
+pub use constants::ConstantsFileError;
 pub use convert::{ConvertError, ErrorKind};
-pub use light::LightError;
 pub use source::{load, Contents, EntryError, LoadError, Loaded};

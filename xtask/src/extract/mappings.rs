@@ -191,7 +191,7 @@ impl Wanted<'_> {
     }
 }
 
-/// Everything the light oracle has to be able to name.
+/// Everything the block oracle has to be able to name.
 ///
 /// Decision record 0008 is the account of why this list exists: a block's
 /// opacity and its light emission are constants in Java code, in no report and
@@ -315,6 +315,33 @@ pub const LIGHT_ORACLE: &[Wanted<'static>] = &[
         method: "bootStrap",
         parameters: &[],
     },
+    // The heightmap predicates. Not light, and on this list anyway: they are
+    // the same kind of thing — a `Predicate<BlockState>` written as Java, in no
+    // report and no data pack — reached through the same jar in the same pass
+    // off the same object. Decision record 0010 is the account.
+    //
+    // **Nothing here names a constant.** The enum's members are reached through
+    // `getEnumConstants`, and each one is asked for its own serialization key —
+    // `MOTION_BLOCKING` and the rest — which are the strings a chunk's NBT uses
+    // and `HeightmapKind::nbt_key` already returns. Taking them by ordinal
+    // would work today and would be an unstated assumption that vanilla
+    // declares them in the order Dust lists them.
+    Wanted::Class {
+        key: "heightmap_types.class",
+        class: HEIGHTMAP_TYPES,
+    },
+    Wanted::Method {
+        key: "heightmap_types.serialization_key",
+        class: HEIGHTMAP_TYPES,
+        method: "getSerializationKey",
+        parameters: &[],
+    },
+    Wanted::Method {
+        key: "heightmap_types.is_opaque",
+        class: HEIGHTMAP_TYPES,
+        method: "isOpaque",
+        parameters: &[],
+    },
 ];
 
 const BLOCK_STATE_BASE: &str =
@@ -324,6 +351,7 @@ const BLOCK_POS: &str = "net.minecraft.core.BlockPos";
 const EMPTY_BLOCK_GETTER: &str = "net.minecraft.world.level.EmptyBlockGetter";
 const ID_MAPPER: &str = "net.minecraft.core.IdMapper";
 const SHARED_CONSTANTS: &str = "net.minecraft.SharedConstants";
+const HEIGHTMAP_TYPES: &str = "net.minecraft.world.level.levelgen.Heightmap$Types";
 
 /// Resolve a list of wanted names into a properties file for the Java side.
 ///

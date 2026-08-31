@@ -183,7 +183,7 @@ So the honest cost is a mappings parser, a properties file, one Java class and
 an `xtask extract` verb — not a research project. **This does not decide
 anything below; it removes the reason option 1 looked expensive.**
 
-### Built, 2026-08-31. `cargo xtask extract --only light`
+### Built, 2026-08-31. `cargo xtask extract --only constants`
 
 Six and a half seconds from a clean cache, and it reports **26,684 block
 states**:
@@ -285,7 +285,7 @@ judgement.
 
 ## How the numbers reach an operator — decided
 
-`cargo xtask extract --only light` is a **developer** command. It runs from a
+`cargo xtask extract --only constants` is a **developer** command. It runs from a
 Rust checkout. An operator has a `dust` binary, a `dust.toml`, and — per D7 — a
 `[data] path` directory they produced with Minecraft's own `--server`
 generator. They have a JDK and a jar already, so the oracle asks nothing new of
@@ -317,14 +317,14 @@ so it could not be the answer to "how does an operator do this today".
 
 ### What was built
 
-The file is `dust-light.tsv`, beside `minecraft/` rather than inside it:
+The file is `dust-constants.tsv`, beside `minecraft/` rather than inside it:
 everything under `minecraft/` is Minecraft's own output in Minecraft's own
 layout, and a bare `light.tsv` in there would look like one more of them. The
 name says who wrote it and who reads it.
 
 ```text
 <[data] path>/
-  dust-light.tsv
+  dust-constants.tsv
   minecraft/
     worldgen/biome/…
 ```
@@ -333,7 +333,7 @@ Absent is not an error, and the server says which case it is in at boot with the
 measured cost of going without. **Present and wrong is** an error that stops the
 server: the alternative is a server that reads the operator's file, puts it
 down, and runs with lighting quietly worse than they asked for. `xtask extract
---only light` prints the one `cp` line that puts the file where it belongs, at
+--only constants` prints the one `cp` line that puts the file where it belongs, at
 the moment somebody has just produced one.
 
 Nothing about this ships a Mojang value. The repository holds the question, the

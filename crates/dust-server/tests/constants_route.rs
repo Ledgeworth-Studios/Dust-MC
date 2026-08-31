@@ -17,13 +17,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dust_registry::STATE_COUNT;
-use dust_server::registries::light;
+use dust_server::registries::constants;
 
 /// A directory of its own per call, so two tests never share a file.
 fn data_dir() -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
-        "dust-light-route-{}-{}",
+        "dust-constants-route-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::SeqCst),
     ));
@@ -35,9 +35,9 @@ fn data_dir() -> PathBuf {
 /// are irrelevant here; what matters is that it is the right *shape*, because
 /// nothing shorter than a complete table is accepted.
 fn table() -> String {
-    let mut text = String::from("# state_id\topacity\temission\tocclude\n");
+    let mut text = String::from("# state_id\topacity\temission\tocclude\tMOTION_BLOCKING\n");
     for state in 0..STATE_COUNT {
-        text.push_str(&format!("{state}\t15\t0\t1\n"));
+        text.push_str(&format!("{state}\t15\t0\t1\t1\n"));
     }
     text
 }
@@ -45,8 +45,8 @@ fn table() -> String {
 #[test]
 fn a_table_beside_the_data_is_read() {
     let dir = data_dir();
-    std::fs::write(dir.join(light::FILE), table()).expect("write the table");
-    let loaded = light::beside(&dir).expect("a well-formed table");
+    std::fs::write(dir.join(constants::FILE), table()).expect("write the table");
+    let loaded = constants::beside(&dir).expect("a well-formed table");
     let loaded = loaded.expect("the file is there, so there is a table");
     assert_eq!(loaded.len(), STATE_COUNT as usize);
 }
@@ -59,9 +59,9 @@ fn the_file_is_looked_for_under_the_data_path_itself_not_inside_minecraft() {
     // like one more of them.
     let dir = data_dir();
     std::fs::create_dir_all(dir.join("minecraft")).expect("create the namespace");
-    std::fs::write(dir.join("minecraft").join(light::FILE), table()).expect("write it wrongly");
+    std::fs::write(dir.join("minecraft").join(constants::FILE), table()).expect("write it wrongly");
     assert!(
-        light::beside(&dir)
+        constants::beside(&dir)
             .expect("no file is not an error")
             .is_none(),
         "a table inside minecraft/ is not the route"
@@ -74,7 +74,7 @@ fn no_table_is_not_an_error() {
     // before they have read about one, and a server that refused to start
     // without it would be a server that refuses to start.
     let dir = data_dir();
-    assert!(light::beside(&dir).expect("absence is fine").is_none());
+    assert!(constants::beside(&dir).expect("absence is fine").is_none());
 }
 
 #[test]
@@ -83,14 +83,14 @@ fn a_table_that_is_there_and_wrong_is_refused_rather_than_skipped() {
     // operator asked it to, silently, having read their file and put it down.
     let dir = data_dir();
     std::fs::write(
-        dir.join(light::FILE),
+        dir.join(constants::FILE),
         "# state_id\topacity\temission\n0\t0\t0\n",
     )
     .expect("write a truncated table");
-    let error = light::beside(&dir).expect_err("a table with one row in it");
+    let error = constants::beside(&dir).expect_err("a table with one row in it");
     let message = error.to_string();
     assert!(
-        message.contains(light::FILE),
+        message.contains(constants::FILE),
         "the message has to name the file: {message}"
     );
     assert!(
@@ -105,5 +105,5 @@ fn the_name_says_who_wrote_it() {
     // dust.toml.example, in the extractor's own output, and in whatever the
     // operator typed the day they set this up. Renaming it silently breaks a
     // working server on upgrade.
-    assert_eq!(light::FILE, "dust-light.tsv");
+    assert_eq!(constants::FILE, "dust-constants.tsv");
 }

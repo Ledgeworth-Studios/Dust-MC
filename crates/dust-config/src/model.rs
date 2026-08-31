@@ -248,11 +248,14 @@ pub struct DataConfig {
     /// one containing `minecraft/`, which is `data/` inside a datapack. Unset
     /// means Dust has no registry contents to send.
     ///
-    /// Dust also looks here for `dust-light.tsv`, the block-state light table
-    /// written by `cargo xtask extract --only light`. Optional: without it
-    /// every block but air stops sky light. With it, sky light matches the
-    /// light Minecraft computes — exactly, on the ocean world the harness
-    /// measures. A file that is there and unreadable stops the server.
+    /// Dust also looks here for `dust-constants.tsv`, the table of what
+    /// Minecraft's own code says about a block state — how much light it
+    /// stops, how much it gives off, and which heightmaps count it — written
+    /// by `cargo xtask extract --only constants`. Optional: without it every
+    /// block but air stops sky light and the sky floor sits above the grass.
+    /// With it, the sky light Dust serves is the light Minecraft computes,
+    /// exactly on an ocean world and within 0.02% of cells inland. A file that
+    /// is there and unreadable stops the server.
     #[config(restart)]
     pub path: Option<String>,
 }

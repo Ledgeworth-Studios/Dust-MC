@@ -805,30 +805,32 @@ impl Server {
             as u32;
         let flat = crate::net::world::FlatWorld::new(palette, plains, biomes.entries.len() as u32);
 
-        // Minecraft's own opacity and emission for every block state, if the
-        // operator put a table beside their data. Read before the world is
-        // built because the world is lit with it, and read here rather than at
-        // the first column for the same reason the region directory is checked
-        // here: a mistake in it should stop a server starting, not surprise the
-        // first player who looks at an ocean.
+        // What Minecraft says about every block state — opacity, emission, and
+        // which heightmaps count it — if the operator put a table beside their
+        // data. Read before the world is built because the world is both lit
+        // and heightmapped with it, and read here rather than at the first
+        // column for the same reason the region directory is checked here: a
+        // mistake in it should stop a server starting, not surprise the first
+        // player who looks at an ocean.
         //
         // Decision record 0008 is why this arrives from `[data] path` rather
-        // than from a table in this repository, and `crate::registries::light`
+        // than from a table in this repository, and `crate::registries::constants`
         // is where the route itself is argued.
-        let light = match data_path.as_deref() {
+        let constants = match data_path.as_deref() {
             None => None,
             Some(path) => {
-                crate::registries::light::beside(path).map_err(|e| fail(format!("{e}")))?
+                crate::registries::constants::beside(path).map_err(|e| fail(format!("{e}")))?
             }
         };
-        match &light {
+        match &constants {
             Some(table) => self.options.logger.info(
                 "dust::data",
                 format!(
-                    "light: Minecraft's own opacity and emission for {} block states, \
-                     {} of them emitting",
+                    "block constants: Minecraft's own answers for {} block states, \
+                     {} of them emitting, and {} heightmap predicate(s)",
                     table.len(),
-                    table.emitting()
+                    table.emitting(),
+                    table.flags().count()
                 ),
             ),
             // Information and not a warning, said once at boot. A server with
@@ -839,13 +841,14 @@ impl Server {
                 "dust::data",
                 format!(
                     "no {} under [data] path, so a served world's sky light treats \
-                     every block but air as a wall: measured at 0.6% of cells \
-                     inland and 3.5% over ocean",
-                    crate::registries::light::FILE
+                     every block but air as a wall and its sky floor sits above \
+                     the grass: measured at 0.6% of cells inland and 3.5% over ocean",
+                    crate::registries::constants::FILE
                 ),
             ),
         }
-        let opacity = crate::net::world::opacity_of(palette.air, light.as_ref());
+        let opacity = crate::net::world::opacity_of(palette.air, constants.as_ref());
+        let constants = constants.map(std::sync::Arc::new);
 
         // Where columns come from. An empty setting means the flat world; a
         // path means a world Minecraft wrote, with the flat one kept as the
@@ -893,7 +896,7 @@ impl Server {
                 },
             );
             crate::net::source::Source::Anvil(Box::new(crate::net::source::AnvilWorld::new(
-                directory, names, flat, opacity,
+                directory, names, flat, opacity, constants,
             )))
         };
 

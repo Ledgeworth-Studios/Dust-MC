@@ -120,7 +120,7 @@ pub fn light_column(
 /// **This is the one place the answer is decided**, and it has two of them.
 ///
 /// With a table — Minecraft's own `getLightBlock` for every block state, read
-/// out of the operator's own jar by `cargo xtask extract --only light` — every
+/// out of the operator's own jar by `cargo xtask extract --only constants` — every
 /// state carries the number Minecraft carries. On 1.21.1 that is three values
 /// and nothing else: 14,616 states cost nothing, 9,552 cost one, 2,516 are
 /// walls.
@@ -132,7 +132,7 @@ pub fn light_column(
 /// present in no `--reports` output and in no data pack, which is decision
 /// record 0008 — and `xtask harness light` measures what it costs, both ways,
 /// in one run.
-pub fn opacity_of(air: u32, light: Option<&dust_registry::LightTable>) -> OpacityModel {
+pub fn opacity_of(air: u32, light: Option<&dust_registry::BlockConstants>) -> OpacityModel {
     match light {
         // Dense and in id order, which is the order the table is keyed by:
         // the oracle reads Minecraft's own `IdMapper`, so no name is matched
@@ -142,6 +142,49 @@ pub fn opacity_of(air: u32, light: Option<&dust_registry::LightTable>) -> Opacit
             OpacityModel::per_state((0..table.len() as u32).map(|state| table.opacity(state)))
         }
         None => OpacityModel::transparent_only([air]),
+    }
+}
+
+/// The predicate `recompute_heightmaps` wants, given whatever constants there
+/// are.
+///
+/// **This is the one place that answer is decided**, and like
+/// [`opacity_of`] it has two of them.
+///
+/// With a table, each of the six heightmaps is asked its own question and the
+/// answer is the one Minecraft's own `Heightmap$Types` predicate gives —
+/// resolved to a column once, here, rather than by name in a loop that runs
+/// six times for every one of a chunk's 98,304 cells.
+///
+/// Without one, every heightmap gets `state != air`. That is exactly right for
+/// `WORLD_SURFACE` and wrong for the other five, and the way it is wrong is
+/// visible in a player's sky light: `MOTION_BLOCKING` is where Dust's sky
+/// starts, vanilla does not count short grass or a flower in it, and a cell
+/// standing in one comes out a level darker than Minecraft makes it.
+/// `cargo xtask harness light` measures that at 179 cells of 2.4 million on
+/// seed 0 — the last of the four inputs, and the only one that was still
+/// Dust's own invention.
+///
+/// It is not even right about air: `state != air` compares against
+/// `minecraft:air` alone, and `cave_air` and `void_air` are two more states
+/// vanilla's `isAir` says yes to.
+pub fn heightmap_predicate(
+    air: u32,
+    constants: Option<&dust_registry::BlockConstants>,
+) -> impl FnMut(dust_world::heightmap::HeightmapKind, u32) -> bool + '_ {
+    // One lookup per heightmap, done now. A `Flag` is a resolved column, so
+    // the closure below does an array index where a name would do a string
+    // comparison against six candidates.
+    let columns: [Option<dust_registry::constants::Flag>; 6] =
+        dust_world::heightmap::HeightmapKind::ALL
+            .map(|kind| constants.and_then(|table| table.flag(kind.nbt_key())));
+    move |kind, state| match (constants, columns[kind as usize]) {
+        (Some(table), Some(column)) => table.is_set(column, state),
+        // No table, or a table written before this heightmap had a column.
+        // The second case is why `flag` answers `None` rather than `false`: a
+        // column that is absent means "fall back", and one that is present and
+        // zero means "Minecraft says no".
+        _ => state != air,
     }
 }
 
