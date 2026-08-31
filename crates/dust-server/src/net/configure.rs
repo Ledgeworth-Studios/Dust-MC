@@ -190,10 +190,10 @@ where
             // one field acted on, and it is kept rather than used here because
             // what consumes it is the join, several packets later.
             //
-            // A client may send this again during play to change its settings.
-            // That is not handled: the distance a player is served is settled
-            // at the join, and re-streaming on a settings change is work with
-            // nothing behind it until there is a per-tick budget to do it in.
+            // A client may send this again during play to change its
+            // settings, and the play loop takes that one too — the view
+            // forgets or sends the difference on its next move, paced by the
+            // loop's own streaming batch.
             configuration::serverbound::Packet::ClientInformation(info) => {
                 requested_view_distance = u32::try_from(info.view_distance).ok();
             }

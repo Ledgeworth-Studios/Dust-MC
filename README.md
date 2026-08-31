@@ -33,6 +33,10 @@ The same work, in the same order, finishing at the same moment — with the
 session answering throughout instead of at the end. A player who joins and walks
 immediately used to have their movement packets sit in the socket for a second.
 
+A player who changes their render distance mid-game is served the new one, which
+the pacing made cheap enough to bother with: the view forgets or sends the
+difference on its next move, out of the same computation it already does.
+
 **What a player waits for no longer depends on the view distance**, which is why
 the default is Minecraft's own ten: 404/421 ms at a distance of 8, 396/415 at
 10, 376/394 at 12. What the number still costs is the streaming behind them and

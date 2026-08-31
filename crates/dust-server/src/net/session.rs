@@ -1028,6 +1028,26 @@ where
                             ctx.roster.posture(me.entity_id, sneaking, sprinting);
                         }
                     }
+                    // A player changing their render distance in options.
+                    // The server's setting is still the ceiling, and the view
+                    // sends or forgets the difference on its next move — which
+                    // is now paced by the loop rather than sent in a burst,
+                    // which is what makes this affordable at all.
+                    Ok(play::serverbound::Packet::ClientInformation(info)) => {
+                        if let Ok(asked) = u32::try_from(info.view_distance) {
+                            if asked > 0 {
+                                view.set_radius(ctx.view_distance.min(asked));
+                                stream_up_to(
+                                    conn,
+                                    ctx,
+                                    &mut view,
+                                    view::column_of(position.0, position.2),
+                                    STREAM_BATCH,
+                                )
+                                .await?;
+                            }
+                        }
+                    }
                     Ok(play::serverbound::Packet::Chat(said)) => {
                         // The signature and the acknowledgement chain are
                         // decoded and dropped. Relaying the signature would be
