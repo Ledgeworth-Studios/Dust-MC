@@ -93,9 +93,10 @@ for them to reach an *operator*, which is the one question left in decision
 record [0008](docs/decisions/0008-block-opacity-and-light-emission.md); sky
 light that crosses a chunk boundary from a neighbour open to the sky but not
 from one it would have to travel through, which is an engine gap and not a data
-one — the propagation trait was given `contains` so the wider version is a
-bigger volume rather than a rewrite, and it is now nearly all of what stands
-between Dust's sky light and Minecraft's; no plugins;
+one — measured at 432 cells of 2.4 million on an inland world and nothing on an
+ocean one, and costed and declined for now in decision record
+[0010](docs/decisions/0010-how-wide-the-sky-light-volume.md), which says what to
+build instead; no plugins;
 and the running server still saves its own edits in its own format beside a
 world rather than back into it — writing Anvil works, but a chunk's block
 entities and scheduled ticks survive a round trip by being *copied*, not because
@@ -290,24 +291,33 @@ lighting is 99.4% right" when half of lighting is not implemented. A chunk
 Minecraft wrote carries the light Minecraft computed, so the same chunks can be
 lit again with Dust's engine and compared cell by cell.
 
-It measures **two opacity models over the same chunks in the same run**: the
-stand-in that treats every block but air as a wall, and Minecraft's own
-`getLightBlock` for all 26,684 block states, read out of the operator's own jar
-by `cargo xtask extract --only light`.
+It measures a **ladder**: four models over the same chunks in the same run,
+each row the one above it plus a single named change.
 
 ```text
-                          agree      cells short
-  seed 0, radius 2
-    air only, stand-in   99.419%          14,276
-    Minecraft's own      99.975%             611
-  seed 1, radius 3
-    air only, stand-in   96.482%         169,480
-    Minecraft's own     100.000%               0
+seed 0, radius 2                              short   sweep
+  air only, one column, Dust's heightmap     14,276    102 ms
+  + Minecraft's own opacity                     611    101 ms
+  + a 3x3 volume of columns                     179    611 ms
+  + the heightmaps Minecraft wrote                0    544 ms
+
+seed 1, radius 3                              short
+  air only, one column, Dust's heightmap    169,480
+  + Minecraft's own opacity                       0
 ```
 
-**Seed 1 is exact.** 4,816,896 sky-light cells of an ocean world, and not one of
-them disagrees with the light Minecraft wrote. A running server lights the same
-way, through the same function, when there is a table in `[data] path`.
+**The last row is a hundred per cent, on both seeds** — 2,457,600 cells and
+4,816,896 cells, and not one disagrees with the light Minecraft computed. Sky
+light has four inputs and only one of them is the engine; what that row says is
+that the walks are right, and everything above it is something Dust is *told*
+about the world. The last rung is not a mode a server could run in, because a
+chunk somebody has edited has a heightmap its file does not; it is there to
+take the last input out of the measurement.
+
+A running server stands on the second row today: Minecraft's own opacity from a
+table in `[data] path`, one column at a time. Decision records
+[0008](docs/decisions/0008-block-opacity-and-light-emission.md) and
+[0010](docs/decisions/0010-how-wide-the-sky-light-volume.md) are why.
 
 **Getting there found a defect the stand-in had been hiding for the whole of
 the light engine's life.** Minecraft's numbers on their own moved seed 0 by a
@@ -317,32 +327,37 @@ reaching under the water and arriving at half the level it should, because the
 engine charged `1 + opacity` for a step where Minecraft charges
 `max(1, opacity)`. Nothing could see it while the only opacity model answered
 0 or 15, because the two rules agree at both ends. A wrong constant hidden by
-another wrong constant, and the fix is what takes seed 0 to 99.975%.
+another wrong constant.
 
-**What is left is a different gap, and the report says which one.** The
-shortfall is split by how far each cell sits from its column's edge: light from
-a neighbouring column enters at a face and fades inward, while opacity does not
-care where in a column a cell is.
+**A 5x5 volume buys exactly nothing** — the same 179, not fewer — which is the
+argument for a finite volume confirmed rather than assumed. Light loses a level
+a block and a chunk is sixteen of them, so one ring of neighbours is not an
+approximation of the infinite volume; it is the infinite volume.
+
+**The report splits the shortfall by how far each cell sits from its column's
+edge**, because light from a neighbouring column enters at a face and fades
+inward while opacity does not care where in a column a cell is.
 
 ```text
 distance from a face    0      1      2      3      4      5      6      7
 seed 0, air only     0.660  0.595  0.561  0.548  0.530  0.510  0.530  0.581
 seed 0, Minecraft's  0.072  0.021  0.008  0.007  0.005  0.005  0.006  0.018
+seed 0, + 3x3        0.009  0.009  0.006  0.006  0.005  0.005  0.006  0.018
 ```
 
-Flat under the stand-in and falling by an order of magnitude under Minecraft's
-own numbers — the shape a neighbour effect makes, and the first time this verb
-has seen one. Seed 0's remaining 611 cells are 400 cells of air near an edge.
-
-The rate and not the count is the whole measurement: a column has `60 - 8d`
-columns at distance `d`, sixty at the face against four in the middle, so a raw
-count reads as "it is all at the edges" for a perfectly uniform cause.
+Flat, then falling by an order of magnitude, then flat again — three different
+causes, each visible as a different shape. What it cannot do is separate a
+cause nobody proposed: it read "flat, therefore opacity" and was right, and was
+equally right about the step cost. The rate and not the count is the whole
+measurement: a column has `60 - 8d` columns at distance `d`, sixty at the face
+against four in the middle, so a raw count reads as "it is all at the edges"
+for a perfectly uniform cause.
 
 Under the stand-in the percentage was a **property of the world rather than of
 the engine**, which was worth knowing before quoting it: seed 0 read 99.4% and
 seed 1 read 96.4% with the same server, because 168,428 of seed 1's 169,480
-shortfalls were water. The world that was worst is the one that now comes out
-exact.
+shortfalls were water. The world that was worst is the one that comes out exact
+first.
 
 It is a measurement and not a gate — a verb that failed for a known gap would be
 red every time it ran — and **there are no over-lit cells, at any radius, either
@@ -440,8 +455,10 @@ for a setting to hide.
 The reasoning behind the things that are hard to change later is in
 [`docs/decisions/`](docs/decisions/): why Dust is written from scratch, why it is
 GPL-3.0, why it targets 1.21.1 first, why it is Rust throughout, why ore
-density is configured the way it is, and which of Minecraft's numbers may live
-here rather than on the operator's disk.
+density is configured the way it is, which of Minecraft's numbers may live here
+rather than on the operator's disk, and how wide a volume the sky light is
+computed over — the last of those being a record of a thing measured and
+deliberately *not* built.
 
 ## Licence
 

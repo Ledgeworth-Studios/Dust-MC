@@ -55,6 +55,7 @@
 //! tested against synthetic bytes constructed in these tests, not against
 //! Mojang files; when `dust-nbt` lands, both are deleted in favour of it.
 
+pub mod area;
 pub mod cache;
 pub mod capture;
 pub mod compare;
