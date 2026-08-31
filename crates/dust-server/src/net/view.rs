@@ -79,6 +79,23 @@ impl View {
     /// movement packet, which arrive twenty times a second and almost never
     /// cross a chunk boundary.
     pub fn move_to(&mut self, centre: ChunkPos) -> ViewChange {
+        self.move_to_limited(centre, None)
+    }
+
+    /// Move the view, taking at most `limit` of the columns it wants.
+    ///
+    /// **The record is updated only for what is actually returned**, which is
+    /// what makes a partial pass composable: the columns left behind are still
+    /// wanted, and the next call to either method returns them. A version that
+    /// marked the whole square loaded and handed back a slice would leave this
+    /// set describing a client that holds columns it was never sent, and the
+    /// forget list wrong from then on.
+    ///
+    /// The columns to *forget* are never limited. They are cheap — a
+    /// coordinate pair each — and a client left holding a column the server
+    /// has stopped tracking is the one disagreement this type exists to
+    /// prevent.
+    pub fn move_to_limited(&mut self, centre: ChunkPos, limit: Option<usize>) -> ViewChange {
         let recentre = self.centre != Some(centre);
         self.centre = Some(centre);
 
@@ -95,6 +112,9 @@ impl View {
             .map(|(x, z)| ChunkPos::new(*x, *z))
             .collect();
         send.sort_by_key(|pos| distance_squared(*pos, centre));
+        if let Some(limit) = limit {
+            send.truncate(limit);
+        }
 
         let forget: Vec<ChunkPos> = self
             .loaded
@@ -106,7 +126,13 @@ impl View {
         // deliberate coupling: a caller that could take the change and not
         // apply it would be a caller that can leave this set describing a
         // client it does not describe.
-        self.loaded = wanted;
+        //
+        // **What the client holds is what it kept plus what it is being sent**,
+        // which is only the same as `wanted` when nothing was limited. Writing
+        // `wanted` here would mark a truncated pass as complete and the columns
+        // it did not send would never be sent at all.
+        self.loaded.retain(|column| wanted.contains(column));
+        self.loaded.extend(send.iter().map(|pos| (pos.x, pos.z)));
 
         ViewChange {
             send,
@@ -246,5 +272,72 @@ mod tests {
         assert_eq!(column_of(-0.5, -0.5), ChunkPos::new(-1, -1));
         assert_eq!(column_of(-16.0, -16.0), ChunkPos::new(-1, -1));
         assert_eq!(column_of(-16.1, -16.1), ChunkPos::new(-2, -2));
+    }
+}
+
+#[cfg(test)]
+mod limited_tests {
+    use super::*;
+
+    /// A truncated pass leaves the rest wanted, and the next one sends it.
+    ///
+    /// This is the property that lets a join end the loading screen after the
+    /// near square and stream the rest afterwards. Without it — if a limited
+    /// pass marked the whole square loaded — the columns it skipped would
+    /// never be sent, and a player would stand in a hole ringed by nothing.
+    #[test]
+    fn a_limited_move_leaves_the_rest_to_the_next_one() {
+        let mut view = View::with_radius(2);
+        let centre = ChunkPos::new(0, 0);
+
+        let near = view.move_to_limited(centre, Some(9));
+        assert_eq!(near.send.len(), 9, "the nine nearest");
+        assert!(near.recentre);
+
+        let rest = view.move_to(centre);
+        assert_eq!(rest.send.len(), 16, "the other sixteen of the five by five");
+        assert!(!rest.recentre, "the centre did not move");
+
+        // Together, the whole square and no repeats.
+        let mut all: Vec<ChunkPos> = near.send;
+        all.extend(rest.send);
+        all.sort_by_key(|pos| (pos.x, pos.z));
+        all.dedup();
+        assert_eq!(all.len(), 25);
+
+        // And a third pass has nothing left to say.
+        assert!(view.move_to(centre).send.is_empty());
+    }
+
+    /// The nearest are sent first, so a limited pass sends what can be seen.
+    #[test]
+    fn a_limited_move_takes_the_nearest() {
+        let mut view = View::with_radius(4);
+        let change = view.move_to_limited(ChunkPos::new(0, 0), Some(5));
+        assert_eq!(change.send.len(), 5);
+        for pos in &change.send {
+            assert!(
+                pos.x.abs() <= 1 && pos.z.abs() <= 1,
+                "{pos:?} is not one of the five nearest columns"
+            );
+        }
+    }
+
+    /// Forgetting is never limited, even when sending is.
+    ///
+    /// A column is a coordinate pair to forget and a megabyte to send, and a
+    /// client left holding a column the server has stopped tracking is exactly
+    /// the disagreement this type exists to prevent.
+    #[test]
+    fn a_limited_move_still_forgets_everything_it_should() {
+        let mut view = View::with_radius(2);
+        view.move_to(ChunkPos::new(0, 0));
+        let change = view.move_to_limited(ChunkPos::new(20, 20), Some(1));
+        assert_eq!(change.send.len(), 1, "sending is limited");
+        assert_eq!(
+            change.forget.len(),
+            25,
+            "forgetting is not: every column of the old square is gone"
+        );
     }
 }
