@@ -221,6 +221,53 @@ That is worth recording here rather than in its own file because it is not a
 second decision. It is the same decision, and whichever way it goes, it goes the
 same way for all three.
 
+## The one question left, stated precisely
+
+Option 1 exists and produces Minecraft's numbers. What is *not* settled is how
+those numbers reach a **server operator**, and it is worth being exact about why
+that is a real question rather than a step nobody has typed yet.
+
+`cargo xtask extract --only light` is a **developer** command. It runs from a
+Rust checkout of this repository. An operator has a `dust` binary, a
+`dust.toml`, and — per D7 — a `[data] path` directory they produced with
+Minecraft's own `--server` generator. **They have a JDK and a jar already**, so
+the oracle is not asking anything new of them; what it is asking is a *route*,
+and there are four:
+
+**1. A new `dust` subcommand** that runs the oracle. Honest and discoverable.
+Costs the thing `cli.rs` opens by stating: the grammar is "one subcommand with
+three flags, and nothing composes". A second subcommand is not fatal, but it is
+the first crack in a deliberate simplicity, and it drags the Java sources and a
+`javac` dependency into the shipped artefact.
+
+**2. The server runs the oracle at boot**, given a jar path in `dust.toml`.
+No new grammar. Puts a JDK, a `javac` and a subprocess on the boot path of every
+server that wants correct light, and turns a class of Java failures into a
+class of server-start failures.
+
+**3. The table travels with `[data] path`.** One more file in a directory the
+operator already populates, read at boot if present and absent otherwise —
+which is exactly how `[data] path` itself behaves. Costs nothing at run time
+and needs no grammar. **The open end is who generates it**: option 3 is a
+*format* decision that still needs one of 1, 2 or 4 to produce the file.
+
+**4. Publish the oracle as a small standalone jar** beside each release.
+An operator runs `java -jar dust-oracle.jar <server.jar> <out>` once. No Rust
+checkout, no new `dust` grammar, nothing Mojang's in the release. Costs a second
+release artefact and a second thing to version.
+
+**This record does not choose**, and the reason is the same as before: it is a
+judgement about what Dust asks of an operator and what it ships, not a judgement
+about lighting. What has changed is that it is now a question about *packaging*
+rather than about principle — the numbers exist, they are Mojang's, and no
+option above puts one of them in this repository.
+
+**What is blocked on it:** nothing that is not already stated as a known gap.
+`opacity_of` treats every block but air as a wall today, `harness light` says
+that costs 0.6% of cells on seed 0 and 3.5% on seed 1, and the ring measurement
+says opacity is very nearly all of it. Reading a table is a small change to one
+function whenever a route to the table exists.
+
 ## Consequences of leaving it
 
 - **No block light at all.** Torches, lava and glowstone light nothing, and
