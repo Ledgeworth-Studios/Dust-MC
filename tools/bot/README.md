@@ -38,11 +38,14 @@ a failure rather than as a crash.
 3. It **has the biome registry**, all sixty-four.
 4. It can **read a block** under its feet, which means the chunk packet decoded
    and the palette resolved.
-5. A **second bot's arm swing** reaches the first.
-6. A **second bot's crouch** reaches the first, as both the entity flag and the
+5. A **second bot's chat line** reaches the first, *with the sender's name on
+   it* — the name is the server's to add and not the client's to send, and a
+   server that relayed the raw line would let anybody speak as anybody.
+6. A **second bot's arm swing** reaches the first.
+7. A **second bot's crouch** reaches the first, as both the entity flag and the
    pose — the two are separate and a client told only one renders a player
    half-doing it.
-7. A **second bot breaking a block** reaches the first as a `world_event`, with
+8. A **second bot breaking a block** reaches the first as a `world_event`, with
    the *broken* block's state in it rather than the air left behind — the
    client makes the particles and the sound out of that, and the air's id gives
    a silent puff of nothing.

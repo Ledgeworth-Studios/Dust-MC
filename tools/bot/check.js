@@ -83,6 +83,14 @@ async function main () {
     if (p.effectId === 2001) sawBreakEffect = p
   })
 
+  // Chat, which nothing else here covers and which is a whole packet path:
+  // the message goes up as `chat`, is rendered server-side with the sender's
+  // name kept apart from their words, and comes back down to everybody.
+  let heard = null
+  watcher.on('messagestr', message => {
+    if (message.includes('soup')) heard = message
+  })
+
   const actor = await spawned('Actor')
   await wait(500)
   actor.swingArm('right')
@@ -98,6 +106,18 @@ async function main () {
     try { await actor.dig(target) } catch (e) { /* the effect is the check */ }
   }
   await wait(SETTLE_MS)
+
+  actor.chat('there is soup')
+  await wait(1000)
+
+  check('one player hears another talk', Boolean(heard), heard || 'nothing arrived')
+  // The sender's name is the server's to add, not the client's to send — a
+  // server that relayed the raw line would let anybody speak as anybody.
+  check(
+    'and is told who said it',
+    Boolean(heard) && heard.includes('Actor'),
+    heard || ''
+  )
 
   check('one player sees another swing', sawSwing)
   check('one player sees another crouch', sawCrouch, 'entity flag and pose together')
