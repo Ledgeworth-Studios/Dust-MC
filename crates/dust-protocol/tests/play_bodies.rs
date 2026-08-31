@@ -903,3 +903,27 @@ fn every_player_command_carries_a_jump_boost_even_when_it_means_nothing() {
     assert_eq!(sneak.meaningful_boost(), None);
     assert_eq!(jump.meaningful_boost(), Some(0));
 }
+
+// ---------------------------------------------------------------------------
+// Sound positions: the unit the field does not carry in its name
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_sound_position_is_eighths_of_a_block() {
+    use dust_protocol::packets::play::sound::eighths;
+
+    // Vanilla writes `(int)(x * 8.0)` and the client reads `x / 8.0`, so the
+    // block centre a placed-block sound plays from is `8n + 4` and never `n`.
+    // A caller that wrote the block coordinate straight into the field would
+    // put the sound an eighth of the way to the origin — legal, quiet, and
+    // wrong in a way no decoder can see.
+    assert_eq!(eighths(0.5), 4);
+    assert_eq!(eighths(64.5), 516);
+    assert_eq!(eighths(-1.5), -12);
+
+    // Truncating toward zero, as the cast does, so the two implementations
+    // agree on the side of the origin a near-zero coordinate falls.
+    assert_eq!(eighths(0.05), 0);
+    assert_eq!(eighths(-0.05), 0);
+    assert_eq!(eighths(-0.2), -1);
+}

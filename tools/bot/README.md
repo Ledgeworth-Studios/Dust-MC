@@ -81,6 +81,25 @@ it is right.**
    the *broken* block's state in it rather than the air left behind — the
    client makes the particles and the sound out of that, and the air's id gives
    a silent puff of nothing.
+9. A **second bot placing a block** reaches the first as a `sound_effect`. A
+   placement has no particles and no level event, so the sound is the only
+   packet and it has to name the sound itself. Three things are checked about
+   it and each fails differently:
+   - it **arrives at all**, which needs a `dust-constants.tsv` beside
+     `[data] path` — without one a server places blocks in silence and this
+     check says so rather than reporting a protocol fault;
+   - it is the **sound that block makes**, resolved through minecraft-data's own
+     table rather than Dust's. There is no inventory, so the block that goes
+     down is the world's surface block whatever the client holds — grass, and
+     grass sounds like `block.grass.place`;
+   - it plays **where the block went**, which is the check that matters most and
+     the one nothing on either side of the wire can do. That packet's position
+     is in *eighths of a block* and its field is called `x`. A server that wrote
+     the block coordinate would put the sound an eighth of the way to the
+     origin: legal, decodable, and audible only as "that sounded far away".
+
+   The bot writes `block_place` by hand rather than through `bot.placeBlock`,
+   which wants a held item this server has no inventory to hold.
 
 ## The long one
 

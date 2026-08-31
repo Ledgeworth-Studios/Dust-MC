@@ -45,7 +45,7 @@ use dust_world::coords::ChunkPos;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::configure::{configure, Configured};
-use super::edits::{Edit, SharedWorld};
+use super::edits::{Edit, Player, SharedWorld};
 use super::finish;
 use super::play as play_mod;
 use super::status::StatusPolicy;
@@ -132,6 +132,14 @@ pub struct SessionContext {
     pub roster: super::players::SharedRoster,
     /// `minecraft:player`'s id in the entity-type registry, resolved at boot.
     pub player_entity_type: i32,
+    /// Minecraft's own per-state constants, if the operator put a table beside
+    /// their data.
+    ///
+    /// The light engine has had these since decision record 0008; what a
+    /// session wants from them is the sound a block makes going down. `None`
+    /// is the ordinary state of a server without a `[data] path`, and it means
+    /// a placement is silent rather than guessed at.
+    pub constants: Option<Arc<dust_registry::BlockConstants>>,
     /// The contents of the registries Dust can serve, read at boot from
     /// `[data] path`.
     ///
@@ -841,21 +849,41 @@ where
                                 ctx.version,
                             )
                             .await?;
-                            // And, if a player broke it, what it looked like
-                            // breaking. Not to the player who dug: their own
+                            // And what a player doing it looked and sounded
+                            // like. Never to the player who did it: their own
                             // client played the effect before the server heard
-                            // about the dig, and telling them again plays it
+                            // about the click, and telling them again plays it
                             // twice. Vanilla leaves them out for the same
                             // reason.
-                            if let Some(broke) = edit.broke {
-                                if broke.by != me.entity_id {
-                                    send_play(
-                                        conn,
-                                        play_mod::block_broken(edit.position, broke.previous),
-                                        ctx.version,
-                                    )
-                                    .await?;
-                                }
+                            //
+                            // The two arms are not symmetrical and the asymmetry
+                            // is vanilla's: a break is one level event carrying
+                            // the broken state, out of which the client makes
+                            // both the particles and the sound, while a
+                            // placement has no particles and a sound that has to
+                            // be named.
+                            match edit.by {
+                                Some(cause) if cause.entity_id() != me.entity_id => match cause {
+                                    Player::Broke { previous, .. } => {
+                                        send_play(
+                                            conn,
+                                            play_mod::block_broken(edit.position, previous),
+                                            ctx.version,
+                                        )
+                                        .await?;
+                                    }
+                                    Player::Placed { placed, seed, .. } => {
+                                        if let Some(sound) = play_mod::block_placed(
+                                            edit.position,
+                                            placed,
+                                            seed,
+                                            ctx.constants.as_deref(),
+                                        ) {
+                                            send_play(conn, sound, ctx.version).await?;
+                                        }
+                                    }
+                                },
+                                _ => {}
                             }
                         }
                     }
@@ -1138,7 +1166,8 @@ where
                         // but the world's own surface block. Stated rather
                         // than dressed up: what a player is holding is not
                         // knowable here yet.
-                        ctx.world.set_block(target, ctx.blocks.placeable);
+                        ctx.world
+                            .place_block(target, ctx.blocks.placeable, me.entity_id);
                         send_play(
                             conn,
                             play::clientbound::BlockChangedAck {

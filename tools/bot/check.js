@@ -82,6 +82,12 @@ async function main () {
   watcher._client.on('world_event', p => {
     if (p.effectId === 2001) sawBreakEffect = p
   })
+  // A placement has no particles and no level event: the sound is the only
+  // packet, and it has to name the sound itself. Kept as the raw packet
+  // because the position on it is the thing being checked, and mineflayer's
+  // own view of a sound would have applied its own idea of the units.
+  let heardPlace = null
+  watcher._client.on('sound_effect', p => { heardPlace = p })
 
   // Chat, which nothing else here covers and which is a whole packet path:
   // the message goes up as `chat`, is rendered server-side with the sender's
@@ -93,6 +99,10 @@ async function main () {
 
   const actor = await spawned('Actor')
   await wait(500)
+  // Where it stands *before* it digs: it is about to break the block under its
+  // own feet and fall, and a neighbour taken from the position afterwards is
+  // taken from somewhere else.
+  const stood = actor.entity.position.clone()
   actor.swingArm('right')
   await wait(500)
   actor.setControlState('sneak', true)
@@ -104,6 +114,33 @@ async function main () {
   const target = actor.blockAt(actor.entity.position.offset(0, -1, 0))
   if (target) {
     try { await actor.dig(target) } catch (e) { /* the effect is the check */ }
+  }
+  await wait(SETTLE_MS)
+
+  // Placing, by hand rather than through `bot.placeBlock`: that helper wants a
+  // held item, and this server has no inventory to hold one in. The packet is
+  // the same packet either way, written by a library that has never seen
+  // Dust's encoder.
+  //
+  // On the block *beside* the one just dug, whose top face is still there.
+  // Face 1 is up, so the block lands above it — the server puts it on the
+  // face that was clicked and not in the cell that was.
+  // Two blocks along, so the dig above did not touch it. Read now rather than
+  // at spawn: `blockAt` answers null until the column has arrived, and half a
+  // second after joining it has not.
+  const beside = actor.blockAt(stood.offset(2, -1, 0))
+  const placedAt = beside && beside.position.offset(0, 1, 0)
+  if (beside) {
+    actor._client.write('block_place', {
+      hand: 0,
+      location: { x: beside.position.x, y: beside.position.y, z: beside.position.z },
+      direction: 1,
+      cursorX: 0.5,
+      cursorY: 1.0,
+      cursorZ: 0.5,
+      insideBlock: false,
+      sequence: 1
+    })
   }
   await wait(SETTLE_MS)
 
@@ -128,6 +165,48 @@ async function main () {
     'one player sees another break a block',
     Boolean(sawBreakEffect) && sawBreakEffect.data > 0,
     sawBreakEffect ? `effect 2001, state ${sawBreakEffect.data}` : 'no world_event arrived'
+  )
+  check(
+    'one player hears another place a block',
+    Boolean(heardPlace),
+    heardPlace
+      ? `sound at ${heardPlace.x}/${heardPlace.y}/${heardPlace.z}, ` +
+        `volume ${heardPlace.volume} pitch ${heardPlace.pitch}`
+      : 'no sound_effect arrived — is there a dust-constants.tsv beside [data] path?'
+  )
+  // And it is the right sound, which is the half of this that the arithmetic
+  // above cannot check: the id came out of Dust's own generated sound-event
+  // table, and this resolves it through a table that has never seen it.
+  //
+  // There is no inventory, so the block that goes down is the world's own
+  // surface block whatever the client is holding — grass, and grass sounds
+  // like `block.grass.place`. minecraft-data numbers sound events from one,
+  // which is the wire's own convention: the packet carries `id + 1` so that
+  // zero can mark an inline sound, and prismarine subtracts it back off.
+  const expectedSound = watcher.registry.soundsByName['block.grass.place']
+  check(
+    'and it is the sound that block makes',
+    Boolean(heardPlace) && Boolean(expectedSound) &&
+      heardPlace.sound.soundId + 1 === expectedSound.id,
+    heardPlace && heardPlace.sound
+      ? `sent ${heardPlace.sound.soundId}, block.grass.place is ` +
+        `${expectedSound && expectedSound.id - 1}`
+      : 'nothing to compare'
+  )
+  // The one field on that packet whose unit is not in its name: vanilla writes
+  // eighths of a block, and a server that wrote the block coordinate would put
+  // the sound an eighth of the way to the origin. Nothing on either side of the
+  // wire can see that; a second implementation reading the number can.
+  check(
+    'and hears it where the block went',
+    Boolean(heardPlace) && Boolean(placedAt) &&
+      heardPlace.x === Math.trunc((placedAt.x + 0.5) * 8) &&
+      heardPlace.y === Math.trunc((placedAt.y + 0.5) * 8) &&
+      heardPlace.z === Math.trunc((placedAt.z + 0.5) * 8),
+    placedAt && heardPlace
+      ? `placed at ${placedAt.x}/${placedAt.y}/${placedAt.z}, ` +
+        `sound at ${heardPlace.x / 8}/${heardPlace.y / 8}/${heardPlace.z / 8}`
+      : 'nothing to compare'
   )
 
   try { actor.quit() } catch (e) { /* already gone */ }

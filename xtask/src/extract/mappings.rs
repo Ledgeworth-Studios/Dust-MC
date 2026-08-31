@@ -345,9 +345,10 @@ pub const LIGHT_ORACLE: &[Wanted<'static>] = &[
     // The block sound group. Same kind of thing again — a `SoundType` handed
     // to a block's properties in Java, in no report and no data pack — and the
     // one a server needs in order to make a noise when somebody puts a block
-    // down. Read per state through `getSoundType`, because that is the method
-    // the game itself calls and a block whose sound depended on its state
-    // would be one a per-block table could not describe.
+    // down. Decision record 0008's own account of it is the section dated
+    // 2026-08-31. Read per state through `getSoundType`, because that is the
+    // method the game itself calls and a block whose sound depended on its
+    // state would be one a per-block table could not describe.
     Wanted::Method {
         key: "blockstate.get_sound_type",
         class: BLOCK_STATE_BASE,

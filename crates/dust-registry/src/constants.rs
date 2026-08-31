@@ -3,8 +3,8 @@
 //! How much light entering a state costs, how much it gives off, whether it
 //! occludes, which of the six heightmaps count it, and what it sounds like
 //! going down. None of it is in any `--reports` output or any data pack: it is
-//! all code. Decision record 0008 is the account for the light values, 0010 for
-//! the heightmap predicates and 0011 for the sound group, and
+//! all code. Decision record 0008 is the account for the light values and the
+//! sound group, and 0010 for the heightmap predicates, and
 //! `cargo xtask extract --only constants` is the oracle that asks the game —
 //! it boots Minecraft's static initialisation against the operator's own jar
 //! and reads the answers off the block-state registry.

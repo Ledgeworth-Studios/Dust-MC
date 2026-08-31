@@ -8,10 +8,11 @@ Dust is being built from nothing and is not finished — but you can play on it.
 
 **Two people can connect, walk around a shared world, break and place blocks,
 see each other doing it, and talk.** They see each other swing, crouch and break
-blocks — particles and sound, out of the block that broke — and what they change
-is still there after a restart, along with where they were standing. The world
-is lit the way Minecraft lights it: sky light and block light both, from
-Minecraft's own numbers, read out of the operator's own jar.
+blocks — particles and sound, out of the block that broke — and hear each other
+put blocks down, each block with its own sound. What they change is still there
+after a restart, along with where they were standing. The world is lit the way
+Minecraft lights it: sky light and block light both, from Minecraft's own
+numbers, read out of the operator's own jar.
 
 `dust server` binds `[server].bind`, answers the server-list ping with the MOTD,
 player count and favicon from `dust.toml`, runs login in either offline or
@@ -88,9 +89,7 @@ section codec, the chunk packet, the light engine.
 **Not yet**, and each of these is stated where the code for it would go: no
 physics, block updates, drops, tool checks or reach validation, so a player may
 break bedrock from across the map; no inventory, so there is one placeable
-block; no sound when a block is placed, which needs one more column in the table
-a server already reads and is stated in decision record
-[0008](docs/decisions/0008-block-opacity-and-light-emission.md); light that
+block; light that
 crosses a chunk boundary — sky light from a neighbour it would have to travel
 *through*, and any light at all from a torch on the far side of one — which is
 an engine gap and not a data one, and is now the *only* thing between a served
@@ -113,21 +112,24 @@ Then add `localhost` to a 1.21.1 client's server list. Set `online_mode = false`
 in `dust.toml` first unless you want Mojang consulted, and point
 `world_source` at a `region` directory if you have a world to serve.
 
-For sky light that matches Minecraft's, put a light table beside your data:
+For light and block sounds that match Minecraft's, put its table beside your
+data:
 
 ```
 cargo xtask extract --version 1.21.1 --only constants
 cp .dust-extract/oracle-1.21.1/constants.tsv <[data] path>/dust-constants.tsv
 ```
 
-How much light a block stops, how much it gives off, and which of the six
-heightmaps count it are Java code inside Minecraft rather than data, so they are
-in no report, no data pack and no copy here — the extractor asks your own server
-jar for them and writes them to your own disk. Without the file, every block but
-air stops sky light and the sky starts above the grass rather than through it,
-and the server says so at boot. Decision record
+How much light a block stops, how much it gives off, which of the six heightmaps
+count it, and what it sounds like going down are Java code inside Minecraft
+rather than data, so they are in no report, no data pack and no copy here — the
+extractor asks your own server jar for them and writes them to your own disk.
+Without the file, every block but air stops sky light, the sky starts above the
+grass rather than through it, and a placed block makes no sound; the server says
+so at boot. Decision record
 [0008](docs/decisions/0008-block-opacity-and-light-emission.md) is why it
-arrives this way rather than in the binary.
+arrives this way rather than in the binary — including why the sound column
+holds a *name* and not a registry id.
 
 The console takes `stop`, `list` and `say`, with or without a leading slash.
 
@@ -232,8 +234,9 @@ with this project, which is why it finds what a test suite agrees with itself
 about. `tools/bot/check.js` joins, checks that the dimension it was told about
 is the one it is in, that it has all sixty-four biomes, that it can read a
 block, that a second bot's chat line arrives with the sender's name on it, and
-that its swing, crouch and block-break all reach the first — nine checks, exit 0
-or 1. `tools/bot/README.md` has the list and what it has caught.
+that its swing, crouch, block-break and block-place all reach the first —
+twelve checks, exit 0 or 1. `tools/bot/README.md` has the list and what it has
+caught.
 
 `just soak <port> <minutes>` is the long version, and a different question:
 `check` asks whether this works, `soak` asks whether it keeps working. A bot

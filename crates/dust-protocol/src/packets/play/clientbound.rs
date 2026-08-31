@@ -330,9 +330,13 @@ packet_group! {
 
     /// A sound plays from a point in the world.
     ///
-    /// The position is three ints — block coordinates, not floats — because
-    /// the client snaps fixed sounds to a block anyway. See [`SoundId`] for
-    /// why the sound itself is a tagged union.
+    /// **The three position fields are eighths of a block, not blocks.**
+    /// Vanilla writes `(int)(x * 8.0)` and the client reads it back as
+    /// `x / 8.0`; a caller that put a block coordinate here would place the
+    /// sound at an eighth of the distance from the origin, which is audible
+    /// only as "that sounded far away" and never as an error.
+    /// [`eighths`](super::sound::eighths) is the conversion. See [`SoundId`]
+    /// for why the sound itself is a tagged union.
     "minecraft:sound" => Sound {
         sound: SoundId,
         category: SoundCategory,

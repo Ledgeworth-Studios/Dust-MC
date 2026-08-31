@@ -50,25 +50,60 @@ type ColumnEdits = HashMap<(i32, i32, i32), u32>;
 pub struct Edit {
     pub position: Position,
     pub state: u32,
-    /// Set when a player broke a block, so everybody else can be shown it
-    /// breaking. `None` for a placement, for a restore from the save file, and
-    /// for anything the server does on its own.
-    pub broke: Option<Broke>,
+    /// Who changed it and how, when a player did. `None` for a restore from
+    /// the save file and for anything the server does on its own.
+    pub by: Option<Player>,
 }
 
-/// A block a player broke: what was there, and who took it.
+/// A block change a player is responsible for, and what it looked like.
 ///
-/// Both halves are needed by the one packet that consumes this. The state is
-/// what the client makes the particles and the sound out of — it is the
-/// *broken* block's, not the air left behind — and the entity id is who to
-/// leave out, because their own client played the effect before the server
-/// heard about the dig and telling them again plays it twice.
+/// One field rather than two `Option`s, because at most one of them was ever
+/// going to be set and a pair of them is a state this cannot be in. Every arm
+/// carries the entity id for the same reason: the player who did it is the one
+/// player who must **not** be sent the effect, since their own client played it
+/// before the server heard about the click, and telling them again plays it
+/// twice. Vanilla leaves them out for the same reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Broke {
-    /// The block state that was there.
-    pub previous: u32,
-    /// The player who broke it.
-    pub by: i32,
+pub enum Player {
+    /// A block a player broke, carrying what was there.
+    ///
+    /// The state is what the client makes the particles and the sound out of —
+    /// the *broken* block's, not the air left behind.
+    Broke {
+        /// The block state that was there.
+        previous: u32,
+        /// The player who broke it.
+        by: i32,
+    },
+    /// A block a player put down, carrying what it now is.
+    ///
+    /// The state is the same one [`Edit::state`] holds, and it is repeated here
+    /// rather than read off the edit because the two mean different things: the
+    /// edit's state is what the world now holds, and this one is what a sound
+    /// is chosen from. They agree today and the day a placement leaves
+    /// something else behind they will not.
+    Placed {
+        /// The block state that went down.
+        placed: u32,
+        /// The player who placed it.
+        by: i32,
+        /// Which of the sound event's samples every listener hears.
+        ///
+        /// Decided here, once, rather than per session — that is the whole
+        /// reason it is on the event. Two players watching one block go down
+        /// are watching one event, and a seed drawn where the packet is built
+        /// would give them different samples of it.
+        seed: i64,
+    },
+}
+
+impl Player {
+    /// The entity id of the player responsible, whatever they did.
+    pub fn entity_id(self) -> i32 {
+        match self {
+            Self::Broke { by, .. } | Self::Placed { by, .. } => by,
+        }
+    }
 }
 
 /// How many block changes a slow session may fall behind before it is told it
@@ -89,6 +124,9 @@ pub struct EditedWorld {
     /// a scan of every edit in the world.
     edits: RwLock<HashMap<ColumnKey, ColumnEdits>>,
     announce: broadcast::Sender<Edit>,
+    /// How many events have chosen a sound sample, which is what the next one
+    /// is derived from. See [`EditedWorld::next_seed`].
+    sounds: std::sync::atomic::AtomicU64,
 }
 
 impl EditedWorld {
@@ -98,6 +136,7 @@ impl EditedWorld {
             generated,
             edits: RwLock::new(HashMap::new()),
             announce,
+            sounds: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -182,7 +221,7 @@ impl EditedWorld {
         let _ = self.announce.send(Edit {
             position,
             state,
-            broke: None,
+            by: None,
         });
         true
     }
@@ -244,7 +283,64 @@ impl EditedWorld {
         let _ = self.announce.send(Edit {
             position,
             state: air,
-            broke: Some(Broke { previous, by }),
+            by: Some(Player::Broke { previous, by }),
+        });
+        true
+    }
+
+    /// Put a block down on a player's behalf, and tell everyone who did it.
+    ///
+    /// The same change as [`EditedWorld::set_block`], plus the one thing that
+    /// call cannot carry: whose it was. A placement makes a sound, and the
+    /// sound goes to everybody except the player whose client already played
+    /// it.
+    ///
+    /// **Placing what is already there announces nothing**, by the same
+    /// argument [`EditedWorld::break_block`] makes about breaking air: setting
+    /// a block to the state it already holds is not a change, and a sound for
+    /// it is a noise with nothing behind it. A client that sends `use_item_on`
+    /// twice for one click — which is a shape this server has already met once,
+    /// from the other end — would otherwise be heard twice.
+    /// The seed for the next sound this world makes.
+    ///
+    /// A counter through SplitMix64's finalizer, which is a well-distributed
+    /// mixing of successive integers and is not a cryptographic anything. It
+    /// does not need to be: the client uses this to pick one of a sound
+    /// event's handful of samples, so the whole requirement is that
+    /// consecutive placements do not all land on the same one — which a bare
+    /// counter would fail, because the low bits of 0, 1, 2 are what a small
+    /// modulus reads.
+    ///
+    /// Counting from zero, so a restarted server replays the same sequence of
+    /// samples. Nobody can hear that, and a clock-seeded start would be a
+    /// source of nondeterminism bought with nothing.
+    fn next_seed(&self) -> i64 {
+        let n = self
+            .sounds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut z = n;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        (z ^ (z >> 31)) as i64
+    }
+
+    pub fn place_block(&self, position: Position, state: u32, by: i32) -> bool {
+        let previous = self.block_at(position);
+        if !self.set_block_quietly(position, state) {
+            return false;
+        }
+        if previous == state {
+            return true;
+        }
+        let _ = self.announce.send(Edit {
+            position,
+            state,
+            by: Some(Player::Placed {
+                placed: state,
+                by,
+                seed: self.next_seed(),
+            }),
         });
         true
     }
@@ -470,8 +566,8 @@ mod tests {
                 position: here,
                 state: 0,
                 // `set_block` is what the server itself does; only a player
-                // breaking something carries the block that broke.
-                broke: None,
+                // breaking or placing something carries who did it.
+                by: None,
             }
         );
     }
@@ -493,8 +589,8 @@ mod tests {
         assert_eq!(edit.position, here);
         assert_eq!(edit.state, 0, "broken to air");
         assert_eq!(
-            edit.broke,
-            Some(Broke {
+            edit.by,
+            Some(Player::Broke {
                 previous: before,
                 by: 7
             }),
@@ -519,6 +615,92 @@ mod tests {
         assert!(
             listener.try_recv().is_err(),
             "nothing changed, so nobody is told anything"
+        );
+    }
+
+    #[test]
+    fn a_placement_carries_what_went_down_and_who_put_it_there() {
+        let world = world();
+        let here = Position {
+            x: 4,
+            y: super::super::world::SURFACE_Y + 1,
+            z: 4,
+        };
+        assert_eq!(world.block_at(here), 0, "the air above the surface");
+        let mut listener = world.subscribe();
+
+        let stone = world.block_at(Position {
+            y: super::super::world::SURFACE_Y,
+            ..here
+        });
+        assert!(world.place_block(here, stone, 9));
+        let edit = listener.try_recv().expect("the placement was announced");
+        assert_eq!(edit.position, here);
+        assert_eq!(edit.state, stone);
+        assert!(
+            matches!(edit.by, Some(Player::Placed { placed, by, .. }) if placed == stone && by == 9),
+            "{:?}",
+            edit.by
+        );
+        assert_eq!(
+            edit.by.map(Player::entity_id),
+            Some(9),
+            "whatever a player did, the id of the one who did it is reachable"
+        );
+    }
+
+    #[test]
+    fn placing_what_is_already_there_announces_nothing() {
+        // The same argument `break_block` makes about breaking air. A client
+        // that sends one click twice — a shape this server has already met
+        // from the other end — would otherwise be heard twice.
+        let world = world();
+        let here = Position {
+            x: 5,
+            y: super::super::world::SURFACE_Y,
+            z: 5,
+        };
+        let already = world.block_at(here);
+        let mut listener = world.subscribe();
+        assert!(
+            world.place_block(here, already, 9),
+            "still a legal position"
+        );
+        assert!(listener.try_recv().is_err(), "nothing changed");
+    }
+
+    #[test]
+    fn two_placements_do_not_choose_the_same_sound_sample() {
+        // What the seed is for. A counter would pass an "are they different"
+        // test and fail the thing the seed exists for, because the client reads
+        // it through a small modulus — so this asserts on the low bits, which
+        // is where a bare counter is visible.
+        let world = world();
+        let stone = world.block_at(Position {
+            x: 0,
+            y: super::super::world::SURFACE_Y,
+            z: 0,
+        });
+        let mut listener = world.subscribe();
+        let mut low = Vec::new();
+        for x in 0..8 {
+            let here = Position {
+                x,
+                y: super::super::world::SURFACE_Y + 1,
+                z: 7,
+            };
+            assert!(world.place_block(here, stone, 9));
+            let edit = listener.try_recv().expect("announced");
+            let Some(Player::Placed { seed, .. }) = edit.by else {
+                panic!("a placement carries a seed: {:?}", edit.by);
+            };
+            low.push(seed & 0b11);
+        }
+        low.sort_unstable();
+        low.dedup();
+        assert!(
+            low.len() > 1,
+            "eight placements landed on one of four samples every time: {low:?}"
         );
     }
 

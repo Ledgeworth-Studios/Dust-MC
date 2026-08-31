@@ -20,8 +20,8 @@ import java.util.function.Predicate;
  * makes when somebody puts it down.
  *
  * None of it is in any `--reports` output or any data pack, which is decision
- * record 0008 for the light values, 0010 for the heightmap predicates and 0011
- * for the sound group. This asks the game.
+ * record 0008 for the light values and the sound group, and 0010 for the
+ * heightmap predicates. This asks the game.
  *
  * Nothing here names a Minecraft class: every identifier comes from the
  * properties file the extractor wrote from Mojang's published mappings, so a

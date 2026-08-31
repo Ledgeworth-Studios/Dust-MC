@@ -19,6 +19,25 @@ use crate::types::{Decode, Encode, Identifier, VarInt};
 use crate::wire::{DecodeError, EncodeError, WireRead, WireWrite};
 use crate::ProtocolVersion;
 
+/// A world coordinate as the positioned sound packets carry it: eighths of a
+/// block.
+///
+/// Vanilla's `ClientboundSoundPacket` stores `(int)(x * 8.0)` and the client
+/// divides by eight again, which gives a sound three bits of sub-block
+/// precision and no more. It is a free function rather than a field type
+/// because the packet's fields are what the wire holds and this is what a
+/// caller has — and because the failure it prevents is silent: a block
+/// coordinate written straight into the field is a legal int that puts the
+/// sound an eighth of the way to the origin.
+///
+/// Truncating toward zero, as the cast vanilla writes does. A sound at
+/// `x = -0.05` therefore plays at 0 on both implementations rather than at
+/// -1/8 on one of them.
+#[must_use]
+pub fn eighths(blocks: f64) -> i32 {
+    (blocks * 8.0) as i32
+}
+
 /// Where in the client's mixer a sound plays from, which is what the volume
 /// sliders control.
 ///
