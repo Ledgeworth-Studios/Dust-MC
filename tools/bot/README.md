@@ -47,6 +47,26 @@ a failure rather than as a crash.
    client makes the particles and the sound out of that, and the air's id gives
    a silent puff of nothing.
 
+## The long one
+
+```
+node soak.js 25565 10
+```
+
+`check.js` answers "does this work". `soak.js` answers "does it keep working",
+which is a different question and the one Phase 3's exit criterion asks: a bot
+that stays for ten minutes, walks a square, digs at every corner and talks,
+while nothing ends and nothing goes quiet.
+
+What it watches for is **ending and stopping**, not a wrong value in one packet:
+a keep-alive that stops being answered, a connection dropped, thirty seconds of
+silence. Those are the failures that only appear after a while, and they are the
+reason a soak exists beside a check.
+
+It reports what it saw either way — packets, columns streamed, columns
+forgotten, keep-alives answered — because "it survived" with no numbers beside
+it is indistinguishable from "it sat there".
+
 ## Why the dependency is not in the licence gate
 
 `cargo xtask licenses` audits what a Dust *build* incorporates. This is a

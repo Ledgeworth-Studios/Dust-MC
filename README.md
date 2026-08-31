@@ -168,10 +168,19 @@ is the one it is in, that it has all sixty-four biomes, that it can read a
 block, and that a second bot's swing, crouch and block-break reach the first —
 seven checks, exit 0 or 1. `tools/bot/README.md` has the list and what it has caught.
 
-It is deliberately outside `just verify`: it needs a server already running, an
-npm install and a `[data] path`, and `verify` is CI's list in CI's order. It has
-already earned its keep: the break check caught the dig path firing twice, the
-second one breaking air and sending a puff of particles made of nothing.
+`just soak <port> <minutes>` is the long version, and a different question:
+`check` asks whether this works, `soak` asks whether it keeps working. A bot
+stays for ten minutes, flies a forty-block square, digs at every corner and
+talks, and what it watches for is *ending and stopping* — a connection dropped,
+a keep-alive that stopped arriving, thirty seconds of silence. Ten minutes on a
+real world: no failures, 15,634 packets, 7,633 columns streamed and 7,344
+forgotten across 144 legs — about five and a half thousand blocks flown.
+
+Both are deliberately outside `just verify`: they need a server already running,
+an npm install and a `[data] path`, and `verify` is CI's list in CI's order. The
+short one has already earned its keep — the break check caught the dig path
+firing twice, the second one breaking air and sending a puff of particles made
+of nothing.
 
 ## Differential testing
 
