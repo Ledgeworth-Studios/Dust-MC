@@ -346,12 +346,20 @@ with a table lights an ocean world exactly as Minecraft does.
 
 ## What is still consequent
 
-- **No block light at all.** Torches, lava and glowstone light nothing, and
-  there is no engine work outstanding for it — `dust_world::propagation` runs
-  the same walks vanilla does. It is waiting on emission values and nothing
-  else, and the table now carries them: 1,588 of 26,684 states emit. Read the
-  measurement above before believing that second sentence, though. The same was
-  said about opacity, and the data was the smaller half of it.
+- **Block light — built, 2026-08-31, and this record was right about it for
+  once.** The emission values were the whole of it: `dust_world::propagation`
+  ran vanilla's walks already, and what was missing was seeds. A torch, lava and
+  glowstone now light what they should, exactly — `harness light` compares block
+  light against Minecraft's own arrays and finds no disagreement at all once the
+  volume is wide enough, on both seeds.
+
+  Read the measurement above before taking that as a pattern. This record said
+  the same about opacity, where the data turned out to be the smaller half, and
+  the reason it was right this time is not a better prediction — it is that
+  block light had already been measured against nothing, so there was no
+  stand-in in the way. **The `EmissionModel` with no table is not a stand-in
+  either**: a server with no constants table says nothing emits, which is a
+  refusal to invent how bright a torch is rather than a guess at it.
 - **Sky light stops at the surface of an ocean and under a tree** on a server
   with no table, and that is now a configuration state rather than a property of
   Dust: 3.5% of every cell in view on an ocean spawn without one, and nothing at

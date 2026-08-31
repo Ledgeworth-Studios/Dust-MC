@@ -9,7 +9,9 @@ Dust is being built from nothing and is not finished — but you can play on it.
 **Two people can connect, walk around a shared world, break and place blocks,
 see each other doing it, and talk.** They see each other swing, crouch and break
 blocks — particles and sound, out of the block that broke — and what they change
-is still there after a restart, along with where they were standing.
+is still there after a restart, along with where they were standing. The world
+is lit the way Minecraft lights it: sky light and block light both, from
+Minecraft's own numbers, read out of the operator's own jar.
 
 `dust server` binds `[server].bind`, answers the server-list ping with the MOTD,
 player count and favicon from `dust.toml`, runs login in either offline or
@@ -86,15 +88,14 @@ section codec, the chunk packet, the light engine.
 **Not yet**, and each of these is stated where the code for it would go: no
 physics, block updates, drops, tool checks or reach validation, so a player may
 break bedrock from across the map; no inventory, so there is one placeable
-block; no block light and no sound when a block is placed — the emission values
-for the first are already in the table a server reads, and the sound needs one
-more column in it, both stated in decision record
-[0008](docs/decisions/0008-block-opacity-and-light-emission.md); sky light that
-crosses a chunk boundary from a neighbour open to the sky but not from one it
-would have to travel through, which is an engine gap and not a data one, and is
-now the *only* thing between a served world's sky light and Minecraft's own —
-435 cells of 2.4 million inland and nothing at all on an ocean world, costed and
-declined in decision record
+block; no sound when a block is placed, which needs one more column in the table
+a server already reads and is stated in decision record
+[0008](docs/decisions/0008-block-opacity-and-light-emission.md); light that
+crosses a chunk boundary — sky light from a neighbour it would have to travel
+*through*, and any light at all from a torch on the far side of one — which is
+an engine gap and not a data one, and is now the *only* thing between a served
+world's light and Minecraft's own: 435 sky cells and 1,163 block cells of 2.4
+million inland, costed and declined in decision record
 [0010](docs/decisions/0010-how-wide-the-sky-light-volume.md); no plugins;
 and the running server still saves its own edits in its own format beside a
 world rather than back into it — writing Anvil works, but a chunk's block
@@ -285,32 +286,37 @@ difference — Dust has no schema for it and says so in code, and the day one is
 added and is wrong, this goes red. Watched to fail: changing one field's type
 from `TAG_Double` to `TAG_Float` produced four findings naming the field.
 
-`light` puts a number on how close the **sky** light is — only the sky light,
-because Dust has no block light at all and a bare percentage would read as "the
-lighting is 99.4% right" when half of lighting is not implemented. A chunk
-Minecraft wrote carries the light Minecraft computed, so the same chunks can be
-lit again with Dust's engine and compared cell by cell.
+`light` puts a number on how close Dust's light is, **both kinds, reported
+apart** — a single figure covering both would read as "the lighting is 99.9%
+right" while hiding which half of it was. A chunk Minecraft wrote carries the
+light Minecraft computed, so the same chunks can be lit again with Dust's engine
+and compared cell by cell.
 
 It measures a **ladder**: five models over the same chunks in the same run,
-each row the one above it plus a single named change.
+each row the one above it plus a single named change, and it now covers **both
+kinds of light**.
 
 ```text
-seed 0, radius 2                                       short   sweep
-  air alone, one column, `not air` heightmaps        14,276    304 ms
-  + Minecraft's own opacity                             611    267 ms
-  + Minecraft's own heightmap predicates                435    252 ms   <- a server
-  + a 3x3 volume of columns                               0  1,482 ms
-  + the heightmaps Minecraft wrote                        0  1,328 ms
+seed 0, radius 2                                sky short   block short
+  no table at all                                  14,276         7,185
+  + Minecraft's own opacity and emission              611         1,163
+  + Minecraft's own heightmap predicates              435         1,163   <- a server
+  + a 3x3 volume of columns                             0             0
+  + the heightmaps Minecraft wrote                      0             0
 ```
 
-On seed 1 the second row is already zero, over 4,816,896 cells.
+On seed 1 the second row's sky light is already zero, over 4,816,896 cells.
 
-**Every disagreement is accounted for.** Given Minecraft's own answers to the
-three questions Dust asks about a block, and a volume wide enough for light to
-cross, the walks reproduce the light Minecraft computed exactly — on both seeds
-and at every radius. Sky light has four inputs and only one of them is the
-engine; that row is what says the walks are right and everything above it is
-something Dust is *told* about the world.
+Block light's percentages need reading with care and the counts do not: most of
+a world has no block light, so a server that computed none still "agrees" with
+99.7% of cells, and the 7,185 in that first row is *every lit cell in view*.
+
+**Every disagreement is accounted for, in both kinds of light.** Given
+Minecraft's own answers to the questions Dust asks about a block, and a volume
+wide enough for light to cross, the walks reproduce the light Minecraft computed
+exactly — on both seeds and at every radius. Lighting has four inputs and only
+one of them is the engine; that row is what says the walks are right and
+everything above it is something Dust is *told* about the world.
 
 The fifth row is a control and agrees with the fourth. It skips the recompute
 and takes the heightmaps out of the chunk as Minecraft wrote them — not a mode

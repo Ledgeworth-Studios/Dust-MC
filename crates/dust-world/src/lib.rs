@@ -134,6 +134,6 @@ pub use coords::{BlockPos, ChunkPos, RegionPos};
 pub use heightmap::{Heightmap, HeightmapKind, HeightmapSet, WorldHeight};
 pub use light::{LightArray, LightArrayError};
 pub use palette::{Palette, PaletteKind};
-pub use propagation::{Budget, LightGraph, OpacityModel, PropagationError};
+pub use propagation::{Budget, EmissionModel, LightGraph, OpacityModel, PropagationError};
 pub use region::{ChunkPayload, Compression, RegionError, RegionFile};
 pub use slab::{Slab, SlabError, SlabKey};

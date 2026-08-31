@@ -530,6 +530,72 @@ impl OpacityModel {
     }
 }
 
+/// How much light a block state gives off.
+///
+/// The other half of what a light engine needs from the registry, and the
+/// mirror of [`OpacityModel`]: opacity is what a cell takes and this is what it
+/// gives. Both are Java code in Minecraft, both arrive from the operator's own
+/// jar, and both answer conservatively for a state they do not know — an
+/// unknown block that emits nothing is one dark cell, where one that emits
+/// would be light coming out of a block nobody can point at.
+///
+/// [`EmissionModel::nothing`] is not a placeholder in the way the opacity
+/// stand-in was. A world of stone and water really does emit nothing, and a
+/// server with no constants table is not approximating anything by saying so —
+/// it is declining to invent the one number it has no source for.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EmissionModel {
+    levels: Box<[u8]>,
+}
+
+impl EmissionModel {
+    /// A model where nothing emits.
+    #[must_use]
+    pub fn nothing() -> Self {
+        Self::default()
+    }
+
+    /// A model holding one emission per block state, indexed by state id.
+    ///
+    /// Levels above fifteen are clamped, for the same reason
+    /// [`OpacityModel::per_state`] clamps: the reader that could tell a bad
+    /// table from an unmet version has already refused one, and a level is a
+    /// nibble.
+    #[must_use]
+    pub fn per_state(levels: impl IntoIterator<Item = u8>) -> Self {
+        Self {
+            levels: levels.into_iter().map(|l| l.min(15)).collect(),
+        }
+    }
+
+    /// What `state` gives off.
+    #[must_use]
+    pub fn emission(&self, state: u32) -> u8 {
+        self.levels.get(state as usize).copied().unwrap_or(0)
+    }
+
+    /// Whether nothing in this model emits at all.
+    ///
+    /// The fast path a whole pass can be skipped on, and it is the common case
+    /// twice over: a server with no constants table, and — with one — a column
+    /// of a world that has no torch, no lava and no glowstone in it.
+    #[must_use]
+    pub fn is_dark(&self) -> bool {
+        self.levels.iter().all(|level| *level == 0)
+    }
+
+    /// Whether any of these states emits.
+    ///
+    /// Asked of a section's palette before its 4,096 cells are read. A palette
+    /// is the shortlist of what a section can possibly hold, so a section whose
+    /// palette holds no emitter has no emitter, and nearly every section of a
+    /// real world is one.
+    #[must_use]
+    pub fn any_emits(&self, states: impl IntoIterator<Item = u32>) -> bool {
+        states.into_iter().any(|state| self.emission(state) > 0)
+    }
+}
+
 impl Default for OpacityModel {
     /// Air and nothing else: the model a freshly generated world effectively
     /// has.

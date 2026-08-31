@@ -43,6 +43,25 @@ A failing check is either a defect or a deadline, and the two look identical
 from here. If the failures are the second-bot ones and nothing else, rebuild
 with `--release` before believing them.
 
+**Do not check light through `bot.world.getSkyLight` or `getBlockLight`.**
+They do not report what the server sent. Chased down on 2026-08-31: on seed 1's
+spawn column the bot read sky light 0 for four cells of open air above the
+sand, and the same four cells read **15** in Dust's own arrays, in the bytes of
+the `map_chunk` packet the bot itself received, *and* in the light Minecraft
+computed into its own region file. `cargo xtask harness light --at 7,11` agrees
+with vanilla cell for cell there.
+
+So the bytes are right on both sides of the wire and `prismarine-chunk`'s
+nibble accessor is reading them back permuted — its `BitArray` is a
+`Uint32Array` built for long-packed containers, and a light array is a flat
+byte sequence. Dumping `p.skyLight[9]` out of the raw packet and reading it by
+hand is what settled it, and is the way to check light from here if you need to.
+
+That is worth the paragraph because the failure is silent and convincing: it
+produces a plausible-looking dark band at a chunk edge, which is exactly what a
+real lighting bug looks like. **An independent client is only independent where
+it is right.**
+
 ## What it checks
 
 1. It **joins** — through login, configuration and into the world.

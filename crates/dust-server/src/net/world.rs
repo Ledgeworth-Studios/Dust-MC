@@ -97,22 +97,56 @@ pub const SURFACE_Y: i32 = -60;
 /// and if the third of those restated the opacity model or the budget, it
 /// would be measuring a lighting policy that no player ever sees.
 ///
+/// Both kinds, in the order they cost: sky light always, and block light only
+/// where something in the column gives light off. The two do not interact —
+/// they are separate arrays walked separately, exactly as vanilla keeps them —
+/// so the block pass is skipped entirely for a column with no torch in it,
+/// which is nearly every column of a real world.
+///
 /// # Errors
 ///
-/// [`dust_world::propagation::PropagationError::BudgetExhausted`] if the walk
-/// runs past [`LIGHT_BUDGET`]. The partial result is consistent: the column is
-/// under-lit rather than corrupt.
+/// [`dust_world::propagation::PropagationError::BudgetExhausted`] if either
+/// walk runs past [`LIGHT_BUDGET`]. The partial result is consistent: the
+/// column is under-lit rather than corrupt.
 pub fn light_column(
     chunk: &mut dust_world::chunk::Chunk,
     opacity: &OpacityModel,
+    emission: &dust_world::propagation::EmissionModel,
     skirt: dust_world::column_light::Skirt,
 ) -> Result<u64, dust_world::propagation::PropagationError> {
-    dust_world::column_light::ColumnSkyLight::seed_with_neighbours(
+    let sky = dust_world::column_light::ColumnSkyLight::seed_with_neighbours(
         chunk,
         opacity,
         skirt,
         dust_world::propagation::Budget::new(LIGHT_BUDGET),
-    )
+    )?;
+    let block = dust_world::column_light::ColumnBlockLight::seed(
+        chunk,
+        opacity,
+        emission,
+        dust_world::propagation::Budget::new(LIGHT_BUDGET),
+    )?;
+    Ok(sky + block)
+}
+
+/// What every block state gives off, given whatever constants there are.
+///
+/// **This is the one place that answer is decided**, beside [`opacity_of`] and
+/// [`heightmap_predicate`], and unlike those two its no-table case is not an
+/// approximation of anything. A server with no constants table says nothing
+/// emits, and that is a refusal to invent a number rather than a stand-in for
+/// one: there is no defensible guess at how bright a torch is.
+///
+/// On 1.21.1 the table says 1,588 of 26,684 states emit.
+pub fn emission_of(
+    constants: Option<&dust_registry::BlockConstants>,
+) -> dust_world::propagation::EmissionModel {
+    match constants {
+        Some(table) => dust_world::propagation::EmissionModel::per_state(
+            (0..table.len() as u32).map(|state| table.emission(state)),
+        ),
+        None => dust_world::propagation::EmissionModel::nothing(),
+    }
 }
 
 /// The opacity model to light with, given whatever light table there is.
@@ -398,7 +432,14 @@ impl FlatWorld {
             north: floors,
             south: floors,
         };
-        let _ = light_column(&mut chunk, &self.opacity, skirt);
+        // Nothing in a superflat emits: bedrock, dirt and grass. The model is
+        // passed rather than assumed for the same reason the skirt is.
+        let _ = light_column(
+            &mut chunk,
+            &self.opacity,
+            &dust_world::propagation::EmissionModel::nothing(),
+            skirt,
+        );
         chunk
     }
 
