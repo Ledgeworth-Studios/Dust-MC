@@ -8,6 +8,8 @@
 //! out. A counter that measured anything else would still be *a* number,
 //! just not the one the docs promise.
 
+mod counters;
+
 use std::time::Duration;
 
 use dust_net::crypt::SharedSecret;
@@ -53,8 +55,10 @@ async fn frames_and_bytes_are_counted_in_both_directions() {
 
     server.send(Frame::new(0x40, b"down")).await.expect("send");
 
-    // Wait until the socket has actually taken the frame, so the writer's
-    // byte count has settled before it is read.
+    // Read what went down the wire. Note what this does *not* establish: the
+    // peer sees these bytes when the socket takes them, and the writer counts
+    // them a moment afterwards, so draining the peer orders nothing against
+    // `bytes_out`. See `counters` for what that cost on CI.
     let expected = wire_of(0x40, b"down");
     let mut seen = vec![0u8; expected.len()];
     tokio::time::timeout(Duration::from_secs(5), client_raw.read_exact(&mut seen))
@@ -63,13 +67,18 @@ async fn frames_and_bytes_are_counted_in_both_directions() {
         .expect("read");
     assert_eq!(seen, expected);
 
-    let stats = server.stats();
+    let stats = counters::settled(
+        || server.stats(),
+        |stats| stats.bytes_out == expected.len() as u64,
+        "one frame down the wire, counted at its full framed size",
+    )
+    .await;
     assert_eq!(stats.frames_in, 2);
     // Wire cost, prefix included — not payload size.
     assert_eq!(stats.bytes_in, (first.len() + second.len()) as u64);
 
-    // Accepted at send time; the close above flushed them to the socket, so
-    // the written total has settled by the time the peer saw EOF.
+    // Accepted at send time, so this one is exact the instant `send` returns;
+    // `bytes_out` is the count waited for above.
     assert_eq!(stats.frames_out, 1);
     assert_eq!(stats.bytes_out, expected.len() as u64);
     assert_eq!(stats.total_errors(), 0);
@@ -153,18 +162,23 @@ async fn encrypted_egress_is_counted_at_its_wire_size() {
         .await
         .expect("send");
 
-    // Wait until the ciphertext has actually left for the peer, so the
-    // writer's count has settled before it is read. The deadline is a stall
-    // guard only — sixteen bytes cross a duplex in microseconds when the
-    // machine is idle — and is set wide enough that a fully loaded CI box
-    // scheduling the whole suite in parallel cannot trip it.
+    // Wait until the ciphertext has actually left for the peer. Widening this
+    // deadline was the first answer to this test failing on CI, and it was the
+    // wrong one: the read was never what timed out. The count was read before
+    // the writer task had got round to incrementing it, which no deadline on
+    // *this* await can fix — `counters::settled` below is the fix.
     let mut wire = vec![0u8; wire_of(0x09, b"secret").len()];
     tokio::time::timeout(Duration::from_secs(30), client_raw.read_exact(&mut wire))
         .await
         .expect("drain")
         .expect("read");
 
-    let stats = server.stats();
+    let stats = counters::settled(
+        || server.stats(),
+        |stats| stats.bytes_out as usize == wire.len(),
+        "ciphertext counted at the size the socket took",
+    )
+    .await;
     assert_eq!(stats.frames_out, 1);
     assert_eq!(
         stats.bytes_out as usize,
