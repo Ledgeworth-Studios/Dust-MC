@@ -4,7 +4,7 @@
 //!
 //! How much light a block state costs to enter and how much it gives off are
 //! Java code in Minecraft. Decision record 0008 is the whole of that problem;
-//! `cargo xtask extract --only light` is the oracle that asks the operator's
+//! `cargo xtask extract --only constants` is the oracle that asks the operator's
 //! own jar for the answer. What was open until now was not where the numbers
 //! come from but how they reach a **server operator**, and the record listed
 //! four routes: a new `dust` subcommand, the server running the oracle at boot,
@@ -18,7 +18,7 @@
 //!
 //! ```text
 //! <[data] path>/
-//!   dust-light.tsv     ← this
+//!   dust-constants.tsv     ← this
 //!   minecraft/
 //!     worldgen/biome/…
 //!     dimension_type/…
@@ -47,27 +47,27 @@
 
 use std::path::{Path, PathBuf};
 
-use dust_registry::LightTable;
+use dust_registry::BlockConstants;
 
 /// What the file is called inside `[data] path`.
-pub const FILE: &str = "dust-light.tsv";
+pub const FILE: &str = "dust-constants.tsv";
 
 /// Why a light table beside the data could not be used.
 #[derive(Debug)]
-pub struct LightError {
+pub struct ConstantsFileError {
     /// The file it was reading.
     pub path: PathBuf,
     /// What was wrong with it.
     pub detail: String,
 }
 
-impl std::fmt::Display for LightError {
+impl std::fmt::Display for ConstantsFileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.path.display(), self.detail)
     }
 }
 
-impl std::error::Error for LightError {}
+impl std::error::Error for ConstantsFileError {}
 
 /// Read the light table beside a data directory, if there is one.
 ///
@@ -75,20 +75,20 @@ impl std::error::Error for LightError {}
 ///
 /// # Errors
 ///
-/// [`LightError`] when the file exists and cannot be used. A file that is
+/// [`ConstantsFileError`] when the file exists and cannot be used. A file that is
 /// there and wrong stops the server, because the alternative is a server that
 /// runs with lighting quietly worse than the operator asked for. A file that
 /// is not there is `Ok(None)`.
-pub fn beside(root: impl AsRef<Path>) -> Result<Option<LightTable>, LightError> {
+pub fn beside(root: impl AsRef<Path>) -> Result<Option<BlockConstants>, ConstantsFileError> {
     let path = root.as_ref().join(FILE);
     if !path.is_file() {
         return Ok(None);
     }
-    let text = std::fs::read_to_string(&path).map_err(|e| LightError {
+    let text = std::fs::read_to_string(&path).map_err(|e| ConstantsFileError {
         path: path.clone(),
         detail: e.to_string(),
     })?;
-    let table = LightTable::parse(&text).map_err(|e| LightError {
+    let table = BlockConstants::parse(&text).map_err(|e| ConstantsFileError {
         path,
         detail: e.to_string(),
     })?;

@@ -145,6 +145,10 @@ pub struct AnvilWorld {
     /// because with a table in it this is 26,684 bytes and the alternative is
     /// building one per column served.
     opacity: dust_world::propagation::OpacityModel,
+    /// What Minecraft says about a block state, or nothing. Held rather than
+    /// folded into `opacity` because the heightmaps need it too and a second
+    /// copy would be a second answer.
+    constants: Option<std::sync::Arc<dust_registry::BlockConstants>>,
     /// Where the sky reaches in each column read so far, for lighting the
     /// columns beside it. See the module note for why this is cached when the
     /// chunks are not.
@@ -198,6 +202,7 @@ impl AnvilWorld {
         names: RegistryNames,
         fallback: FlatWorld,
         opacity: dust_world::propagation::OpacityModel,
+        constants: Option<std::sync::Arc<dust_registry::BlockConstants>>,
     ) -> Self {
         Self {
             directory,
@@ -206,6 +211,7 @@ impl AnvilWorld {
             height: fallback.height(),
             fallback,
             opacity,
+            constants,
             sky_floors: Mutex::new(HashMap::new()),
         }
     }
@@ -239,7 +245,10 @@ impl AnvilWorld {
         }
         let floors = match self.read(pos) {
             Some(mut chunk) => {
-                chunk.recompute_heightmaps(|_, state| state != self.fallback.palette().air);
+                chunk.recompute_heightmaps(super::world::heightmap_predicate(
+                    self.fallback.palette().air,
+                    self.constants.as_deref(),
+                ));
                 SkyFloor::of(&chunk)
             }
             None => SkyFloor::of(self.fallback.column()),
@@ -286,7 +295,10 @@ impl AnvilWorld {
                 // known approximation and the reason a save must not go
                 // through here: `harness rewrite` reads and writes without
                 // this step, so a round trip keeps the file's own answers.
-                chunk.recompute_heightmaps(|_, state| state != self.fallback.palette().air);
+                chunk.recompute_heightmaps(super::world::heightmap_predicate(
+                    self.fallback.palette().air,
+                    self.constants.as_deref(),
+                ));
                 // Light is computed, not read. A chunk's stored light is a
                 // cache of what an engine would produce, and this server has
                 // its own engine; trusting the file would mean serving light

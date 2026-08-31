@@ -14,7 +14,7 @@
 //!
 //! # One table here is not generated
 //!
-//! [`light::LightTable`] is the exception to the first sentence above, and it
+//! [`constants::BlockConstants`] is the exception to the first sentence above, and it
 //! is an exception on purpose. How much light a block state costs to enter and
 //! how much it gives off are Java code in Minecraft — in no report, no data
 //! pack and nothing `xtask extract`'s generators can reach — so decision
@@ -42,11 +42,11 @@
 //! disagree with the obvious reading of the report.
 
 pub mod commands;
+pub mod constants;
 pub mod flat;
 pub mod fluids;
 pub mod generated;
 pub mod items;
-pub mod light;
 pub mod loot;
 pub mod recipes;
 pub mod registry;
@@ -54,12 +54,12 @@ pub mod synced;
 pub mod tags;
 
 pub use commands::{ArgumentProperties, CommandDef, CommandGraph, NodeKind};
+pub use constants::{BlockConstants, ConstantsError};
 pub use flat::{EntityType, Fluid, Item};
 pub use generated::blocks::{DATA_VERSION, STATE_COUNT, STATE_SAMPLES};
 pub use generated::items::COMPONENT_SAMPLES;
 pub use generated::registries::{ENTRY_COUNT, ENTRY_SAMPLES};
 pub use items::{ComponentValue, Components, Rarity};
-pub use light::{LightTable, LightTableError};
 pub use registry::{Registry, RegistryDef};
 
 /// One property of a block, and the values it may take, in id order.

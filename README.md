@@ -86,17 +86,16 @@ section codec, the chunk packet, the light engine.
 **Not yet**, and each of these is stated where the code for it would go: no
 physics, block updates, drops, tool checks or reach validation, so a player may
 break bedrock from across the map; no inventory, so there is one placeable
-block; no block light and no sound when a block is placed, and the served
-world's sky light still treats every block but air as a wall — the numbers that
-close all three exist and are Minecraft's own, and what is missing is a route
-for them to reach an *operator*, which is the one question left in decision
-record [0008](docs/decisions/0008-block-opacity-and-light-emission.md); sky
-light that crosses a chunk boundary from a neighbour open to the sky but not
-from one it would have to travel through, which is an engine gap and not a data
-one — measured at 432 cells of 2.4 million on an inland world and nothing on an
-ocean one, and costed and declined for now in decision record
-[0010](docs/decisions/0010-how-wide-the-sky-light-volume.md), which says what to
-build instead; no plugins;
+block; no block light and no sound when a block is placed — the emission values
+for the first are already in the table a server reads, and the sound needs one
+more column in it, both stated in decision record
+[0008](docs/decisions/0008-block-opacity-and-light-emission.md); sky light that
+crosses a chunk boundary from a neighbour open to the sky but not from one it
+would have to travel through, which is an engine gap and not a data one, and is
+now the *only* thing between a served world's sky light and Minecraft's own —
+435 cells of 2.4 million inland and nothing at all on an ocean world, costed and
+declined in decision record
+[0010](docs/decisions/0010-how-wide-the-sky-light-volume.md); no plugins;
 and the running server still saves its own edits in its own format beside a
 world rather than back into it — writing Anvil works, but a chunk's block
 entities and scheduled ticks survive a round trip by being *copied*, not because
@@ -116,15 +115,16 @@ in `dust.toml` first unless you want Mojang consulted, and point
 For sky light that matches Minecraft's, put a light table beside your data:
 
 ```
-cargo xtask extract --version 1.21.1 --only light
-cp .dust-extract/oracle-1.21.1/light.tsv <[data] path>/dust-light.tsv
+cargo xtask extract --version 1.21.1 --only constants
+cp .dust-extract/oracle-1.21.1/constants.tsv <[data] path>/dust-constants.tsv
 ```
 
-How much light a block stops and how much it gives off are Java code inside
-Minecraft rather than data, so those numbers are in no report, no data pack and
-no copy here — the extractor asks your own server jar for them and writes them
-to your own disk. Without the file, every block but air stops sky light and the
-server says so at boot. Decision record
+How much light a block stops, how much it gives off, and which of the six
+heightmaps count it are Java code inside Minecraft rather than data, so they are
+in no report, no data pack and no copy here — the extractor asks your own server
+jar for them and writes them to your own disk. Without the file, every block but
+air stops sky light and the sky starts above the grass rather than through it,
+and the server says so at boot. Decision record
 [0008](docs/decisions/0008-block-opacity-and-light-emission.md) is why it
 arrives this way rather than in the binary.
 
@@ -291,33 +291,38 @@ lighting is 99.4% right" when half of lighting is not implemented. A chunk
 Minecraft wrote carries the light Minecraft computed, so the same chunks can be
 lit again with Dust's engine and compared cell by cell.
 
-It measures a **ladder**: four models over the same chunks in the same run,
+It measures a **ladder**: five models over the same chunks in the same run,
 each row the one above it plus a single named change.
 
 ```text
-seed 0, radius 2                              short   sweep
-  air only, one column, Dust's heightmap     14,276    102 ms
-  + Minecraft's own opacity                     611    101 ms
-  + a 3x3 volume of columns                     179    611 ms
-  + the heightmaps Minecraft wrote                0    544 ms
-
-seed 1, radius 3                              short
-  air only, one column, Dust's heightmap    169,480
-  + Minecraft's own opacity                       0
+seed 0, radius 2                                       short   sweep
+  air alone, one column, `not air` heightmaps        14,276    304 ms
+  + Minecraft's own opacity                             611    267 ms
+  + Minecraft's own heightmap predicates                435    252 ms   <- a server
+  + a 3x3 volume of columns                               0  1,482 ms
+  + the heightmaps Minecraft wrote                        0  1,328 ms
 ```
 
-**The last row is a hundred per cent, on both seeds** — 2,457,600 cells and
-4,816,896 cells, and not one disagrees with the light Minecraft computed. Sky
-light has four inputs and only one of them is the engine; what that row says is
-that the walks are right, and everything above it is something Dust is *told*
-about the world. The last rung is not a mode a server could run in, because a
-chunk somebody has edited has a heightmap its file does not; it is there to
-take the last input out of the measurement.
+On seed 1 the second row is already zero, over 4,816,896 cells.
 
-A running server stands on the second row today: Minecraft's own opacity from a
-table in `[data] path`, one column at a time. Decision records
-[0008](docs/decisions/0008-block-opacity-and-light-emission.md) and
-[0010](docs/decisions/0010-how-wide-the-sky-light-volume.md) are why.
+**Every disagreement is accounted for.** Given Minecraft's own answers to the
+three questions Dust asks about a block, and a volume wide enough for light to
+cross, the walks reproduce the light Minecraft computed exactly — on both seeds
+and at every radius. Sky light has four inputs and only one of them is the
+engine; that row is what says the walks are right and everything above it is
+something Dust is *told* about the world.
+
+The fifth row is a control and agrees with the fourth. It skips the recompute
+and takes the heightmaps out of the chunk as Minecraft wrote them — not a mode
+a server can run in, since an edited chunk has a heightmap its file does not.
+Its agreeing is the statement that Dust's recompute, given Minecraft's
+predicates, *is* Minecraft's heightmap and not merely close to it.
+
+A server with a `dust-constants.tsv` stands on the third row. What separates it
+from exact is the multi-column volume, costed and declined in decision record
+[0010](docs/decisions/0010-how-wide-the-sky-light-volume.md); why the numbers
+come from the operator's jar rather than from here is
+[0008](docs/decisions/0008-block-opacity-and-light-emission.md).
 
 **Getting there found a defect the stand-in had been hiding for the whole of
 the light engine's life.** Minecraft's numbers on their own moved seed 0 by a
@@ -329,8 +334,8 @@ engine charged `1 + opacity` for a step where Minecraft charges
 0 or 15, because the two rules agree at both ends. A wrong constant hidden by
 another wrong constant.
 
-**A 5x5 volume buys exactly nothing** — the same 179, not fewer — which is the
-argument for a finite volume confirmed rather than assumed. Light loses a level
+**A 5x5 volume buys exactly nothing** over a 3x3 — which is the argument for a
+finite volume confirmed rather than assumed. Light loses a level
 a block and a chunk is sixteen of them, so one ring of neighbours is not an
 approximation of the infinite volume; it is the infinite volume.
 
@@ -342,14 +347,13 @@ inward while opacity does not care where in a column a cell is.
 distance from a face    0      1      2      3      4      5      6      7
 seed 0, air only     0.660  0.595  0.561  0.548  0.530  0.510  0.530  0.581
 seed 0, Minecraft's  0.072  0.021  0.008  0.007  0.005  0.005  0.006  0.018
-seed 0, + 3x3        0.009  0.009  0.006  0.006  0.005  0.005  0.006  0.018
 ```
 
-Flat, then falling by an order of magnitude, then flat again — three different
-causes, each visible as a different shape. What it cannot do is separate a
-cause nobody proposed: it read "flat, therefore opacity" and was right, and was
-equally right about the step cost. The rate and not the count is the whole
-measurement: a column has `60 - 8d` columns at distance `d`, sixty at the face
+Flat, then falling by an order of magnitude — two different causes, each
+visible as a different shape. What it cannot do is separate a cause nobody
+proposed: it read "flat, therefore opacity" and was right, and was equally
+right about the step cost and about a heightmap predicate that put the sky
+floor above a flower. The rate and not the count is the whole measurement: a column has `60 - 8d` columns at distance `d`, sixty at the face
 against four in the middle, so a raw count reads as "it is all at the edges"
 for a perfectly uniform cause.
 

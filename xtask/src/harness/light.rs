@@ -37,7 +37,7 @@
 //! # Two models, one run
 //!
 //! Opacity is not one of Dust's numbers. Minecraft keeps `getLightBlock` as
-//! Java code; `cargo xtask extract --only light` asks the game for it against
+//! Java code; `cargo xtask extract --only constants` asks the game for it against
 //! the operator's own jar; and this verb measures **both** that answer and the
 //! stand-in that stood in for it — over the same chunks of the same world, in
 //! the same run. Two runs of one verb with a flag between them would be two
@@ -79,37 +79,44 @@
 //! # The ladder: four inputs, one engine
 //!
 //! Sky light has four inputs and only one of them is Dust's lighting. The verb
-//! measures them as a ladder — four models over the same chunks in the same
+//! measures them as a ladder — five models over the same chunks in the same
 //! run, each row the one above it plus a single named change — because a table
 //! like that is what says which input owns which part of the gap. A single
-//! percentage cannot, and twice now it has been read as saying something it
-//! was not.
+//! percentage cannot, and three times now it has been read as saying something
+//! it was not.
 //!
 //! ```text
-//! seed 0, radius 2                              short   sweep
-//!   air only, one column, Dust's heightmap     14,276    102 ms
-//!   + Minecraft's own opacity                     611    101 ms
-//!   + a 3x3 volume of columns                     179    611 ms
-//!   + the heightmaps Minecraft wrote                0    544 ms
+//! seed 0, radius 2                                       short   sweep
+//!   air alone, one column, `not air` heightmaps         14,276    304 ms
+//!   + Minecraft's own opacity                              611    267 ms
+//!   + Minecraft's own heightmap predicates                 435    252 ms
+//!   + a 3x3 volume of columns                                0  1,482 ms
+//!   + the heightmaps Minecraft wrote                         0  1,328 ms
 //! ```
 //!
-//! **The last row is a hundred per cent, on both seeds.** 2,457,600 cells and
-//! 4,816,896 cells, and not one disagrees with the light Minecraft computed. So
-//! the walks are right, and everything above that row is something Dust is
-//! *told* about the world rather than something it does with what it is told.
+//! On seed 1 the second row is already zero, over 4,816,896 cells.
 //!
-//! The last rung is not a mode a server could run in: a chunk somebody has
-//! edited has a heightmap its file does not. It is there to take the last input
-//! out of the measurement.
+//! **Every disagreement is accounted for**, which is what the fourth row says:
+//! given Minecraft's own answers to the three questions Dust asks about a block
+//! and a volume wide enough for light to cross, the walks reproduce the light
+//! Minecraft computed exactly, on both seeds and every radius.
 //!
-//! **`--volume 2` buys exactly nothing** — the same 179, not fewer — which is
-//! the argument for a finite volume confirmed rather than assumed. Light loses
-//! a level a block and a chunk is sixteen of them, so one ring of neighbours is
-//! not an approximation of the infinite volume; it is the infinite volume.
+//! **The fifth row is a control and agrees with the fourth.** It skips the
+//! recompute entirely and takes the heightmaps out of the chunk as Minecraft
+//! wrote them — not a mode a server could run in, since an edited chunk has a
+//! heightmap its file does not. Its agreeing with the row above is the
+//! statement that Dust's recompute, given Minecraft's predicates, *is*
+//! Minecraft's heightmap and not merely close to it.
 //!
-//! Decision record 0010 is why the 3x3 is measured here and not adopted in the
-//! engine: it closes 432 of the 611 for six times the work, and the heightmap
-//! predicate closes the other 179 for a column in a table Dust already reads.
+//! The third row is where a server with a `dust-constants.tsv` stands. What is
+//! between it and the fourth is the multi-column volume, measured at 435 cells
+//! of 2.4 million and declined in decision record 0010 for costing six times
+//! the work.
+//!
+//! **`--volume 2` buys exactly nothing** over `--volume 1` — the argument for a
+//! finite volume confirmed rather than assumed. Light loses a level a block and
+//! a chunk is sixteen of them, so one ring of neighbours is not an
+//! approximation of the infinite volume; it is the infinite volume.
 //!
 //! # The ring histogram, and what it can and cannot separate
 //!
@@ -122,18 +129,19 @@
 //! distance from a face    0      1      2      3      4      5      6      7
 //! seed 0, air only     0.660  0.595  0.561  0.548  0.530  0.510  0.530  0.581
 //! seed 0, Minecraft's  0.072  0.021  0.008  0.007  0.005  0.005  0.006  0.018
-//! seed 0, + 3x3        0.009  0.009  0.006  0.006  0.005  0.005  0.006  0.018
 //! ```
 //!
-//! Flat under the stand-in; falling by an order of magnitude once opacity is
-//! Minecraft's, which is the shape a neighbour effect makes and was the first
-//! time this verb had seen one; flat again once the volume has taken that away,
-//! leaving a third thing that is neither.
+//! Flat under the stand-in, because opacity does not care where in a column a
+//! cell is; falling by an order of magnitude once opacity is Minecraft's, which
+//! is the shape a neighbour effect makes and was the first time this verb had
+//! seen one. The rung below that is zero and has no histogram at all.
 //!
 //! **What it cannot do is separate a cause nobody proposed.** It read "flat,
 //! therefore opacity" and was right, and was equally right about a step cost
-//! that doubled every opacity that was not 0 or 15. It is a discriminator
-//! between two named hypotheses and not a detector.
+//! that doubled every opacity that was not 0 or 15, and about a heightmap
+//! predicate that put the sky floor above a flower. It is a discriminator
+//! between named hypotheses and not a detector; the ladder is what turns a new
+//! hypothesis into a row.
 //!
 //! **The rate and not the count is the whole measurement.** A 16x16 column has
 //! `60 - 8d` columns at distance `d` — sixty at the face and four in the
@@ -205,7 +213,7 @@ names what the disagreements are standing on.
 Measured twice where this checkout has a light table — once with Minecraft's
 own opacity for every block state and once with the stand-in that treats
 everything but air as a wall — over the same chunks in the same run. Write one
-with `cargo xtask extract --version <v> --only light`; nothing is committed and
+with `cargo xtask extract --version <v> --only constants`; nothing is committed and
 none of it leaves .dust-extract/.
 
   --version <v>   Minecraft version, e.g. 1.21.1.
@@ -387,6 +395,27 @@ fn measure(options: &Options) -> Result<(), String> {
         options.seed
     );
 
+    // The table, if this checkout has one. **Both models are measured in one
+    // run**, because the number that matters is not "Minecraft's opacity gets
+    // 99.9%" — it is the difference between the two on the same chunks of the
+    // same world, and two runs of one verb with a flag between them invites
+    // exactly the mistake the ring histogram was built to avoid: comparing
+    // numbers taken under conditions nobody held fixed.
+    let table = light_table(&options.version)?;
+    match &table {
+        Some((path, table)) => println!(
+            "light table: {} — {} states, {} of them emitting",
+            path.display(),
+            table.len(),
+            table.emitting()
+        ),
+        None => println!(
+            "no light table in this checkout, so only the stand-in is measured; \
+             `cargo xtask extract --version {} --only constants` writes one",
+            options.version
+        ),
+    }
+
     // Every column's sky floors, including the ring around the square, so
     // each chunk is lit against its *real* neighbours.
     //
@@ -403,7 +432,11 @@ fn measure(options: &Options) -> Result<(), String> {
     // neighbours' written ones would be measuring the difference between the
     // two rather than either.
     let mut floors: BTreeMap<Heightmaps, BTreeMap<(i32, i32), SkyFloor>> = BTreeMap::new();
-    for mode in [Heightmaps::Recomputed, Heightmaps::AsWritten] {
+    for mode in [
+        Heightmaps::FromAirAlone,
+        Heightmaps::FromMinecraftsPredicates,
+        Heightmaps::AsWritten,
+    ] {
         let floors = floors.entry(mode).or_default();
         for &(x, z) in &expected {
             for (nx, nz) in [(x, z), (x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)] {
@@ -424,69 +457,68 @@ fn measure(options: &Options) -> Result<(), String> {
                 if !is_full(&region_dir, nx, nz)? {
                     continue;
                 }
-                if let Ok(chunk) = dust_chunk(&region_dir, nx, nz, height, &names, air, mode) {
+                if let Ok(chunk) = dust_chunk(
+                    &region_dir,
+                    nx,
+                    nz,
+                    height,
+                    &names,
+                    air,
+                    mode,
+                    table.as_ref().map(|(_, table)| table),
+                ) {
                     floors.insert((nx, nz), SkyFloor::of(&chunk));
                 }
             }
         }
     }
 
-    // The table, if this checkout has one. **Both models are measured in one
-    // run**, because the number that matters is not "Minecraft's opacity gets
-    // 99.9%" — it is the difference between the two on the same chunks of the
-    // same world, and two runs of one verb with a flag between them invites
-    // exactly the mistake the ring histogram was built to avoid: comparing
-    // numbers taken under conditions nobody held fixed.
-    let table = light_table(&options.version)?;
-    match &table {
-        Some((path, table)) => println!(
-            "light table: {} — {} states, {} of them emitting",
-            path.display(),
-            table.len(),
-            table.emitting()
-        ),
-        None => println!(
-            "no light table in this checkout, so only the stand-in is measured; \
-             `cargo xtask extract --version {} --only light` writes one",
-            options.version
-        ),
-    }
-
     // **A ladder, and each rung adds exactly one thing.** Sky light has four
-    // inputs and only one of them is the engine; a table of four numbers where
-    // each row differs from the one above it in a single named way is what
-    // says which input owns which part of the gap. Two of the four turned out
-    // not to be what this project thought they were, and both times it was a
-    // row of this table that said so.
+    // inputs and only one of them is the engine; a table of five numbers where
+    // each row differs from the one above it in a single named way is what says
+    // which input owns which part of the gap. Three of the four turned out not
+    // to be what this project thought they were, and every time it was a row of
+    // this table that said so.
+    //
+    // The order is cheapest first, so a reader can stop at the row a server
+    // actually stands on and see what is above and below it.
     let mut models = vec![Model {
-        name: "air only, one column, Dust's heightmap".to_owned(),
+        name: "air alone, one column, `not air` heightmaps".to_owned(),
         from_minecraft: false,
         opacity: world::opacity_of(air, None),
         volume: Volume::Column,
-        heightmaps: Heightmaps::Recomputed,
+        heightmaps: Heightmaps::FromAirAlone,
     }];
     if let Some((_, table)) = &table {
         let real = world::opacity_of(air, Some(table));
         models.push(Model {
-            name: "+ Minecraft's own opacity, from the operator's jar".to_owned(),
+            name: "+ Minecraft's own opacity".to_owned(),
             from_minecraft: true,
             opacity: real.clone(),
             volume: Volume::Column,
-            heightmaps: Heightmaps::Recomputed,
+            heightmaps: Heightmaps::FromAirAlone,
+        });
+        models.push(Model {
+            name: "+ Minecraft's own heightmap predicates  <- a server with a table".to_owned(),
+            from_minecraft: true,
+            opacity: real.clone(),
+            volume: Volume::Column,
+            heightmaps: Heightmaps::FromMinecraftsPredicates,
         });
         for k in 1..=options.volume {
             let side = 2 * k + 1;
             models.push(Model {
-                name: format!("+ a {side}x{side} volume of columns"),
+                name: format!("+ a {side}x{side} volume of columns  (declined in D10)"),
                 from_minecraft: true,
                 opacity: real.clone(),
                 volume: Volume::Area(k),
-                heightmaps: Heightmaps::Recomputed,
+                heightmaps: Heightmaps::FromMinecraftsPredicates,
             });
         }
         // The last rung, and the only one no server could stand on: a chunk
-        // that has been edited has a heightmap its file does not. It is here
-        // to take the last input out of the measurement and leave the engine.
+        // that has been edited has a heightmap its file does not. It is here to
+        // take the recompute out of the measurement entirely — so if it agrees
+        // with the rung above, the recompute is right and not merely close.
         models.push(Model {
             name: "+ the heightmaps Minecraft wrote (no server can do this)".to_owned(),
             from_minecraft: true,
@@ -570,6 +602,7 @@ fn measure(options: &Options) -> Result<(), String> {
             height,
             names: &names,
             air,
+            constants: table.as_ref().map(|(_, table)| table),
             model,
         })?;
         ladder.push(Rung {
@@ -638,12 +671,19 @@ fn ladder_summary(ladder: &[Rung]) {
 /// Ordered so `BTreeMap` can key on it, and that is the only reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Heightmaps {
-    /// Recomputed from the blocks with "anything that is not air blocks
-    /// motion", which is what a server does and is an approximation of
-    /// vanilla's `MOTION_BLOCKING` — see `dust_chunk` for what it costs.
-    Recomputed,
-    /// Taken from the chunk as Minecraft wrote it. Not a mode a server can
-    /// run in; a diagnostic that takes the predicate out of the measurement.
+    /// Recomputed from the blocks with "anything that is not `minecraft:air`",
+    /// which is what a server does with no constants table and is an
+    /// approximation of all six of vanilla's predicates — see `dust_chunk`.
+    FromAirAlone,
+    /// Recomputed from the blocks with Minecraft's own predicate for each of
+    /// the six, read from the operator's jar by the oracle. What a server with
+    /// a table does.
+    FromMinecraftsPredicates,
+    /// Taken from the chunk as Minecraft wrote it. Not a mode a server can run
+    /// in — an edited chunk has a heightmap its file does not — and a
+    /// diagnostic that takes the recompute out of the measurement entirely.
+    /// If it disagrees with `FromMinecraftsPredicates`, the recompute is wrong
+    /// about something other than the predicate.
     AsWritten,
 }
 
@@ -679,6 +719,7 @@ struct Sweep<'a> {
     height: WorldHeight,
     names: &'a RegistryNames,
     air: u32,
+    constants: Option<&'a dust_registry::BlockConstants>,
     model: &'a Model,
 }
 
@@ -703,6 +744,7 @@ fn sweep(run: &Sweep) -> Result<Tally, String> {
                     run.names,
                     run.air,
                     run.model.heightmaps,
+                    run.constants,
                 )?;
                 let skirt = skirt_for(run.floors, x, z, run.height);
                 let dust = dust_light(&mut chunk, skirt, run.height, &run.model.opacity);
@@ -740,6 +782,7 @@ fn area_light(
                 run.names,
                 run.air,
                 run.model.heightmaps,
+                run.constants,
             )?);
         }
     }
@@ -778,7 +821,7 @@ fn area_light(
 /// limit, which is the failure this whole file keeps finding.
 const AREA_LIGHT_BUDGET: u64 = 1 << 30;
 
-/// The light table `cargo xtask extract --only light` wrote for this version,
+/// The light table `cargo xtask extract --only constants` wrote for this version,
 /// if this checkout has one.
 ///
 /// **A developer route and deliberately only that.** The oracle runs from a
@@ -789,18 +832,18 @@ const AREA_LIGHT_BUDGET: u64 = 1 << 30;
 ///
 /// Absent is not an error — most of the reasons to run this verb do not need
 /// one, and the run says which models it measured.
-fn light_table(version: &str) -> Result<Option<(PathBuf, dust_registry::LightTable)>, String> {
+fn light_table(version: &str) -> Result<Option<(PathBuf, dust_registry::BlockConstants)>, String> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("xtask lives one level below the workspace root")
-        .join(format!(".dust-extract/oracle-{version}/light.tsv"));
+        .join(format!(".dust-extract/oracle-{version}/constants.tsv"));
     if !path.is_file() {
         return Ok(None);
     }
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("could not read {}: {e}", path.display()))?;
-    let table =
-        dust_registry::LightTable::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let table = dust_registry::BlockConstants::parse(&text)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(Some((path, table)))
 }
 
@@ -906,6 +949,7 @@ fn dust_chunk(
     names: &RegistryNames,
     air: u32,
     heightmaps: Heightmaps,
+    constants: Option<&dust_registry::BlockConstants>,
 ) -> Result<dust_world::chunk::Chunk, String> {
     let path = region::region_file_path(region_dir, x, z);
     let bytes =
@@ -934,8 +978,14 @@ fn dust_chunk(
     // `Heightmaps::AsWritten` is not a mode a server could run in — it cannot
     // know the heightmap of a chunk it has changed. It is here to take the
     // predicate out of the measurement, so that what is left is the engine.
-    if heightmaps == Heightmaps::Recomputed {
-        chunk.recompute_heightmaps(|_, state| state != air);
+    match heightmaps {
+        Heightmaps::FromAirAlone => {
+            chunk.recompute_heightmaps(world::heightmap_predicate(air, None))
+        }
+        Heightmaps::FromMinecraftsPredicates => {
+            chunk.recompute_heightmaps(world::heightmap_predicate(air, constants));
+        }
+        Heightmaps::AsWritten => {}
     }
     let _ = ChunkPos::new(x, z);
     Ok(chunk)
@@ -1152,7 +1202,7 @@ fn report(tally: &Tally, model: &Model) {
     if model.volume == Volume::Column {
         gaps.push("light does not travel through a neighbouring column");
     }
-    if model.heightmaps == Heightmaps::Recomputed {
+    if model.heightmaps == Heightmaps::FromAirAlone {
         gaps.push("the sky floor is `not air` where vanilla's is `blocks motion`");
     }
     if gaps.is_empty() {

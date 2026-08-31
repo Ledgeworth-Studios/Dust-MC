@@ -107,13 +107,15 @@ pub enum Domain {
     Packets,
     /// Worldgen: the ore baseline in `dust-gen`.
     Worldgen,
-    /// The light constants, asked of the game itself.
+    /// The per-block-state constants Minecraft keeps in Java, asked of the
+    /// game itself.
     ///
     /// Reads nothing either generator produced. Runs a small Java program on
     /// the jar's own classpath and prints what Minecraft says a block state's
-    /// opacity and emission are — the numbers decision record 0008 exists
+    /// opacity, light emission and occlusion are, and which of the six
+    /// heightmaps count it — the values decision records 0008 and 0010 exist
     /// because no report and no data pack carries them.
-    Light,
+    Constants,
     /// The obfuscated-name table an oracle needs to call into the jar.
     ///
     /// The odd one out, and it says so: every other domain reads what the data
@@ -137,7 +139,7 @@ pub const ALL_DOMAINS: &[Domain] = &[
     Domain::Packets,
     Domain::Worldgen,
     Domain::Mappings,
-    Domain::Light,
+    Domain::Constants,
 ];
 
 impl Domain {
@@ -156,7 +158,7 @@ impl Domain {
             Self::Packets => "packets",
             Self::Worldgen => "worldgen",
             Self::Mappings => "mappings",
-            Self::Light => "light",
+            Self::Constants => "constants",
         }
     }
 
@@ -414,7 +416,7 @@ pub fn run(options: &Options, workspace_root: &Path) -> Result<(), String> {
                 worldgen_domain(registries.as_ref().expect("parsed above"), &context)?
             }
             Domain::Mappings => mappings_domain(&context)?,
-            Domain::Light => light_domain(&context)?,
+            Domain::Constants => constants_domain(&context)?,
         };
         println!("({} in {:.1}s)", outcome, begun.elapsed().as_secs_f64());
         results.push((*domain, begun.elapsed(), outcome));
@@ -836,7 +838,7 @@ fn mappings_domain(context: &Context) -> Result<Outcome, String> {
         println!("  {line}");
     }
     Ok(format!(
-        "{} name(s) resolved for the light oracle",
+        "{} name(s) resolved for the block oracle",
         mappings::LIGHT_ORACLE.len()
     ))
 }
@@ -845,7 +847,7 @@ fn mappings_domain(context: &Context) -> Result<Outcome, String> {
 ///
 /// Shared by the `mappings` domain, which exists to do exactly this and print
 /// it, and by `light`, which needs the file and should not require a reader to
-/// have run the other domain first. **`--only light` on a clean checkout
+/// have run the other domain first. **`--only constants` on a clean checkout
 /// works**, and a domain that failed with "no names.properties" would be one
 /// that only works for whoever already knew the order.
 fn mappings_table(context: &Context, cache: &Path) -> Result<PathBuf, String> {
@@ -903,7 +905,7 @@ fn mappings_table(context: &Context, cache: &Path) -> Result<PathBuf, String> {
 /// contains it.
 ///
 /// So: unpack, then compile the oracle, then run it with a classpath we build.
-fn light_domain(context: &Context) -> Result<Outcome, String> {
+fn constants_domain(context: &Context) -> Result<Outcome, String> {
     let cache = context.workspace_root.join(CACHE_DIR);
     let names = mappings_table(context, &cache)?;
     let jar = absolute(context.jar)?;
@@ -934,7 +936,7 @@ fn light_domain(context: &Context) -> Result<Outcome, String> {
         .map_err(|e| format!("could not create {}: {e}", classes.display()))?;
     let sources = context.workspace_root.join("xtask/oracle/dustoracle");
     let mut javac: Vec<String> = vec!["-d".to_owned(), classes.display().to_string()];
-    for name in ["Names.java", "LightOracle.java"] {
+    for name in ["Names.java", "BlockOracle.java"] {
         javac.push(sources.join(name).display().to_string());
     }
     println!("compiling the oracle");
@@ -948,18 +950,18 @@ fn light_domain(context: &Context) -> Result<Outcome, String> {
         .map(|p| p.display().to_string())
         .collect::<Vec<_>>()
         .join(":");
-    let out = cache.join(format!("oracle-{}/light.tsv", context.version));
-    println!("asking Minecraft for every state's opacity and emission");
+    let out = cache.join(format!("oracle-{}/constants.tsv", context.version));
+    println!("asking Minecraft what every block state does to light and to a heightmap");
     run_java(
         &repo,
         &[
             "-cp".to_owned(),
             joined,
-            "dustoracle.LightOracle".to_owned(),
+            "dustoracle.BlockOracle".to_owned(),
             names.display().to_string(),
             out.display().to_string(),
         ],
-        "running the light oracle",
+        "running the block oracle",
     )?;
 
     let table = std::fs::read_to_string(&out)
@@ -974,13 +976,26 @@ fn light_domain(context: &Context) -> Result<Outcome, String> {
     }
     println!("wrote {}", out.display());
 
-    let summary = LightSummary::of(&table);
+    let summary = ConstantsSummary::of(&table);
     print!("  opacity:");
     for (value, count) in &summary.opacity {
         print!(" {value}={count}");
     }
     println!();
     println!("  {} state(s) emit light", summary.emitting);
+    // The heightmap predicates, one line each. A count per heightmap is what
+    // says the columns are the six Minecraft declares and are not six copies
+    // of one predicate — the failure a single "6 heightmaps" line would pass.
+    for (name, count) in &summary.heightmaps {
+        println!("  {name}: {count} state(s)");
+    }
+    if summary.heightmaps.is_empty() {
+        return Err(format!(
+            "{} carries no heightmap columns; the oracle resolved \
+             `heightmap_types.class` to something with no enum constants",
+            out.display()
+        ));
+    }
     // The route, printed where somebody who just ran this is looking. The
     // table is read from `[data] path` — decision record 0008 chose that over a
     // new `dust` subcommand, a JDK on the server's boot path and a second
@@ -989,7 +1004,7 @@ fn light_domain(context: &Context) -> Result<Outcome, String> {
     // than in a document somewhere.
     println!();
     println!("  to serve a world lit the way Minecraft lights it, copy it beside your data:");
-    println!("    cp {} <[data] path>/dust-light.tsv", out.display());
+    println!("    cp {} <[data] path>/dust-constants.tsv", out.display());
 
     // Every light level Minecraft has is 0..=15, so a value outside that did
     // not come from the field or method this asked for — it came from a
@@ -1004,33 +1019,66 @@ fn light_domain(context: &Context) -> Result<Outcome, String> {
         ));
     }
 
-    Ok(format!("{rows} block states, opacity and emission"))
+    Ok(format!(
+        "{rows} block states: light, occlusion and {} heightmap(s)",
+        summary.heightmaps.len()
+    ))
 }
 
-/// The distributions in an extracted light table.
+/// The distributions in an extracted constants table.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct LightSummary {
+struct ConstantsSummary {
     /// How many states take each opacity. **1.21.1 gives exactly three values
     /// — 0, 1 and 15** — and printing the distribution rather than a total is
     /// what lets a reader see that at a glance, and see it change.
     opacity: std::collections::BTreeMap<u32, u64>,
     /// How many states emit any light at all.
     emitting: u64,
+    /// How many states each heightmap counts, by the name in the header.
+    ///
+    /// **A count per heightmap and not a count of heightmaps.** Six columns
+    /// holding six copies of one predicate would print as "6 heightmaps" and
+    /// be wrong in a way nothing else here would notice; six different numbers
+    /// are six different predicates.
+    heightmaps: std::collections::BTreeMap<String, u64>,
 }
 
-impl LightSummary {
+impl ConstantsSummary {
     /// Read a table the oracle wrote.
     ///
     /// Malformed rows are skipped rather than refused: this is a summary for a
     /// human, and the row count beside it — taken from the same file by the
-    /// caller — is what would disagree if rows were being lost.
+    /// caller — is what would disagree if rows were being lost. The flag
+    /// columns are found by name out of the header, exactly as
+    /// `dust_registry::constants` finds them, because a summary that read them
+    /// positionally could report a column the reader will not.
     fn of(table: &str) -> Self {
         let mut summary = Self::default();
+        let header: Vec<&str> = table
+            .lines()
+            .find(|line| line.starts_with('#'))
+            .map(|line| {
+                line.trim_start_matches('#')
+                    .split('\t')
+                    .map(str::trim)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let named = |wanted: &str| header.iter().position(|name| *name == wanted);
+        let flags: Vec<(&str, usize)> = header
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| !matches!(**name, "state_id" | "opacity" | "emission" | "occlude"))
+            .map(|(at, name)| (*name, at))
+            .collect();
+
         for line in table.lines().filter(|l| !l.starts_with('#')) {
-            let mut fields = line.split('\t');
-            let (Some(_), Some(opacity), Some(emission)) =
-                (fields.next(), fields.next(), fields.next())
-            else {
+            let fields: Vec<&str> = line.split('\t').collect();
+            let at = |column: Option<usize>| column.and_then(|c| fields.get(c)).copied();
+            let (Some(opacity), Some(emission)) = (
+                at(named("opacity").or(Some(1))),
+                at(named("emission").or(Some(2))),
+            ) else {
                 continue;
             };
             if let Ok(opacity) = opacity.parse::<u32>() {
@@ -1038,6 +1086,12 @@ impl LightSummary {
             }
             if emission.parse::<u32>().is_ok_and(|e| e > 0) {
                 summary.emitting += 1;
+            }
+            for (name, column) in &flags {
+                let entry = summary.heightmaps.entry((*name).to_owned()).or_default();
+                if fields.get(*column).copied() == Some("1") {
+                    *entry += 1;
+                }
             }
         }
         summary
@@ -1546,8 +1600,8 @@ mod tests {
 ";
 
     #[test]
-    fn a_light_table_summarises_to_its_distributions() {
-        let summary = LightSummary::of(TABLE);
+    fn a_constants_table_summarises_to_its_distributions() {
+        let summary = ConstantsSummary::of(TABLE);
         assert_eq!(
             summary.opacity,
             [(0, 2), (1, 1), (15, 2)].into_iter().collect()
@@ -1561,12 +1615,13 @@ mod tests {
         // writes. Counting it would put a state at opacity `opacity`, which
         // parses as nothing and would quietly vanish instead — a row lost
         // rather than a row wrong, which is harder to notice.
-        assert_eq!(LightSummary::of(TABLE).opacity.values().sum::<u64>(), 5);
+        assert_eq!(ConstantsSummary::of(TABLE).opacity.values().sum::<u64>(), 5);
     }
 
     #[test]
     fn a_truncated_row_is_skipped_rather_than_guessed_at() {
-        let summary = LightSummary::of("0\t0\n1\t15\t0\t1\n");
+        let summary =
+            ConstantsSummary::of("# state_id\topacity\temission\tocclude\n0\t0\n1\t15\t0\t1\n");
         assert_eq!(summary.opacity, [(15, 1)].into_iter().collect());
     }
 
