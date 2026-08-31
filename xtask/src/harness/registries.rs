@@ -43,10 +43,11 @@ use std::process::ExitCode;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::{cache, capture, nbt, properties, rcon, wire};
+use super::{cache, capture, nbt, outline, properties, rcon, wire};
 
 const USAGE: &str = "\
 harness registries --version <v> [--data <dir>] [--timeout <secs>]
+harness registries --version <v> --dump <registry> [--timeout <secs>]
 
 Boots Minecraft, boots Dust, and asks both what they tell a client that
 acknowledges no data packs. Compares the synced registries and the tag set.
@@ -57,6 +58,12 @@ acknowledges no data packs. Compares the synced registries and the tag set.
                   holding `minecraft/`. Defaults to the extractor's own
                   unpacked data for this version.
   --timeout <s>   Whole-run budget. Default 300.
+  --dump <r>      Boot only Minecraft and print the shape of one registry —
+                  every key path, its NBT type, and how many entries carry it.
+                  Dust is not started and nothing is compared; this is the
+                  input to writing that registry's schema, taken off the wire
+                  rather than from the JSON on disk. `--dump list` names the
+                  registries instead of dumping one.
 ";
 
 /// One run's inputs.
@@ -65,11 +72,15 @@ pub struct Options {
     pub version: String,
     pub data: Option<PathBuf>,
     pub timeout: Duration,
+    /// A registry to describe instead of comparing anything, or the literal
+    /// `list` to name them. See [`dump`].
+    pub dump: Option<String>,
 }
 
 pub fn parse(args: &[String]) -> Result<Options, String> {
     let mut version = None;
     let mut data = None;
+    let mut dump = None;
     let mut timeout = Duration::from_secs(300);
     let mut seen: Vec<(&'static str, String)> = Vec::new();
     let mut at = 0;
@@ -82,6 +93,10 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
             "--data" => {
                 at = super::take_value(&mut seen, "--data", args, at + 1)?;
                 data = Some(PathBuf::from(seen.last().expect("just stored").1.clone()));
+            }
+            "--dump" => {
+                at = super::take_value(&mut seen, "--dump", args, at + 1)?;
+                dump = Some(seen.last().expect("just stored").1.clone());
             }
             "--timeout" => {
                 at = super::take_value(&mut seen, "--timeout", args, at + 1)?;
@@ -102,11 +117,16 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
         })?,
         data,
         timeout,
+        dump,
     })
 }
 
 pub fn run(options: &Options) -> ExitCode {
-    match compare(options) {
+    let outcome = match &options.dump {
+        Some(registry) => dump(options, registry),
+        None => compare(options),
+    };
+    match outcome {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::from(1),
         Err(e) => {
@@ -190,6 +210,86 @@ fn compare(options: &Options) -> Result<bool, String> {
     }
     println!("\n{} difference(s).", findings.len());
     Ok(false)
+}
+
+/// Boot Minecraft alone and describe one registry's shape.
+///
+/// Dust is deliberately not started. The question here is not "do the two
+/// agree" but "what is there to agree with", and it is asked before a schema
+/// exists — which is exactly the case `compare` cannot help with, since a
+/// registry Dust has no schema for is reported as a stated omission and its
+/// contents are never looked at.
+///
+/// Returns `Ok(true)` when the registry was found and described. A name the
+/// server did not send is `Ok(false)` rather than an error: the run worked and
+/// the answer is "not that one", which is the same shape as a difference.
+fn dump(options: &Options, wanted: &str) -> Result<bool, String> {
+    let deadline = Instant::now() + options.timeout;
+    let dirs = cache::Layout::resolve()?;
+    let jar = dirs.jars.join(format!("server-{}.jar", options.version));
+    if !jar.is_file() {
+        return Err(format!(
+            "no server jar at {}; run `cargo xtask harness provision --version {}` first",
+            jar.display(),
+            options.version
+        ));
+    }
+    let run_dir = dirs.server_dir(&options.version, 0);
+    if !run_dir.is_dir() {
+        return Err(format!(
+            "no provisioned server at {}; run `cargo xtask harness provision --version {}` \
+             first",
+            run_dir.display(),
+            options.version
+        ));
+    }
+
+    println!("== Minecraft {} ==", options.version);
+    let vanilla = ask_vanilla(&jar, &run_dir, deadline)?;
+
+    if wanted == "list" {
+        println!("\n== registries sent ==");
+        report("Minecraft", &vanilla);
+        return Ok(true);
+    }
+
+    let Some(registry) = vanilla.registries.iter().find(|r| r.name == wanted) else {
+        println!("\n== not sent ==");
+        println!(
+            "  Minecraft {} sent no `{wanted}`. It sent:",
+            options.version
+        );
+        for r in &vanilla.registries {
+            println!("    {}", r.name);
+        }
+        return Ok(false);
+    };
+
+    // Entries the server sent without contents say "you already have this",
+    // which is a statement about the client's copy and not about the shape.
+    // Folding them in would count every key as absent once more.
+    let roots: Vec<&nbt::Node> = registry
+        .entries
+        .iter()
+        .filter_map(|e| e.data.as_ref())
+        .collect();
+    println!("\n== {} ==", registry.name);
+    println!(
+        "  {} entries, {} with contents\n",
+        registry.entries.len(),
+        roots.len()
+    );
+    if roots.is_empty() {
+        println!("  Every entry was sent without contents; there is no shape to report.");
+        return Ok(true);
+    }
+    outline::print(&outline::of(&roots));
+    println!(
+        "\n  Counts are `carried / observations of the parent`. A path present in \n  \
+         every observation of its parent is required; the rest are optional. More \n  \
+         than one tag type on a path is a union, and every type seen is listed."
+    );
+    Ok(true)
 }
 
 /// The extractor's unpacked data for a version, which is where a developer's

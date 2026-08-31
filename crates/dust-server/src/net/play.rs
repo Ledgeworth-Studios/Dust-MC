@@ -114,16 +114,22 @@ pub fn login_packet(
     })
 }
 
-/// Where the player is, and the teleport it must acknowledge.
+/// Where the player is, which way they face, and the teleport to acknowledge.
+///
+/// `yaw` is a parameter rather than a zero here because a world states the
+/// direction its spawn faces (`level.dat`'s `SpawnAngle`) and a client dropped
+/// facing south into a world built to be seen the other way sees the back of
+/// it. Pitch stays level: no world states one.
 pub fn position_packet(
     spawn: (f64, f64, f64),
+    yaw: f32,
     teleport_id: i32,
 ) -> play::clientbound::PlayerPosition {
     play::clientbound::PlayerPosition {
         x: spawn.0,
         y: spawn.1,
         z: spawn.2,
-        yaw: 0.0,
+        yaw,
         pitch: 0.0,
         // Zero flags means every field is absolute. The bits mark *relative*
         // axes, so a set bit would have the client add these numbers to where

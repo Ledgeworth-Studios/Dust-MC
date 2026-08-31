@@ -1483,6 +1483,30 @@ fn a_world_minecraft_generated_is_served_to_a_client() {
          world's"
     );
 
+    // And it is standing where `level.dat` says, not at the origin. Read
+    // through the server's own reader rather than a second parser here: what
+    // is being checked is that the number reached the teleport, and a test
+    // that re-derived it from the file would be checking its own arithmetic.
+    let (x, _, z) = client.spawned_at.expect("the join teleport carries one");
+    match dust_server::net::level::spawn_beside(std::path::Path::new(region)) {
+        Ok(Some(point)) => {
+            assert_eq!(
+                (x, z),
+                (f64::from(point.x) + 0.5, f64::from(point.z) + 0.5),
+                "the world spawns at x {}, z {} and the player was put at \
+                 x {x}, z {z}",
+                point.x,
+                point.z
+            );
+        }
+        Ok(None) => assert_eq!(
+            (x, z),
+            (0.5, 0.5),
+            "no level.dat beside this world, so the origin is the answer"
+        ),
+        Err(why) => panic!("{why}"),
+    }
+
     // A flat column has one section with anything in it and twenty-three of
     // air. A generated one has terrain up through the surface, so several
     // sections carry a palette of more than one block.

@@ -59,6 +59,15 @@ sends the two registries such a client cannot manage without. See decision
 record [0007](docs/decisions/0007-registry-contents.md) for where the line
 between a protocol fact and Mojang's content falls, and why it falls there.
 
+Ten of the eleven synced registries go that way. The eleventh,
+`minecraft:enchantment`, is **declined out loud**: a client sent nothing for a
+registry falls back to its own correct copy, and one sent an enchantment
+without its effects believes Protection does nothing. Decision record
+[0009](docs/decisions/0009-enchantment-registry.md) measures what serving it
+would take — 470 key paths, eleven levels deep — and
+`cargo xtask harness registries --dump minecraft:enchantment` is the command
+that measured it, against any registry and any version.
+
 **It can serve a world Minecraft made, and hand one back.** Point
 `[server].world_source` at a region directory and Dust reads the columns out of
 it — blocks, their properties, biomes, heightmaps — and streams them. It also
@@ -365,8 +374,9 @@ for a setting to hide.
 
 The reasoning behind the things that are hard to change later is in
 [`docs/decisions/`](docs/decisions/): why Dust is written from scratch, why it is
-GPL-3.0, why it targets 1.21.1 first, why it is Rust throughout, and why ore
-density is configured the way it is.
+GPL-3.0, why it targets 1.21.1 first, why it is Rust throughout, why ore
+density is configured the way it is, and which of Minecraft's numbers may live
+here rather than on the operator's disk.
 
 ## Licence
 

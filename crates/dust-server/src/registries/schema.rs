@@ -411,14 +411,20 @@ pub const JUKEBOX_SONG: Registry = Registry {
 
 /// Every registry whose contents Dust can build.
 ///
-/// Ten of the eleven. The missing one is `minecraft:enchantment`, and it is
-/// missing for a reason rather than for want of an afternoon: the other ten
-/// are flat records — a handful of strings, numbers and one map — while an
-/// enchantment's `effects` is an open codec tree of level-based values, loot
-/// conditions and entity predicates, several levels deep and different in
-/// every entry. Writing that as a table here would be reimplementing a slice
-/// of Minecraft's codec graph on the way to Phase 4, which has to do it
-/// properly anyway.
+/// Ten of the eleven. The missing one is `minecraft:enchantment`, and decision
+/// record 0009 is why, from a measurement rather than an impression:
+/// `harness registries --dump minecraft:enchantment` reports **470 key paths,
+/// eleven levels deep**, of which nine are the flat part and 461 live under
+/// `effects`. Three of its seventy-nine floating-point paths are doubles and
+/// the rest floats, written identically in the JSON, separated only by what
+/// dispatched the object holding them — so the table cannot reach them, and a
+/// table of the 470 paths vanilla happens to exercise would refuse a datapack
+/// enchantment that used a 471st.
+///
+/// **Sending the nine flat keys and leaving `effects` out is worse than
+/// sending nothing**, which is the part worth stating here. It parses — one
+/// vanilla enchantment has no `effects` — and it makes Protection stop
+/// protecting on a client that would otherwise have used its own correct copy.
 ///
 /// A registry not on this list is sent as *names* to a client that
 /// acknowledged the core pack, and **not sent at all** to one that did not —
@@ -508,6 +514,26 @@ mod tests {
                 registry.name
             );
         }
+    }
+
+    #[test]
+    fn exactly_one_synced_registry_is_left_unserved() {
+        // The omission is deliberate and it is one registry. An eleventh name
+        // appearing here means either a new registry nobody wrote a schema
+        // for — which would be sent as bare names to a client with no
+        // definitions for them, the failure the `SERVED` note describes — or
+        // `minecraft:enchantment` quietly gaining one. Both want a reader,
+        // and decision record 0009 is what they should read.
+        let unserved: Vec<&str> = dust_registry::synced::all()
+            .iter()
+            .map(|registry| registry.name)
+            .filter(|name| by_name(name).is_none())
+            .collect();
+        assert_eq!(
+            unserved,
+            ["minecraft:enchantment"],
+            "see docs/decisions/0009-enchantment-registry.md"
+        );
     }
 
     #[test]
