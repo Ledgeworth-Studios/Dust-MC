@@ -46,6 +46,34 @@ So the cost of this decision is known block by block, and its size is known to
 depend on how much water and foliage a world has. That is an unusually good
 position from which to not have decided something.
 
+### And opacity owns nearly all of it (2026-08-31)
+
+The measurement above had a confound while it was written: sky light has *two*
+known gaps, and a percentage cannot say which one it is reporting. `harness
+light` now splits the shortfall by how far each cell sits from its column's
+edge. Light arriving from a neighbour enters at a face and loses a level per
+step inward; opacity does not care where in a column it is.
+
+```text
+distance from a face   0      1      2      3      4      5      6      7
+seed 0, radius 2    0.660  0.595  0.561  0.548  0.530  0.510  0.530  0.581
+seed 1, radius 3    3.522  3.521  3.521  3.516  3.512  3.513  3.516  3.516
+```
+
+**Flat on both worlds**, and on seed 0 the rate *rises again* at the centre,
+which no neighbour effect produces. Reading seed 0's interior as the opacity
+floor puts everything the edge carries above it at roughly 750 cells of 14,276.
+
+**So this record is not choosing between two comparable causes. It is the whole
+question**, and the multi-column light volume — the other outstanding item — is
+worth about five per cent of the gap, on a world where the gap is 0.6%.
+
+The measurement is a rate per ring and not a count, and that is the load-bearing
+part: a column has `60 - 8d` columns at distance `d`, sixty at the face against
+four in the middle. Counted raw, a perfectly uniform cause reads as "it is all
+at the edges". The histogram would have confirmed the impression it was built
+to test.
+
 ## Options
 
 **1. Extract it from the server jar.** A small Java program on the jar's
