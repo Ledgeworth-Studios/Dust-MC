@@ -33,6 +33,14 @@ struct VersionDetail {
 #[derive(Debug, Deserialize)]
 struct Downloads {
     server: Artifact,
+    /// The ProGuard mappings published beside the jar.
+    ///
+    /// Optional in the type because it is optional in the manifest: Mojang
+    /// began publishing mappings with 1.14.4, and a version older than that
+    /// has a `downloads` object without this key. Deserialising it as required
+    /// would turn "this version has no mappings" into "the manifest is
+    /// malformed", which sends a reader to the wrong place.
+    server_mappings: Option<Artifact>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,6 +130,58 @@ pub fn server_jar(version: &str, cache: &Path) -> Result<PathBuf, String> {
 
     println!(
         "downloading the {version} server jar ({} MiB)",
+        artifact.size / (1024 * 1024)
+    );
+    let body = fetch(&artifact.url)?;
+    std::fs::write(&path, &body).map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    verify(&path, artifact)?;
+    Ok(path)
+}
+
+/// Resolve a version id to its published mappings, download them if the cache
+/// does not hold them, and verify the digest either way.
+///
+/// The same contract as [`server_jar`] and for the same reasons — a cache
+/// checked on write and trusted forever serves a truncated file for the rest of
+/// its life — over the artifact that sits beside the jar in the same manifest
+/// entry.
+///
+/// # Errors
+///
+/// An unknown version, a version predating published mappings, a failed fetch,
+/// or a digest that does not match.
+pub fn server_mappings(version: &str, cache: &Path) -> Result<PathBuf, String> {
+    let manifest: VersionManifest = fetch_json(VERSION_MANIFEST)?;
+    let entry = manifest
+        .versions
+        .iter()
+        .find(|v| v.id == version)
+        .ok_or_else(|| format!("Mojang's manifest lists no version `{version}`"))?;
+
+    let detail: VersionDetail = fetch_json(&entry.url)?;
+    let artifact = detail.downloads.server_mappings.as_ref().ok_or_else(|| {
+        format!("Mojang published no server mappings for {version}; they begin at 1.14.4")
+    })?;
+
+    std::fs::create_dir_all(cache)
+        .map_err(|e| format!("could not create {}: {e}", cache.display()))?;
+    let path = cache.join(format!("server-mappings-{version}.txt"));
+
+    if path.exists() {
+        match verify(&path, artifact) {
+            Ok(()) => {
+                println!("using the cached mappings at {}", path.display());
+                return Ok(path);
+            }
+            Err(why) => {
+                println!("the cached mappings are unusable ({why}); fetching them again");
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
+    println!(
+        "downloading the {version} server mappings ({} MiB)",
         artifact.size / (1024 * 1024)
     );
     let body = fetch(&artifact.url)?;

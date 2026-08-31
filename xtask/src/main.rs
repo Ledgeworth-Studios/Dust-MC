@@ -24,7 +24,12 @@ cargo xtask <command>
                    dust-protocol from the reports. Needs a network and a JDK 21
                    or newer. Not part of `just verify`, and not something CI
                    runs. With --only, extract just the named domains (blocks,
-                   items, packets, worldgen) instead of all of them.
+                   items, packets, worldgen, mappings) instead of all of them.
+                   `mappings` is the odd one: it reads the obfuscated-name
+                   table published beside the jar rather than anything the
+                   data generators produced, and writes it to the extract
+                   cache for an oracle to resolve names against. Nothing it
+                   produces is committed. See decision record 0008.
 
   harness <verb>   Differential-testing groundwork against vanilla: provision
                    a cached server, capture a fingerprint of a world it
