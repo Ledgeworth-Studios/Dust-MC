@@ -33,7 +33,9 @@
 //! is one more than a level can travel.
 
 use dust_world::chunk::Chunk;
-use dust_world::propagation::{raise, Budget, LightGraph, OpacityModel, PropagationError};
+use dust_world::propagation::{
+    raise, Budget, EmissionModel, LightGraph, OpacityModel, PropagationError,
+};
 
 /// Which heightmap says where the sky starts.
 ///
@@ -173,6 +175,143 @@ impl LightGraph for AreaSkyLight<'_> {
         self.chunks[chunk]
             .section_mut(y)
             .sky_light_mut()
+            .set(lx, row, lz, level);
+    }
+
+    fn opacity(&self, x: i32, y: i32, z: i32) -> u8 {
+        let (chunk, lx, lz) = self.locate(x, z);
+        self.opacity
+            .opacity(self.chunks[chunk].get_block(lx, y, lz))
+    }
+
+    fn contains(&self, x: i32, y: i32, z: i32) -> bool {
+        let span = 16 * self.side;
+        (0..span).contains(&x) && (0..span).contains(&z) && (self.min_y..self.max_y).contains(&y)
+    }
+}
+
+/// Block light over the same square of columns, lit together.
+///
+/// The gap this measures is sharper than sky light's. A column lit on its own
+/// misses every emitter on the far side of a chunk boundary, so a torch a block
+/// into the next chunk lights nothing here — a hard edge at a chunk border with
+/// a lit room on one side of it, where the sky-light seam was a shade across a
+/// cliff face.
+///
+/// `dust_world::column_light::ColumnBlockLight` says why it is left that way:
+/// the sky-light skirt works because a neighbour's sky floor is a *complete*
+/// description of what that neighbour shines in, and a neighbour's emitters are
+/// not. This is the honest version, and it is here rather than in the engine
+/// for the reason the whole module is.
+pub struct AreaBlockLight<'a> {
+    chunks: &'a mut [Chunk],
+    side: i32,
+    opacity: &'a OpacityModel,
+    min_y: i32,
+    max_y: i32,
+}
+
+impl std::fmt::Debug for AreaBlockLight<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AreaBlockLight")
+            .field("side", &self.side)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> AreaBlockLight<'a> {
+    /// Light every column of the block from the emitters in all of them.
+    ///
+    /// # Errors
+    ///
+    /// [`PropagationError::BudgetExhausted`] if the walk runs past `budget`.
+    pub fn seed(
+        chunks: &'a mut [Chunk],
+        side: i32,
+        opacity: &'a OpacityModel,
+        emission: &EmissionModel,
+        budget: Budget,
+    ) -> Result<u64, PropagationError> {
+        assert_eq!(
+            chunks.len(),
+            (side * side) as usize,
+            "a square block of columns"
+        );
+        for chunk in chunks.iter_mut() {
+            for section in chunk.sections_mut() {
+                *section.block_light_mut() = dust_world::light::LightArray::new();
+            }
+        }
+        if emission.is_dark() {
+            return Ok(0);
+        }
+
+        let min_y = chunks[0].world().min_y();
+        let max_y = min_y + chunks[0].world().height() as i32;
+
+        let mut seeds: Vec<(i32, i32, i32, u8)> = Vec::new();
+        for (at, chunk) in chunks.iter().enumerate() {
+            let (cx, cz) = ((at as i32) % side, (at as i32) / side);
+            for (index, section) in chunk.sections().iter().enumerate() {
+                // The palette is the shortlist of what a section can hold, so
+                // one whose palette holds no emitter is skipped without reading
+                // its 4,096 cells. A direct palette answers `None` and is read.
+                if let Some(entries) = section.states().palette().entries() {
+                    if !emission.any_emits(entries.iter().copied()) {
+                        continue;
+                    }
+                }
+                let base = min_y + (index as i32) * 16;
+                for y in 0..16i32 {
+                    for z in 0..16i32 {
+                        for x in 0..16i32 {
+                            let state = section.states().get_at(x as u32, y as u32, z as u32);
+                            let level = emission.emission(state);
+                            if level > 0 {
+                                seeds.push((cx * 16 + x, base + y, cz * 16 + z, level));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if seeds.is_empty() {
+            return Ok(0);
+        }
+
+        let mut graph = Self {
+            chunks,
+            side,
+            opacity,
+            min_y,
+            max_y,
+        };
+        raise(&mut graph, &seeds, budget)
+    }
+
+    /// Which chunk of the block a cell belongs to, and where in it.
+    fn locate(&self, x: i32, z: i32) -> (usize, u32, u32) {
+        (
+            (x / 16 + (z / 16) * self.side) as usize,
+            (x % 16) as u32,
+            (z % 16) as u32,
+        )
+    }
+}
+
+impl LightGraph for AreaBlockLight<'_> {
+    fn level(&self, x: i32, y: i32, z: i32) -> u8 {
+        let (chunk, lx, lz) = self.locate(x, z);
+        let row = (y - self.min_y) as u32 % 16;
+        self.chunks[chunk].section(y).block_light().get(lx, row, lz)
+    }
+
+    fn set_level(&mut self, x: i32, y: i32, z: i32, level: u8) {
+        let (chunk, lx, lz) = self.locate(x, z);
+        let row = (y - self.min_y) as u32 % 16;
+        self.chunks[chunk]
+            .section_mut(y)
+            .block_light_mut()
             .set(lx, row, lz, level);
     }
 

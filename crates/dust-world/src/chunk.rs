@@ -451,6 +451,16 @@ impl Chunk {
         &self.sections
     }
 
+    /// The chunk's sections, for writing.
+    ///
+    /// Bottom to top, as [`Chunk::sections`]. What wants the whole slice
+    /// mutable rather than one section at a time is a pass over the column —
+    /// clearing the block light before recomputing it, for instance.
+    #[must_use]
+    pub fn sections_mut(&mut self) -> &mut [Section] {
+        &mut self.sections
+    }
+
     /// The block state at world coordinates.
     ///
     /// # Panics

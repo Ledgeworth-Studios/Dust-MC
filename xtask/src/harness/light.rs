@@ -1,10 +1,14 @@
-//! `harness light` — how close is Dust's sky light to Minecraft's?
+//! `harness light` — how close is Dust's light to Minecraft's?
 //!
-//! **Sky light only.** Dust has no block light, so there is nothing on this
-//! side to compare a real server's block-light arrays against — see decision
-//! record 0008 for what that waits on. Every number this prints says
-//! "sky-light" for that reason: a bare percentage would read as "the lighting
-//! is 99.4% right" when half of lighting is not implemented.
+//! **Both kinds, reported apart.** Sky light and block light are separate
+//! arrays computed by separate passes, and every number here says which it is
+//! about: a single figure covering both would read as "the lighting is 99.9%
+//! right" while hiding which half of it was.
+//!
+//! Block light's percentage needs reading with particular care. Most of a
+//! world has none, so a server that computed no block light at all still
+//! "agrees" with 99.7% of cells — the 0.3% is *every lit cell in view*. The
+//! count beside the percentage is the number to read.
 //!
 //! # Why this is measurable at all
 //!
@@ -184,6 +188,27 @@
 //! edge. A single "0.6% disagree" line would have hidden all three inside a
 //! number that already looked good.
 //!
+//! # Naming the cells, not just counting them
+//!
+//! `DUST_LIGHT_TRACE=1` prints every disagreeing cell: world coordinates, both
+//! levels, how far it sits from its column's edge, and the block it is standing
+//! in. Two questions need that and no histogram can answer either.
+//!
+//! The first is what the last thirty-two over-lit cells were, which was settled
+//! by seeing that every one of them sat on a chunk edge. The second came up on
+//! 2026-08-31 and is the reason the trace now covers shortfalls too: a
+//! third-party client showed a four-block dark band above the terrain at seed
+//! 1's spawn, and the only useful question was whether *that column* was one of
+//! the ones this verb was already counting. It was not — Dust and Minecraft
+//! agree there, cell for cell, and `tools/bot/README.md` has where the band
+//! actually came from.
+//!
+//! `--at <x>,<z>` is the other half of that: the square is centred on chunk 0,0
+//! because that is where `harness capture` force-generates, and a world's own
+//! spawn is somewhere else entirely — seed 1's is chunk 7,11. "Is the light
+//! right where a player stands" is a different question from "is it right where
+//! the harness looked", and it now has a flag.
+//!
 //! # Exit codes
 //!
 //! `0` always, unless the run itself failed (`2`). This is a **measurement and
@@ -218,14 +243,18 @@ none of it leaves .dust-extract/.
 
   --version <v>   Minecraft version, e.g. 1.21.1.
   --seed <n>      The provisioned world's seed. Default 0.
+  --at <x>,<z>    Centre the square on this chunk instead of 0,0. A world's
+                  own spawn is not at the origin -- seed 1's is chunk 7,11 --
+                  and where a player actually stands is a different question
+                  from where the harness forced chunks.
   --volume <k>    Also light each column inside a (2k+1)x(2k+1) block of
                   columns and report what that buys. Default 1, so a 3x3 is
                   measured; 0 turns it off. Needs a world generated k chunks
                   wider than --radius, or the edge chunks are skipped.
   --radius <r>    Chunks either side of the origin. Default 2 (a 5x5).
-                  The origin and not the world's spawn point: `expected_chunks`
-                  is centred on chunk 0,0. Those were the same place only
-                  while Dust put every player at x 0, z 0.
+                  Centred on --at, which defaults to the origin. The origin
+                  and the world's spawn point were the same place only while
+                  Dust put every player at x 0, z 0.
 ";
 
 #[derive(Debug)]
@@ -233,6 +262,10 @@ pub struct Options {
     pub version: String,
     pub seed: i64,
     pub radius: i32,
+    /// The chunk the square is centred on. Chunk 0,0 by default, which is
+    /// where `harness capture` force-generates; a world's own spawn is
+    /// somewhere else entirely and is worth being able to point at.
+    pub centre: (i32, i32),
     /// The widest multi-column volume to measure, in chunks either side. `0`
     /// measures none of them; `1` adds a 3x3, `2` adds a 5x5 as well.
     pub volume: i32,
@@ -243,6 +276,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
     let mut seed = 0i64;
     let mut radius = 2i32;
     let mut volume = 1i32;
+    let mut centre = (0i32, 0i32);
     let mut seen: Vec<(&'static str, String)> = Vec::new();
     let mut at = 0;
     while at < args.len() {
@@ -259,6 +293,21 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
                     .1
                     .parse()
                     .map_err(|_| "--seed needs a signed 64-bit integer")?;
+            }
+            "--at" => {
+                at = super::take_value(&mut seen, "--at", args, at + 1)?;
+                let value = seen.last().expect("just stored").1.clone();
+                let (x, z) = value
+                    .split_once(',')
+                    .ok_or("--at needs two chunk coordinates, as `x,z`")?;
+                centre = (
+                    x.trim()
+                        .parse()
+                        .map_err(|_| "--at's x is not a whole number")?,
+                    z.trim()
+                        .parse()
+                        .map_err(|_| "--at's z is not a whole number")?,
+                );
             }
             "--volume" => {
                 at = super::take_value(&mut seen, "--volume", args, at + 1)?;
@@ -287,6 +336,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
         seed,
         radius,
         volume,
+        centre,
     })
 }
 
@@ -387,7 +437,10 @@ fn measure(options: &Options) -> Result<(), String> {
         .default_state()
         .id();
 
-    let expected = digest::expected_chunks(options.radius);
+    let expected: Vec<(i32, i32)> = digest::expected_chunks(options.radius)
+        .into_iter()
+        .map(|(x, z)| (x + options.centre.0, z + options.centre.1))
+        .collect();
     println!(
         "comparing the sky light of {} chunk(s) of Minecraft {} seed {}",
         expected.len(),
@@ -483,18 +536,21 @@ fn measure(options: &Options) -> Result<(), String> {
     // The order is cheapest first, so a reader can stop at the row a server
     // actually stands on and see what is above and below it.
     let mut models = vec![Model {
-        name: "air alone, one column, `not air` heightmaps".to_owned(),
+        name: "no table at all: air alone, one column, `not air` heightmaps".to_owned(),
         from_minecraft: false,
         opacity: world::opacity_of(air, None),
+        emission: world::emission_of(None),
         volume: Volume::Column,
         heightmaps: Heightmaps::FromAirAlone,
     }];
     if let Some((_, table)) = &table {
         let real = world::opacity_of(air, Some(table));
+        let emission = world::emission_of(Some(table));
         models.push(Model {
-            name: "+ Minecraft's own opacity".to_owned(),
+            name: "+ Minecraft's own opacity and emission".to_owned(),
             from_minecraft: true,
             opacity: real.clone(),
+            emission: emission.clone(),
             volume: Volume::Column,
             heightmaps: Heightmaps::FromAirAlone,
         });
@@ -502,6 +558,7 @@ fn measure(options: &Options) -> Result<(), String> {
             name: "+ Minecraft's own heightmap predicates  <- a server with a table".to_owned(),
             from_minecraft: true,
             opacity: real.clone(),
+            emission: emission.clone(),
             volume: Volume::Column,
             heightmaps: Heightmaps::FromMinecraftsPredicates,
         });
@@ -511,6 +568,7 @@ fn measure(options: &Options) -> Result<(), String> {
                 name: format!("+ a {side}x{side} volume of columns  (declined in D10)"),
                 from_minecraft: true,
                 opacity: real.clone(),
+                emission: emission.clone(),
                 volume: Volume::Area(k),
                 heightmaps: Heightmaps::FromMinecraftsPredicates,
             });
@@ -523,6 +581,7 @@ fn measure(options: &Options) -> Result<(), String> {
             name: "+ the heightmaps Minecraft wrote (no server can do this)".to_owned(),
             from_minecraft: true,
             opacity: real,
+            emission,
             volume: if options.volume >= 1 {
                 Volume::Area(options.volume)
             } else {
@@ -593,7 +652,7 @@ fn measure(options: &Options) -> Result<(), String> {
         println!();
         println!("--- {} ---", model.name);
         let started = std::time::Instant::now();
-        let tally = sweep(&Sweep {
+        let swept = sweep(&Sweep {
             region_dir: &region_dir,
             comparable: &comparable,
             floors: floors
@@ -607,11 +666,12 @@ fn measure(options: &Options) -> Result<(), String> {
         })?;
         ladder.push(Rung {
             name: &model.name,
-            agree: tally.agree,
-            cells: tally.cells,
+            sky: (swept.sky.agree, swept.sky.cells),
+            block: (swept.block.agree, swept.block.cells),
             took: started.elapsed(),
         });
-        report(&tally, model);
+        report("sky", &swept.sky, model);
+        report("block", &swept.block, model);
     }
 
     ladder_summary(&ladder);
@@ -621,8 +681,8 @@ fn measure(options: &Options) -> Result<(), String> {
 /// One rung of the ladder: what it agreed on, and what it cost.
 struct Rung<'a> {
     name: &'a str,
-    agree: u64,
-    cells: u64,
+    sky: (u64, u64),
+    block: (u64, u64),
     /// Wall time for the whole sweep — reading the chunks and lighting them.
     ///
     /// **Not a benchmark and it says so below.** It reads every chunk from
@@ -642,15 +702,25 @@ fn ladder_summary(ladder: &[Rung]) {
     if ladder.len() < 2 {
         return;
     }
+    #[expect(clippy::cast_precision_loss, reason = "counts here are far below 2^53")]
+    fn percent((agree, cells): (u64, u64)) -> f64 {
+        if cells == 0 {
+            100.0
+        } else {
+            agree as f64 * 100.0 / cells as f64
+        }
+    }
     println!();
     println!("what each one buys, over the same chunks:");
     println!();
+    println!("        sky light            block light");
     for rung in ladder {
-        #[expect(clippy::cast_precision_loss, reason = "counts here are far below 2^53")]
-        let percent = rung.agree as f64 * 100.0 / rung.cells as f64;
         println!(
-            "  {percent:8.3}%  {:>8} short  {:>7} ms   {}",
-            rung.cells - rung.agree,
+            "  {:8.3}% {:>8} short  {:8.3}% {:>8} short  {:>7} ms   {}",
+            percent(rung.sky),
+            rung.sky.1 - rung.sky.0,
+            percent(rung.block),
+            rung.block.1 - rung.block.0,
             rung.took.as_millis(),
             rung.name
         );
@@ -705,6 +775,7 @@ struct Model {
     /// report is allowed to blame.
     from_minecraft: bool,
     opacity: dust_world::propagation::OpacityModel,
+    emission: dust_world::propagation::EmissionModel,
     volume: Volume,
     heightmaps: Heightmaps,
 }
@@ -725,14 +796,16 @@ struct Sweep<'a> {
 
 /// Light every comparable chunk with one model and compare it with what
 /// vanilla wrote.
-fn sweep(run: &Sweep) -> Result<Tally, String> {
-    let mut tally = Tally::default();
+fn sweep(run: &Sweep) -> Result<Swept, String> {
+    let mut swept = Swept::default();
     for &(x, z) in run.comparable {
         let Some(root) = read(run.region_dir, x, z)? else {
             return Err(format!("chunk {x},{z} has never been generated"));
         };
-        let vanilla = vanilla_light(&root, run.height)
-            .map_err(|e| format!("chunk {x},{z}: reading Minecraft's light: {e}"))?;
+        let vanilla_sky = vanilla_light(&root, run.height)
+            .map_err(|e| format!("chunk {x},{z}: reading Minecraft's sky light: {e}"))?;
+        let vanilla_block = vanilla_block_light(&root, run.height)
+            .map_err(|e| format!("chunk {x},{z}: reading Minecraft's block light: {e}"))?;
 
         let (chunk, dust) = match run.model.volume {
             Volume::Column => {
@@ -747,15 +820,39 @@ fn sweep(run: &Sweep) -> Result<Tally, String> {
                     run.constants,
                 )?;
                 let skirt = skirt_for(run.floors, x, z, run.height);
-                let dust = dust_light(&mut chunk, skirt, run.height, &run.model.opacity);
+                let dust = dust_light(
+                    &mut chunk,
+                    skirt,
+                    run.height,
+                    &run.model.opacity,
+                    &run.model.emission,
+                );
                 (chunk, dust)
             }
             Volume::Area(k) => area_light(run, x, z, k)?,
         };
 
-        compare(&chunk, &vanilla, &dust, run.height, &mut tally);
+        compare(&chunk, &vanilla_sky, &dust.sky, run.height, &mut swept.sky);
+        compare(
+            &chunk,
+            &vanilla_block,
+            &dust.block,
+            run.height,
+            &mut swept.block,
+        );
     }
-    Ok(tally)
+    Ok(swept)
+}
+
+/// What one pass found, one tally per kind of light.
+///
+/// Two tallies and not one, and the reason is the same one the verb has said
+/// about every number it prints: a single figure covering both would read as
+/// "the lighting is 99.9% right" while hiding which half of it was.
+#[derive(Default)]
+struct Swept {
+    sky: Tally,
+    block: Tally,
 }
 
 /// Light a `(2k+1)²` block of columns together and read the centre back.
@@ -769,7 +866,7 @@ fn area_light(
     x: i32,
     z: i32,
     k: i32,
-) -> Result<(dust_world::chunk::Chunk, Column), String> {
+) -> Result<(dust_world::chunk::Chunk, Lit), String> {
     let side = 2 * k + 1;
     let mut chunks = Vec::with_capacity((side * side) as usize);
     for cz in -k..=k {
@@ -792,25 +889,17 @@ fn area_light(
         &run.model.opacity,
         dust_world::propagation::Budget::new(AREA_LIGHT_BUDGET),
     );
+    let _ = super::area::AreaBlockLight::seed(
+        &mut chunks,
+        side,
+        &run.model.opacity,
+        &run.model.emission,
+        dust_world::propagation::Budget::new(AREA_LIGHT_BUDGET),
+    );
 
-    let centre = &chunks[((k) + (k) * side) as usize];
-    let mut column = Column::empty(run.height);
-    for y in run.height.min_y()..run.height.min_y() + run.height.height() as i32 {
-        let row = (y - run.height.min_y()) as u32 % 16;
-        let section = centre.section(y);
-        for cx in 0..16usize {
-            for cz in 0..16usize {
-                column.set(
-                    cx,
-                    y,
-                    cz,
-                    section.sky_light().get(cx as u32, row, cz as u32),
-                );
-            }
-        }
-    }
-    let centre = chunks.swap_remove(((k) + (k) * side) as usize);
-    Ok((centre, column))
+    let middle = (k + k * side) as usize;
+    let lit = read_back(&chunks[middle], run.height);
+    Ok((chunks.swap_remove(middle), lit))
 }
 
 /// How much work lighting one block of columns may do.
@@ -929,6 +1018,53 @@ fn vanilla_light(root: &nbt::Node, height: WorldHeight) -> Result<Column, String
     Ok(column)
 }
 
+/// The block light Minecraft computed for a column, out of its own file.
+///
+/// **The absent-array convention is not the same one sky light has**, and that
+/// is the whole reason this is a second function rather than a parameter. Sky
+/// light's missing arrays mean darkness below the highest stored one and
+/// daylight above it, because the sky is above the terrain. Nothing is above
+/// the *torches*: a section with no `BlockLight` is dark, wherever it sits.
+///
+/// So a column with no `BlockLight` at all is not an error here either — it is
+/// a column with nothing in it that glows, which is most of them. Sky light
+/// refuses that case because resolving it would need the terrain height, which
+/// is what the comparison is about.
+fn vanilla_block_light(root: &nbt::Node, height: WorldHeight) -> Result<Column, String> {
+    let sections = match root.get("sections") {
+        Some(node @ nbt::Node::List(_)) => node.list(),
+        _ => return Err("no sections".to_owned()),
+    };
+
+    let mut stored: BTreeMap<i32, &[u8]> = BTreeMap::new();
+    for section in sections {
+        let y = match section.get("Y") {
+            Some(nbt::Node::Byte(v)) => i32::from(*v),
+            Some(nbt::Node::Int(v)) => *v,
+            _ => return Err("a section has no Y".to_owned()),
+        };
+        if let Some(nbt::Node::ByteArray(bytes)) = section.get("BlockLight") {
+            if bytes.len() != 2048 {
+                return Err(format!("section {y} has a {}-byte BlockLight", bytes.len()));
+            }
+            stored.insert(y, bytes);
+        }
+    }
+
+    let mut column = Column::empty(height);
+    for y in height.min_y()..height.min_y() + height.height() as i32 {
+        let Some(bytes) = stored.get(&y.div_euclid(16)) else {
+            continue;
+        };
+        for x in 0..16usize {
+            for z in 0..16usize {
+                column.set(x, y, z, nibble(bytes, x, y.rem_euclid(16) as usize, z));
+            }
+        }
+    }
+    Ok(column)
+}
+
 /// One nibble out of a 2048-byte light array. Low nibble first, y-z-x order.
 fn nibble(bytes: &[u8], x: usize, y: usize, z: usize) -> u8 {
     let index = y * 256 + z * 16 + x;
@@ -1018,20 +1154,33 @@ fn dust_light(
     skirt: Skirt,
     height: WorldHeight,
     opacity: &dust_world::propagation::OpacityModel,
-) -> Column {
-    let _ = dust_server::net::world::light_column(chunk, opacity, skirt);
+    emission: &dust_world::propagation::EmissionModel,
+) -> Lit {
+    let _ = dust_server::net::world::light_column(chunk, opacity, emission, skirt);
+    read_back(chunk, height)
+}
 
-    let mut column = Column::empty(height);
+/// Both of a column's light arrays, as this comparison holds them.
+struct Lit {
+    sky: Column,
+    block: Column,
+}
+
+/// Read a lit column's two arrays back out.
+fn read_back(chunk: &dust_world::chunk::Chunk, height: WorldHeight) -> Lit {
+    let mut sky = Column::empty(height);
+    let mut block = Column::empty(height);
     for y in height.min_y()..height.min_y() + height.height() as i32 {
         let row = (y - height.min_y()) as u32 % 16;
         let section = chunk.section(y);
         for x in 0..16usize {
             for z in 0..16usize {
-                column.set(x, y, z, section.sky_light().get(x as u32, row, z as u32));
+                sky.set(x, y, z, section.sky_light().get(x as u32, row, z as u32));
+                block.set(x, y, z, section.block_light().get(x as u32, row, z as u32));
             }
         }
     }
-    column
+    Lit { sky, block }
 }
 
 /// How far a cell sits from the nearest of its column's four faces.
@@ -1068,20 +1217,29 @@ fn compare(
                 let name = dust_registry::BlockState::from_id(state)
                     .map(|s| s.block().name().to_owned())
                     .unwrap_or_else(|| format!("state {state}"));
+                // **Coordinates, on request, for both directions.** The last
+                // thirty-two over-lit cells were explained by printing where
+                // they were and seeing that every one sat on a chunk edge, and
+                // the same question comes up about a shortfall a player can
+                // see from inside the world: is *this* dark column one of the
+                // ones the report is already counting? A histogram cannot
+                // answer that and a list of coordinates can.
+                let trace = std::env::var_os("DUST_LIGHT_TRACE").is_some();
+                if trace {
+                    let pos = chunk.pos();
+                    eprintln!(
+                        "{} world ({}, {y}, {}) local ({x},{z}) vanilla={want} dust={got} \
+                         edge={from_edge} block={name}",
+                        if got < want { "short " } else { "OVER  " },
+                        pos.x * 16 + x as i32,
+                        pos.z * 16 + z as i32,
+                    );
+                }
                 if got < want {
                     *tally.darker.entry(want - got).or_default() += 1;
                     *tally.darker_blocks.entry(name).or_default() += 1;
                     *tally.darker_by_edge.entry(from_edge).or_default() += 1;
                 } else {
-                    if std::env::var_os("DUST_LIGHT_TRACE").is_some() {
-                        let pos = chunk.pos();
-                        eprintln!(
-                            "over-lit: chunk {},{} local ({x},{y},{z}) vanilla={want} dust={got}                              edge={}",
-                            pos.x,
-                            pos.z,
-                            x == 0 || x == 15 || z == 0 || z == 15
-                        );
-                    }
                     *tally.brighter.entry(got - want).or_default() += 1;
                     *tally.brighter_blocks.entry(name).or_default() += 1;
                 }
@@ -1134,7 +1292,7 @@ fn histogram(blocks: &BTreeMap<String, u64>) {
     }
 }
 
-fn report(tally: &Tally, model: &Model) {
+fn report(kind: &str, tally: &Tally, model: &Model) {
     let disagree = tally.cells - tally.agree;
     let percent = |n: u64| {
         if tally.cells == 0 {
@@ -1150,7 +1308,7 @@ fn report(tally: &Tally, model: &Model) {
     // block-light arrays a real server writes are not compared here because
     // there is nothing on this side to compare them to; see decision record
     // 0008 for what that is waiting on.
-    println!("{} sky-light cells compared", tally.cells);
+    println!("{} {kind}-light cells compared", tally.cells);
     println!(
         "{} agree ({:.3}%), {disagree} do not ({:.3}%)",
         tally.agree,
@@ -1194,19 +1352,33 @@ fn report(tally: &Tally, model: &Model) {
     // sentence that names all of them whatever is running. A report that still
     // blamed opacity under Minecraft's own numbers would be pointing at the
     // wrong rung of its own ladder.
+    let sky = kind == "sky";
     let mut gaps: Vec<&str> = Vec::new();
     if !model.from_minecraft {
         gaps.push("every block but air is fully opaque here");
+        if !sky {
+            // Block light's version of the stand-in, and it is not an
+            // approximation of anything: a server with no table declines to
+            // invent how bright a torch is. Named separately because "nothing
+            // emits" explains a shortfall that "everything is opaque" does not.
+            gaps.push("and nothing in this world emits at all");
+        }
     }
-
     if model.volume == Volume::Column {
-        gaps.push("light does not travel through a neighbouring column");
+        gaps.push(if sky {
+            "light does not travel through a neighbouring column"
+        } else {
+            "an emitter in a neighbouring column lights nothing here"
+        });
     }
-    if model.heightmaps == Heightmaps::FromAirAlone {
+    // Only sky light has a floor. Block light comes from cells and does not
+    // care where the terrain stops, so naming the heightmap here would be
+    // blaming a gap that cannot produce this shortfall.
+    if sky && model.heightmaps == Heightmaps::FromAirAlone {
         gaps.push("the sky floor is `not air` where vanilla's is `blocks motion`");
     }
     if gaps.is_empty() {
-        println!("      (every known gap is closed in this model, so these are a fourth thing)");
+        println!("      (every known gap is closed in this model, so these are one more thing)");
     } else {
         for (at, gap) in gaps.iter().enumerate() {
             let open = if at == 0 { "(" } else { " " };

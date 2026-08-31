@@ -221,6 +221,11 @@ fn network_name(kind: HeightmapKind) -> &'static str {
 /// sized to the sections alone leaves a dark seam at the world's floor and
 /// another at its ceiling. The two extra arrays are the world's outside: the
 /// one below is dark, the one above is open sky.
+///
+/// Sky light goes out for every section and block light only for the sections
+/// that have any, which is the difference between a light that is everywhere
+/// by default and one that comes from cells. Both are the same 2,048-byte
+/// nibble arrays and the client reads them the same way.
 fn column_light(chunk: &Chunk, section_count: usize) -> play::chunk::LightData {
     let mut sky_mask = BitSet(Vec::new());
     let mut sky_arrays = Vec::with_capacity(section_count + 2);
@@ -239,22 +244,35 @@ fn column_light(chunk: &Chunk, section_count: usize) -> play::chunk::LightData {
     sky_mask.set(section_count + 1, true);
     sky_arrays.push(LightArray(vec![FULL_BRIGHT; LIGHT_SECTION_BYTES]));
 
+    // Block light, and only where there is any. **Absent and "present but
+    // zero" mean the same thing to a renderer**, so a section with no light in
+    // it is named in the empty mask instead of carrying 2,048 zero bytes —
+    // which is what vanilla does, and on a surface chunk it is every section.
+    //
+    // The two sections outside the world are always empty: there is nothing
+    // under bedrock to hold a torch, and nothing above the sky either.
+    let mut block_mask = BitSet(Vec::new());
     let mut empty_block_mask = BitSet(Vec::new());
-    for index in 0..section_count + 2 {
-        empty_block_mask.set(index, true);
+    let mut block_arrays = Vec::new();
+    empty_block_mask.set(0, true);
+    for (index, section) in chunk.sections().iter().enumerate() {
+        let bytes = section.block_light().as_bytes();
+        if bytes.iter().all(|byte| *byte == 0) {
+            empty_block_mask.set(index + 1, true);
+        } else {
+            block_mask.set(index + 1, true);
+            block_arrays.push(LightArray(bytes.to_vec()));
+        }
     }
+    empty_block_mask.set(section_count + 1, true);
 
     play::chunk::LightData {
         sky_mask,
-        // Nothing in this world emits light, so no block-light array is sent
-        // and every section is named in the empty mask. Absent and
-        // "present but zero" mean the same thing to a renderer; absent is
-        // fewer bytes and is what vanilla sends for a chunk with no torches.
-        block_mask: BitSet(Vec::new()),
+        block_mask,
         empty_sky_mask: BitSet(Vec::new()),
         empty_block_mask,
         sky_arrays,
-        block_arrays: Vec::new(),
+        block_arrays,
     }
 }
 

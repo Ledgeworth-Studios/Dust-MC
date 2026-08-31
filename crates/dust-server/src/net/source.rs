@@ -149,6 +149,9 @@ pub struct AnvilWorld {
     /// folded into `opacity` because the heightmaps need it too and a second
     /// copy would be a second answer.
     constants: Option<std::sync::Arc<dust_registry::BlockConstants>>,
+    /// What every block state gives off. Built once at boot beside `opacity`
+    /// and for the same reason: with a table in it this is 26,684 bytes.
+    emission: dust_world::propagation::EmissionModel,
     /// Where the sky reaches in each column read so far, for lighting the
     /// columns beside it. See the module note for why this is cached when the
     /// chunks are not.
@@ -209,6 +212,7 @@ impl AnvilWorld {
             regions: Mutex::new(HashMap::new()),
             names,
             height: fallback.height(),
+            emission: super::world::emission_of(constants.as_deref()),
             fallback,
             opacity,
             constants,
@@ -309,7 +313,8 @@ impl AnvilWorld {
                 // it pays for the four that follow.
                 self.remember(pos, SkyFloor::of(&chunk));
                 let skirt = self.skirt(pos);
-                let _ = super::world::light_column(&mut chunk, &self.opacity, skirt);
+                let _ =
+                    super::world::light_column(&mut chunk, &self.opacity, &self.emission, skirt);
                 chunk
             }
             // Off the edge of what was generated. See the module note: a plain

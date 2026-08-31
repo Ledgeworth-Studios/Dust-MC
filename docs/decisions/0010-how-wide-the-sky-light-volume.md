@@ -1,7 +1,8 @@
 # D10 — How wide the sky-light volume should be
 
-**Status:** Measured and **not adopted**. A 3x3 volume is now the *whole* of
-what is left of Dust's sky-light gap — 435 cells of 2.4 million on seed 0,
+**Status:** Measured and **not adopted**, and re-measured on 2026-08-31 when
+block light landed — it is the whole of that gap too, and the larger share of
+it. A 3x3 volume is now the *whole* of what is left of Dust's lighting gap — 435 cells of 2.4 million on seed 0,
 nothing at all on seed 1 — and costs roughly six times the work. The cheaper
 input this record sent people to build instead has been built, and the numbers
 below are from after it. This record exists so that the next person to look at
@@ -150,10 +151,22 @@ produced in either direction.
 
 ## Consequences
 
-- **Dust's sky light stays one column wide**, with the skirt, and under-lights
-  where light would have to travel through a neighbour. 435 cells of 2.4
-  million on an inland world — 0.018% — and nothing at all on an ocean one.
-  It is now the only thing between a served world and Minecraft's own light.
+- **Dust's light stays one column wide**, with the skirt for sky light and
+  nothing at all for block light, and under-lights where light would have to
+  cross a boundary. 435 sky cells and 1,163 block cells of 2.4 million on an
+  inland world; nothing at all in sky light on an ocean one. It is now the only
+  thing between a served world and Minecraft's own light, in either kind.
+
+- **Block light's share of it is the larger one, and it looks worse.** A
+  neighbour's *sky floor* is a complete description of what that neighbour
+  shines in, which is why the sky-light skirt works and closes most of that
+  gap. A neighbour's *emitters* are not — what reaches the shared face depends
+  on what the light travelled through — so block light has no skirt at all and
+  a torch a block into the next chunk lights nothing. The sky-light seam is a
+  shade across a cliff face; this one is a hard edge at a chunk border with a
+  lit room on one side of it. Seeding the boundary with `emission - distance`
+  would close it and would **over-light**, which is the one kind of wrong this
+  project's light harness treats as unexplained.
 - **`harness light`'s ladder is the record of it.** Adding a rung is how the
   next input gets measured, and the last rung is the engine with every input
   handed to it — a hundred per cent, which is the number that says the walks

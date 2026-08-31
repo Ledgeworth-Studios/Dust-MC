@@ -420,3 +420,140 @@ impl ColumnSkyLight<'_> {
         ((), (y - min_y) as u32 % 16)
     }
 }
+
+/// Block light for one column, from the blocks in it that give light off.
+///
+/// # The other half of lighting
+///
+/// Sky light comes from above and is a property of where the terrain stops.
+/// Block light comes from *cells* — a torch, lava, glowstone — and is a
+/// property of what is in them. Same walk, same attenuation, different seeds,
+/// and [`propagation::raise`](crate::propagation::raise) does not know or care
+/// which it is running.
+///
+/// # What this does not do, and it shows
+///
+/// One column, so **a torch on the far side of a chunk boundary lights nothing
+/// here**. That is the same gap the sky-light skirt exists to close, and it is
+/// worse-looking for block light: sky light's seam is a shade across a cliff
+/// face, and this one is a hard edge at a chunk border with a lit room on one
+/// side of it.
+///
+/// It is left that way on purpose rather than patched. The sky-light skirt
+/// works because a neighbour's *sky floor* is a complete description of what
+/// that neighbour shines in — the light there is fifteen by definition. A
+/// neighbour's emitters are not: what reaches the shared face depends on what
+/// the light travelled through to get there, and seeding the boundary with
+/// `emission - distance` would **over-light**, which is the one kind of wrong
+/// this project's light harness treats as unexplained. The honest version is
+/// the wider volume, which is measured in the harness and costed in decision
+/// record 0010.
+#[derive(Debug)]
+pub struct ColumnBlockLight<'a> {
+    chunk: &'a mut Chunk,
+    opacity: &'a OpacityModel,
+}
+
+impl<'a> ColumnBlockLight<'a> {
+    /// Fill this column's block light from the emitters in it.
+    ///
+    /// Returns the edge examinations spent, which is zero for a column with
+    /// nothing in it that emits — most columns of most worlds.
+    ///
+    /// The arrays are cleared first. A column is lit from nothing every time
+    /// rather than corrected, because a correction needs to know what changed
+    /// and the caller here is "a chunk arrived from disk"; the incremental
+    /// pair — [`raise`] and `darken` — is what an edit will use.
+    ///
+    /// # Errors
+    ///
+    /// [`PropagationError::BudgetExhausted`] if the walk runs past `budget`.
+    /// The partial result is consistent: the column is under-lit rather than
+    /// corrupt.
+    pub fn seed(
+        chunk: &'a mut Chunk,
+        opacity: &'a OpacityModel,
+        emission: &crate::propagation::EmissionModel,
+        budget: Budget,
+    ) -> Result<u64, PropagationError> {
+        for section in chunk.sections_mut() {
+            *section.block_light_mut() = crate::light::LightArray::new();
+        }
+        if emission.is_dark() {
+            return Ok(0);
+        }
+
+        let min_y = chunk.world().min_y();
+        let mut seeds: Vec<(i32, i32, i32, u8)> = Vec::new();
+        for (index, section) in chunk.sections().iter().enumerate() {
+            // The palette is the shortlist of what this section can hold, so a
+            // section whose palette holds no emitter has no emitter and its
+            // 4,096 cells are never read. A direct palette answers `None` —
+            // any registry id is possible — and is scanned.
+            if let Some(entries) = section.states().palette().entries() {
+                if !emission.any_emits(entries.iter().copied()) {
+                    continue;
+                }
+            }
+            let base = min_y + (index as i32) * 16;
+            for y in 0..16i32 {
+                for z in 0..16i32 {
+                    for x in 0..16i32 {
+                        let state = section.states().get_at(x as u32, y as u32, z as u32);
+                        let level = emission.emission(state);
+                        if level > 0 {
+                            seeds.push((x, base + y, z, level));
+                        }
+                    }
+                }
+            }
+        }
+        if seeds.is_empty() {
+            return Ok(0);
+        }
+
+        let mut graph = Self { chunk, opacity };
+        raise(&mut graph, &seeds, budget)
+    }
+}
+
+impl LightGraph for ColumnBlockLight<'_> {
+    fn level(&self, x: i32, y: i32, z: i32) -> u8 {
+        let row = self.row(y);
+        self.chunk
+            .section(y)
+            .block_light()
+            .get(x as u32, row, z as u32)
+    }
+
+    fn set_level(&mut self, x: i32, y: i32, z: i32, level: u8) {
+        let row = self.row(y);
+        self.chunk
+            .section_mut(y)
+            .block_light_mut()
+            .set(x as u32, row, z as u32, level);
+    }
+
+    fn opacity(&self, x: i32, y: i32, z: i32) -> u8 {
+        self.opacity
+            .opacity(self.chunk.get_block(x as u32, y, z as u32))
+    }
+
+    fn contains(&self, x: i32, y: i32, z: i32) -> bool {
+        let min_y = self.chunk.world().min_y();
+        let max_y = min_y + self.chunk.world().height() as i32;
+        (0..16).contains(&x) && (0..16).contains(&z) && (min_y..max_y).contains(&y)
+    }
+}
+
+impl ColumnBlockLight<'_> {
+    /// The row a world y occupies inside its own section.
+    ///
+    /// The same arithmetic [`ColumnSkyLight`] does, and separate from it
+    /// because the two types differ only in which array they reach for —
+    /// sharing a graph between them would mean a parameter saying which, in
+    /// the hottest loop either of them has, to save four lines.
+    fn row(&self, y: i32) -> u32 {
+        (y - self.chunk.world().min_y()) as u32 % 16
+    }
+}
