@@ -61,6 +61,7 @@ pub mod compare;
 pub mod digest;
 pub mod light;
 mod nbt;
+mod outline;
 mod properties;
 mod provision;
 mod rcon;
