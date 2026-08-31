@@ -340,9 +340,10 @@ Nothing about this ships a Mojang value. The repository holds the question, the
 oracle that asks it, and the reader for the answer.
 
 **What is left:** nothing this record opened. Sky light is done, block light is
-done, the block-place sound is done, and so is which block an item puts down —
-the last two by the sections directly below, which are the same route carrying a
-third and a fourth kind of constant.
+done, the block-place sound is done, so is which block an item puts down, and so
+is whether a placement replaces what it lands on — the last three by the
+sections directly below, which are the same route carrying a third, a fourth and
+a fifth kind of constant.
 
 ## And the sound a block makes going down (2026-08-31)
 
@@ -438,6 +439,38 @@ the way they were standing; that is `getStateForPlacement`, it needs a placement
 context, and it is a different problem in a different place. The caller takes
 `Block::default_state` and the gap is stated where it is taken.
 
+## And whether a placement replaces what it lands on (2026-08-31)
+
+One boolean column, `replaceable`, carrying Minecraft's no-argument
+`canBeReplaced()`. 766 of 26,684 states on 1.21.1: air, both fluids, fire,
+snow layers, light blocks, vines, lichen and the small plants — twenty-four
+blocks.
+
+It is on this list rather than in the binary for the same reason everything else
+is, and it is worth one paragraph of its own because of **which** overload it
+is. `BlockBehaviour$BlockStateBase` declares three `canBeReplaced` — taking
+nothing, a `Fluid`, and a `BlockPlaceContext` — and two of them are `a` in the
+obfuscated jar. The parameter-keyed lookup in `mappings` is what tells them
+apart, and this is the sharpest case it has had.
+
+What is taken is the **property** and not the context-aware answer. Vanilla's
+`canBeReplaced(state, context)` is this property *plus* a question about what
+the player is holding: deep snow may only be replaced by more snow, a slab only
+by its own other half. So Dust replaces eight layers of snow where vanilla
+refuses. That is the same class of gap as placing a block in its default state
+— both need a placement context, neither has one, and both are stated where the
+code for them would go.
+
+**The default when the column is absent is `true`, and the caller must not use
+it.** True is right for a caller reading one state, because before the column
+existed every right-click replaced whatever it landed on. It is wrong for the
+caller that exists, which chooses between the block clicked and the cell on its
+face: taking the default at face value sends every placement into the block that
+was clicked, which is neither the old behaviour nor Minecraft's. So the chooser
+asks `has_replaceable()` first — whether the table *knows* — and falls back to
+the old rule whole. That was caught by a test rather than by reading, which is
+why it is written down.
+
 ## What is still consequent
 
 - **Block light — built, 2026-08-31, and this record was right about it for
@@ -472,11 +505,15 @@ context, and it is a different problem in a different place. The caller takes
   that is the whole path from the creative menu to a block going down. A server
   with no item table places the world's own surface block whatever is held,
   which is what every server here did before.
+- **A placement goes into what can be replaced and refuses what cannot —
+  built, 2026-08-31.** Right-clicking tall grass puts the block where the grass
+  was; right-clicking a face whose far side is solid does nothing, where it used
+  to replace the block behind it silently.
 - **`opacity_of` is the one place this is decided** for light, and it says so.
   It takes the table, the emission model beside it takes the table,
-  `net::play::block_placed` takes it for the sound, and
-  `net::session::held_block` takes the item table for the block. Four readers,
-  one route.
+  `net::play::block_placed` takes it for the sound, `net::session::placement`
+  takes it for where a block lands, and `net::session::held_block` takes the
+  item table for which block it is. Five readers, one route.
 
 ## Related
 

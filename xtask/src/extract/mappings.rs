@@ -248,6 +248,20 @@ pub const LIGHT_ORACLE: &[Wanted<'static>] = &[
         method: "canOcclude",
         parameters: &[],
     },
+    // Whether a block placed here goes *into* this state rather than beside
+    // it. The no-argument overload, which is the property; the one taking a
+    // `BlockPlaceContext` is that property plus a question about the item
+    // being held, and a context is exactly what a table has never seen.
+    //
+    // Keyed by parameters for the usual reason and unusually sharply here:
+    // this class declares three `canBeReplaced`, taking nothing, a `Fluid` and
+    // a `BlockPlaceContext`, and two of them are `a`.
+    Wanted::Method {
+        key: "blockstate.can_be_replaced",
+        class: BLOCK_STATE_BASE,
+        method: "canBeReplaced",
+        parameters: &[],
+    },
     Wanted::Method {
         key: "blockstate.propagates_skylight_down",
         class: BLOCK_STATE_BASE,

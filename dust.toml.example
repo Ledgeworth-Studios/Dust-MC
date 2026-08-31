@@ -101,8 +101,8 @@ vein_size = 2.5
 #
 # Dust reads two more files from here. `dust-constants.tsv` says what
 # Minecraft's own code says about a block state — how much light it stops, how
-# much it gives off, which of the six heightmaps count it, and what it sounds
-# like going down. `dust-items.tsv` says which block each item puts down. None
+# much it gives off, which of the six heightmaps count it, whether a block
+# placed there goes into it, and what it sounds like going down. `dust-items.tsv` says which block each item puts down. None
 # of that is data: it is Java, so it is not in the directory above and there is
 # no copy of it in Dust either. You make both from your own server jar:
 #
@@ -112,7 +112,9 @@ vein_size = 2.5
 #
 # Without the first, sky light stops dead at the surface of an ocean and under
 # a tree, because every block but air is treated as a wall; the sky starts
-# above the grass rather than through it; and a placed block makes no sound.
+# above the grass rather than through it; a placed block makes no sound; and a
+# right-click replaces whatever sits on the face it clicked, rather than going
+# into the tall grass it was aimed at and refusing the wall it was not.
 # Without the second, a right-click puts down the world's own surface block
 # whatever the player is holding. With them, the sky light Dust serves is the
 # light Minecraft computes and a player places what they are holding. A file

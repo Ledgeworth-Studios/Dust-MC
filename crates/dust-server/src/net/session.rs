@@ -1171,18 +1171,24 @@ where
                         )
                         .await?;
                     }
-                    // Placing. The block goes on the *face* that was clicked,
-                    // not in the block that was clicked — a right-click on the
-                    // top of the ground puts a block above it, and putting it
-                    // in the clicked cell would replace the ground instead.
+                    // Placing. Where it lands is [`placement`]; whether it
+                    // lands at all is the same question asked of the cell it
+                    // chose.
                     Ok(play::serverbound::Packet::UseItemOnBlock(use_on)) => {
-                        let target = offset(use_on.hit.location, use_on.hit.face);
                         let state = held_block(
                             ctx.item_blocks.as_deref(),
                             hotbar.held(),
                             ctx.blocks.placeable,
                         );
-                        ctx.world.place_block(target, state, me.entity_id);
+                        let target = placement(
+                            &ctx.world,
+                            ctx.constants.as_deref(),
+                            use_on.hit.location,
+                            use_on.hit.face,
+                        );
+                        if let Some(target) = target {
+                            ctx.world.place_block(target, state, me.entity_id);
+                        }
                         send_play(
                             conn,
                             play::clientbound::BlockChangedAck {
@@ -1265,6 +1271,63 @@ fn held_block(
         .zip(held)
         .and_then(|(table, item)| table.places(item))
         .map_or(fallback, |block| block.default_state().id())
+}
+
+/// Where a right-click on `face` of `clicked` actually puts a block, if
+/// anywhere.
+///
+/// Two questions, in vanilla's order, and both are the same question asked of a
+/// different cell.
+///
+/// **Is the clicked block itself replaceable?** Then the placement goes *into*
+/// it. Right-clicking tall grass puts the block where the grass was rather than
+/// on top of it, and the same for snow, water and fire. Getting this wrong is
+/// the difference between building a wall through a meadow and building a wall
+/// one block above it.
+///
+/// **Otherwise, is the cell on that face replaceable?** Then the placement goes
+/// there, and if it is not, nothing happens. That second refusal is what stops
+/// a player right-clicking into the side of a wall and replacing the block
+/// behind it — which is what this did before, silently, for every solid cell.
+///
+/// # What this is not
+///
+/// Minecraft's own answer is `canBeReplaced(state, BlockPlaceContext)`, which
+/// is this property *and* a question about what the player is holding: deep
+/// snow may only be replaced by more snow, and a slab only by its own other
+/// half. What the table carries is the no-argument property, so a placement
+/// into eight layers of snow replaces them where vanilla would refuse. Same
+/// class of gap as the default block state going down: it needs a placement
+/// context, and there is not one yet.
+///
+/// Nothing here validates *reach*, either — a player may still place a block
+/// from across the map, which is stated with the rest of the missing rules in
+/// [`super::edits`].
+///
+/// A server with no table, or with one written before the column, keeps the
+/// rule it had: always the face, never a refusal. An operator who has not
+/// copied a file should have the server they had rather than one that ignores
+/// right-clicks.
+fn placement(
+    world: &super::edits::EditedWorld,
+    constants: Option<&dust_registry::BlockConstants>,
+    clicked: dust_protocol::types::Position,
+    face: u8,
+) -> Option<dust_protocol::types::Position> {
+    let beside = offset(clicked, face);
+    // With nothing to ask, the old rule stands: the face, always, and never a
+    // refusal. **Not `BlockConstants::replaceable`'s own default**, which
+    // answers true and would send every placement into the block that was
+    // clicked — that default is for a caller reading one state, and this caller
+    // is choosing between two. The question here is whether the table *knows*,
+    // and `has_replaceable` is the one that asks it.
+    let Some(table) = constants.filter(|table| table.has_replaceable()) else {
+        return Some(beside);
+    };
+    if table.replaceable(world.block_at(clicked)) {
+        return Some(clicked);
+    }
+    table.replaceable(world.block_at(beside)).then_some(beside)
 }
 
 /// The block one step off `face` from `location`.
@@ -1449,6 +1512,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dust_protocol::types::Position;
     use dust_registry::{Block, Item, ItemBlocks};
 
     /// A table where every item places the block of its own name if there is
@@ -1482,6 +1546,156 @@ mod tests {
     /// A state id no block has, so a test that got the fallback back can say so
     /// rather than matching some real block by accident.
     const FALLBACK: u32 = u32::MAX;
+
+    /// A flat world to click at, and what is in it.
+    fn world() -> super::super::edits::EditedWorld {
+        let palette = super::world::Palette::resolve().expect("the block table");
+        super::super::edits::EditedWorld::new(super::super::source::Source::Flat(Box::new(
+            super::world::FlatWorld::new(palette, 0, 64),
+        )))
+    }
+
+    /// A constants table where exactly the states of `replaceable` are.
+    ///
+    /// Named blocks rather than parity, because the whole question is about
+    /// specific blocks: the grass a wall is built through, and the stone it is
+    /// built against.
+    fn replaceable(names: &[&str]) -> dust_registry::BlockConstants {
+        let states: std::collections::HashSet<u32> = names
+            .iter()
+            .flat_map(|name| {
+                Block::from_name(name)
+                    .expect("this build has that block")
+                    .states()
+                    .map(|state| state.id())
+            })
+            .collect();
+        let mut text = String::from(
+            "# state_id	opacity	emission	occlude	replaceable
+",
+        );
+        for state in 0..dust_registry::STATE_COUNT {
+            text.push_str(&format!(
+                "{state}	0	0	1	{}
+",
+                u32::from(states.contains(&state))
+            ));
+        }
+        dust_registry::BlockConstants::parse(&text).expect("a complete table")
+    }
+
+    /// The cell the flat world's surface block is in, and the air above it.
+    fn surface() -> Position {
+        Position {
+            x: 6,
+            y: super::world::SURFACE_Y,
+            z: 6,
+        }
+    }
+
+    #[test]
+    fn a_click_on_solid_ground_puts_the_block_on_the_face() {
+        // Face 1 is up. The block goes above the ground rather than into it,
+        // which is the case that has always worked and the one everything else
+        // here is a departure from.
+        let world = world();
+        let table = replaceable(&["minecraft:air"]);
+        let ground = surface();
+        assert_eq!(
+            placement(&world, Some(&table), ground, 1),
+            Some(Position {
+                y: ground.y + 1,
+                ..ground
+            })
+        );
+    }
+
+    #[test]
+    fn a_click_on_something_replaceable_puts_the_block_into_it() {
+        // Right-clicking tall grass puts the block *where the grass was*. A
+        // server that always went to the face builds a wall one block above
+        // the meadow it was meant to cross.
+        let world = world();
+        let grass = Block::from_name("minecraft:short_grass").expect("this build has it");
+        let table = replaceable(&["minecraft:air", "minecraft:short_grass"]);
+        let at = Position {
+            y: surface().y + 1,
+            ..surface()
+        };
+        assert!(world.set_block(at, grass.default_state().id()));
+        assert_eq!(
+            placement(&world, Some(&table), at, 1),
+            Some(at),
+            "into the grass, not above it"
+        );
+    }
+
+    #[test]
+    fn a_click_into_a_solid_neighbour_places_nothing() {
+        // The refusal this rule exists for. Clicking the side of a block whose
+        // neighbour is also solid used to replace that neighbour, silently, for
+        // every solid cell in the world — a player could hollow a wall out from
+        // the outside without breaking anything.
+        let world = world();
+        let table = replaceable(&["minecraft:air"]);
+        let buried = Position {
+            y: surface().y - 1,
+            ..surface()
+        };
+        // Face 1 is up, and the cell above a buried block is more ground.
+        assert_eq!(placement(&world, Some(&table), buried, 1), None);
+    }
+
+    #[test]
+    fn a_table_written_before_the_column_also_places_on_the_face() {
+        // The trap this rule nearly walked into. `BlockConstants::replaceable`
+        // answers *true* for an absent column — the right default for a caller
+        // reading one state — and a chooser between two cells that took it at
+        // face value would send every placement into the block that was
+        // clicked, which is neither the old behaviour nor Minecraft's.
+        let world = world();
+        let mut text = String::from(
+            "# state_id	opacity	emission	occlude
+",
+        );
+        for state in 0..dust_registry::STATE_COUNT {
+            text.push_str(&format!(
+                "{state}	0	0	1
+"
+            ));
+        }
+        let old = dust_registry::BlockConstants::parse(&text).expect("a complete table");
+        assert!(!old.has_replaceable());
+        let ground = surface();
+        assert_eq!(
+            placement(&world, Some(&old), ground, 1),
+            Some(Position {
+                y: ground.y + 1,
+                ..ground
+            }),
+            "the face, not the block that was clicked"
+        );
+    }
+
+    #[test]
+    fn a_server_with_no_table_places_on_the_face_the_way_it_always_did() {
+        // Absent is the old behaviour and not a refusal, by the same argument
+        // the light table's absence is made with: an operator who has not
+        // copied a file should have the server they had, not one that ignores
+        // right-clicks.
+        let world = world();
+        let buried = Position {
+            y: surface().y - 1,
+            ..surface()
+        };
+        assert_eq!(
+            placement(&world, None, buried, 1),
+            Some(Position {
+                y: buried.y + 1,
+                ..buried
+            })
+        );
+    }
 
     #[test]
     fn a_held_block_item_places_its_own_block() {

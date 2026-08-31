@@ -987,11 +987,27 @@ fn constants_domain(context: &Context) -> Result<Outcome, String> {
     }
     println!();
     println!("  {} state(s) emit light", summary.emitting);
+    println!(
+        "  {} state(s) a placement replaces rather than goes beside",
+        summary.replaceable
+    );
     // The heightmap predicates, one line each. A count per heightmap is what
     // says the columns are the six Minecraft declares and are not six copies
     // of one predicate — the failure a single "6 heightmaps" line would pass.
     for (name, count) in &summary.heightmaps {
         println!("  {name}: {count} state(s)");
+    }
+    if summary.replaceable == 0 || summary.replaceable as usize == rows {
+        return Err(format!(
+            "{} says {} of {rows} block states are replaceable, and Minecraft \
+             says neither none nor all of them; `blockstate.can_be_replaced` \
+             resolved to a method that answers the same thing every time. That \
+             class declares three `canBeReplaced` overloads and two share an \
+             obfuscated name — check {}/names.properties.",
+            out.display(),
+            summary.replaceable,
+            out.parent().unwrap_or(&out).display()
+        ));
     }
     if summary.heightmaps.is_empty() {
         return Err(format!(
@@ -1077,7 +1093,8 @@ fn constants_domain(context: &Context) -> Result<Outcome, String> {
     }
 
     Ok(format!(
-        "{rows} block states: light, occlusion, {} heightmap(s) and {} sound group(s); \
+        "{rows} block states: light, occlusion, replacement, {} heightmap(s) and \
+         {} sound group(s); \
          {} item(s), {} placing",
         summary.heightmaps.len(),
         summary.sounds.len(),
@@ -1147,6 +1164,13 @@ struct ConstantsSummary {
     opacity: std::collections::BTreeMap<u32, u64>,
     /// How many states emit any light at all.
     emitting: u64,
+    /// How many states a placement replaces rather than going beside.
+    ///
+    /// 766 of 26,684 on 1.21.1 — air, the two fluids, fire, snow layers, light
+    /// blocks and the small plants. Printed because both ends of its range are
+    /// wrong in a recognisable way: zero is a method that resolved to something
+    /// answering false, and all of them is one answering true.
+    replaceable: u64,
     /// How many states each heightmap counts, by the name in the header.
     ///
     /// **A count per heightmap and not a count of heightmaps.** Six columns
@@ -1199,6 +1223,7 @@ impl ConstantsSummary {
                         | "opacity"
                         | "emission"
                         | "occlude"
+                        | "replaceable"
                         | "place_sound"
                         | "sound_volume"
                         | "sound_pitch"
@@ -1221,6 +1246,9 @@ impl ConstantsSummary {
             }
             if emission.parse::<u32>().is_ok_and(|e| e > 0) {
                 summary.emitting += 1;
+            }
+            if at(named("replaceable")) == Some("1") {
+                summary.replaceable += 1;
             }
             for (name, column) in &flags {
                 let entry = summary.heightmaps.entry((*name).to_owned()).or_default();

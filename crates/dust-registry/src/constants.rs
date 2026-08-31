@@ -1,8 +1,8 @@
 //! The per-block-state values Minecraft keeps in Java code rather than in data.
 //!
 //! How much light entering a state costs, how much it gives off, whether it
-//! occludes, which of the six heightmaps count it, and what it sounds like
-//! going down. None of it is in any `--reports` output or any data pack: it is
+//! occludes, whether a block placed here goes into it, which of the six
+//! heightmaps count it, and what it sounds like going down. None of it is in any `--reports` output or any data pack: it is
 //! all code. Decision record 0008 is the account for the light values and the
 //! sound group, and 0010 for the heightmap predicates, and
 //! `cargo xtask extract --only constants` is the oracle that asks the game —
@@ -32,8 +32,9 @@
 //! ```
 //!
 //! Tab-separated in the file. The columns this module knows by name are
-//! `state_id`, `opacity`, `emission`, `occlude`, `place_sound`, `sound_volume`
-//! and `sound_pitch`; every other column is a **flag column** holding `0` or
+//! `state_id`, `opacity`, `emission`, `occlude`, `replaceable`, `place_sound`,
+//! `sound_volume` and `sound_pitch`; every other column is a **flag column**
+//! holding `0` or
 //! `1`, addressed by the name in the header — which for the heightmaps is the
 //! same string a chunk's NBT uses and [`HeightmapKind::nbt_key`] returns, so
 //! the two sides match on something they each know independently rather than
@@ -92,6 +93,9 @@ pub struct BlockConstants {
     emission: Box<[u8]>,
     /// Whether each state occludes — Minecraft's `canOcclude()`.
     occludes: Box<[bool]>,
+    /// Whether a block placed at each state goes *into* it — Minecraft's
+    /// `canBeReplaced()`. `None` for a table written before the column.
+    replaceable: Option<Box<[bool]>>,
     /// What each state sounds like going down, when the table carries the
     /// columns for it. `None` for a table written before they existed.
     place: Option<Box<[PlaceSound]>>,
@@ -202,6 +206,43 @@ impl BlockConstants {
         seen.len()
     }
 
+    /// Whether a block placed at `state` replaces it rather than going beside
+    /// it — Minecraft's no-argument `canBeReplaced()`.
+    ///
+    /// Air, water, tall grass, snow layers and the rest. **True for a state
+    /// this table does not describe, and true for every state when the table
+    /// has no such column**, which is the direction `occludes` picks its
+    /// default in and for the same reason: it is what the engine assumed before
+    /// the column existed, so an operator whose table predates it keeps the
+    /// server they had. The alternative default refuses every placement, which
+    /// is a server that looks broken because a file is old.
+    #[must_use]
+    pub fn replaceable(&self, state: u32) -> bool {
+        self.replaceable
+            .as_ref()
+            .is_none_or(|set| set.get(state as usize).copied().unwrap_or(true))
+    }
+
+    /// Whether this table carries the replaceable column at all.
+    ///
+    /// Worth asking apart from the answer, because "everything is replaceable"
+    /// is both what an absent column reads as and what no version of Minecraft
+    /// says. A boot log that could not tell them apart would report a server
+    /// running on a year-old table as though it were running on Minecraft's own
+    /// numbers.
+    #[must_use]
+    pub fn has_replaceable(&self) -> bool {
+        self.replaceable.is_some()
+    }
+
+    /// How many states a placement replaces.
+    #[must_use]
+    pub fn replaceable_count(&self) -> usize {
+        self.replaceable
+            .as_ref()
+            .map_or(0, |set| set.iter().filter(|r| **r).count())
+    }
+
     /// The flag column called `name`, if this table carries one.
     ///
     /// `None` is not an error. A table written before a column existed is
@@ -261,7 +302,10 @@ impl BlockConstants {
     /// The first `#` line is the header and names the columns; blank lines and
     /// any further `#` lines are skipped. `state_id`, `opacity` and `emission`
     /// must be there; `occlude` is optional and defaults to occluding, which is
-    /// what the engine assumed before the column existed; `place_sound`,
+    /// what the engine assumed before the column existed; `replaceable` is
+    /// optional the same way and defaults the same way, to what the engine
+    /// assumed — which for placement was that everything could be replaced;
+    /// `place_sound`,
     /// `sound_volume` and `sound_pitch` are optional **together**, because two
     /// of the three describe a sound nobody can play; every other column is a
     /// flag holding `0` or `1`.
@@ -276,6 +320,7 @@ impl BlockConstants {
         let mut opacity = vec![None; expected];
         let mut emission = vec![0u8; expected];
         let mut occludes = vec![true; expected];
+        let mut replaceable = header.replaceable.map(|_| vec![true; expected]);
         let mut place = header.sound.map(|_| vec![SILENCE; expected]);
         let events = sound_events();
         let mut flags: Vec<FlagColumn> = header
@@ -331,6 +376,9 @@ impl BlockConstants {
             *slot = Some(op);
             emission[state as usize] = em;
             occludes[state as usize] = occlude;
+            if let (Some(column), Some(replaceable)) = (header.replaceable, replaceable.as_mut()) {
+                replaceable[state as usize] = boolean(at, "replaceable", cell(column))?;
+            }
             if let (Some(columns), Some(place)) = (header.sound, place.as_mut()) {
                 place[state as usize] = sound(
                     at,
@@ -357,6 +405,7 @@ impl BlockConstants {
                 .collect(),
             emission: emission.into_boxed_slice(),
             occludes: occludes.into_boxed_slice(),
+            replaceable: replaceable.map(Vec::into_boxed_slice),
             place: place.map(Vec::into_boxed_slice),
             flags,
         })
@@ -370,6 +419,7 @@ struct Header {
     opacity: usize,
     emission: usize,
     occlude: Option<usize>,
+    replaceable: Option<usize>,
     /// The three sound columns, present or absent together.
     sound: Option<SoundColumns>,
     /// Every other column, by name and position.
@@ -408,6 +458,7 @@ impl Header {
         let opacity = required("opacity")?;
         let emission = required("emission")?;
         let occlude = column("occlude");
+        let replaceable = column("replaceable");
         // All three or none. Two of them describe a sound with no name or a
         // name with no loudness, and a reader that took what it could get
         // would turn an oracle that half-ran into a server that plays block
@@ -444,6 +495,7 @@ impl Header {
                 || at == opacity
                 || at == emission
                 || Some(at) == occlude
+                || Some(at) == replaceable
                 || sound.is_some_and(|s| at == s.name || at == s.volume || at == s.pitch)
         };
         let flags = names
@@ -458,6 +510,7 @@ impl Header {
             opacity,
             emission,
             occlude,
+            replaceable,
             sound,
             flags,
         })
