@@ -145,36 +145,62 @@ pub fn opacity_of(air: u32) -> OpacityModel {
 /// [`spawn_in`] exists and this is only its fallback.
 pub const SPAWN: (f64, f64, f64) = (0.5, SURFACE_Y as f64 + 1.0, 0.5);
 
-/// Where a player spawns in the world this server is actually serving.
+/// Where a player spawns at the world's origin.
 ///
-/// Same x and z as [`SPAWN`] — nothing here reads the world's own spawn point,
-/// which lives in `level.dat` beside the region directory rather than in it —
-/// but the **y comes from the column's own heightmap** instead of from a
-/// superflat's constant. Serving a world Minecraft generated with the flat
-/// world's y puts a player at bedrock level: underground, in the dark, inside
-/// stone, on a server that looks broken.
+/// The x and z of [`SPAWN`], which is right for a flat world and is the
+/// fallback for a real one with no `level.dat` beside it to say otherwise.
+pub fn spawn_in(world: &crate::net::edits::EditedWorld) -> (f64, f64, f64) {
+    spawn_at(world, 0, 0)
+}
+
+/// Where a player spawns in the column at `x`, `z`.
+///
+/// **The x and z come from the world and the y comes from the blocks**, and
+/// those are two different sources on purpose.
+///
+/// The column is the world's own spawn point, read out of `level.dat` beside
+/// the region directory by [`level::spawn_beside`](crate::net::level::spawn_beside)
+/// — Minecraft's seed 1 spawns at x 112, z 176, and serving that world from x
+/// 0, z 0 puts a joining player 176 blocks out in open ocean looking at a
+/// world they were never meant to see first.
+///
+/// The y is **not** `level.dat`'s `SpawnY`, and this is the part worth stating.
+/// A stored y is a claim about what the world was when it was written; the
+/// column may have been dug out since, and a player teleported into stone is
+/// ejected by the client in a direction nobody chose. The heightmap is a fact
+/// about the world being served right now. Serving a real world with the
+/// *flat* world's y is worse again: bedrock level, underground, in the dark,
+/// on a server that looks broken.
 ///
 /// The heightmap is `MOTION_BLOCKING`, which is the row above the highest
 /// thing that stops a player falling. Under a tree that is the ground rather
 /// than the leaves; over an ocean it is the water's surface, because water
-/// blocks motion — checked against Minecraft's own seed 0, where spawn is
-/// ocean and this lands at y = 63 on the water rather than at y = 40 on the
-/// sea floor. Standing on water is wrong, and it is wrong in the way a server
-/// with no physics is wrong; what this replaces is the far larger error of
-/// spawning at bedrock in the dark.
-pub fn spawn_in(world: &crate::net::edits::EditedWorld) -> (f64, f64, f64) {
-    let column = world.chunk(dust_world::coords::ChunkPos::new(0, 0));
+/// blocks motion — checked against Minecraft's own seed 0, where this lands at
+/// y = 63 on the water rather than at y = 40 on the sea floor. Standing on
+/// water is wrong, and it is wrong in the way a server with no physics is
+/// wrong; what it replaces is the far larger error of standing in bedrock.
+pub fn spawn_at(world: &crate::net::edits::EditedWorld, x: i32, z: i32) -> (f64, f64, f64) {
+    let column = world.chunk(dust_world::coords::ChunkPos::new(x >> 4, z >> 4));
+    // The column's own 16x16 grid. `rem_euclid` and not `& 15` written out,
+    // because a negative x is the common case here — Minecraft's seed 0 spawns
+    // at x -32 — and the two agree only because the block is a power of two.
+    // No sign-loss suppression, and none is needed: clippy follows
+    // `rem_euclid(16)` to 0..16 and does not fire. An `#[expect]` here was an
+    // error rather than dead weight, which is the lint config working.
+    let (local_x, local_z) = (x.rem_euclid(16) as u32, z.rem_euclid(16) as u32);
     let surface = column
         .heightmaps()
         .get(dust_world::heightmap::HeightmapKind::MotionBlocking)
-        .first_available(0, 0);
+        .first_available(local_x, local_z);
     let min_y = column.world().min_y();
     let max_y = min_y + column.world().height() as i32;
     // Clamped, because a heightmap is a claim about a column and this is a
     // position a client will be teleported to. An empty column reports the
     // world's floor, which is a legal answer and a fine place to stand.
     let y = surface.clamp(min_y, max_y - 2);
-    (SPAWN.0, f64::from(y), SPAWN.2)
+    // The half-block offsets, for the reason [`SPAWN`] gives: an integer x and
+    // z is a block corner, and the first physics tick pushes a player off it.
+    (f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5)
 }
 
 /// One flat world.
@@ -347,6 +373,32 @@ mod tests {
             Box::new(FlatWorld::new(palette, 0, 64)),
         ));
         assert_eq!(spawn_in(&world), SPAWN);
+    }
+
+    /// A spawn column that is not the origin lands in the middle of that
+    /// column, and the local coordinates are worked out the right way round.
+    ///
+    /// Both halves matter and only one of them is obvious. The half-block
+    /// offsets have to follow the column rather than stay at 0.5, or every
+    /// world with a spawn point puts its players on a block corner a thousand
+    /// blocks from where they belong. And **a negative x is the common case,
+    /// not the edge case**: Minecraft's own seed 0 spawns at x -32. `-33 >> 4`
+    /// is -3 and `(-33).rem_euclid(16)` is 15, which is the column to the west
+    /// and its last cell; a `/ 16` and a `% 16` would give -2 and -1, and -1
+    /// is not a cell.
+    #[test]
+    fn a_spawn_column_that_is_not_the_origin_is_found_and_centred() {
+        let palette = Palette::resolve().expect("the block table");
+        let world = crate::net::edits::EditedWorld::new(crate::net::source::Source::Flat(
+            Box::new(FlatWorld::new(palette, 0, 64)),
+        ));
+        let y = SPAWN.1;
+        assert_eq!(spawn_at(&world, 112, 176), (112.5, y, 176.5));
+        assert_eq!(spawn_at(&world, -32, 0), (-31.5, y, 0.5));
+        assert_eq!(spawn_at(&world, -33, -1), (-32.5, y, -0.5));
+        // And the origin still answers what the constant says, which is what
+        // `spawn_in` is now written in terms of.
+        assert_eq!(spawn_at(&world, 0, 0), SPAWN);
     }
 
     /// A player spawns on top of what is there, not inside it.

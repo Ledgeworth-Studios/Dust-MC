@@ -43,6 +43,7 @@ pub mod chat;
 pub mod configure;
 pub mod edits;
 pub mod favicon;
+pub mod level;
 pub mod listen;
 pub mod play;
 pub mod players;

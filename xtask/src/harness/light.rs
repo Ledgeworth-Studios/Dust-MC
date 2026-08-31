@@ -121,7 +121,10 @@ names what the disagreements are standing on.
 
   --version <v>   Minecraft version, e.g. 1.21.1.
   --seed <n>      The provisioned world's seed. Default 0.
-  --radius <r>    Chunks either side of spawn. Default 2 (a 5x5).
+  --radius <r>    Chunks either side of the origin. Default 2 (a 5x5).
+                  The origin and not the world's spawn point: `expected_chunks`
+                  is centred on chunk 0,0. Those were the same place only
+                  while Dust put every player at x 0, z 0.
 ";
 
 #[derive(Debug)]

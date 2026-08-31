@@ -812,6 +812,11 @@ impl Server {
         // The path is checked here rather than at the first column, because a
         // mistyped one otherwise produces a server that starts, serves flat
         // terrain, and never says why.
+        // The world's own spawn point, which is not in the region files: it
+        // is in `level.dat` beside them. Read here for the same reason the
+        // directory is checked here — a world whose spawn this server cannot
+        // read is one it would silently serve from the origin instead.
+        let mut world_spawn = None;
         let source = if world_source.is_empty() {
             crate::net::source::Source::Flat(Box::new(flat))
         } else {
@@ -828,9 +833,22 @@ impl Server {
                         .to_owned(),
                 )
             })?;
+            world_spawn = crate::net::level::spawn_beside(&directory).map_err(fail)?;
             self.options.logger.info(
                 "dust::server",
-                format!("serving the world at {}", directory.display()),
+                match world_spawn {
+                    Some(point) => format!(
+                        "serving the world at {}, spawning at x {}, z {}",
+                        directory.display(),
+                        point.x,
+                        point.z
+                    ),
+                    None => format!(
+                        "serving the world at {}, with no level.dat beside it to give a \
+                         spawn point; spawning at the origin",
+                        directory.display()
+                    ),
+                },
             );
             crate::net::source::Source::Anvil(Box::new(crate::net::source::AnvilWorld::new(
                 directory, names, flat,
@@ -927,6 +945,7 @@ impl Server {
             conn: dust_net::io::ConnConfig::default(),
             auth: authority,
             world: std::sync::Arc::clone(&world),
+            world_spawn,
             view_distance,
             overworld_dimension_type: overworld,
             blocks: crate::net::PlaceableBlocks {

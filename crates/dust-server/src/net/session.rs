@@ -92,6 +92,14 @@ pub struct SessionContext {
     /// The world a joining player is put into, with whatever players have
     /// changed in it.
     pub world: SharedWorld,
+    /// The world's own spawn point, read from `level.dat` at boot, or `None`
+    /// for a world that has no such file — a flat world, or a directory of
+    /// region files with nothing beside them.
+    ///
+    /// Read once at boot rather than per join: it is a property of the world
+    /// on disk, and re-reading it on every connection would make a join depend
+    /// on a file read that can fail.
+    pub world_spawn: Option<super::level::WorldSpawn>,
     /// The furthest this server will stream, in columns.
     ///
     /// A ceiling and not the answer: a client asks for a distance of its own
@@ -467,14 +475,25 @@ where
     // first time. Read before the join packet, because the join packet is not
     // what carries a position — the teleport below is — and a player told the
     // wrong one first would see themselves move.
-    let spawn = world::spawn_in(&ctx.world);
-    let start = ctx
+    let spawn = match ctx.world_spawn {
+        Some(point) => world::spawn_at(&ctx.world, point.x, point.z),
+        None => world::spawn_in(&ctx.world),
+    };
+    let saved = ctx
         .positions
         .lock()
         .expect("the position map is never poisoned")
         .get(&profile_id)
-        .copied()
-        .unwrap_or(spawn);
+        .copied();
+    let start = saved.unwrap_or(spawn);
+    // Which way they face. The world's spawn angle is for somebody arriving at
+    // the spawn; a returning player is put back where they stood, and the save
+    // records that and not which way they were looking. Facing south is what
+    // vanilla does with no angle, so it is a behaviour rather than a stand-in.
+    let yaw = match (saved, ctx.world_spawn) {
+        (None, Some(point)) => point.angle,
+        _ => 0.0,
+    };
 
     // Counted here rather than when the session ends, and held by a guard so
     // that every way out of this function — a disconnect, a timeout, a decode
@@ -505,7 +524,7 @@ where
     // throws them away.
     send_play(
         conn,
-        play_mod::position_packet(start, FIRST_TELEPORT_ID),
+        play_mod::position_packet(start, yaw, FIRST_TELEPORT_ID),
         version,
     )
     .await?;
