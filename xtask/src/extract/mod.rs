@@ -31,6 +31,18 @@
 //! writes its own file or files; nothing a later domain writes depends on an
 //! earlier one having been selected in the same run, because everything they
 //! share comes from the reports themselves.
+//!
+//! **[`Domain::Mappings`] is the exception to every sentence above**, and it is
+//! stated here rather than left to be discovered. It reads neither generated
+//! tree — it reads the obfuscated-name table Mojang publish beside the jar —
+//! and it writes nothing into `crates/`, because what it produces is Mojang's
+//! names rather than a fact about a format, and they are of no use to anything
+//! but a program running against that exact jar. Its output lands in the
+//! extract cache behind the same `.gitignore` line the jar does. Decision
+//! record 0008 is why such a domain has to exist at all: a block's opacity and
+//! its light emission are constants in Java code, in no report and no data
+//! pack, and an oracle reflecting into the jar is the only source for them that
+//! is not an invention.
 
 mod blocks;
 mod codegen;
@@ -39,6 +51,7 @@ mod entities;
 mod fluids;
 mod items;
 mod loot;
+mod mappings;
 mod numbers;
 mod packets;
 mod recipes;
@@ -94,6 +107,13 @@ pub enum Domain {
     Packets,
     /// Worldgen: the ore baseline in `dust-gen`.
     Worldgen,
+    /// The obfuscated-name table an oracle needs to call into the jar.
+    ///
+    /// The odd one out, and it says so: every other domain reads what the data
+    /// generators *produced*, and this one reads the mappings published beside
+    /// the jar because what it is after was never in a report. Decision record
+    /// 0008 is why there has to be such a domain at all.
+    Mappings,
 }
 
 /// Every domain, in execution order.
@@ -109,6 +129,7 @@ pub const ALL_DOMAINS: &[Domain] = &[
     Domain::Synced,
     Domain::Packets,
     Domain::Worldgen,
+    Domain::Mappings,
 ];
 
 impl Domain {
@@ -126,6 +147,7 @@ impl Domain {
             Self::Synced => "synced",
             Self::Packets => "packets",
             Self::Worldgen => "worldgen",
+            Self::Mappings => "mappings",
         }
     }
 
@@ -382,6 +404,7 @@ pub fn run(options: &Options, workspace_root: &Path) -> Result<(), String> {
             Domain::Worldgen => {
                 worldgen_domain(registries.as_ref().expect("parsed above"), &context)?
             }
+            Domain::Mappings => mappings_domain(&context)?,
         };
         println!("({} in {:.1}s)", outcome, begun.elapsed().as_secs_f64());
         results.push((*domain, begun.elapsed(), outcome));
@@ -777,6 +800,57 @@ fn synced_domain(context: &Context) -> Result<Outcome, String> {
     Ok(format!(
         "{} datapack registries, {total} entries, names only",
         registries.len()
+    ))
+}
+
+/// Resolve the names an oracle needs and write them where the oracle looks.
+///
+/// # Why this writes a file instead of generating Rust
+///
+/// Every other domain ends in `crates/.../generated/`, because what it read is
+/// a fact about the protocol or the format and may be committed. **These names
+/// are Mojang's**, they change wholesale between versions, and they are of no
+/// use to anything but a program running against that exact jar. So they land
+/// in the extract cache beside the jar they describe, behind the same
+/// `.gitignore` line, and the Java side reads them at run time.
+///
+/// That is also what keeps `xtask/oracle/` free of Minecraft identifiers: the
+/// oracle asks for `blockstate.light_emission` and this decides what that is
+/// called today. See decision record 0008.
+fn mappings_domain(context: &Context) -> Result<Outcome, String> {
+    let cache = context.workspace_root.join(CACHE_DIR);
+    let path = download::server_mappings(context.version, &cache)?;
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    let mappings = mappings::Mappings::parse(&text)?;
+    if mappings.is_empty() {
+        // A truncated or comment-only file parses cleanly and names nothing.
+        // Left to `properties` it would report twelve missing entries, which
+        // sends a reader looking for a renamed method in a file that has no
+        // methods in it.
+        return Err(format!(
+            "{} parsed without error and named no classes at all; it is not a \
+             mappings file, or it is a truncated one",
+            path.display()
+        ));
+    }
+    println!("  {} classes mapped", mappings.len());
+
+    let table = mappings::properties(&mappings, mappings::LIGHT_ORACLE)?;
+    let out_dir = cache.join(format!("oracle-{}", context.version));
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("could not create {}: {e}", out_dir.display()))?;
+    let out = out_dir.join("names.properties");
+    std::fs::write(&out, &table).map_err(|e| format!("could not write {}: {e}", out.display()))?;
+    println!("wrote {}", out.display());
+    for line in table.lines().filter(|l| !l.starts_with('#')) {
+        println!("  {line}");
+    }
+
+    Ok(format!(
+        "{} classes, {} name(s) resolved for the light oracle",
+        mappings.len(),
+        mappings::LIGHT_ORACLE.len()
     ))
 }
 
