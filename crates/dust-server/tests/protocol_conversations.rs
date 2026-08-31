@@ -24,7 +24,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dust_server::clock::{Clock, ManualClock};
 use dust_server::engine::TICK_NS;
@@ -429,21 +429,46 @@ impl Joined {
 
     /// Read until `done` is satisfied, or give up and say so.
     ///
-    /// The bounded form of draining. A plain drain stops at the first quiet
-    /// moment, which is a claim about the socket and not about the server; a
+    /// The bounded form of draining, and the one every count in this file
+    /// should be taken after. A plain drain stops at the first quiet moment,
+    /// which is a claim about the socket and not about the server; a
     /// `wait_for` cannot be used when the packet in question may already have
     /// been read by an earlier drain. This waits for a *condition on what has
     /// been seen*, which is the thing the caller actually means.
+    ///
+    /// **The bound is in seconds and not in passes.** It was forty passes, and
+    /// a pass is "read until fifty milliseconds of silence" — so the patience
+    /// was denominated in the server's own gaps, and a server that was merely
+    /// slow ran out of them and reported a shortfall as though the columns had
+    /// never been sent. Thirty seconds is a stall guard and not a timing
+    /// assumption: what these tests wait for arrives in milliseconds on an
+    /// idle machine, and a run that reaches the deadline has a server that
+    /// stopped sending — a failure worth reporting as itself.
     fn drain_until(&mut self, stream: &mut TcpStream, done: impl Fn(&Self) -> bool) -> bool {
-        for _ in 0..40 {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
             if done(self) {
                 return true;
             }
+            if Instant::now() >= deadline {
+                return false;
+            }
             self.drain(stream);
         }
-        done(self)
     }
 
+    /// Read until three quarters of a second of silence.
+    ///
+    /// **For asserting an absence, and nothing else.** Silence means nothing
+    /// has arrived *yet*, and on a slow server "yet" includes "before it got
+    /// round to it" — so every count this file takes after a quiet drain was a
+    /// count of whatever had happened to arrive by then. Three of them failed
+    /// that way under load, one of them on CI. They wait for what they assert
+    /// now, with [`Self::drain_until`].
+    ///
+    /// What is left is the case that has no positive event to wait for: a
+    /// packet that must **not** come. There the passage of quiet time is the
+    /// evidence, and the two remaining callers say which absence they mean.
     fn drain_until_quiet(&mut self, stream: &mut TcpStream) {
         self.read_for(stream, Duration::from_millis(750));
     }
@@ -955,7 +980,20 @@ fn a_player_walking_a_thousand_blocks_is_streamed_the_world_as_they_go() {
             client.drain(&mut stream);
         }
     }
-    client.drain_until_quiet(&mut stream);
+    // Waited for, not listened for. The drains inside the loop stop at the
+    // first fifty-millisecond gap, which says the socket is empty and nothing
+    // at all about whether the server has finished — so the three counts
+    // asserted below are the three counts to wait for. They stay *equalities*
+    // afterwards, which is what still catches a resend as an overshoot.
+    assert!(
+        client.drain_until(&mut stream, |c| c.centres >= 63
+            && c.forgets >= 310
+            && c.chunks >= 25 + 310),
+        "the walk delivered {} recentre(s), {} forget(s) and {} column(s)",
+        client.centres,
+        client.forgets,
+        client.chunks
+    );
 
     // 1000 blocks east from x = 0.5 crosses into column 63, so sixty-two
     // boundaries after the first. Each one is five columns each way.
@@ -1101,8 +1139,11 @@ fn a_broken_block_and_a_walked_to_position_both_survive_a_restart() {
         // that the *chunk* arrived with the edit in it — checked below by the
         // column count, since an edited column is built rather than templated
         // and both paths have to produce a chunk.
-        client.drain_until_quiet(&mut stream);
-        assert!(client.chunks >= 25, "the world arrived");
+        assert!(
+            client.drain_until(&mut stream, |c| c.chunks >= 25),
+            "the world arrived: {} of the twenty-five columns",
+            client.chunks
+        );
 
         drop(stream);
         running.finish();
@@ -1448,7 +1489,11 @@ fn a_world_minecraft_generated_is_served_to_a_client() {
     let mut interesting = 0usize;
     let mut stream2 = connect(addr);
     let mut second = join_as(&mut stream2, addr, "Reader");
-    second.drain_until_quiet(&mut stream2);
+    assert!(
+        second.drain_until(&mut stream2, |c| c.chunks >= 25),
+        "the second client was sent {} of the twenty-five columns",
+        second.chunks
+    );
     for body in &second.chunk_bodies {
         interesting += mixed_sections(body);
     }
@@ -1953,7 +1998,13 @@ fn a_player_already_crouching_is_crouching_to_whoever_arrives_next() {
     // Only now does the third player arrive.
     let mut watcher_stream = connect(addr);
     let mut watcher = join_as(&mut watcher_stream, addr, "Watcher");
-    watcher.drain_until_quiet(&mut watcher_stream);
+    assert!(
+        watcher.drain_until(&mut watcher_stream, |w| w.spawned_entities >= 2
+            && w.postures >= 1),
+        "the watcher was told about {} player(s) and {} posture(s)",
+        watcher.spawned_entities,
+        watcher.postures
+    );
 
     assert_eq!(watcher.spawned_entities, 2, "the observer and the sneaker");
     assert_eq!(
@@ -2018,7 +2069,11 @@ fn a_render_distance_lowered_mid_game_forgets_what_fell_outside_it() {
     let addr = running.addr;
     let mut stream = connect(addr);
     let mut joined = join_asking_for_view_distance(&mut stream, addr, "Shrinking", 4);
-    joined.drain_until_quiet(&mut stream);
+    assert!(
+        joined.drain_until(&mut stream, |j| j.chunks >= 81),
+        "only {} of the eighty-one columns arrived",
+        joined.chunks
+    );
     assert_eq!(joined.chunks, 81, "nine by nine to begin with");
     let forgotten_before = joined.forgets;
 
@@ -2044,9 +2099,8 @@ fn a_render_distance_lowered_mid_game_forgets_what_fell_outside_it() {
     walk.push(1);
     send_compressed_frame(&mut stream, 26, &walk);
 
-    joined.drain_until_quiet(&mut stream);
     assert!(
-        joined.forgets - forgotten_before >= 72,
+        joined.drain_until(&mut stream, |j| j.forgets - forgotten_before >= 72),
         "eighty-one columns down to nine is seventy-two forgotten; saw {}",
         joined.forgets - forgotten_before
     );
