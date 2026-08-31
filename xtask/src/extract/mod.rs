@@ -951,6 +951,7 @@ fn constants_domain(context: &Context) -> Result<Outcome, String> {
         .collect::<Vec<_>>()
         .join(":");
     let out = cache.join(format!("oracle-{}/constants.tsv", context.version));
+    let items = cache.join(format!("oracle-{}/items.tsv", context.version));
     println!(
         "asking Minecraft what every block state does to light, to a heightmap, and sounds like"
     );
@@ -962,6 +963,7 @@ fn constants_domain(context: &Context) -> Result<Outcome, String> {
             "dustoracle.BlockOracle".to_owned(),
             names.display().to_string(),
             out.display().to_string(),
+            items.display().to_string(),
         ],
         "running the block oracle",
     )?;
@@ -1015,15 +1017,51 @@ fn constants_domain(context: &Context) -> Result<Outcome, String> {
             out.parent().unwrap_or(&out).display()
         ));
     }
+    // The second table: which block each item puts down. Read from the same
+    // file and the same jar, in the same run, because it is the same kind of
+    // value — `BlockItem.block` is Java, in no report and no data pack.
+    let placements = std::fs::read_to_string(&items)
+        .map_err(|e| format!("could not read {}: {e}", items.display()))?;
+    let placement = PlacementSummary::of(&placements);
+    println!("wrote {}", items.display());
+    println!(
+        "  {} item(s), {} of which place a block",
+        placement.items, placement.placing
+    );
+    // Named, not counted, and this is the line worth reading twice: an item
+    // that places a block of another name is where a server matching names
+    // instead of reading this table would be wrong, and it is a short enough
+    // list to print in full.
+    if !placement.renamed.is_empty() {
+        println!(
+            "  {} of them place a block of another name:",
+            placement.renamed.len()
+        );
+        for (item, block) in &placement.renamed {
+            println!("    {item} -> {block}");
+        }
+    }
+    if placement.placing == 0 {
+        return Err(format!(
+            "{} has no item placing any block, which no version of Minecraft \
+             does; `blockitem.block` resolved to the wrong member. Check \
+             {}/names.properties against this version's mappings.",
+            items.display(),
+            items.parent().unwrap_or(&items).display()
+        ));
+    }
+
     // The route, printed where somebody who just ran this is looking. The
-    // table is read from `[data] path` — decision record 0008 chose that over a
-    // new `dust` subcommand, a JDK on the server's boot path and a second
-    // release artefact — and a copy is what puts it there. One line, so that
-    // "how do I use this" is answered at the moment the question occurs rather
-    // than in a document somewhere.
+    // tables are read from `[data] path` — decision record 0008 chose that over
+    // a new `dust` subcommand, a JDK on the server's boot path and a second
+    // release artefact — and a copy is what puts them there. Printed here so
+    // that "how do I use this" is answered at the moment the question occurs
+    // rather than in a document somewhere.
     println!();
-    println!("  to serve a world lit the way Minecraft lights it, copy it beside your data:");
+    println!("  to light a world the way Minecraft lights it and place the blocks");
+    println!("  Minecraft places, copy both beside your data:");
     println!("    cp {} <[data] path>/dust-constants.tsv", out.display());
+    println!("    cp {} <[data] path>/dust-items.tsv", items.display());
 
     // Every light level Minecraft has is 0..=15, so a value outside that did
     // not come from the field or method this asked for — it came from a
@@ -1039,10 +1077,65 @@ fn constants_domain(context: &Context) -> Result<Outcome, String> {
     }
 
     Ok(format!(
-        "{rows} block states: light, occlusion, {} heightmap(s) and {} sound group(s)",
+        "{rows} block states: light, occlusion, {} heightmap(s) and {} sound group(s); \
+         {} item(s), {} placing",
         summary.heightmaps.len(),
-        summary.sounds.len()
+        summary.sounds.len(),
+        placement.items,
+        placement.placing
     ))
+}
+
+/// What an item-to-block table says, for a human reading a run of the oracle.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PlacementSummary {
+    /// How many rows the table has.
+    items: usize,
+    /// How many of them place a block.
+    placing: usize,
+    /// The ones that place a block of a *different* name, item then block.
+    ///
+    /// Kept because they are the whole reason this is a table: a server that
+    /// matched item names against block names would be right about every other
+    /// row and wrong about these, and a count would not say which.
+    renamed: Vec<(String, String)>,
+}
+
+impl PlacementSummary {
+    fn of(table: &str) -> Self {
+        let mut summary = Self::default();
+        let header: Vec<&str> = table
+            .lines()
+            .find(|line| line.starts_with('#'))
+            .map(|line| {
+                line.trim_start_matches('#')
+                    .split('\t')
+                    .map(str::trim)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let named = |wanted: &str| header.iter().position(|name| *name == wanted);
+        let (Some(item), Some(places)) = (named("item"), named("places")) else {
+            return summary;
+        };
+        for line in table.lines().filter(|l| !l.starts_with('#')) {
+            let fields: Vec<&str> = line.split('\t').collect();
+            let (Some(item), Some(places)) = (fields.get(item), fields.get(places)) else {
+                continue;
+            };
+            summary.items += 1;
+            if *places == "-" {
+                continue;
+            }
+            summary.placing += 1;
+            if item != places {
+                summary
+                    .renamed
+                    .push(((*item).to_owned(), (*places).to_owned()));
+            }
+        }
+        summary
+    }
 }
 
 /// The distributions in an extracted constants table.

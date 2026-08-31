@@ -391,6 +391,54 @@ pub const LIGHT_ORACLE: &[Wanted<'static>] = &[
         method: "getLocation",
         parameters: &[],
     },
+    // Which block an item puts down. `BlockItem` holds it in a field and the
+    // accessor is not in the mappings at all, so the field is what there is —
+    // which is the case `lightEmission` already made the argument for.
+    //
+    // The two built-in registries beside it are how an item is numbered and how
+    // a block is named. Both are reached through `Registry`'s own interface
+    // rather than through the concrete `DefaultedRegistry`, because the two
+    // fields are declared as different types and one lookup that works for both
+    // is one place for it to be wrong.
+    Wanted::Class {
+        key: "blockitem.class",
+        class: BLOCK_ITEM,
+    },
+    Wanted::Field {
+        key: "blockitem.block",
+        class: BLOCK_ITEM,
+        field: "block",
+    },
+    Wanted::Class {
+        key: "builtin_registries.class",
+        class: BUILT_IN_REGISTRIES,
+    },
+    Wanted::Field {
+        key: "builtin_registries.item",
+        class: BUILT_IN_REGISTRIES,
+        field: "ITEM",
+    },
+    Wanted::Field {
+        key: "builtin_registries.block",
+        class: BUILT_IN_REGISTRIES,
+        field: "BLOCK",
+    },
+    Wanted::Class {
+        key: "registry.class",
+        class: REGISTRY,
+    },
+    Wanted::Method {
+        key: "registry.get_id",
+        class: REGISTRY,
+        method: "getId",
+        parameters: &["java.lang.Object"],
+    },
+    Wanted::Method {
+        key: "registry.get_key",
+        class: REGISTRY,
+        method: "getKey",
+        parameters: &["java.lang.Object"],
+    },
 ];
 
 const BLOCK_STATE_BASE: &str =
@@ -403,6 +451,9 @@ const SHARED_CONSTANTS: &str = "net.minecraft.SharedConstants";
 const HEIGHTMAP_TYPES: &str = "net.minecraft.world.level.levelgen.Heightmap$Types";
 const SOUND_TYPE: &str = "net.minecraft.world.level.block.SoundType";
 const SOUND_EVENT: &str = "net.minecraft.sounds.SoundEvent";
+const BLOCK_ITEM: &str = "net.minecraft.world.item.BlockItem";
+const BUILT_IN_REGISTRIES: &str = "net.minecraft.core.registries.BuiltInRegistries";
+const REGISTRY: &str = "net.minecraft.core.Registry";
 
 /// Resolve a list of wanted names into a properties file for the Java side.
 ///

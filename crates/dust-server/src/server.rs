@@ -861,6 +861,38 @@ impl Server {
                 ),
             ),
         }
+        // The second table beside the same data: which block each item places.
+        // Read here rather than at the first right-click, for the reason the
+        // one above is: a mistake in a file the operator wrote should stop a
+        // server starting.
+        let item_blocks = match data_path.as_deref() {
+            None => None,
+            Some(path) => crate::registries::constants::items_beside(path)
+                .map_err(|e| fail(format!("{e}")))?,
+        };
+        match &item_blocks {
+            Some(table) => self.options.logger.info(
+                "dust::data",
+                format!(
+                    "item placements: {} item(s), {} of which place a block",
+                    table.len(),
+                    table.placing()
+                ),
+            ),
+            // Information and said once, like the light table's. The
+            // consequence is one sentence and it is a visible one, so it is
+            // spelled out rather than left as "some feature is off".
+            None => self.options.logger.info(
+                "dust::data",
+                format!(
+                    "no {} under [data] path, so a right-click places the world's \
+                     own surface block whatever the player is holding",
+                    crate::registries::constants::ITEMS_FILE
+                ),
+            ),
+        }
+        let item_blocks = item_blocks.map(std::sync::Arc::new);
+
         let opacity = crate::net::world::opacity_of(palette.air, constants.as_ref());
         // Shared rather than moved: the world lights and heightmaps with this
         // table, and a session reads the sound a placed block makes out of the
@@ -1026,6 +1058,7 @@ impl Server {
             })?,
             counters: std::sync::Arc::clone(&counters),
             constants,
+            item_blocks,
             registry_contents,
         });
 

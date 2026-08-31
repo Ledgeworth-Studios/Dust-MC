@@ -26,10 +26,11 @@
 //!   live there and not here; see decision record 0007.
 //!
 //! And one file that is not about registry contents at all but is about the
-//! same directory: [`light`], which reads the block-state light table an
-//! operator drops in beside `minecraft/`. It is here because `[data] path` is
-//! what this module owns, and a second reader of one setting in a second place
-//! is how two answers to one question start.
+//! same directory: [`constants`], which reads the two tables an operator drops
+//! in beside `minecraft/` — what every block state does to light and what every
+//! item places. It is here because `[data] path` is what this module owns, and
+//! a second reader of one setting in a second place is how two answers to one
+//! question start.
 
 pub mod constants;
 pub mod convert;

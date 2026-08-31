@@ -47,6 +47,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use super::configure::{configure, Configured};
 use super::edits::{Edit, Player, SharedWorld};
 use super::finish;
+use super::hotbar::Hotbar;
 use super::play as play_mod;
 use super::status::StatusPolicy;
 use super::view::{self, View};
@@ -140,6 +141,15 @@ pub struct SessionContext {
     /// is the ordinary state of a server without a `[data] path`, and it means
     /// a placement is silent rather than guessed at.
     pub constants: Option<Arc<dust_registry::BlockConstants>>,
+    /// Which block each item puts down, if the operator put a table beside
+    /// their data.
+    ///
+    /// `None` is a server where a right-click puts down
+    /// [`PlaceableBlocks::placeable`] whatever the player is holding — which is
+    /// what every server did before this existed, and is a refusal to guess
+    /// rather than a gap: matching item names to block names is right about
+    /// nine hundred items and wrong about sixteen.
+    pub item_blocks: Option<Arc<dust_registry::ItemBlocks>>,
     /// The contents of the registries Dust can serve, read at boot from
     /// `[data] path`.
     ///
@@ -778,6 +788,11 @@ where
         .expect("the position map is never poisoned")
         .insert(profile_id, position);
 
+    // What this player is holding. Empty on join and filled by the client:
+    // there is no saved inventory, so a player who relogs is holding nothing
+    // until they pick something out of the creative menu again.
+    let mut hotbar = Hotbar::default();
+
     let mut next_id: i64 = 1;
     // `interval`'s first tick fires immediately, and that is kept rather than
     // skipped: one keep-alive right after the chunks proves the round trip
@@ -1162,12 +1177,12 @@ where
                     // in the clicked cell would replace the ground instead.
                     Ok(play::serverbound::Packet::UseItemOnBlock(use_on)) => {
                         let target = offset(use_on.hit.location, use_on.hit.face);
-                        // There is no inventory, so there is nothing to place
-                        // but the world's own surface block. Stated rather
-                        // than dressed up: what a player is holding is not
-                        // knowable here yet.
-                        ctx.world
-                            .place_block(target, ctx.blocks.placeable, me.entity_id);
+                        let state = held_block(
+                            ctx.item_blocks.as_deref(),
+                            hotbar.held(),
+                            ctx.blocks.placeable,
+                        );
+                        ctx.world.place_block(target, state, me.entity_id);
                         send_play(
                             conn,
                             play::clientbound::BlockChangedAck {
@@ -1176,6 +1191,20 @@ where
                             ctx.version,
                         )
                         .await?;
+                    }
+                    // Which hotbar slot is in hand. It changes no block and
+                    // no position, so nothing goes out — but the next
+                    // right-click is a different block because of it.
+                    Ok(play::serverbound::Packet::SetCarriedItem(carried)) => {
+                        hotbar.select(carried.slot);
+                    }
+                    // A creative client writing a slot directly, which is the
+                    // one inventory write that needs no container open — and
+                    // the only one this server understands. Every player here
+                    // is in creative, so it is also the only way anything ever
+                    // gets into a hand.
+                    Ok(play::serverbound::Packet::SetCreativeModeSlot(set)) => {
+                        hotbar.set(set.slot, &set.item);
                     }
                     Ok(_) => {}
                     // A packet this server has no definition for is not a
@@ -1213,6 +1242,29 @@ where
     // all here would put the same stall back that the join just lost — the
     // loop's own ticker takes the rest.
     stream_up_to(conn, ctx, view, view::column_of(x, z), STREAM_BATCH).await
+}
+
+/// The block state a right-click puts down.
+///
+/// The held item's block, in its **default** state — a stair placed this way
+/// faces north whichever way the player was standing, because the state a real
+/// placement computes needs a context nothing here has. That is a gap in
+/// placement rules and not in this lookup, and it lives with the rest of them.
+///
+/// Falls back to [`PlaceableBlocks::placeable`] when there is nothing to look
+/// up with: no table beside the data, an empty hand, or an item that places no
+/// block. All three used to be the only case, and the fallback is what keeps a
+/// server with no `[data] path` behaving the way it always has rather than
+/// refusing right-clicks.
+fn held_block(
+    table: Option<&dust_registry::ItemBlocks>,
+    held: Option<dust_registry::Item>,
+    fallback: u32,
+) -> u32 {
+    table
+        .zip(held)
+        .and_then(|(table, item)| table.places(item))
+        .map_or(fallback, |block| block.default_state().id())
 }
 
 /// The block one step off `face` from `location`.
@@ -1391,5 +1443,100 @@ where
                 return finish(conn, Served::Status { pinged: true }).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dust_registry::{Block, Item, ItemBlocks};
+
+    /// A table where every item places the block of its own name if there is
+    /// one, plus the one row that says a table is not a name match.
+    ///
+    /// Not Minecraft's answers — none of those are in this repository, which is
+    /// decision record 0008. What it can carry is the *shape* of the case:
+    /// `minecraft:wheat_seeds` placing something other than a block called
+    /// `minecraft:wheat_seeds`.
+    fn table() -> ItemBlocks {
+        let mut text = String::from("# item_id\titem\tplaces\n");
+        for item in Item::all() {
+            let places = if item.name() == "minecraft:wheat_seeds" {
+                "minecraft:wheat"
+            } else {
+                Block::from_name(item.name()).map_or("-", Block::name)
+            };
+            text.push_str(&format!(
+                "{}\t{}\t{places}\n",
+                item.protocol_id(),
+                item.name()
+            ));
+        }
+        ItemBlocks::parse(&text).expect("a complete table")
+    }
+
+    fn item(name: &str) -> Item {
+        Item::from_name(name).expect("this build has that item")
+    }
+
+    /// A state id no block has, so a test that got the fallback back can say so
+    /// rather than matching some real block by accident.
+    const FALLBACK: u32 = u32::MAX;
+
+    #[test]
+    fn a_held_block_item_places_its_own_block() {
+        let table = table();
+        let expected = Block::from_name("minecraft:cobblestone")
+            .expect("this build has cobblestone")
+            .default_state()
+            .id();
+        assert_eq!(
+            held_block(Some(&table), Some(item("minecraft:cobblestone")), FALLBACK),
+            expected
+        );
+    }
+
+    #[test]
+    fn an_item_whose_block_has_another_name_places_that_block() {
+        // The row the table exists for. A server matching item names against
+        // block names would look for a block called `minecraft:wheat_seeds`,
+        // find none, and fall back — silently placing the wrong thing.
+        let table = table();
+        let wheat = Block::from_name("minecraft:wheat")
+            .expect("this build has wheat")
+            .default_state()
+            .id();
+        assert_eq!(
+            held_block(Some(&table), Some(item("minecraft:wheat_seeds")), FALLBACK),
+            wheat
+        );
+        assert_ne!(wheat, FALLBACK, "and it is not the fallback wearing a hat");
+    }
+
+    #[test]
+    fn an_empty_hand_and_an_item_that_places_nothing_both_fall_back() {
+        let table = table();
+        assert_eq!(held_block(Some(&table), None, FALLBACK), FALLBACK);
+        assert_eq!(
+            held_block(
+                Some(&table),
+                Some(item("minecraft:diamond_sword")),
+                FALLBACK
+            ),
+            FALLBACK,
+            "a sword places nothing, and nothing is the fallback and not air"
+        );
+    }
+
+    #[test]
+    fn a_server_with_no_table_places_what_it_always_did() {
+        // Every server did this before the table existed, and one whose
+        // operator has not copied the file still does. It is the fallback and
+        // not a refusal: a right-click that did nothing would read as a
+        // dropped packet.
+        assert_eq!(
+            held_block(None, Some(item("minecraft:cobblestone")), FALLBACK),
+            FALLBACK
+        );
     }
 }

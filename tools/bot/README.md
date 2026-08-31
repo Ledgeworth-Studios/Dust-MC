@@ -30,6 +30,12 @@ that a client acknowledging no data packs can be served at all. Without that
 path the server refuses the connection and says so, which the check reports as
 a failure rather than as a crash.
 
+**Put both of the oracle's tables in that directory**, or the last five checks
+fail for a reason that is not a defect: without `dust-constants.tsv` a placed
+block makes no sound, and without `dust-items.tsv` every placement is the
+world's own surface block. `cargo xtask extract --only constants` prints the two
+`cp` lines.
+
 **Serve a real world from a release build.** Every check that involves a
 *second* bot has a deadline, and a debug build streaming a real Minecraft world
 misses them: pointed at seed 1's ocean spawn, `cargo build`'s binary fails five
@@ -99,7 +105,22 @@ it is right.**
      origin: legal, decodable, and audible only as "that sounded far away".
 
    The bot writes `block_place` by hand rather than through `bot.placeBlock`,
-   which wants a held item this server has no inventory to hold.
+   which wants a held item mineflayer can only get from an inventory this
+   server does not keep.
+10. **What the second bot was holding is what went into the world.** It writes
+    `set_creative_slot` and `held_item_slot` — the two packets a creative client
+    uses, and the only inventory writes this server understands — and the first
+    bot reads back the block that landed. Two items, for two different failures:
+    - **cobblestone**, the ordinary case, which fails if the held item never
+      reaches the server or is looked up in the wrong table;
+    - **wheat seeds**, which place `minecraft:wheat`. That row is the one that
+      says the server read a table rather than matching item names against
+      block names — a rule that is right about nine hundred items and wrong
+      about sixteen, and `minecraft:wheat` the *item* places nothing at all.
+
+    Each cell is broken before it is placed into, because this server keeps its
+    edits across a restart and a placement into a cell that already holds that
+    block is correctly silent.
 
 ## The long one
 
