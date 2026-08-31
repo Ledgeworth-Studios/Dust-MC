@@ -101,6 +101,12 @@ pub struct SessionContext {
     /// on disk, and re-reading it on every connection would make a join depend
     /// on a file read that can fail.
     pub world_spawn: Option<super::level::WorldSpawn>,
+    /// How far a player may reach to break or place a block.
+    ///
+    /// The check itself is `dust_guard`'s, and it lives there rather than here
+    /// for the reason that crate's own documentation gives: a rule that can
+    /// only be run from inside a session can only be tested by running one.
+    pub reach: dust_guard::Reach,
     /// The furthest this server will stream, in columns.
     ///
     /// A ceiling and not the answer: a client asks for a distance of its own
@@ -1149,7 +1155,9 @@ where
                     // that actually happens.
                     Ok(play::serverbound::Packet::PlayerAction(action)) => {
                         use play::serverbound::PlayerActionKind::{FinishDigging, StartDigging};
-                        if matches!(action.status, StartDigging | FinishDigging) {
+                        if matches!(action.status, StartDigging | FinishDigging)
+                            && within_reach(ctx, position, action.location)
+                        {
                             // Through `break_block` and not `set_block`: the
                             // other players are shown the block breaking, and
                             // the particles and the sound come from what was
@@ -1180,12 +1188,20 @@ where
                             hotbar.held(),
                             ctx.blocks.placeable,
                         );
+                        // Reach is checked against the block that was
+                        // *clicked* and not the one the placement lands in.
+                        // They differ by a block, and the clicked one is the
+                        // one the player actually touched — checking the target
+                        // would refuse a legitimate click at the edge of range
+                        // and allow one aimed back towards the player from just
+                        // outside it.
                         let target = placement(
                             &ctx.world,
                             ctx.constants.as_deref(),
                             use_on.hit.location,
                             use_on.hit.face,
-                        );
+                        )
+                        .filter(|_| within_reach(ctx, position, use_on.hit.location));
                         if let Some(target) = target {
                             ctx.world.place_block(target, state, me.entity_id);
                         }
@@ -1271,6 +1287,28 @@ fn held_block(
         .zip(held)
         .and_then(|(table, item)| table.places(item))
         .map_or(fallback, |block| block.default_state().id())
+}
+
+/// Whether a player at `feet` may act on the block at `location`.
+///
+/// The position is the one their last movement packet claimed, which this
+/// server trusts as sent — so this refuses acting far from a position the
+/// player is honestly at, and not a client that lies about where it is. That
+/// is the cheat the README names: breaking bedrock from across the map.
+///
+/// The eye height is a standing player's. Dust does not track a pose, so a
+/// crouching player is measured 0.35 too high; `[server] interaction_range`'s
+/// default carries half a block of slack for exactly that, and its own
+/// documentation says so.
+fn within_reach(
+    ctx: &SessionContext,
+    feet: (f64, f64, f64),
+    location: dust_protocol::types::Position,
+) -> bool {
+    ctx.reach.allows(
+        dust_guard::eye_of(feet),
+        (location.x, location.y, location.z),
+    )
 }
 
 /// Where a right-click on `face` of `clicked` actually puts a block, if

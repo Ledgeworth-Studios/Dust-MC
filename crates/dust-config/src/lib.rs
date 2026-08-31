@@ -390,6 +390,31 @@ mod tests {
     }
 
     #[test]
+    fn a_reach_that_would_refuse_ordinary_play_is_named_as_an_error() {
+        // Under 1.63 a player cannot break the ground they are standing on,
+        // and under 5 they lose reach a vanilla client legitimately has. The
+        // bound is the second of those, because the first is already inside it
+        // and a setting that fails only at the useless end is one that lets
+        // somebody ship a nearly-useless value.
+        for bad in ["0.0", "1.5", "4.9", "nan"] {
+            let err = DustConfig::from_toml_and_env(
+                &format!("[server]\ninteraction_range = {bad}\n"),
+                "test",
+                [],
+            )
+            .expect_err("a reach that refuses ordinary play is a configuration error");
+            assert!(
+                err.to_string().contains("interaction_range"),
+                "{bad}: {err}"
+            );
+        }
+        // And the default is not near the bound it just refused: 6.0 leaves a
+        // player their full vanilla reach with half a block over.
+        let config = DustConfig::from_toml_and_env("", "test", []).expect("the defaults load");
+        assert!(config.server.interaction_range >= 5.5);
+    }
+
+    #[test]
     fn a_zero_shutdown_timeout_is_named_as_an_error() {
         let err =
             DustConfig::from_toml_and_env("[server]\nshutdown_timeout_secs = 0\n", "test", [])

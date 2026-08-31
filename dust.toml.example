@@ -21,6 +21,15 @@ online_mode = true
 # asks for more gets this.
 view_distance = 10
 
+# How far a player may reach to break or place a block, in blocks, measured
+# from their eyes to the nearest point of the block. Past it the server ignores
+# what they did. A vanilla client reaches 4.5 and vanilla's server refuses past
+# 5.5; the extra half block here covers a crouching player's lower eyes and a
+# position packet a tick behind the click that followed it. Raise it for a
+# modded client that reaches further. Below 5 it starts refusing ordinary play,
+# and the server refuses to start rather than let you find that out in game.
+interaction_range = 6.0
+
 # After a stall (a slow disk, a paused laptop) the tick loop repays at most
 # this many ticks per pass and skips past anything longer. Twenty is one
 # second of game time: shorter stalls catch up smoothly, longer ones are

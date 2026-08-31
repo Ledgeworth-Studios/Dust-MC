@@ -128,6 +128,13 @@ it is right.**
     world — a player could hollow a wall out from the outside without breaking
     anything. Watched to fail: with the rule taken out the check reports
     `dirt -> wheat, and a sound was heard`.
+12. **A player cannot break or place fifty blocks away.** Both verbs, because
+    they are two packets down two paths and a check covering one would pass
+    while the other stayed open. The block is read from the first bot before
+    and after, so what is checked is what reached the world rather than what
+    either client believes. Watched to fail: with
+    `interaction_range = 5000.0` in the server's `dust.toml` it reports
+    `grass_block -> wheat`.
 
 ## The long one
 

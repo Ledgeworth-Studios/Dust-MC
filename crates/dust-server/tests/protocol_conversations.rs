@@ -1035,7 +1035,7 @@ fn a_block_one_player_breaks_is_announced_to_another() {
     // packs a position — 26 bits of x, 26 of z, 12 of y, in that order — by
     // hand, because a helper shared with the server would agree with it about
     // a layout neither of them checked.
-    let (x, y, z) = (3i64, -60i64, 5i64);
+    let (x, y, z) = within_reach_of_spawn(3, -60, 5);
     let packed = ((x & 0x3ff_ffff) << 38) | ((z & 0x3ff_ffff) << 12) | (y & 0xfff);
 
     let mut body = packed.to_be_bytes().to_vec();
@@ -1072,7 +1072,7 @@ fn a_broken_block_and_a_walked_to_position_both_survive_a_restart() {
         ICON_SEQ.fetch_add(1, Ordering::SeqCst)
     ));
 
-    let (x, y, z) = (3i64, -60i64, 5i64);
+    let (x, y, z) = within_reach_of_spawn(3, -60, 5);
     let packed = ((x & 0x3ff_ffff) << 38) | ((z & 0x3ff_ffff) << 12) | (y & 0xfff);
     // Far enough to be a different column, so the position is not
     // accidentally right by being the spawn one.
@@ -1327,7 +1327,7 @@ fn everything_still_works_with_the_jvm_switched_off() {
     );
 
     // Breaking a block, which is world state changing.
-    let (x, y, z) = (2i64, -60i64, 2i64);
+    let (x, y, z) = within_reach_of_spawn(2, -60, 2);
     let packed = ((x & 0x3ff_ffff) << 38) | ((z & 0x3ff_ffff) << 12) | (y & 0xfff);
     let mut body = packed.to_be_bytes().to_vec();
     body.insert(0, 0);
@@ -1886,6 +1886,40 @@ fn a_swing_and_a_crouch_reach_the_other_player() {
     running.finish();
 }
 
+/// A block position, checked to be one a player standing at the spawn may
+/// actually reach.
+///
+/// The server refuses a dig or a place beyond `[server] interaction_range`, and
+/// a test that aimed further used to pass and now fails with "the watcher is
+/// told the block changed" — which names the packet it waited for and says
+/// nothing about why it never came. This asserts the real constraint at the
+/// place the coordinates are written, so the failure names the cause.
+///
+/// The same arithmetic `dust_guard::Reach` makes, deliberately written out
+/// again rather than called: a test that used the checker to decide what the
+/// checker should allow would agree with it under any rule, including a wrong
+/// one.
+fn within_reach_of_spawn(x: i64, y: i64, z: i64) -> (i64, i64, i64) {
+    let (ex, ey, ez) = (
+        dust_server::net::world::SPAWN.0,
+        dust_server::net::world::SPAWN.1 + 1.62,
+        dust_server::net::world::SPAWN.2,
+    );
+    let gap = |eye: f64, low: i64| {
+        let low = low as f64;
+        (low - eye).max(eye - (low + 1.0)).max(0.0)
+    };
+    let (dx, dy, dz) = (gap(ex, x), gap(ey, y), gap(ez, z));
+    let distance = (dx * dx + dy * dy + dz * dz).sqrt();
+    let limit = dust_config::DustConfig::default().server.interaction_range;
+    assert!(
+        distance < limit,
+        "({x}, {y}, {z}) is {distance:.2} blocks from the spawn and the server \
+         refuses past {limit}; pick a block a player could actually touch"
+    );
+    (x, y, z)
+}
+
 /// `write_var_int` with the arguments the other way round, because every call
 /// beside it reads `(buffer, value)` and one that reads `(value, buffer)` is a
 /// bug waiting for somebody in a hurry.
@@ -1914,9 +1948,14 @@ fn a_block_one_player_breaks_is_seen_breaking_by_another() {
     let mut breaker_stream = connect(addr);
     let mut breaker = join_as(&mut breaker_stream, addr, "Breaker");
 
-    // The surface block at the spawn column, packed the way the protocol packs
-    // a position, by hand for the same reason the test above does it by hand.
-    let (x, y, z) = (7i64, -60i64, 9i64);
+    // The surface block under the spawn, packed the way the protocol packs a
+    // position, by hand for the same reason the test above does it by hand.
+    //
+    // It used to be (7, -60, 9) — eleven blocks away, which no player can
+    // reach and which the server now refuses. Every coordinate here goes
+    // through `within_reach_of_spawn` so that the next one to drift out is a
+    // named failure rather than a packet that never arrives.
+    let (x, y, z) = within_reach_of_spawn(0, -60, 0);
     let packed = ((x & 0x3ff_ffff) << 38) | ((z & 0x3ff_ffff) << 12) | (y & 0xfff);
     let mut body = packed.to_be_bytes().to_vec();
     body.insert(0, 0); // status: start digging

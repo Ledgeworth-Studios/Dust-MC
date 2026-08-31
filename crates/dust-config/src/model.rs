@@ -71,6 +71,17 @@ pub struct ServerConfig {
     #[config(restart)]
     pub view_distance: u32,
 
+    /// How far, in blocks, a player may break or place a block from — measured
+    /// from their eyes to the nearest point of the block, not to its centre.
+    /// Beyond it the server ignores the action. Vanilla's own client reaches
+    /// 4.5 blocks and its server refuses past 5.5, so anything at or under 5.5
+    /// is a request an honest client can make; the extra half block here covers
+    /// a crouching player's lower eyes and a position a tick behind the one
+    /// they acted from. Raise it for a modded client that reaches further;
+    /// lowering it below about 5 starts refusing ordinary play.
+    #[config(restart)]
+    pub interaction_range: f64,
+
     /// The lowest severity the server logs: one of `error`, `warn`, `info`,
     /// `debug`, `trace`. Everything less severe than the chosen level is
     /// suppressed.
@@ -117,6 +128,15 @@ impl Default for ServerConfig {
             // vanilla's number the right default now and made it the wrong one
             // before.
             view_distance: 10,
+            // 5.5 is what vanilla's server refuses past — 4.5 of client reach
+            // plus the 1.0 of slack it adds before checking. The extra half
+            // block is Dust's own and is there because Dust does not track a
+            // player's pose: a crouching player's eyes are 0.35 lower than the
+            // 1.62 this measures from, and a position packet may be a tick
+            // behind the click that followed it. Half a block covers both with
+            // room over, and what it costs is that a cheat reaching 5.9 blocks
+            // is not caught — which is not the cheat this exists to stop.
+            interaction_range: 6.0,
             log_level: LogLevel::default(),
             world_source: String::new(),
             favicon: String::new(),
@@ -149,6 +169,17 @@ impl ServerConfig {
             findings.push(Finding::error(
                 format!("{path}.view_distance"),
                 "must be at least 1; at 0 a player is sent the column they are                  standing in and nothing else, and the world ends at the chunk                  border",
+            ));
+        }
+        // The floor is where the setting starts refusing ordinary play rather
+        // than cheating, and it is not a taste either: a standing player's eyes
+        // are 1.62 above their feet, so under 1.63 they cannot break the ground
+        // they are standing on. Five is the first whole number that leaves a
+        // player their full vanilla reach in every direction.
+        if !self.interaction_range.is_finite() || self.interaction_range < 5.0 {
+            findings.push(Finding::error(
+                format!("{path}.interaction_range"),
+                "must be a number of at least 5; below that the server starts                  refusing blocks a player can legitimately reach, and at 1.62                  or less they cannot break the ground under their own feet",
             ));
         }
         // A ceiling rather than a taste. 32 is vanilla's own maximum and 65x65

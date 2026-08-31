@@ -90,9 +90,16 @@ What exists either way is the whole path from the socket to the block table —
 framing, compression, encryption, the four connection states, the paletted
 section codec, the chunk packet, the light engine.
 
+A player only reaches as far as their arms: breaking and placing are refused
+past `[server] interaction_range`, measured from the eye to the nearest point of
+the block, and the check lives in `dust-guard` rather than in the session
+because a rule that can only be run from inside a session can only be tested by
+running one.
+
 **Not yet**, and each of these is stated where the code for it would go: no
-physics, block updates, drops, tool checks or reach validation, so a player may
-break bedrock from across the map; no inventory beyond the nine hotbar slots a
+physics, block updates, drops or tool checks, and nothing that validates
+*movement*, so the position a reach is measured from is whatever the client
+last claimed; no inventory beyond the nine hotbar slots a
 creative client writes, so nothing is stored and nothing is carried between
 sessions; no placement *context*, so a block goes down in its default state
 rather than facing the way the player stood, and eight layers of snow are
@@ -245,8 +252,9 @@ with this project, which is why it finds what a test suite agrees with itself
 about. `tools/bot/check.js` joins, checks that the dimension it was told about
 is the one it is in, that it has all sixty-four biomes, that it can read a
 block, that a second bot's chat line arrives with the sender's name on it, and
-that its swing, crouch, block-break and block-place all reach the first —
-sixteen checks, exit 0 or 1. `tools/bot/README.md` has the list and what it has
+that its swing, crouch, block-break and block-place all reach the first, and
+that a block fifty blocks away reaches nothing —
+seventeen checks, exit 0 or 1. `tools/bot/README.md` has the list and what it has
 caught.
 
 `just soak <port> <minutes>` is the long version, and a different question:

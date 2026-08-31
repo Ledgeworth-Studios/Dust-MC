@@ -731,6 +731,7 @@ impl Server {
         let world_source = config.server.world_source.clone();
         let online_mode = config.server.online_mode;
         let view_distance = config.server.view_distance;
+        let reach = dust_guard::Reach::new(config.server.interaction_range);
         let data_path = config.data.path.clone();
 
         let fail = |message: String| -> ServerError {
@@ -1055,6 +1056,7 @@ impl Server {
             world: std::sync::Arc::clone(&world),
             world_spawn,
             view_distance,
+            reach,
             overworld_dimension_type: overworld,
             blocks: crate::net::PlaceableBlocks {
                 air: palette.air,
