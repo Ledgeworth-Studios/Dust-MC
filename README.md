@@ -86,13 +86,16 @@ section codec, the chunk packet, the light engine.
 **Not yet**, and each of these is stated where the code for it would go: no
 physics, block updates, drops, tool checks or reach validation, so a player may
 break bedrock from across the map; no inventory, so there is one placeable
-block; no block light and no sound when a block is placed, both waiting on the
-same data rather than on effort and costed in decision record
-[0008](docs/decisions/0008-block-opacity-and-light-emission.md); sky light that
-crosses a chunk boundary from a neighbour open to the sky but not from one it
-would have to travel through, which is an engine gap and not a data one — the
-propagation trait was given `contains` so the wider version is a bigger volume
-rather than a rewrite; no plugins;
+block; no block light and no sound when a block is placed, and the served
+world's sky light still treats every block but air as a wall — the numbers that
+close all three exist and are Minecraft's own, and what is missing is a route
+for them to reach an *operator*, which is the one question left in decision
+record [0008](docs/decisions/0008-block-opacity-and-light-emission.md); sky
+light that crosses a chunk boundary from a neighbour open to the sky but not
+from one it would have to travel through, which is an engine gap and not a data
+one — the propagation trait was given `contains` so the wider version is a
+bigger volume rather than a rewrite, and it is now nearly all of what stands
+between Dust's sky light and Minecraft's; no plugins;
 and the running server still saves its own edits in its own format beside a
 world rather than back into it — writing Anvil works, but a chunk's block
 entities and scheduled ticks survive a round trip by being *copied*, not because
@@ -172,8 +175,19 @@ per Minecraft release, and is deliberately not part of `just verify` — what CI
 checks is the generated code.
 
 The work is split into domains: blocks, items, entities, fluids, tags,
-recipes, loot, commands, packets and worldgen. A full run regenerates
-everything; each domain prints what it found and how long it took. Two things
+recipes, loot, commands, packets, worldgen and light. A full run regenerates
+everything; each domain prints what it found and how long it took.
+
+`light` is the odd one and is odd on purpose. How much light a block state
+costs to enter and how much it gives off are Java code in Minecraft — in no
+report, no data pack and nothing the generators emit — so that domain runs an
+**oracle**: a small Java program on the jar's own classpath that boots
+Minecraft's static initialisation and reads `getLightBlock` and `lightEmission`
+off every state in the block-state registry. It writes a table to
+`.dust-extract/` and, unlike every other domain, **generates no Rust**: those
+are Mojang's numbers and they stay on the operator's disk. Decision record
+[0008](docs/decisions/0008-block-opacity-and-light-emission.md) is why, and
+`harness light` is what checks the result. Two things
 make re-runs cheap:
 
 - **The generator output is cached.** The `--reports` and `--server` trees are
@@ -257,38 +271,73 @@ from `TAG_Double` to `TAG_Float` produced four findings naming the field.
 
 `light` puts a number on how close the **sky** light is — only the sky light,
 because Dust has no block light at all and a bare percentage would read as "the
-lighting is 99.4% right" when half of lighting is not implemented. A chunk Minecraft wrote
-carries the light Minecraft computed, so the same chunks can be lit again with
-Dust's engine and compared cell by cell.
+lighting is 99.4% right" when half of lighting is not implemented. A chunk
+Minecraft wrote carries the light Minecraft computed, so the same chunks can be
+lit again with Dust's engine and compared cell by cell.
 
-**The percentage turns out to be a property of the world rather than of the
-engine, which is worth knowing before quoting it.** Seed 0 reads 99.4%; seed 1
-reads 96.4% with the same server, because it spawns in deep ocean and 168,428 of
-its 169,480 shortfalls are water — an even 12,544 cells at each level from
-fourteen downwards, one per column per level, the water column marching down.
+It measures **two opacity models over the same chunks in the same run**: the
+stand-in that treats every block but air as a wall, and Minecraft's own
+`getLightBlock` for all 26,684 block states, read out of the operator's own jar
+by `cargo xtask extract --only light`.
 
-What is invariant is the shape. On both seeds and at every radius, **every
-single disagreement is Dust being darker** — the direction both known gaps point
-in — and the shortfalls are one block list: water, leaves, grass, seagrass,
-kelp. Every one a block Minecraft gives an opacity of one or two and Dust treats
-as a wall, because light emission and opacity are code constants in Minecraft
-and are in no report and no data pack.
+```text
+                          agree      cells short
+  seed 0, radius 2
+    air only, stand-in   99.419%          14,276
+    Minecraft's own      99.975%             611
+  seed 1, radius 3
+    air only, stand-in   96.482%         169,480
+    Minecraft's own     100.000%               0
+```
 
-It is a measurement and not a gate — the number is expected to be short of a
-hundred per cent today, and a verb that failed for a known gap would be red
-every time it ran.
+**Seed 1 is exact.** 4,816,896 sky-light cells of an ocean world, and not one of
+them disagrees with the light Minecraft wrote.
 
-**Getting it there took three corrections and every one was the harness rather
-than the engine.** It lit each column against *itself* on all four sides: 805
-over-lit cells. It compared chunks vanilla had not finished lighting, which a
-world holds around whatever was force-generated: 167,000 more, and the
-agreement fell to 98.1% with no change to the engine. And it took sky floors
-from *neighbours* vanilla had not finished, so Dust was told there was open sky
-where the finished world has terrain: the last thirty-two, every one within a
-step of a chunk edge. Separating over-lighting from under-lighting in the report
-is what made all three visible instead of letting them hide inside a number that
-already looked good — both known gaps under-light, so an over-lit cell is
-always a third thing.
+**Getting there found a defect the stand-in had been hiding for the whole of
+the light engine's life.** Minecraft's numbers on their own moved seed 0 by a
+hundred and seven cells. The shortfall did not shrink; it got *shallower* —
+6,128 cells short by fourteen became nineteen short by thirteen. Light was
+reaching under the water and arriving at half the level it should, because the
+engine charged `1 + opacity` for a step where Minecraft charges
+`max(1, opacity)`. Nothing could see it while the only opacity model answered
+0 or 15, because the two rules agree at both ends. A wrong constant hidden by
+another wrong constant, and the fix is what takes seed 0 to 99.975%.
+
+**What is left is a different gap, and the report says which one.** The
+shortfall is split by how far each cell sits from its column's edge: light from
+a neighbouring column enters at a face and fades inward, while opacity does not
+care where in a column a cell is.
+
+```text
+distance from a face    0      1      2      3      4      5      6      7
+seed 0, air only     0.660  0.595  0.561  0.548  0.530  0.510  0.530  0.581
+seed 0, Minecraft's  0.072  0.021  0.008  0.007  0.005  0.005  0.006  0.018
+```
+
+Flat under the stand-in and falling by an order of magnitude under Minecraft's
+own numbers — the shape a neighbour effect makes, and the first time this verb
+has seen one. Seed 0's remaining 611 cells are 400 cells of air near an edge.
+
+The rate and not the count is the whole measurement: a column has `60 - 8d`
+columns at distance `d`, sixty at the face against four in the middle, so a raw
+count reads as "it is all at the edges" for a perfectly uniform cause.
+
+Under the stand-in the percentage was a **property of the world rather than of
+the engine**, which was worth knowing before quoting it: seed 0 read 99.4% and
+seed 1 read 96.4% with the same server, because 168,428 of seed 1's 169,480
+shortfalls were water. The world that was worst is the one that now comes out
+exact.
+
+It is a measurement and not a gate — a verb that failed for a known gap would be
+red every time it ran — and **there are no over-lit cells, at any radius, either
+seed or either model.** Getting to that took three corrections and every one was
+the harness rather than the engine. It lit each column against *itself* on all
+four sides: 805 over-lit cells. It compared chunks vanilla had not finished
+lighting: 167,000 more, and the agreement fell to 98.1% with no change to the
+engine. And it took sky floors from *neighbours* vanilla had not finished: the
+last thirty-two, every one within a step of a chunk edge. Separating over-lighting
+from under-lighting is what made all three visible instead of letting them hide
+inside a number that already looked good.
 
 `capture` boots the provisioned server headless, watches its own log for the
 readiness line, force-generates the square of chunks within `--radius` chunks

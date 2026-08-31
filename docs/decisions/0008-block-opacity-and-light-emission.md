@@ -1,8 +1,9 @@
 # D8 — The block constants Minecraft keeps in code
 
-**Status:** Open, with the options costed and the cost of the gap measured.
-Decided when somebody chooses a source; nothing is blocked on it that is not
-already stated as a known gap.
+**Status:** Open on one question and one only — how a light table reaches a
+**server operator**. The source is settled and built: the oracle asks
+Minecraft. What that bought is measured below, and it turned out to be larger
+than this record predicted, for a reason this record had no way to see.
 
 ## Context
 
@@ -73,6 +74,69 @@ part: a column has `60 - 8d` columns at distance `d`, sixty at the face against
 four in the middle. Counted raw, a perfectly uniform cause reads as "it is all
 at the edges". The histogram would have confirmed the impression it was built
 to test.
+
+### And then it was measured, and it was not what this record thought (2026-08-31)
+
+`harness light` now runs **both** opacity models over the same chunks in the
+same run. Adopting Minecraft's own numbers, on their own, moved seed 0 from
+99.419% to **99.423%** — a hundred and seven cells of fourteen thousand.
+
+That is not a small win. It is a **wrong prediction by this record**, and what
+was wrong with it is worth more than the number.
+
+The cells were still short. What changed was *how* short: 6,128 cells short by
+fourteen became nineteen cells short by thirteen. Light was reaching under the
+water and into the leaves after all, and arriving at half the level Minecraft
+says it should. The cause was in the engine, not the data —
+`dust_world::propagation` charged `1 + opacity` for a step where Minecraft
+charges `max(1, opacity)`, so every block of opacity one cost two.
+
+**Nothing could see it while the only opacity model answered 0 or 15**, because
+the two rules agree at both ends: at 0 they are both one, and at 15 they both
+take everything. A wrong constant hidden by another wrong constant, for the
+whole of the light engine's life.
+
+With both fixed:
+
+```text
+                          agree      cells short
+  seed 0, radius 2
+    air only, stand-in   99.419%          14,276
+    Minecraft's own      99.975%             611
+  seed 1, radius 3
+    air only, stand-in   96.482%         169,480
+    Minecraft's own     100.000%               0
+```
+
+**Seed 1 is exact** — 4,816,896 sky-light cells of an ocean world, and not one
+of them disagrees with the light Minecraft wrote. The world that was *worst*
+under the stand-in is the one that comes out right.
+
+And the residual has changed identity, which the ring histogram says out loud:
+
+```text
+distance from a face    0      1      2      3      4      5      6      7
+seed 0, air only     0.660  0.595  0.561  0.548  0.530  0.510  0.530  0.581
+seed 0, Minecraft's  0.072  0.021  0.008  0.007  0.005  0.005  0.006  0.018
+```
+
+Flat under the stand-in, because opacity does not care where in a column a cell
+is. Falling by an order of magnitude from the face inwards under Minecraft's
+numbers, which is the shape a **neighbour** effect makes and the first time this
+verb has seen one. Seed 0's remaining 611 cells are 400 cells of air near an
+edge with some grass and leaves beside them, and they belong to the multi-column
+light volume — the other outstanding item, which this record had costed at "five
+per cent of the gap" and which is now very nearly all of what is left of it.
+
+**The transferable part is not about lighting.** The ring measurement above was
+built to separate two known causes and it did that correctly. It could not
+separate either of them from a *third* cause nobody had proposed, and it read
+"flat, therefore opacity" — which was true, and which was also true of a step
+cost that doubled every opacity that was not 0 or 15. The stand-in did not just
+under-light the world; it made a second defect unobservable, because it never
+produced the input under which the two rules differ. A guard can only fail on a
+question somebody thought to ask, and a stand-in can only expose the defects its
+own range reaches.
 
 ## Options
 
@@ -262,21 +326,23 @@ about lighting. What has changed is that it is now a question about *packaging*
 rather than about principle — the numbers exist, they are Mojang's, and no
 option above puts one of them in this repository.
 
-**What is blocked on it:** nothing that is not already stated as a known gap.
-`opacity_of` treats every block but air as a wall today, `harness light` says
-that costs 0.6% of cells on seed 0 and 3.5% on seed 1, and the ring measurement
-says opacity is very nearly all of it. Reading a table is a small change to one
-function whenever a route to the table exists.
+**What is blocked on it:** a served world that is lit the way Minecraft lights
+it. `opacity_of` reads a table when it is handed one and every call site is
+wired; the server hands it `None`, because there is no route for a table to
+arrive on. That is now the *only* thing between Dust's sky light and Minecraft's
+— seed 1 is exact through this same function, in the harness, today.
 
 ## Consequences of leaving it
 
 - **No block light at all.** Torches, lava and glowstone light nothing, and
   there is no engine work outstanding for it — `dust_world::propagation` runs
   the same walks vanilla does. It is waiting on emission values and nothing
-  else.
+  else, and the table already holds them: 1,588 of 26,684 states emit. Read the
+  paragraph above before believing that second sentence, though. The same was
+  said about opacity.
 - **Sky light stops at the surface of an ocean and under a tree**, which is
   visible to a player and is nearly all of the shortfall. On an ocean spawn it
-  is 3.5% of every cell in view.
+  is 3.5% of every cell in view. With a table it is 0.0%.
 - **No sound when a block is placed**, for the reason above. Breaking one is
   fine — the break effect carries the block's *state* and the client picks the
   sound itself, which is why that could be built and this cannot.
