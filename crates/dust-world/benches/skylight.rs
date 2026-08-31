@@ -27,7 +27,7 @@ use dust_world::chunk::Chunk;
 use dust_world::column_light::{ColumnSkyLight, Skirt, SkyFloor};
 use dust_world::coords::ChunkPos;
 use dust_world::heightmap::{HeightmapKind, WorldHeight};
-use dust_world::propagation::{seed_skylight, Budget, DefaultOpacity, LightGraph};
+use dust_world::propagation::{seed_skylight, Budget, LightGraph, OpacityModel};
 
 const AIR: u32 = 0;
 const STONE: u32 = 1;
@@ -49,7 +49,7 @@ fn generate(world: WorldHeight) -> Chunk {
 
 /// The implementation `ColumnSkyLight::seed` replaced: every cell the sky
 /// reaches, handed to the walk as a seed.
-fn seed_every_open_cell(chunk: &mut Chunk, opacity: &DefaultOpacity) {
+fn seed_every_open_cell(chunk: &mut Chunk, opacity: &OpacityModel) {
     let min_y = chunk.world().min_y();
     let max_y = min_y + chunk.world().height() as i32;
     let mut columns = Vec::with_capacity(16 * 16);
@@ -78,7 +78,7 @@ fn time(label: &str, rounds: u32, mut body: impl FnMut()) {
 
 fn main() {
     let world = WorldHeight::OVERWORLD;
-    let opacity = DefaultOpacity::transparent_only([AIR]);
+    let opacity = OpacityModel::transparent_only([AIR]);
 
     // Generation split into its three parts, because "generation is 2.7 ms"
     // named no suspect. Two of these turned out to be nearly free.

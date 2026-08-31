@@ -274,7 +274,13 @@ impl AnvilWorld {
                 // cache of what an engine would produce, and this server has
                 // its own engine; trusting the file would mean serving light
                 // that no code here can reproduce.
-                let opacity = super::world::opacity_of(self.fallback.palette().air);
+                // No light table yet: decision record 0008's remaining
+                // question is how one reaches an *operator*, and until that is
+                // answered there is no route for one to arrive on. The
+                // argument exists because `harness light` has a route — a
+                // developer checkout — and measures both models through this
+                // same function.
+                let opacity = super::world::opacity_of(self.fallback.palette().air, None);
                 // This column's own floors go in the cache before its
                 // neighbours are asked for theirs: a column is almost always
                 // asked for beside the ones around it, so the pass that lights

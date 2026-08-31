@@ -25,7 +25,7 @@ use dust_registry::Block;
 use dust_world::chunk::Chunk;
 use dust_world::coords::ChunkPos;
 use dust_world::heightmap::{HeightmapKind, WorldHeight};
-use dust_world::propagation::DefaultOpacity as OpacityModel;
+use dust_world::propagation::OpacityModel;
 
 /// The block states one flat world is built from, resolved once.
 #[derive(Debug, Clone, Copy)]
@@ -115,21 +115,34 @@ pub fn light_column(
     )
 }
 
-/// The opacity model a world of `air` and nothing transparent has.
+/// The opacity model to light with, given whatever light table there is.
 ///
-/// **Air and nothing else, which is wrong, is stated as wrong, and is the one
-/// place that changes when it stops being.** Vanilla gives water, glass,
-/// leaves and ice an opacity of one or two; every one of them is fifteen here,
-/// so sky light stops dead at the surface of an ocean and under a tree.
+/// **This is the one place the answer is decided**, and it has two of them.
 ///
-/// It is not a shortcut. Light emission and opacity are code constants in
-/// Minecraft, present in no `--reports` output and in no data pack, so there is
-/// nothing to extract yet — see decision record 0008, which costs the options
-/// and says why none has been taken. `xtask harness light` measures what the
-/// gap costs: 99.41% of cells agree with a world vanilla lit, and every
-/// disagreement is this.
-pub fn opacity_of(air: u32) -> OpacityModel {
-    OpacityModel::transparent_only([air])
+/// With a table — Minecraft's own `getLightBlock` for every block state, read
+/// out of the operator's own jar by `cargo xtask extract --only light` — every
+/// state carries the number Minecraft carries. On 1.21.1 that is three values
+/// and nothing else: 14,616 states cost nothing, 9,552 cost one, 2,516 are
+/// walls.
+///
+/// Without one, `air` passes light and every other block is a wall. That is
+/// wrong and is stated as wrong: vanilla gives water, glass, leaves and ice an
+/// opacity of one, so sky light stops dead at the surface of an ocean and under
+/// a tree. It is not a shortcut — opacity is a code constant in Minecraft,
+/// present in no `--reports` output and in no data pack, which is decision
+/// record 0008 — and `xtask harness light` measures what it costs, both ways,
+/// in one run.
+pub fn opacity_of(air: u32, light: Option<&dust_registry::LightTable>) -> OpacityModel {
+    match light {
+        // Dense and in id order, which is the order the table is keyed by:
+        // the oracle reads Minecraft's own `IdMapper`, so no name is matched
+        // anywhere along this path and there is no place for a mismatch to
+        // hide.
+        Some(table) => {
+            OpacityModel::per_state((0..table.len() as u32).map(|state| table.opacity(state)))
+        }
+        None => OpacityModel::transparent_only([air]),
+    }
 }
 
 /// Where a player spawns in a *flat* world: the middle of a block, standing on

@@ -50,9 +50,11 @@
 //!   its size; [`heightmap::Heightmap`] takes the "does this state count"
 //!   predicate as a closure because all six maps differ in exactly that;
 //!   and which block states let light through is answered by whoever wires
-//!   [`propagation::LightGraph`], with
-//!   [`propagation::DefaultOpacity`] — everything opaque except an explicit
-//!   transparent set — standing in until then.
+//!   [`propagation::LightGraph`], through
+//!   [`propagation::OpacityModel`] — which carries either Minecraft's own
+//!   level for every state, read from the operator's jar by the light oracle,
+//!   or the stand-in that treats everything but an explicit transparent set as
+//!   a wall. This crate holds neither table and cannot tell them apart.
 //! * **A connected light engine.** [`propagation`] walks levels across any
 //!   graph it is handed, including sky seeding above heightmaps, but nothing
 //!   yet connects a chunk's blocks to its light arrays: that connection is
@@ -120,6 +122,6 @@ pub use coords::{BlockPos, ChunkPos, RegionPos};
 pub use heightmap::{Heightmap, HeightmapKind, HeightmapSet, WorldHeight};
 pub use light::{LightArray, LightArrayError};
 pub use palette::{Palette, PaletteKind};
-pub use propagation::{Budget, DefaultOpacity, LightGraph, PropagationError};
+pub use propagation::{Budget, LightGraph, OpacityModel, PropagationError};
 pub use region::{ChunkPayload, Compression, RegionError, RegionFile};
 pub use slab::{Slab, SlabError, SlabKey};

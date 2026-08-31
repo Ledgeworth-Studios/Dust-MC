@@ -47,17 +47,17 @@
 //! the column.
 
 use crate::chunk::Chunk;
-use crate::propagation::{raise, Budget, DefaultOpacity, LightGraph, PropagationError};
+use crate::propagation::{raise, step_cost, Budget, LightGraph, OpacityModel, PropagationError};
 
 /// Sky light for one column, backed by that column's own arrays.
 #[derive(Debug)]
 pub struct ColumnSkyLight<'a> {
     chunk: &'a mut Chunk,
-    opacity: &'a DefaultOpacity,
+    opacity: &'a OpacityModel,
 }
 
 impl<'a> ColumnSkyLight<'a> {
-    pub fn new(chunk: &'a mut Chunk, opacity: &'a DefaultOpacity) -> Self {
+    pub fn new(chunk: &'a mut Chunk, opacity: &'a OpacityModel) -> Self {
         Self { chunk, opacity }
     }
 
@@ -105,7 +105,7 @@ impl<'a> ColumnSkyLight<'a> {
     /// a column that ran out is under-lit rather than corrupt.
     pub fn seed(
         chunk: &'a mut Chunk,
-        opacity: &'a DefaultOpacity,
+        opacity: &'a OpacityModel,
         budget: Budget,
     ) -> Result<u64, PropagationError> {
         Self::seed_inner(chunk, opacity, None, budget)
@@ -123,7 +123,7 @@ impl<'a> ColumnSkyLight<'a> {
     /// As [`ColumnSkyLight::seed`].
     pub fn seed_with_neighbours(
         chunk: &'a mut Chunk,
-        opacity: &'a DefaultOpacity,
+        opacity: &'a OpacityModel,
         skirt: Skirt,
         budget: Budget,
     ) -> Result<u64, PropagationError> {
@@ -132,7 +132,7 @@ impl<'a> ColumnSkyLight<'a> {
 
     fn seed_inner(
         chunk: &'a mut Chunk,
-        opacity: &'a DefaultOpacity,
+        opacity: &'a OpacityModel,
         skirt: Option<Skirt>,
         budget: Budget,
     ) -> Result<u64, PropagationError> {
@@ -183,10 +183,10 @@ impl<'a> ColumnSkyLight<'a> {
         //
         // The neighbour is not part of the volume: it is a *source*, and what
         // reaches the edge cell facing it is what a cell at fifteen would
-        // offer across one step — `15 - (1 + opacity)`, which is `spread`'s
-        // own arithmetic and is written here as the same expression rather
-        // than a number, so the two cannot come to disagree about how much a
-        // step costs.
+        // offer across one step. That is `step_cost`, called rather than
+        // rewritten: this expression and `spread`'s used to be two copies of
+        // one rule, and the day the rule turned out to be wrong they were two
+        // places to fix it.
         //
         // Modelling the neighbour as a source rather than as extra cells of
         // the volume is not only simpler. A read-only ring inside the volume
@@ -210,7 +210,7 @@ impl<'a> ColumnSkyLight<'a> {
                         if !skirt.open_at(rx, y, rz) || open(ix, y, iz) {
                             continue;
                         }
-                        let offered = 15_u8.saturating_sub(1 + graph.opacity(ix, y, iz));
+                        let offered = 15_u8.saturating_sub(step_cost(graph.opacity(ix, y, iz)));
                         if offered > 0 {
                             seeds.push((ix, y, iz, offered));
                         }

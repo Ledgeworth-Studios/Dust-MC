@@ -222,6 +222,34 @@ impl Queue {
 /// made. Either way the entry describes a past the field no longer agrees
 /// with, and spreading from it would resurrect light nobody holds.
 ///
+/// What one step into a cell of this opacity costs.
+///
+/// **`max(1, opacity)`, and not `1 + opacity`.** Minecraft charges the move
+/// itself *or* the block, whichever is larger, so entering water — opacity one
+/// — costs one level and not two, and a column of water reads 15, 14, 13
+/// rather than 15, 13, 11.
+///
+/// This was `1 + opacity` for the whole of the light engine's life and nothing
+/// could see it, because the only opacity model that existed answered 0 or 15
+/// and the two rules agree at both ends: at 0 they are both one, and at 15
+/// they both take everything. It became visible the day
+/// [`OpacityModel::per_state`] carried Minecraft's own numbers into the same
+/// walk and `cargo xtask harness light` reported six thousand cells short by
+/// exactly the amount this doubled. **A wrong constant hidden by another wrong
+/// constant** — which is the argument for measuring against the real thing
+/// rather than against a stand-in, made once more.
+///
+/// Saturating at fifteen is not a third case: a cell that costs everything
+/// takes everything, and a level is a nibble.
+#[must_use]
+pub const fn step_cost(opacity: u8) -> u8 {
+    if opacity > 1 {
+        opacity
+    } else {
+        1
+    }
+}
+
 /// Each neighbour is charged to the budget before it is examined.
 fn spread<G: LightGraph + ?Sized>(
     graph: &mut G,
@@ -237,8 +265,7 @@ fn spread<G: LightGraph + ?Sized>(
                 continue;
             }
             queue.charge()?;
-            let offered =
-                level.saturating_sub(1_u8.saturating_add(graph.opacity(next.0, next.1, next.2)));
+            let offered = level.saturating_sub(step_cost(graph.opacity(next.0, next.1, next.2)));
             if offered > graph.level(next.0, next.1, next.2) {
                 graph.set_level(next.0, next.1, next.2, offered);
                 queue.pending.push_back((next, offered));
@@ -422,43 +449,88 @@ where
     raise(graph, &seeds, budget)
 }
 
-/// The default opacity model: everything is opaque except an explicit
-/// transparent set.
+/// How much light is lost entering a block state.
 ///
-/// Real opacity is per-block-state knowledge — water dims, glass does not,
-/// leaves partly — and the registry that knows it lives elsewhere. Until a
-/// wiring brings that table, this is the model every call site shares: the
-/// states named transparent pass light untouched, and *everything else*
-/// costs the full fifteen, which swallows light in one step. Conservative
-/// by construction — a missing entry darkens rather than leaks — and the
-/// thing to replace wholesale when the real table lands, not extend.
+/// Two shapes, and which one is in force is the difference between Dust's
+/// lighting being approximate and being Minecraft's own.
+///
+/// * [`OpacityModel::transparent_only`] — the stand-in. The named states pass
+///   light untouched and *everything else* costs the full fifteen, which
+///   swallows light in one step. It is conservative by construction: a state
+///   nobody named darkens rather than leaks. It is also wrong about water,
+///   glass, leaves and ice, and `cargo xtask harness light` says by how much.
+/// * [`OpacityModel::per_state`] — Minecraft's own number for every state,
+///   read out of the operator's own jar by the light oracle. Opacity and
+///   emission are Java code in Minecraft, in no report and no data pack, which
+///   is decision record 0008; `dust_registry::light::LightTable` is the reader
+///   and this is where its answer arrives.
+///
+/// Both answer 15 for a state they have never heard of, for the same reason:
+/// every known gap in Dust's lighting under-lights, so an unknown block that
+/// stops light is one more of the same, while one that passes it is a new kind
+/// of wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DefaultOpacity {
-    transparent: Vec<u32>,
+pub struct OpacityModel {
+    shape: Shape,
 }
 
-impl DefaultOpacity {
-    /// A model where exactly these block states pass light.
+/// The two shapes an [`OpacityModel`] takes. Private: which one a model is
+/// carrying is not a question any caller has needed to ask, and the day one
+/// does it wants a named method rather than a match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Shape {
+    /// Sorted state ids that pass light; everything else is a wall.
+    TransparentOnly(Vec<u32>),
+    /// One level per state id, indexed directly.
+    PerState(Box<[u8]>),
+}
+
+impl OpacityModel {
+    /// A model where exactly these block states pass light and every other
+    /// one is a wall.
     #[must_use]
     pub fn transparent_only(states: impl IntoIterator<Item = u32>) -> Self {
         let mut transparent: Vec<u32> = states.into_iter().collect();
         transparent.sort_unstable();
         transparent.dedup();
-        Self { transparent }
+        Self {
+            shape: Shape::TransparentOnly(transparent),
+        }
+    }
+
+    /// A model holding one level per block state, indexed by state id.
+    ///
+    /// Levels above fifteen are clamped rather than refused. This crate has no
+    /// idea what a block state is and cannot tell a bad table from a version
+    /// it has not met; the reader that *can* —
+    /// `dust_registry::light::LightTable` — refuses one, and by the time a
+    /// slice arrives here the question has been asked by somebody who could
+    /// answer it. Clamping keeps the invariant the walks rely on, which is
+    /// that a step costs at most everything.
+    #[must_use]
+    pub fn per_state(levels: impl IntoIterator<Item = u8>) -> Self {
+        Self {
+            shape: Shape::PerState(levels.into_iter().map(|l| l.min(15)).collect()),
+        }
     }
 
     /// The opacity a block state carries under this model.
     #[must_use]
     pub fn opacity(&self, state: u32) -> u8 {
-        if self.transparent.binary_search(&state).is_ok() {
-            0
-        } else {
-            15
+        match &self.shape {
+            Shape::TransparentOnly(transparent) => {
+                if transparent.binary_search(&state).is_ok() {
+                    0
+                } else {
+                    15
+                }
+            }
+            Shape::PerState(levels) => levels.get(state as usize).copied().unwrap_or(15),
         }
     }
 }
 
-impl Default for DefaultOpacity {
+impl Default for OpacityModel {
     /// Air and nothing else: the model a freshly generated world effectively
     /// has.
     fn default() -> Self {
@@ -471,10 +543,14 @@ mod tests {
     use super::*;
 
     /// A small transparent box of cells, everything else void. Opacity is
-    /// uniform except for cells listed in `walls`.
+    /// uniform except for cells listed in `walls`, which are solid, and cells
+    /// in `dim`, which carry whatever level they were given — the shape water
+    /// and leaves have in a real world, and the only shape under which
+    /// [`step_cost`] and `1 + opacity` disagree.
     struct Box {
         size: i32,
         walls: Vec<(i32, i32, i32)>,
+        dim: Vec<((i32, i32, i32), u8)>,
         levels: std::collections::BTreeMap<(i32, i32, i32), u8>,
     }
 
@@ -483,12 +559,18 @@ mod tests {
             Self {
                 size,
                 walls: Vec::new(),
+                dim: Vec::new(),
                 levels: std::collections::BTreeMap::new(),
             }
         }
 
         fn wall(mut self, x: i32, y: i32, z: i32) -> Self {
             self.walls.push((x, y, z));
+            self
+        }
+
+        fn dim(mut self, x: i32, y: i32, z: i32, opacity: u8) -> Self {
+            self.dim.push(((x, y, z), opacity));
             self
         }
 
@@ -510,6 +592,9 @@ mod tests {
         }
 
         fn opacity(&self, x: i32, y: i32, z: i32) -> u8 {
+            if let Some((_, opacity)) = self.dim.iter().find(|(c, _)| *c == (x, y, z)) {
+                return *opacity;
+            }
             if self.walls.contains(&(x, y, z)) {
                 15
             } else {
@@ -668,8 +753,8 @@ mod tests {
     }
 
     #[test]
-    fn the_default_opacity_model_is_air_clear_and_everything_else_a_wall() {
-        let model = DefaultOpacity::transparent_only([0, 42, 7]);
+    fn the_stand_in_opacity_model_is_air_clear_and_everything_else_a_wall() {
+        let model = OpacityModel::transparent_only([0, 42, 7]);
         assert_eq!(model.opacity(0), 0);
         assert_eq!(model.opacity(42), 0);
         assert_eq!(model.opacity(7), 0);
@@ -680,8 +765,64 @@ mod tests {
         );
         assert_eq!(model.opacity(43), 15);
         // Order of construction is irrelevant to the answers.
-        assert_eq!(DefaultOpacity::transparent_only([7, 0, 42]), model);
-        assert_eq!(DefaultOpacity::default().opacity(0), 0);
-        assert_eq!(DefaultOpacity::default().opacity(5), 15);
+        assert_eq!(OpacityModel::transparent_only([7, 0, 42]), model);
+        assert_eq!(OpacityModel::default().opacity(0), 0);
+        assert_eq!(OpacityModel::default().opacity(5), 15);
+    }
+
+    #[test]
+    fn a_per_state_model_answers_what_it_was_given() {
+        // Minecraft's three values on 1.21.1, in the order the oracle writes
+        // them: air, stone, water.
+        let model = OpacityModel::per_state([0, 15, 1]);
+        assert_eq!(model.opacity(0), 0);
+        assert_eq!(model.opacity(1), 15);
+        assert_eq!(model.opacity(2), 1);
+    }
+
+    #[test]
+    fn a_state_past_the_end_of_a_per_state_model_is_a_wall() {
+        // The same direction the stand-in errs in, and for the same reason:
+        // an unknown block that stops light is one more under-lit cell, while
+        // one that passes it is light inside a sealed room.
+        let model = OpacityModel::per_state([0, 15, 1]);
+        assert_eq!(model.opacity(3), 15);
+        assert_eq!(model.opacity(u32::MAX), 15);
+    }
+
+    #[test]
+    fn a_per_state_level_above_fifteen_is_clamped_rather_than_trusted() {
+        // A step costs at most everything: the walks subtract `1 + opacity`
+        // from a nibble, and a level of 200 arriving here would be an
+        // arithmetic hazard rather than a dark block.
+        assert_eq!(OpacityModel::per_state([200]).opacity(0), 15);
+    }
+
+    #[test]
+    fn a_step_costs_the_move_or_the_block_whichever_is_larger() {
+        // Minecraft's rule, and not `1 + opacity`. The two agree at both ends
+        // of the model that used to be the only one — 0 and 15 — which is
+        // exactly why this was wrong for the whole of the engine's life
+        // without anything being able to see it.
+        assert_eq!(step_cost(0), 1, "clear air still costs the move");
+        assert_eq!(step_cost(1), 1, "water costs one level, not two");
+        assert_eq!(step_cost(2), 2);
+        assert_eq!(step_cost(15), 15);
+    }
+
+    #[test]
+    fn a_column_of_water_dims_one_level_a_block() {
+        // The fact `harness light` measures against a world Minecraft lit,
+        // written here as the five cells it comes down to. Under `1 + opacity`
+        // this column read 15, 13, 11, 9, 7 and the cell four blocks down was
+        // half as bright as Minecraft says it is.
+        let mut column = Box::new(5)
+            .dim(0, 3, 0, 1)
+            .dim(0, 2, 0, 1)
+            .dim(0, 1, 0, 1)
+            .dim(0, 0, 0, 1);
+        raise(&mut column, &[(0, 4, 0, 15)], Budget::default()).expect("five cells");
+        let down: Vec<u8> = (0..5).rev().map(|y| column.level(0, y, 0)).collect();
+        assert_eq!(down, vec![15, 14, 13, 12, 11]);
     }
 }
