@@ -46,6 +46,34 @@ So the cost of this decision is known block by block, and its size is known to
 depend on how much water and foliage a world has. That is an unusually good
 position from which to not have decided something.
 
+### And opacity owns nearly all of it (2026-08-31)
+
+The measurement above had a confound while it was written: sky light has *two*
+known gaps, and a percentage cannot say which one it is reporting. `harness
+light` now splits the shortfall by how far each cell sits from its column's
+edge. Light arriving from a neighbour enters at a face and loses a level per
+step inward; opacity does not care where in a column it is.
+
+```text
+distance from a face   0      1      2      3      4      5      6      7
+seed 0, radius 2    0.660  0.595  0.561  0.548  0.530  0.510  0.530  0.581
+seed 1, radius 3    3.522  3.521  3.521  3.516  3.512  3.513  3.516  3.516
+```
+
+**Flat on both worlds**, and on seed 0 the rate *rises again* at the centre,
+which no neighbour effect produces. Reading seed 0's interior as the opacity
+floor puts everything the edge carries above it at roughly 750 cells of 14,276.
+
+**So this record is not choosing between two comparable causes. It is the whole
+question**, and the multi-column light volume — the other outstanding item — is
+worth about five per cent of the gap, on a world where the gap is 0.6%.
+
+The measurement is a rate per ring and not a count, and that is the load-bearing
+part: a column has `60 - 8d` columns at distance `d`, sixty at the face against
+four in the middle. Counted raw, a perfectly uniform cause reads as "it is all
+at the edges". The histogram would have confirmed the impression it was built
+to test.
+
 ## Options
 
 **1. Extract it from the server jar.** A small Java program on the jar's
@@ -57,8 +85,38 @@ The right answer in principle — it produces Minecraft's own numbers, at the
 operator's machine, from the operator's jar, which is exactly D6 and D7's rule.
 The cost is that Minecraft's static initialisation has to run, which means
 `Bootstrap.bootStrap()` through obfuscated names, which is what mod-loader-based
-extractors exist to avoid doing by hand. Not attempted; not costed beyond
-"hours, with a real chance of not working".
+extractors exist to avoid doing by hand.
+
+**Costed, 2026-08-31, and it is cheaper than that paragraph says.** Everything
+the oracle would reflect over is in the published mappings for 1.21.1, checked
+name by name:
+
+| what | mapped to |
+| --- | --- |
+| `Block.BLOCK_STATE_REGISTRY` (an `IdMapper`) | `dfy.q` |
+| `BlockBehaviour$BlockStateBase` | `dtb$a` |
+| &nbsp;&nbsp;`int lightEmission` — a **field**, not a call | `b` |
+| &nbsp;&nbsp;`getLightBlock(BlockGetter, BlockPos)` | `b` |
+| &nbsp;&nbsp;`canOcclude()` / `propagatesSkylightDown(..)` | `p` / `a` |
+| `EmptyBlockGetter`, `BlockPos`, `Bootstrap` | `dcl`, `jd`, `akt` |
+
+Two things follow. `BLOCK_STATE_REGISTRY` is an id-to-state map, so the
+extraction comes out **keyed by the same state ids Dust already generates
+against** rather than by name — no matching step, and no place for one to be
+subtly wrong. And `lightEmission` being a field means emission needs no world
+at all; only `getLightBlock` takes one, and `EmptyBlockGetter.INSTANCE` with
+`BlockPos.ZERO` is what it wants.
+
+**Half the machinery is also already written.** `xtask/oracle/dustoracle/Names.java`
+on `wip/0.5-worldgen` looks Minecraft's classes and members up from a
+key-to-name properties file the extractor writes, and **contains no Minecraft
+identifier of its own** — so it does not need rewriting when a version renames
+everything. What is missing is the Rust half: a parser for the mappings file and
+the small table of keys above.
+
+So the honest cost is a mappings parser, a properties file, one Java class and
+an `xtask extract` verb — not a research project. **This does not decide
+anything below; it removes the reason option 1 looked expensive.**
 
 **2. Derive it from tags.** Dust now holds all thirteen tag registries. A rough
 opacity model could be built from `minecraft:leaves`, `minecraft:impermeable`
@@ -81,6 +139,12 @@ file, which is nobody.
 direction, and wrong in a way that is written down where the code lives.
 
 ## Why this is not decided here
+
+**Read the costing above first.** The reason this record sat open was that
+option 1 was the right answer nobody had priced, which left options 2 and 3 —
+the ones that need a judgement — looking like the only live ones. If option 1
+is a day's work producing Mojang's own numbers on the operator's own machine,
+then there is no judgement to make and the rest of this section is moot.
 
 Option 2 is an afternoon's work and would visibly improve the world a player
 sees. It is also the one that puts numbers in this repository that no

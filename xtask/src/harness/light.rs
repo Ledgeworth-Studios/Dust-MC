@@ -47,10 +47,44 @@
 //! * **Light through a neighbour.** A column is lit with its neighbours' sky
 //!   floors as sources, which is exact where a neighbour is open to the sky
 //!   and under-lights where the light would have to travel *through* one.
+//!   **This one is now measured, and it is very nearly nothing** — see the
+//!   ring report below.
 //!
 //! Both under-light rather than over-light, so a cell where Dust is *brighter*
 //! than vanilla is a third thing and is counted separately: it means light
 //! arriving where vanilla says none does, which neither gap explains.
+//!
+//! # Which of the two gaps is bigger, answered
+//!
+//! That question had an impression for an answer — "the smaller of the two by
+//! a wide margin" — until the report grew a ring histogram. Light arriving
+//! from a neighbour enters at a face and loses a level per step inward, so a
+//! shortfall it causes leans towards the edge; opacity has no reason to care
+//! where in a column it is. The shortfall *rate* per ring separates them.
+//!
+//! ```text
+//! distance from a face   0      1      2      3      4      5      6      7
+//! seed 0, radius 2    0.660  0.595  0.561  0.548  0.530  0.510  0.530  0.581
+//! seed 1, radius 3    3.522  3.521  3.521  3.516  3.512  3.513  3.516  3.516
+//! ```
+//!
+//! **Flat, on both worlds.** Seed 1 spans 0.006 of a percentage point from the
+//! face to the middle. Seed 0 falls by a tenth of a point and then *rises
+//! again* at the centre, which is not a shape a neighbour effect can produce.
+//! Taking seed 0's interior rate as the opacity floor, everything the edge
+//! carries above it is about 750 cells of 14,276 — **five per cent of the gap,
+//! and not shown to be neighbour transit even so.**
+//!
+//! So the multi-column volume is worth what that five per cent is worth, and
+//! opacity owns the rest. D8 was already the record that mattered; this is how
+//! much it matters.
+//!
+//! **The rate and not the count is the whole measurement.** A 16x16 column has
+//! `60 - 8d` columns at distance `d` — sixty at the face and four in the
+//! middle, fifteen to one — so a raw count reads as "it is all at the edges"
+//! for any cause whatsoever, including one that is perfectly uniform. A
+//! histogram without its denominator would have confirmed the impression it
+//! was built to test.
 //!
 //! # The percentage is a property of the world, not of the engine
 //!
@@ -230,6 +264,24 @@ struct Tally {
     /// because no known gap produces one: a list they share would let a
     /// hundred unexplained cells hide inside ten thousand explained ones.
     brighter_blocks: BTreeMap<String, u64>,
+    /// Under-lit cells by how far they sit from the nearest column edge,
+    /// `min(x, 15 - x, z, 15 - z)`, so 0 is a face and 7 is the middle.
+    ///
+    /// This is the second known gap made countable. Light that would have to
+    /// travel *through* a neighbouring column arrives from a face and
+    /// attenuates a level per step, so shortfalls it causes lean towards zero;
+    /// shortfalls opacity causes have no reason to care where in the column
+    /// they are.
+    darker_by_edge: BTreeMap<u8, u64>,
+    /// Every cell compared, by the same distance.
+    ///
+    /// **Without this the ring histogram lies**, and by nearly fifteen to one.
+    /// A 16x16 column has 60 - 8d columns at distance d: sixty at the face and
+    /// four in the middle. So a shortfall spread evenly through a column still
+    /// puts fifteen times more of itself on the edge than in the centre, and a
+    /// raw count would read as "it is all at the edges" for a cause that is
+    /// not at the edges at all. The rates below are per cell at that distance.
+    cells_by_edge: BTreeMap<u8, u64>,
 }
 
 fn measure(options: &Options) -> Result<(), String> {
@@ -520,6 +572,17 @@ fn dust_light(chunk: &mut dust_world::chunk::Chunk, skirt: Skirt, height: WorldH
     column
 }
 
+/// How far a cell sits from the nearest of its column's four faces.
+///
+/// Zero on a face, seven in the middle of a 16x16 column. The measure a
+/// neighbour's light has to cross: it enters at a face with what a cell at
+/// fifteen offers across one step and loses a level per step inward, so a
+/// shortfall the multi-column volume would repair cannot be far from one.
+fn edge_distance(x: usize, z: usize) -> u8 {
+    let from = |v: usize| v.min(15 - v);
+    u8::try_from(from(x).min(from(z))).expect("0..=7")
+}
+
 fn compare(
     chunk: &dust_world::chunk::Chunk,
     vanilla: &Column,
@@ -533,6 +596,8 @@ fn compare(
                 let want = vanilla.at(x, y, z);
                 let got = dust.at(x, y, z);
                 tally.cells += 1;
+                let from_edge = edge_distance(x, z);
+                *tally.cells_by_edge.entry(from_edge).or_default() += 1;
                 if want == got {
                     tally.agree += 1;
                     continue;
@@ -544,6 +609,7 @@ fn compare(
                 if got < want {
                     *tally.darker.entry(want - got).or_default() += 1;
                     *tally.darker_blocks.entry(name).or_default() += 1;
+                    *tally.darker_by_edge.entry(from_edge).or_default() += 1;
                 } else {
                     if std::env::var_os("DUST_LIGHT_TRACE").is_some() {
                         let pos = chunk.pos();
@@ -563,6 +629,38 @@ fn compare(
 }
 
 /// The blocks a set of disagreeing cells sits in, most common first.
+/// Print the shortfall as a rate per ring, innermost figure last.
+///
+/// **A rate and not a count.** The rings are not the same size — 60 columns
+/// at the face against 4 in the middle — so counts alone say "the edges" for
+/// any cause whatsoever. What separates the two known gaps is whether the
+/// *rate* falls as you walk inward.
+///
+/// Reading it: a rate that collapses towards the middle is light failing to
+/// arrive from a neighbour, and is what the multi-column volume would repair.
+/// A flat rate is opacity, which does not care where in a column it is. This
+/// is the verb's answer to "which of the two gaps is bigger", which was an
+/// impression before it was a column of numbers.
+fn rings(tally: &Tally) {
+    if tally.darker_by_edge.is_empty() {
+        return;
+    }
+    println!();
+    println!("      by distance from a column's edge (0 = a face, 7 = the middle):");
+    for distance in 0u8..=7 {
+        let short = tally.darker_by_edge.get(&distance).copied().unwrap_or(0);
+        let of = tally.cells_by_edge.get(&distance).copied().unwrap_or(0);
+        if of == 0 {
+            continue;
+        }
+        #[expect(clippy::cast_precision_loss, reason = "counts here are far below 2^53")]
+        let rate = short as f64 * 100.0 / of as f64;
+        println!("        {distance}: {rate:6.3}% of {of} cell(s) short");
+    }
+    println!("      a rate that falls towards the middle is light not arriving");
+    println!("      from a neighbour; a flat one is opacity.");
+}
+
 fn histogram(blocks: &BTreeMap<String, u64>) {
     let mut rows: Vec<(&String, &u64)> = blocks.iter().collect();
     rows.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
@@ -633,6 +731,7 @@ fn report(tally: &Tally) {
         println!("      short by {by:>2}: {count}");
     }
     histogram(&tally.darker_blocks);
+    rings(tally);
 
     if brighter > 0 {
         // Printed loudly and with its own block list rather than folded into
