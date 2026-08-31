@@ -44,8 +44,9 @@ import java.util.function.Predicate;
 public final class BlockOracle {
 
     public static void main(String[] args) throws Exception {
-        if (args.length != 2) {
-            System.err.println("usage: BlockOracle <names.properties> <output.tsv>");
+        if (args.length != 3) {
+            System.err.println(
+                "usage: BlockOracle <names.properties> <states.tsv> <items.tsv>");
             System.exit(2);
         }
         Names names = new Names(args[0]);
@@ -108,6 +109,7 @@ public final class BlockOracle {
         System.out.println("states=" + written);
         System.out.println("heightmaps=" + heightmaps.size());
         System.out.println("sound_groups=" + sounds.seen());
+        System.out.println("items=" + writeItems(names, Path.of(args[2])));
     }
 
     /** One heightmap: the name a chunk's NBT calls it, and what it counts. */
@@ -163,6 +165,48 @@ public final class BlockOracle {
         } finally {
             System.setOut(out);
         }
+    }
+
+    /**
+     * Write, for every item, the block it puts down — or nothing, for the items
+     * that put nothing down.
+     *
+     * `BlockItem` is the whole answer and the whole question: an item either is
+     * one, in which case the block it holds is what a right-click places, or it
+     * is not, in which case there is no block to name. Nothing here consults a
+     * placement context, and the Rust side is explicit that what it gets is the
+     * block and not the *state* — a stair knows which way it faces from where
+     * the player stood, and that is a different problem in a different place.
+     *
+     * Two columns and both are names: the item's, and the block's. A number
+     * would be a position in whichever Minecraft this ran against.
+     */
+    private static int writeItems(Names names, Path out) throws Exception {
+        Object items = names.field("builtin_registries.class", "builtin_registries.item").get(null);
+        Object blocks = names.field("builtin_registries.class", "builtin_registries.block").get(null);
+        Method getId = names.method("registry.class", "registry.get_id", Object.class);
+        Method getKey = names.method("registry.class", "registry.get_key", Object.class);
+        Class<?> blockItem = names.type("blockitem.class");
+        Field held = names.field("blockitem.class", "blockitem.block");
+
+        int written = 0;
+        try (BufferedWriter writer = Files.newBufferedWriter(out)) {
+            writer.write("# item_id\titem\tplaces\n");
+            for (Object item : (Iterable<?>) items) {
+                int id = (int) getId.invoke(items, item);
+                Object name = getKey.invoke(items, item);
+                // `-` and not an empty field: a trailing tab is invisible in a
+                // diff and in an editor, and a row whose last column vanished
+                // would read as one that was never written.
+                String places = "-";
+                if (blockItem.isInstance(item)) {
+                    places = getKey.invoke(blocks, held.get(item)).toString();
+                }
+                writer.write(id + "\t" + name + "\t" + places + "\n");
+                written++;
+            }
+        }
+        return written;
     }
 
     /** One block sound group: what placing it sounds like, and how loud. */

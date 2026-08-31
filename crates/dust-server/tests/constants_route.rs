@@ -1,4 +1,4 @@
-//! The route a light table takes from the operator's disk into the engine.
+//! The route the oracle's tables take from the operator's disk into the engine.
 //!
 //! Decision record 0008 chose this route over three others — a new `dust`
 //! subcommand, the server running the oracle at boot, and a standalone jar per
@@ -106,4 +106,91 @@ fn the_name_says_who_wrote_it() {
     // operator typed the day they set this up. Renaming it silently breaks a
     // working server on upgrade.
     assert_eq!(constants::FILE, "dust-constants.tsv");
+}
+
+// ---------------------------------------------------------------------------
+// The second file on the same route: which block each item places
+// ---------------------------------------------------------------------------
+
+/// A complete item table where every item places nothing.
+///
+/// Nothing rather than something, for the same reason the block table above is
+/// all walls: the values are not what these tests are about, and an item table
+/// with real placements in it would be Mojang's answers in this repository.
+fn items() -> String {
+    let mut text = String::from("# item_id\titem\tplaces\n");
+    for item in dust_registry::Item::all() {
+        text.push_str(&format!("{}\t{}\t-\n", item.protocol_id(), item.name()));
+    }
+    text
+}
+
+#[test]
+fn an_item_table_beside_the_data_is_read() {
+    let dir = data_dir();
+    std::fs::write(dir.join(constants::ITEMS_FILE), items()).expect("write the table");
+    let loaded = constants::items_beside(&dir).expect("a well-formed table");
+    let loaded = loaded.expect("the file is there, so there is a table");
+    assert_eq!(loaded.len(), dust_registry::Item::all().count());
+}
+
+#[test]
+fn no_item_table_is_not_an_error() {
+    // Same rule as the light table, and the same reason: a server that refused
+    // to start without a file the operator has not been told about yet is a
+    // server that refuses to start. What it costs is one sentence at boot.
+    let dir = data_dir();
+    assert!(constants::items_beside(&dir)
+        .expect("absence is fine")
+        .is_none());
+}
+
+#[test]
+fn an_item_table_that_is_there_and_wrong_is_refused_rather_than_skipped() {
+    let dir = data_dir();
+    std::fs::write(
+        dir.join(constants::ITEMS_FILE),
+        "# item_id\titem\tplaces\n0\tminecraft:air\t-\n",
+    )
+    .expect("write a truncated table");
+    let error = constants::items_beside(&dir).expect_err("a table with one row in it");
+    let message = error.to_string();
+    assert!(
+        message.contains(constants::ITEMS_FILE),
+        "the message has to name the file: {message}"
+    );
+}
+
+#[test]
+fn the_two_files_are_two_files() {
+    // Pinned for the same reason `the_name_says_who_wrote_it` is, plus one of
+    // its own: a route that read the same name twice would pass every test
+    // above that does not compare the two.
+    assert_eq!(constants::ITEMS_FILE, "dust-items.tsv");
+    assert_ne!(constants::FILE, constants::ITEMS_FILE);
+}
+
+#[test]
+fn each_reader_looks_for_its_own_file_and_not_the_other() {
+    // The failure this catches is one substitution in one line: a reader
+    // pointed at the other table finds a file, parses it, and refuses it as
+    // malformed — which reads as "your table is broken" for a table that is
+    // fine and a route that is not.
+    let dir = data_dir();
+    std::fs::write(dir.join(constants::FILE), table()).expect("write the block table");
+    assert!(
+        constants::items_beside(&dir)
+            .expect("the item file is absent, which is not an error")
+            .is_none(),
+        "the item reader must not read the block table"
+    );
+
+    let other = data_dir();
+    std::fs::write(other.join(constants::ITEMS_FILE), items()).expect("write the item table");
+    assert!(
+        constants::beside(&other)
+            .expect("the block file is absent, which is not an error")
+            .is_none(),
+        "the block reader must not read the item table"
+    );
 }

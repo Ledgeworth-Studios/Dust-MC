@@ -99,20 +99,24 @@ vein_size = 2.5
 # Point it at a directory in the usual data pack layout — the one containing
 # `minecraft/`. Unpacking a server jar with `cargo xtask extract` produces one.
 #
-# Dust reads one more file from here: `dust-constants.tsv`, which says what
+# Dust reads two more files from here. `dust-constants.tsv` says what
 # Minecraft's own code says about a block state — how much light it stops, how
-# much it gives off, and which of the six heightmaps count it. None of that is
-# data: it is Java, so it is not in the directory above and there is no copy of
-# it in Dust either. You make one from your own server jar:
+# much it gives off, which of the six heightmaps count it, and what it sounds
+# like going down. `dust-items.tsv` says which block each item puts down. None
+# of that is data: it is Java, so it is not in the directory above and there is
+# no copy of it in Dust either. You make both from your own server jar:
 #
 #   cargo xtask extract --version 1.21.1 --only constants
 #   cp .dust-extract/oracle-1.21.1/constants.tsv /path/to/minecraft/data/dust-constants.tsv
+#   cp .dust-extract/oracle-1.21.1/items.tsv     /path/to/minecraft/data/dust-items.tsv
 #
-# Without it, sky light stops dead at the surface of an ocean and under a tree,
-# because every block but air is treated as a wall, and the sky starts above
-# the grass rather than through it. With it, the sky light Dust serves is the
-# light Minecraft computes. A file that is here and unreadable stops the server
-# rather than being ignored.
+# Without the first, sky light stops dead at the surface of an ocean and under
+# a tree, because every block but air is treated as a wall; the sky starts
+# above the grass rather than through it; and a placed block makes no sound.
+# Without the second, a right-click puts down the world's own surface block
+# whatever the player is holding. With them, the sky light Dust serves is the
+# light Minecraft computes and a player places what they are holding. A file
+# that is here and unreadable stops the server rather than being ignored.
 # ---------------------------------------------------------------------------
 # [data]
 # path = "/path/to/minecraft/data"

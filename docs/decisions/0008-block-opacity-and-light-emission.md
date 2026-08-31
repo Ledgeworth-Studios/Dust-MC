@@ -340,8 +340,9 @@ Nothing about this ships a Mojang value. The repository holds the question, the
 oracle that asks it, and the reader for the answer.
 
 **What is left:** nothing this record opened. Sky light is done, block light is
-done, and the block-place sound is done — the last of them by the section
-directly below, which is the same route carrying a third kind of constant.
+done, the block-place sound is done, and so is which block an item puts down —
+the last two by the sections directly below, which are the same route carrying a
+third and a fourth kind of constant.
 
 ## And the sound a block makes going down (2026-08-31)
 
@@ -384,6 +385,59 @@ field resolved to the wrong member answers the same thing for every state. The
 extractor refuses a table that reports one group, for the same reason it refuses
 one with no heightmap columns.
 
+## And which block an item places (2026-08-31)
+
+The fourth value through this route, and the first that needed a **second
+file**. `dust-items.tsv` sits beside `dust-constants.tsv` in `[data] path`,
+because the two are keyed by different things — one row per block state, one row
+per item — and a table whose rows meant two different things depending on which
+column was filled would be a format nobody could check.
+
+`BlockItem.block` is a Java field. It is in no report and no data pack, and the
+oracle reads it in the same run, off the same jar, as everything above.
+
+**The reason it is a table and not a rule.** 925 of 1.21.1's 1,333 items place a
+block, and 909 of those place the block of their own name. It is tempting to
+stop there and write `Block::from_name(item.name())`, and it would be wrong
+sixteen times:
+
+```text
+minecraft:redstone       -> minecraft:redstone_wire
+minecraft:string         -> minecraft:tripwire
+minecraft:wheat_seeds    -> minecraft:wheat
+minecraft:powder_snow_bucket -> minecraft:powder_snow
+minecraft:cocoa_beans    -> minecraft:cocoa
+minecraft:pumpkin_seeds  -> minecraft:pumpkin_stem
+minecraft:melon_seeds    -> minecraft:melon_stem
+minecraft:carrot         -> minecraft:carrots
+minecraft:potato         -> minecraft:potatoes
+minecraft:torchflower_seeds -> minecraft:torchflower_crop
+minecraft:pitcher_pod    -> minecraft:pitcher_crop
+minecraft:beetroot_seeds -> minecraft:beetroots
+minecraft:sweet_berries  -> minecraft:sweet_berry_bush
+minecraft:glow_berries   -> minecraft:cave_vines
+```
+
+— and, the other way round, **`minecraft:air` and `minecraft:wheat` are items
+that share a block's name and place nothing at all.** The second of those is the
+sharp one: `minecraft:wheat` is what bread is made of, the crop of that name
+comes from the seeds, and a name-matching server would let a player put a crop
+down by holding a handful of harvest. That is a bug found by a player and not by
+a test, which is the same argument option 2 of this record already lost.
+
+**The item's own name is in the file beside its id, and it is load bearing.**
+The light table can only check its row *count*, so it catches a version with a
+different number of block states and nothing finer. This one checks every row's
+name against the name this build gives that id, so a version that renumbered a
+single item is caught on the row where it happened, by name. It is the strongest
+version-skew check anything on this route has, and it is there because the
+column was free.
+
+**What arrives is a block, not a block state.** A stair placed by a player faces
+the way they were standing; that is `getStateForPlacement`, it needs a placement
+context, and it is a different problem in a different place. The caller takes
+`Block::default_state` and the gap is stated where it is taken.
+
 ## What is still consequent
 
 - **Block light — built, 2026-08-31, and this record was right about it for
@@ -411,9 +465,18 @@ one with no heightmap columns.
   silence, which is what every server did before this and is a refusal to invent
   what a block sounds like rather than a guess at it — every block would have
   been stone.
+- **A player places what they are holding — built, 2026-08-31.** Not an
+  inventory: nine hotbar slots and a selected one, written by
+  `set_creative_mode_slot`, which is the single inventory write a creative
+  client makes without a container open. Dust puts every player in creative, so
+  that is the whole path from the creative menu to a block going down. A server
+  with no item table places the world's own surface block whatever is held,
+  which is what every server here did before.
 - **`opacity_of` is the one place this is decided** for light, and it says so.
-  It takes the table, the emission model beside it takes the table, and
-  `net::play::block_placed` is the third and last reader this record opened.
+  It takes the table, the emission model beside it takes the table,
+  `net::play::block_placed` takes it for the sound, and
+  `net::session::held_block` takes the item table for the block. Four readers,
+  one route.
 
 ## Related
 
