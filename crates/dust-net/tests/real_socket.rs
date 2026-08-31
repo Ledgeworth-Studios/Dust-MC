@@ -22,6 +22,8 @@
 //! configuration, and the idle timeout must cut it off — reported through
 //! the counters as exactly one idle timeout and nothing else.
 
+mod counters;
+
 use std::sync::{LockResult, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -296,7 +298,15 @@ async fn a_server_list_ping_survives_a_real_kernel() {
         client.close().await.expect("close");
         let ended = server.next_frame().await.expect("read");
         assert_eq!(ended, None, "FIN arrives as a clean end");
-        let stats = server.stats();
+        // `bytes_out` is counted by the writer task after the socket takes
+        // the bytes, so having read them here does not mean the count has
+        // landed — the same race that failed `connection_metrics` on CI.
+        let stats = counters::settled(
+            || server.stats(),
+            |stats| stats.bytes_out > 0,
+            "the status response and the pong, counted on their way out",
+        )
+        .await;
         assert_eq!(stats.frames_in, 3, "handshake, request, ping");
         assert!(stats.bytes_in > 0 && stats.bytes_out > 0);
     })

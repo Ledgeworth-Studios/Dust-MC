@@ -212,13 +212,54 @@ async fn clones_share_one_pool_of_permits() {
     );
 }
 
+/// Two waiters cancelled while the gate is still full.
+///
+/// The point of holding the permit across the abort is that it makes the
+/// outcome a fact about the gate rather than a fact about scheduling: with no
+/// permit to be had, no waiter can complete, so cancellation is the only end
+/// available to them. Nothing here is a race, and nothing here is timed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_waiter_cancelled_while_the_gate_is_full_is_never_admitted() {
+    let gate = AdmissionGate::new(1);
+    let held = gate.admit().await;
+
+    let waiters = [
+        tokio::spawn({
+            let gate = gate.clone();
+            async move { gate.admit().await }
+        }),
+        tokio::spawn({
+            let gate = gate.clone();
+            async move { gate.admit().await }
+        }),
+    ];
+    for waiter in &waiters {
+        waiter.abort();
+    }
+    // Joined, not slept on: awaiting the handle is what guarantees the task is
+    // finished. A sleep would be a guess about how long cancellation takes.
+    for waiter in waiters {
+        assert!(
+            waiter.await.is_err(),
+            "with the only permit held, an aborted waiter has nothing to be \
+             admitted by"
+        );
+    }
+
+    drop(held);
+    assert_eq!(gate.available(), 1, "the held permit came back whole");
+}
+
+/// The abort and the release, deliberately racing.
+///
+/// This is the window a real login queue lives in: a peer hangs up in the same
+/// breath as a slot frees. The invariant that has to survive it is that the
+/// gate comes back whole — and that is all this asserts.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancelled_wait_leaves_the_gate_untouched() {
     let gate = AdmissionGate::new(1);
-    let _held = gate.admit().await;
+    let held = gate.admit().await;
 
-    // Two waiters race for the one remaining slot; both are cancelled
-    // before it frees. Capacity must come back whole.
     let waiter_a = tokio::spawn({
         let gate = gate.clone();
         async move { gate.admit().await }
@@ -229,24 +270,24 @@ async fn a_cancelled_wait_leaves_the_gate_untouched() {
     });
     waiter_a.abort();
     waiter_b.abort();
+    drop(held);
 
-    // Joined, not slept on. `abort` *requests* cancellation; the task is not
-    // finished when it returns, and a waiter that had already been polled can
-    // still take the permit the drop below frees and then give it back as it
-    // unwinds. A fixed sleep is a guess about how long that takes, and it was
-    // long enough here and not on a CI runner — where this failed with
-    // `available() == 0`, which is the window itself.
-    //
-    // Awaiting an aborted task returns a cancellation error and guarantees the
-    // task is done and its guard dropped, which is the thing being asserted.
-    drop(_held);
     for waiter in [waiter_a, waiter_b] {
-        let outcome = waiter.await;
-        assert!(
-            outcome.is_err(),
-            "an aborted waiter must not report having been admitted"
-        );
+        // Deliberately not asserted as cancelled, which is what this test used
+        // to do and what failed on CI with "an aborted waiter must not report
+        // having been admitted". `abort` is a *request*: a waiter the runtime
+        // had already polled can be handed the permit the drop above frees
+        // before the cancellation is ever looked at, and then its handle
+        // yields the guard instead of a cancellation error. Which one happens
+        // is tokio's timing and not this gate's behaviour, so asserting it
+        // here was asserting an ordering the test never arranged — the
+        // deterministic half of the claim is the test above.
+        //
+        // Dropping the outcome hands back whichever of the two it turned out
+        // to be, which is exactly what a cancelled login does.
+        drop(waiter.await);
     }
+
     assert_eq!(gate.available(), 1, "cancelled acquisitions leaked nothing");
 }
 
