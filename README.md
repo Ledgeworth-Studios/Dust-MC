@@ -246,7 +246,9 @@ difference — Dust has no schema for it and says so in code, and the day one is
 added and is wrong, this goes red. Watched to fail: changing one field's type
 from `TAG_Double` to `TAG_Float` produced four findings naming the field.
 
-`light` puts a number on how close the sky light is. A chunk Minecraft wrote
+`light` puts a number on how close the **sky** light is — only the sky light,
+because Dust has no block light at all and a bare percentage would read as "the
+lighting is 99.4% right" when half of lighting is not implemented. A chunk Minecraft wrote
 carries the light Minecraft computed, so the same chunks can be lit again with
 Dust's engine and compared cell by cell.
 

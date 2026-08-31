@@ -1,5 +1,11 @@
 //! `harness light` — how close is Dust's sky light to Minecraft's?
 //!
+//! **Sky light only.** Dust has no block light, so there is nothing on this
+//! side to compare a real server's block-light arrays against — see decision
+//! record 0008 for what that waits on. Every number this prints says
+//! "sky-light" for that reason: a bare percentage would read as "the lighting
+//! is 99.4% right" when half of lighting is not implemented.
+//!
 //! # Why this is measurable at all
 //!
 //! A chunk vanilla wrote carries the light vanilla computed. It is stored per
@@ -247,7 +253,7 @@ fn measure(options: &Options) -> Result<(), String> {
 
     let expected = digest::expected_chunks(options.radius);
     println!(
-        "comparing {} chunk(s) of Minecraft {} seed {}",
+        "comparing the sky light of {} chunk(s) of Minecraft {} seed {}",
         expected.len(),
         options.version,
         options.seed
@@ -575,7 +581,13 @@ fn report(tally: &Tally) {
         }
     };
     println!();
-    println!("{} cells compared", tally.cells);
+    // **Sky light, and it says so.** Dust has no block light at all, so a
+    // percentage that did not name which light it was about would read as "the
+    // lighting is 99.4% right" when half of lighting is not implemented. The
+    // block-light arrays a real server writes are not compared here because
+    // there is nothing on this side to compare them to; see decision record
+    // 0008 for what that is waiting on.
+    println!("{} sky-light cells compared", tally.cells);
     println!(
         "{} agree ({:.3}%), {disagree} do not ({:.3}%)",
         tally.agree,
