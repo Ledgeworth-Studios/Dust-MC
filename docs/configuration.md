@@ -78,4 +78,4 @@ Where Minecraft's own data lives, for the parts of it Dust may not ship.
 
 | Setting | Type | Default | When | Meaning |
 | --- | --- | --- | --- | --- |
-| `path` | `Option<String>` | `unset` | restart | Directory holding Minecraft's data in the usual datapack layout — the one containing `minecraft/`, which is `data/` inside a datapack. Unset means Dust has no registry contents to send. |
+| `path` | `Option<String>` | `unset` | restart | Directory holding Minecraft's data in the usual datapack layout — the one containing `minecraft/`, which is `data/` inside a datapack. Unset means Dust has no registry contents to send.  Dust also looks here for `dust-light.tsv`, the block-state light table written by `cargo xtask extract --only light`. Optional: without it every block but air stops sky light. With it, sky light matches the light Minecraft computes — exactly, on the ocean world the harness measures. A file that is there and unreadable stops the server. |

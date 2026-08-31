@@ -236,15 +236,23 @@ pub struct WorldgenConfig {
 /// come from a copy the operator already has. Decision record 0007 has the
 /// reasoning and record 0006 has the precedent.
 ///
-/// Leaving this unset costs one thing and only one: a client that acknowledges
-/// no data packs cannot be served, because it has no copy of its own to fall
-/// back on. Vanilla clients acknowledge `minecraft:core` and are unaffected.
+/// Leaving this unset costs two things. A client that acknowledges no data
+/// packs cannot be served, because it has no copy of its own to fall back on —
+/// vanilla clients acknowledge `minecraft:core` and are unaffected. And a
+/// served world's sky light stops at the surface of an ocean and under a tree,
+/// because the block-state light table is read from here too.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, ConfigSection)]
 #[serde(default, deny_unknown_fields)]
 pub struct DataConfig {
     /// Directory holding Minecraft's data in the usual datapack layout — the
     /// one containing `minecraft/`, which is `data/` inside a datapack. Unset
     /// means Dust has no registry contents to send.
+    ///
+    /// Dust also looks here for `dust-light.tsv`, the block-state light table
+    /// written by `cargo xtask extract --only light`. Optional: without it
+    /// every block but air stops sky light. With it, sky light matches the
+    /// light Minecraft computes — exactly, on the ocean world the harness
+    /// measures. A file that is there and unreadable stops the server.
     #[config(restart)]
     pub path: Option<String>,
 }

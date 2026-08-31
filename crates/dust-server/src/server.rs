@@ -805,6 +805,48 @@ impl Server {
             as u32;
         let flat = crate::net::world::FlatWorld::new(palette, plains, biomes.entries.len() as u32);
 
+        // Minecraft's own opacity and emission for every block state, if the
+        // operator put a table beside their data. Read before the world is
+        // built because the world is lit with it, and read here rather than at
+        // the first column for the same reason the region directory is checked
+        // here: a mistake in it should stop a server starting, not surprise the
+        // first player who looks at an ocean.
+        //
+        // Decision record 0008 is why this arrives from `[data] path` rather
+        // than from a table in this repository, and `crate::registries::light`
+        // is where the route itself is argued.
+        let light = match data_path.as_deref() {
+            None => None,
+            Some(path) => {
+                crate::registries::light::beside(path).map_err(|e| fail(format!("{e}")))?
+            }
+        };
+        match &light {
+            Some(table) => self.options.logger.info(
+                "dust::data",
+                format!(
+                    "light: Minecraft's own opacity and emission for {} block states, \
+                     {} of them emitting",
+                    table.len(),
+                    table.emitting()
+                ),
+            ),
+            // Information and not a warning, said once at boot. A server with
+            // no table lights the way Dust has always lit — and the numbers
+            // beside it are `cargo xtask harness light`'s, so the sentence says
+            // what it costs instead of only that it costs something.
+            None => self.options.logger.info(
+                "dust::data",
+                format!(
+                    "no {} under [data] path, so a served world's sky light treats \
+                     every block but air as a wall: measured at 0.6% of cells \
+                     inland and 3.5% over ocean",
+                    crate::registries::light::FILE
+                ),
+            ),
+        }
+        let opacity = crate::net::world::opacity_of(palette.air, light.as_ref());
+
         // Where columns come from. An empty setting means the flat world; a
         // path means a world Minecraft wrote, with the flat one kept as the
         // fallback for columns it does not contain.
@@ -851,7 +893,7 @@ impl Server {
                 },
             );
             crate::net::source::Source::Anvil(Box::new(crate::net::source::AnvilWorld::new(
-                directory, names, flat,
+                directory, names, flat, opacity,
             )))
         };
 

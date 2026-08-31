@@ -141,6 +141,10 @@ pub struct AnvilWorld {
     names: RegistryNames,
     height: WorldHeight,
     fallback: FlatWorld,
+    /// How much light entering each block state costs. Built once at boot,
+    /// because with a table in it this is 26,684 bytes and the alternative is
+    /// building one per column served.
+    opacity: dust_world::propagation::OpacityModel,
     /// Where the sky reaches in each column read so far, for lighting the
     /// columns beside it. See the module note for why this is cached when the
     /// chunks are not.
@@ -182,13 +186,26 @@ impl std::fmt::Debug for RegistryNames {
 }
 
 impl AnvilWorld {
-    pub fn new(directory: PathBuf, names: RegistryNames, fallback: FlatWorld) -> Self {
+    /// `opacity` is what the columns are lit with — see
+    /// [`world::opacity_of`](super::world::opacity_of), which is the one place
+    /// that decides between Minecraft's own numbers and the air-only stand-in.
+    ///
+    /// The flat `fallback` keeps its own model and that is not an oversight: it
+    /// is made of bedrock, dirt and grass, every one of which both models agree
+    /// is a wall, so the two answers are the same answer.
+    pub fn new(
+        directory: PathBuf,
+        names: RegistryNames,
+        fallback: FlatWorld,
+        opacity: dust_world::propagation::OpacityModel,
+    ) -> Self {
         Self {
             directory,
             regions: Mutex::new(HashMap::new()),
             names,
             height: fallback.height(),
             fallback,
+            opacity,
             sky_floors: Mutex::new(HashMap::new()),
         }
     }
@@ -274,20 +291,13 @@ impl AnvilWorld {
                 // cache of what an engine would produce, and this server has
                 // its own engine; trusting the file would mean serving light
                 // that no code here can reproduce.
-                // No light table yet: decision record 0008's remaining
-                // question is how one reaches an *operator*, and until that is
-                // answered there is no route for one to arrive on. The
-                // argument exists because `harness light` has a route — a
-                // developer checkout — and measures both models through this
-                // same function.
-                let opacity = super::world::opacity_of(self.fallback.palette().air, None);
                 // This column's own floors go in the cache before its
                 // neighbours are asked for theirs: a column is almost always
                 // asked for beside the ones around it, so the pass that lights
                 // it pays for the four that follow.
                 self.remember(pos, SkyFloor::of(&chunk));
                 let skirt = self.skirt(pos);
-                let _ = super::world::light_column(&mut chunk, &opacity, skirt);
+                let _ = super::world::light_column(&mut chunk, &self.opacity, skirt);
                 chunk
             }
             // Off the edge of what was generated. See the module note: a plain

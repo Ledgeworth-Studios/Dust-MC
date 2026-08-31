@@ -88,6 +88,18 @@
 //! * **A heightmap computed with the wrong predicate.** It is a valid heightmap
 //!   of wrong numbers, and this crate cannot know: it does not have the
 //!   registry that would let it disagree.
+//! * **An attenuation rule that is wrong in both the walk and the reference.**
+//!   `tests/light_propagation.rs` plays random worlds through [`propagation`]
+//!   and against a naive relaxation "too dumb to share the bug" — and both said
+//!   a step cost `1 + opacity` for the life of the light engine, where
+//!   Minecraft charges `max(1, opacity)`. Every seed passed. A differential
+//!   catches a divergence between two statements of a rule and cannot catch a
+//!   rule that is wrong in both, and nothing in this crate can, because the
+//!   rule is Minecraft's. What contradicted it was `cargo xtask harness light`
+//!   against light a real server computed — and only after
+//!   [`propagation::OpacityModel`] could carry an opacity that was neither 0
+//!   nor 15, which is the only range where the two rules differ. **A stand-in
+//!   can only expose the defects its own range reaches.**
 //! * **Light values that were never propagated.** [`light::LightArray`] pins
 //!   the encoding and [`propagation`] walks levels across a graph, but
 //!   nothing yet connects a chunk's blocks to its light: whether fifteen is

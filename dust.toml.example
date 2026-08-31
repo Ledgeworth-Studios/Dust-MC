@@ -98,6 +98,20 @@ vein_size = 2.5
 #
 # Point it at a directory in the usual data pack layout — the one containing
 # `minecraft/`. Unpacking a server jar with `cargo xtask extract` produces one.
+#
+# Dust reads one more file from here: `dust-light.tsv`, which says how much
+# light every block state stops and how much it gives off. Those two numbers
+# are Java code inside Minecraft rather than data, so they are not in the
+# directory above and there is no copy of them in Dust either — you make one
+# from your own server jar:
+#
+#   cargo xtask extract --version 1.21.1 --only light
+#   cp .dust-extract/oracle-1.21.1/light.tsv /path/to/minecraft/data/dust-light.tsv
+#
+# Without it, sky light stops dead at the surface of an ocean and under a tree,
+# because every block but air is treated as a wall. With it, the sky light Dust
+# serves is the light Minecraft computes. A file that is here and unreadable
+# stops the server rather than being ignored.
 # ---------------------------------------------------------------------------
 # [data]
 # path = "/path/to/minecraft/data"

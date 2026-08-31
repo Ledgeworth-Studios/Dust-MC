@@ -112,6 +112,21 @@ Then add `localhost` to a 1.21.1 client's server list. Set `online_mode = false`
 in `dust.toml` first unless you want Mojang consulted, and point
 `world_source` at a `region` directory if you have a world to serve.
 
+For sky light that matches Minecraft's, put a light table beside your data:
+
+```
+cargo xtask extract --version 1.21.1 --only light
+cp .dust-extract/oracle-1.21.1/light.tsv <[data] path>/dust-light.tsv
+```
+
+How much light a block stops and how much it gives off are Java code inside
+Minecraft rather than data, so those numbers are in no report, no data pack and
+no copy here — the extractor asks your own server jar for them and writes them
+to your own disk. Without the file, every block but air stops sky light and the
+server says so at boot. Decision record
+[0008](docs/decisions/0008-block-opacity-and-light-emission.md) is why it
+arrives this way rather than in the binary.
+
 The console takes `stop`, `list` and `say`, with or without a leading slash.
 
 ## How it is checked
@@ -291,7 +306,8 @@ by `cargo xtask extract --only light`.
 ```
 
 **Seed 1 is exact.** 4,816,896 sky-light cells of an ocean world, and not one of
-them disagrees with the light Minecraft wrote.
+them disagrees with the light Minecraft wrote. A running server lights the same
+way, through the same function, when there is a table in `[data] path`.
 
 **Getting there found a defect the stand-in had been hiding for the whole of
 the light engine's life.** Minecraft's numbers on their own moved seed 0 by a

@@ -18,10 +18,22 @@
 //!
 //! **On randomness:** fixed-seed xorshift throughout; a failure replays.
 //!
-//! **What this does not catch:** a wrongness shared by both sides. The
-//! reference derives its edges from the same opacity table the walks read;
+//! **What this does not catch:** a wrongness shared by both sides, and the
+//! list has two entries rather than the one it used to have.
+//!
+//! The reference derives its edges from the same opacity table the walks read;
 //! if the *table* misstates the world, both agree on the wrong answer. That
 //! seam belongs to whoever wires real block states into [`LightGraph`].
+//!
+//! And the reference states the **attenuation rule** a second time rather than
+//! deriving it a second way. Both sides said a step cost `1 + opacity` for the
+//! life of the light engine, and this file passed on every seed while a column
+//! of water came out half as bright as Minecraft makes it — see
+//! `propagation::step_cost`. A differential catches a divergence between two
+//! statements of a rule; it cannot catch a rule that is wrong in both, and
+//! nothing inside this crate can, because the rule is Minecraft's. What
+//! contradicted it was `cargo xtask harness light`, against light a real
+//! server computed.
 
 use dust_world::propagation::{darken, raise, seed_skylight, Budget, LightGraph, PropagationError};
 
@@ -120,8 +132,19 @@ fn relax_until_stable(graph: &Volume, sources: &[(i32, i32, i32, u8)]) -> Vec<u8
                         continue;
                     }
                     let index = graph.offset(x, y, z);
-                    // Entering this cell costs its opacity, on top of the step.
-                    let cost = 1_u16 + u16::from(graph.opacity(x, y, z));
+                    // What entering this cell costs: the move, or the block,
+                    // whichever is larger. Minecraft's rule, spelled out here
+                    // by hand rather than by calling
+                    // `dust_world::propagation::step_cost` — a reference that
+                    // called the thing it is checking would agree with it by
+                    // construction, which is this file's whole argument.
+                    //
+                    // Being a second *copy* of the rule is not the same as
+                    // being a second *derivation* of it, and the note at the
+                    // top of this file now says so: this was `1 + opacity` on
+                    // both sides for the life of the engine and the
+                    // differential passed every time.
+                    let cost = u16::from(graph.opacity(x, y, z).max(1));
                     let mut best = levels[index];
                     for &(dx, dy, dz) in &[
                         (1, 0, 0),
@@ -258,10 +281,16 @@ fn removing_sources_lands_on_the_field_the_remaining_ones_produce() {
 }
 
 #[test]
-fn uniform_opacity_attenuates_exactly_one_plus_opacity_per_step() {
+fn uniform_opacity_attenuates_exactly_one_step_cost_per_step() {
     // In clear uniform air the shortest path is the Manhattan distance, so
     // the whole field is a closed-form sentence -- and monotonicity is not
     // an approximation but the arithmetic itself.
+    //
+    // A step costs `max(1, opacity)`: the move, or the block, whichever is
+    // larger. Opacity 1 is the case that separates that from `1 + opacity`,
+    // and it is the case nearly every translucent block in Minecraft is —
+    // water, leaves, grass, ice. This test read `1 + opacity` and passed,
+    // because so did the engine.
     for opacity in [0u8, 1, 2] {
         for brightness in [7u8, 15] {
             let mut graph = Volume::new((6, 6, 6));
@@ -278,7 +307,7 @@ fn uniform_opacity_attenuates_exactly_one_plus_opacity_per_step() {
                 for y in 0..6i32 {
                     for x in 0..6i32 {
                         let distance = (x - 2).abs() + (y - 2).abs() + (z - 2).abs();
-                        let expected = brightness.saturating_sub(distance as u8 * (1 + opacity));
+                        let expected = brightness.saturating_sub(distance as u8 * opacity.max(1));
                         assert_eq!(
                             graph.level(x, y, z),
                             expected,

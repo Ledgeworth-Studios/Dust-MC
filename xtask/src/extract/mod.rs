@@ -981,6 +981,15 @@ fn light_domain(context: &Context) -> Result<Outcome, String> {
     }
     println!();
     println!("  {} state(s) emit light", summary.emitting);
+    // The route, printed where somebody who just ran this is looking. The
+    // table is read from `[data] path` — decision record 0008 chose that over a
+    // new `dust` subcommand, a JDK on the server's boot path and a second
+    // release artefact — and a copy is what puts it there. One line, so that
+    // "how do I use this" is answered at the moment the question occurs rather
+    // than in a document somewhere.
+    println!();
+    println!("  to serve a world lit the way Minecraft lights it, copy it beside your data:");
+    println!("    cp {} <[data] path>/dust-light.tsv", out.display());
 
     // Every light level Minecraft has is 0..=15, so a value outside that did
     // not come from the field or method this asked for — it came from a
