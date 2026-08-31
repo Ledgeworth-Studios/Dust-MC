@@ -18,6 +18,11 @@ chunks as players move out to `[server].view_distance`, and keeps the connection
 up. That distance is a ceiling: the client asks for one of its own during
 configuration and is served the smaller of the two.
 
+The loading screen ends once the near square has arrived rather than once the
+whole view has. Measured A/B on one binary at the default distance: **668 ms
+against 1,757 ms**, with the last of the 289 columns arriving at the same moment
+either way. It shortens the wait and not the work.
+
 **Tags go out, all thirteen registries of them** — 514 tags flattened to
 6,362 registry ids, which is exactly what a real 1.21.1 server sends, compared
 tag by tag and id by id against one. Nothing went out while five of the

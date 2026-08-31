@@ -1385,19 +1385,35 @@ mod tests {
     /// real work, so a healthy one is done in milliseconds. Sleeping rather
     /// than spinning, because this thread has nothing to do until the loop has
     /// run and a spin denies it the core it is waiting on.
-    fn wait_until_ticks(metrics: &LiveMetrics, minimum: u64) {
+    fn wait_until_ticks(run: &Run, minimum: u64) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while std::time::Instant::now() < deadline {
-            if metrics.ticks_observed() >= minimum {
+            if run.metrics.ticks_observed() >= minimum {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        // **The log, printed rather than referred to.** A boot that failed
+        // leaves the tick count at zero and says why in the log this test is
+        // already capturing — and a panic that told somebody to go and read it
+        // cost three separate diagnoses on the day it was written. It is four
+        // lines to print and it turns "stuck at 0" into a cause.
+        let log = run
+            .sink
+            .lock()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_else(|_| "<the log sink was poisoned>".to_owned());
         panic!(
-            "the server never reached {minimum} tick(s) in 30s; stuck at {}. A boot that \
-             failed leaves this at zero — read the log this test captured, or the error the \
-             run thread returned.",
-            metrics.ticks_observed()
+            "the server never reached {minimum} tick(s) in 30s; stuck at {}. \
+             A boot that failed leaves this at zero, and its log is:\n{}",
+            run.metrics.ticks_observed(),
+            if log.trim().is_empty() {
+                "<nothing was logged, so the boot did not get as far as its \
+                 first line>"
+                    .to_owned()
+            } else {
+                log
+            }
         );
     }
 
@@ -1443,7 +1459,7 @@ mod tests {
                 WatchdogSetting::Custom(WatchdogPolicy::custom(600_000_000_000, |_| {}));
         });
         let worker = std::thread::spawn(move || server.run());
-        wait_until_ticks(&run.metrics, 2);
+        wait_until_ticks(&run, 2);
         assert!(run.stop.request_stop());
         let report = worker.join().expect("run finishes").expect("clean");
         assert_eq!(report.thread_panics, Vec::<String>::new());
@@ -1455,7 +1471,7 @@ mod tests {
     fn the_configured_shutdown_timeout_reaches_the_watchdog() {
         let (run, server) = boot("[server]\nshutdown_timeout_secs = 600\n", |_| {});
         let worker = std::thread::spawn(move || server.run());
-        wait_until_ticks(&run.metrics, 3);
+        wait_until_ticks(&run, 3);
         assert!(run.stop.request_stop());
         let report = worker.join().expect("run finishes").expect("clean");
         assert_eq!(report.shutdown_grace_ns, Some(600_000_000_000));
@@ -1484,7 +1500,7 @@ mod tests {
         // At warn, the info-level heartbeat never reaches the sink...
         let (run, server) = boot("[server]\nlog_level = \"warn\"\n", |_| {});
         let worker = std::thread::spawn(move || server.run());
-        wait_until_ticks(&run.metrics, 2);
+        wait_until_ticks(&run, 2);
         run.stop.request_stop();
         let report = worker.join().expect("finishes").expect("clean");
         assert!(report.is_clean());
@@ -1495,7 +1511,7 @@ mod tests {
         // not a broken sink.
         let (run, server) = boot("", |_| {});
         let worker = std::thread::spawn(move || server.run());
-        wait_until_ticks(&run.metrics, 2);
+        wait_until_ticks(&run, 2);
         run.stop.request_stop();
         worker.join().expect("finishes").expect("clean");
         let text = String::from_utf8(run.sink.lock().unwrap().clone()).expect("utf8");
@@ -1506,7 +1522,7 @@ mod tests {
     fn jvm_disabled_keeps_its_placeholder_out_of_the_participant_list() {
         let (run, server) = boot("[jvm]\nenabled = false\n", |_| {});
         let worker = std::thread::spawn(move || server.run());
-        wait_until_ticks(&run.metrics, 1);
+        wait_until_ticks(&run, 1);
         run.stop.request_stop();
         let report = worker.join().expect("finishes").expect("clean");
         assert!(
