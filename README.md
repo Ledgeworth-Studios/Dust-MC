@@ -191,8 +191,9 @@ just bot 25565
 with this project, which is why it finds what a test suite agrees with itself
 about. `tools/bot/check.js` joins, checks that the dimension it was told about
 is the one it is in, that it has all sixty-four biomes, that it can read a
-block, and that a second bot's swing, crouch and block-break reach the first —
-seven checks, exit 0 or 1. `tools/bot/README.md` has the list and what it has caught.
+block, that a second bot's chat line arrives with the sender's name on it, and
+that its swing, crouch and block-break all reach the first — nine checks, exit 0
+or 1. `tools/bot/README.md` has the list and what it has caught.
 
 `just soak <port> <minutes>` is the long version, and a different question:
 `check` asks whether this works, `soak` asks whether it keeps working. A bot
