@@ -255,20 +255,65 @@ pub const LIGHT_ORACLE: &[Wanted<'static>] = &[
         parameters: &[BLOCK_GETTER, BLOCK_POS],
     },
     Wanted::Class {
+        key: "block_getter.class",
+        class: BLOCK_GETTER,
+    },
+    Wanted::Class {
         key: "empty_block_getter.class",
-        class: "net.minecraft.world.level.EmptyBlockGetter",
+        class: EMPTY_BLOCK_GETTER,
+    },
+    Wanted::Field {
+        key: "empty_block_getter.instance",
+        class: EMPTY_BLOCK_GETTER,
+        field: "INSTANCE",
     },
     Wanted::Class {
         key: "blockpos.class",
         class: BLOCK_POS,
     },
+    Wanted::Field {
+        key: "blockpos.zero",
+        class: BLOCK_POS,
+        field: "ZERO",
+    },
     Wanted::Class {
         key: "idmapper.class",
-        class: "net.minecraft.core.IdMapper",
+        class: ID_MAPPER,
+    },
+    Wanted::Method {
+        key: "idmapper.get_id",
+        class: ID_MAPPER,
+        method: "getId",
+        parameters: &["java.lang.Object"],
+    },
+    // Before `Bootstrap` will run at all. Minecraft's own `Main` calls this
+    // first, and without it static initialisation dies on "Game version not
+    // set" from inside a class the stack trace names only by its obfuscated
+    // letter.
+    //
+    // It is also the sharpest case for keying methods by their parameters:
+    // `tryDetectVersion()` and `setVersion(WorldVersion)` are **both `a`** on
+    // this class, and only the empty parameter list tells the oracle which of
+    // them it is asking for.
+    Wanted::Class {
+        key: "sharedconstants.class",
+        class: SHARED_CONSTANTS,
+    },
+    Wanted::Method {
+        key: "sharedconstants.try_detect_version",
+        class: SHARED_CONSTANTS,
+        method: "tryDetectVersion",
+        parameters: &[],
     },
     Wanted::Class {
         key: "bootstrap.class",
         class: "net.minecraft.server.Bootstrap",
+    },
+    Wanted::Method {
+        key: "bootstrap.boot",
+        class: "net.minecraft.server.Bootstrap",
+        method: "bootStrap",
+        parameters: &[],
     },
 ];
 
@@ -276,6 +321,9 @@ const BLOCK_STATE_BASE: &str =
     "net.minecraft.world.level.block.state.BlockBehaviour$BlockStateBase";
 const BLOCK_GETTER: &str = "net.minecraft.world.level.BlockGetter";
 const BLOCK_POS: &str = "net.minecraft.core.BlockPos";
+const EMPTY_BLOCK_GETTER: &str = "net.minecraft.world.level.EmptyBlockGetter";
+const ID_MAPPER: &str = "net.minecraft.core.IdMapper";
+const SHARED_CONSTANTS: &str = "net.minecraft.SharedConstants";
 
 /// Resolve a list of wanted names into a properties file for the Java side.
 ///

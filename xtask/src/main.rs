@@ -25,11 +25,15 @@ cargo xtask <command>
                    or newer. Not part of `just verify`, and not something CI
                    runs. With --only, extract just the named domains (blocks,
                    items, packets, worldgen, mappings) instead of all of them.
-                   `mappings` is the odd one: it reads the obfuscated-name
-                   table published beside the jar rather than anything the
-                   data generators produced, and writes it to the extract
-                   cache for an oracle to resolve names against. Nothing it
-                   produces is committed. See decision record 0008.
+                   `mappings` and `light` are the odd ones: they read the
+                   jar and the obfuscated-name table published beside it
+                   rather than anything the data generators produced, and
+                   write to the extract cache rather than to crates/.
+                   `light` runs a small Java program on Minecraft's own
+                   classpath and asks it what every block state's opacity and
+                   emission are — constants that appear in no report and no
+                   data pack. Nothing either produces is committed. See
+                   decision record 0008.
 
   harness <verb>   Differential-testing groundwork against vanilla: provision
                    a cached server, capture a fingerprint of a world it
