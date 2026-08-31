@@ -951,7 +951,9 @@ fn constants_domain(context: &Context) -> Result<Outcome, String> {
         .collect::<Vec<_>>()
         .join(":");
     let out = cache.join(format!("oracle-{}/constants.tsv", context.version));
-    println!("asking Minecraft what every block state does to light and to a heightmap");
+    println!(
+        "asking Minecraft what every block state does to light, to a heightmap, and sounds like"
+    );
     run_java(
         &repo,
         &[
@@ -996,6 +998,23 @@ fn constants_domain(context: &Context) -> Result<Outcome, String> {
             out.display()
         ));
     }
+    // The sound groups, as a count and the three widest. A hundred and nine
+    // lines is not a summary; a count of one would be the whole story.
+    println!("  {} distinct block sound group(s)", summary.sounds.len());
+    let mut widest: Vec<(&String, &u64)> = summary.sounds.iter().collect();
+    widest.sort_by_key(|(name, count)| (std::cmp::Reverse(**count), (*name).clone()));
+    for (name, count) in widest.iter().take(3) {
+        println!("    {name}: {count} state(s)");
+    }
+    if summary.sounds.len() == 1 {
+        return Err(format!(
+            "{} gives every block state the same sound group, which no version \
+             of Minecraft does; a `soundtype.*` name resolved to the wrong \
+             member. Check {}/names.properties against this version's mappings.",
+            out.display(),
+            out.parent().unwrap_or(&out).display()
+        ));
+    }
     // The route, printed where somebody who just ran this is looking. The
     // table is read from `[data] path` — decision record 0008 chose that over a
     // new `dust` subcommand, a JDK on the server's boot path and a second
@@ -1020,8 +1039,9 @@ fn constants_domain(context: &Context) -> Result<Outcome, String> {
     }
 
     Ok(format!(
-        "{rows} block states: light, occlusion and {} heightmap(s)",
-        summary.heightmaps.len()
+        "{rows} block states: light, occlusion, {} heightmap(s) and {} sound group(s)",
+        summary.heightmaps.len(),
+        summary.sounds.len()
     ))
 }
 
@@ -1041,6 +1061,14 @@ struct ConstantsSummary {
     /// be wrong in a way nothing else here would notice; six different numbers
     /// are six different predicates.
     heightmaps: std::collections::BTreeMap<String, u64>,
+    /// How many states take each distinct `(place sound, volume, pitch)`.
+    ///
+    /// Kept for the same reason and against the same failure: a `SoundType`
+    /// field that resolved to the wrong member answers one thing for every
+    /// state, and one group covering twenty-six thousand of them is a line a
+    /// reader can see. Only the count of groups and the largest few are
+    /// printed — a hundred and nine lines is not a summary.
+    sounds: std::collections::BTreeMap<String, u64>,
 }
 
 impl ConstantsSummary {
@@ -1065,10 +1093,24 @@ impl ConstantsSummary {
             })
             .unwrap_or_default();
         let named = |wanted: &str| header.iter().position(|name| *name == wanted);
+        // Everything that is not one of the named columns. The list has to
+        // match `dust_registry::constants`'s or this prints a sound name as a
+        // heightmap that counts no states, which is what it did the first time.
         let flags: Vec<(&str, usize)> = header
             .iter()
             .enumerate()
-            .filter(|(_, name)| !matches!(**name, "state_id" | "opacity" | "emission" | "occlude"))
+            .filter(|(_, name)| {
+                !matches!(
+                    **name,
+                    "state_id"
+                        | "opacity"
+                        | "emission"
+                        | "occlude"
+                        | "place_sound"
+                        | "sound_volume"
+                        | "sound_pitch"
+                )
+            })
             .map(|(at, name)| (*name, at))
             .collect();
 
@@ -1092,6 +1134,16 @@ impl ConstantsSummary {
                 if fields.get(*column).copied() == Some("1") {
                     *entry += 1;
                 }
+            }
+            if let (Some(sound), Some(volume), Some(pitch)) = (
+                at(named("place_sound")),
+                at(named("sound_volume")),
+                at(named("sound_pitch")),
+            ) {
+                *summary
+                    .sounds
+                    .entry(format!("{sound} at {volume}/{pitch}"))
+                    .or_default() += 1;
             }
         }
         summary
@@ -1616,6 +1668,40 @@ mod tests {
         // parses as nothing and would quietly vanish instead — a row lost
         // rather than a row wrong, which is harder to notice.
         assert_eq!(ConstantsSummary::of(TABLE).opacity.values().sum::<u64>(), 5);
+    }
+
+    /// The same shape with the sound columns the oracle now writes. Two
+    /// groups, so a summary that collapsed them onto one would fail here
+    /// rather than in the check the extractor prints.
+    const SOUNDING_TABLE: &str = "\
+# state_id	opacity	emission	occlude	place_sound	sound_volume	sound_pitch	MOTION_BLOCKING
+0	0	0	0	minecraft:block.stone.place	1.0	1.0	0
+1	15	0	1	minecraft:block.stone.place	1.0	1.0	1
+2	1	0	0	minecraft:block.wool.place	1.0	1.0	1
+";
+
+    #[test]
+    fn the_sound_columns_are_summarised_and_are_not_counted_as_heightmaps() {
+        // The failure this catches is the one it was written after: the flag
+        // list is "every column that is not named", so a summary that did not
+        // learn these three names printed `place_sound: 0 state(s)` beside the
+        // six real heightmaps and read as a seventh predicate that counts
+        // nothing.
+        let summary = ConstantsSummary::of(SOUNDING_TABLE);
+        assert_eq!(
+            summary.heightmaps.keys().collect::<Vec<_>>(),
+            vec!["MOTION_BLOCKING"]
+        );
+        assert_eq!(summary.sounds.len(), 2);
+        assert_eq!(
+            summary.sounds.get("minecraft:block.stone.place at 1.0/1.0"),
+            Some(&2)
+        );
+    }
+
+    #[test]
+    fn a_table_without_the_sound_columns_summarises_no_groups() {
+        assert!(ConstantsSummary::of(TABLE).sounds.is_empty());
     }
 
     #[test]

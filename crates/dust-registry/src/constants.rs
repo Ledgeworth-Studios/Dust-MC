@@ -1,9 +1,10 @@
 //! The per-block-state values Minecraft keeps in Java code rather than in data.
 //!
 //! How much light entering a state costs, how much it gives off, whether it
-//! occludes, and which of the six heightmaps count it. None of it is in any
-//! `--reports` output or any data pack: it is all code. Decision record 0008 is
-//! the account for the light values and 0010 for the heightmap predicates, and
+//! occludes, which of the six heightmaps count it, and what it sounds like
+//! going down. None of it is in any `--reports` output or any data pack: it is
+//! all code. Decision record 0008 is the account for the light values, 0010 for
+//! the heightmap predicates and 0011 for the sound group, and
 //! `cargo xtask extract --only constants` is the oracle that asks the game —
 //! it boots Minecraft's static initialisation against the operator's own jar
 //! and reads the answers off the block-state registry.
@@ -25,16 +26,24 @@
 //! # The format is header-driven, and that is load bearing
 //!
 //! ```text
-//! # state_id | opacity | emission | occlude | WORLD_SURFACE | MOTION_BLOCKING | …
-//! 0            0         0          0         0               0                 air
-//! 1            15        0          1         1               1                 stone
+//! # state_id | opacity | emission | occlude | place_sound | … | WORLD_SURFACE | …
+//! 0            0         0          0         minecraft:block.stone.place   0
+//! 1            15        0          1         minecraft:block.stone.place   1
 //! ```
 //!
-//! Tab-separated in the file. The first four columns are named values; every
-//! other column is a **flag column** holding `0` or `1`, addressed by the name
-//! in the header — which for the heightmaps is the same string a chunk's NBT
-//! uses and [`HeightmapKind::nbt_key`] returns, so the two sides match on
-//! something they each know independently rather than on a position.
+//! Tab-separated in the file. The columns this module knows by name are
+//! `state_id`, `opacity`, `emission`, `occlude`, `place_sound`, `sound_volume`
+//! and `sound_pitch`; every other column is a **flag column** holding `0` or
+//! `1`, addressed by the name in the header — which for the heightmaps is the
+//! same string a chunk's NBT uses and [`HeightmapKind::nbt_key`] returns, so
+//! the two sides match on something they each know independently rather than
+//! on a position.
+//!
+//! `place_sound` is a **name** and not an id, and is resolved here against this
+//! crate's own generated `minecraft:sound_event` table. Same argument as the
+//! heightmap keys, and it buys the same thing: a table extracted from a version
+//! whose sound registry differs is caught by a name that does not resolve,
+//! where an id would have been accepted and played the wrong noise.
 //!
 //! A reader that took columns by position would silently change meaning the day
 //! one was inserted. This one can also answer *which columns a table it has been
@@ -54,7 +63,8 @@
 
 use std::fmt;
 
-use crate::STATE_COUNT;
+use crate::generated::registries::index;
+use crate::{Registry, STATE_COUNT};
 
 /// One flag column of a constants table, resolved from its name once.
 ///
@@ -70,7 +80,11 @@ pub struct Flag(usize);
 /// Dense and indexed by state id: the oracle reads Minecraft's own `IdMapper`,
 /// so the ids are the ids `dust-registry`'s generated tables are numbered by
 /// and there is no name-matching step for a mistake to hide in.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Not `Eq`, and the reason is the sound group: a volume is a float, and the
+/// two tables that would compare equal under a total ordering of bit patterns
+/// are not a question anybody asks of this type.
+#[derive(Debug, Clone, PartialEq)]
 pub struct BlockConstants {
     /// How much light is lost entering each state, `0..=15`.
     opacity: Box<[u8]>,
@@ -78,8 +92,32 @@ pub struct BlockConstants {
     emission: Box<[u8]>,
     /// Whether each state occludes — Minecraft's `canOcclude()`.
     occludes: Box<[bool]>,
+    /// What each state sounds like going down, when the table carries the
+    /// columns for it. `None` for a table written before they existed.
+    place: Option<Box<[PlaceSound]>>,
     /// The flag columns, in header order.
     flags: Vec<FlagColumn>,
+}
+
+/// What a block sounds like when a player puts it down.
+///
+/// The three values Minecraft's `SoundType` hands to `Level.playSound` for a
+/// placement, before the caller's own scaling: vanilla plays it at
+/// `(volume + 1) / 2` and `pitch * 0.8`, and that arithmetic belongs to the
+/// caller rather than here — a step sound off the same group scales
+/// differently, and a table that had already applied one of them could not
+/// serve the other.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlaceSound {
+    /// The protocol id of the sound event in `minecraft:sound_event`.
+    ///
+    /// Resolved from the name in the table, so this is an id into *this
+    /// build's* registry rather than one carried over from the extractor's.
+    pub sound: u32,
+    /// The sound group's volume.
+    pub volume: f32,
+    /// The sound group's pitch.
+    pub pitch: f32,
 }
 
 /// One named boolean column: what it is called, and one bit per state.
@@ -122,6 +160,46 @@ impl BlockConstants {
     #[must_use]
     pub fn occludes(&self, state: u32) -> bool {
         self.occludes.get(state as usize).copied().unwrap_or(true)
+    }
+
+    /// What `state` sounds like going down.
+    ///
+    /// `None` when the table carries no sound columns, and `None` for a state
+    /// id it does not describe — by the same argument as
+    /// [`BlockConstants::opacity`], except that the safe answer here is silence
+    /// rather than a guess. A server that gets `None` sends no sound packet,
+    /// which is exactly what a server without a table does today.
+    #[must_use]
+    pub fn place_sound(&self, state: u32) -> Option<PlaceSound> {
+        self.place.as_ref()?.get(state as usize).copied()
+    }
+
+    /// Whether this table carries the sound columns at all.
+    ///
+    /// Distinct from every state answering `None`, and worth its own question:
+    /// the server says at boot what its table gave it, and "no sound columns"
+    /// sends an operator to re-run the extractor while "no sound for that
+    /// block" would send them looking for the block.
+    #[must_use]
+    pub fn has_place_sounds(&self) -> bool {
+        self.place.is_some()
+    }
+
+    /// How many distinct sound groups the table describes.
+    ///
+    /// The same check the per-heightmap counts are: a field that resolved to
+    /// the wrong member of `SoundType` would answer the same thing for every
+    /// state, and one group covering twenty-six thousand states says so in one
+    /// number.
+    #[must_use]
+    pub fn sound_groups(&self) -> usize {
+        let Some(place) = self.place.as_ref() else {
+            return 0;
+        };
+        let mut seen: Vec<u32> = place.iter().map(|p| p.sound).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        seen.len()
     }
 
     /// The flag column called `name`, if this table carries one.
@@ -183,8 +261,10 @@ impl BlockConstants {
     /// The first `#` line is the header and names the columns; blank lines and
     /// any further `#` lines are skipped. `state_id`, `opacity` and `emission`
     /// must be there; `occlude` is optional and defaults to occluding, which is
-    /// what the engine assumed before the column existed; every other column is
-    /// a flag holding `0` or `1`.
+    /// what the engine assumed before the column existed; `place_sound`,
+    /// `sound_volume` and `sound_pitch` are optional **together**, because two
+    /// of the three describe a sound nobody can play; every other column is a
+    /// flag holding `0` or `1`.
     ///
     /// # Errors
     ///
@@ -196,6 +276,8 @@ impl BlockConstants {
         let mut opacity = vec![None; expected];
         let mut emission = vec![0u8; expected];
         let mut occludes = vec![true; expected];
+        let mut place = header.sound.map(|_| vec![SILENCE; expected]);
+        let events = sound_events();
         let mut flags: Vec<FlagColumn> = header
             .flags
             .iter()
@@ -249,6 +331,15 @@ impl BlockConstants {
             *slot = Some(op);
             emission[state as usize] = em;
             occludes[state as usize] = occlude;
+            if let (Some(columns), Some(place)) = (header.sound, place.as_mut()) {
+                place[state as usize] = sound(
+                    at,
+                    events,
+                    cell(columns.name),
+                    cell(columns.volume),
+                    cell(columns.pitch),
+                )?;
+            }
             for (flag, (name, column)) in flags.iter_mut().zip(&header.flags) {
                 flag.set[state as usize] = boolean_named(at, name, cell(*column))?;
             }
@@ -266,6 +357,7 @@ impl BlockConstants {
                 .collect(),
             emission: emission.into_boxed_slice(),
             occludes: occludes.into_boxed_slice(),
+            place: place.map(Vec::into_boxed_slice),
             flags,
         })
     }
@@ -278,8 +370,18 @@ struct Header {
     opacity: usize,
     emission: usize,
     occlude: Option<usize>,
+    /// The three sound columns, present or absent together.
+    sound: Option<SoundColumns>,
     /// Every other column, by name and position.
     flags: Vec<(String, usize)>,
+}
+
+/// Where the sound group's three columns sit.
+#[derive(Debug, Clone, Copy)]
+struct SoundColumns {
+    name: usize,
+    volume: usize,
+    pitch: usize,
 }
 
 impl Header {
@@ -306,12 +408,48 @@ impl Header {
         let opacity = required("opacity")?;
         let emission = required("emission")?;
         let occlude = column("occlude");
+        // All three or none. Two of them describe a sound with no name or a
+        // name with no loudness, and a reader that took what it could get
+        // would turn an oracle that half-ran into a server that plays block
+        // sounds at whatever the default happened to be. The error names the
+        // one that is missing rather than the group.
+        let sound = match (
+            column("place_sound"),
+            column("sound_volume"),
+            column("sound_pitch"),
+        ) {
+            (None, None, None) => None,
+            (Some(name), Some(volume), Some(pitch)) => Some(SoundColumns {
+                name,
+                volume,
+                pitch,
+            }),
+            (name, volume, pitch) => {
+                let missing = [
+                    ("place_sound", name),
+                    ("sound_volume", volume),
+                    ("sound_pitch", pitch),
+                ]
+                .into_iter()
+                .find_map(|(what, at)| at.is_none().then_some(what))
+                .expect("one of the three is absent or the arm above matched");
+                return Err(ConstantsError::MissingColumn {
+                    line: at + 1,
+                    column: missing,
+                });
+            }
+        };
+        let named = |at: usize| {
+            at == state_id
+                || at == opacity
+                || at == emission
+                || Some(at) == occlude
+                || sound.is_some_and(|s| at == s.name || at == s.volume || at == s.pitch)
+        };
         let flags = names
             .iter()
             .enumerate()
-            .filter(|(at, _)| {
-                *at != state_id && *at != opacity && *at != emission && Some(*at) != occlude
-            })
+            .filter(|(at, _)| !named(*at))
             .map(|(at, name)| (name.clone(), at))
             .collect();
         Ok(Self {
@@ -320,6 +458,7 @@ impl Header {
             opacity,
             emission,
             occlude,
+            sound,
             flags,
         })
     }
@@ -348,6 +487,80 @@ fn level(line: usize, field: &'static str, value: u32) -> Result<u8, ConstantsEr
         .ok_or(ConstantsError::OutOfRange { line, field, value })
 }
 
+/// The state a row gets before its sound column is read, and the answer for a
+/// table that has no sound columns at all.
+///
+/// Not reachable from outside: a `BlockConstants` with no sound columns answers
+/// `None` rather than this, because "no table said" and "the table said
+/// silence" are different facts and only one of them is worth logging.
+const SILENCE: PlaceSound = PlaceSound {
+    sound: 0,
+    volume: 0.0,
+    pitch: 0.0,
+};
+
+/// The sound event registry, resolved once rather than per row.
+///
+/// 26,684 rows against a binary search over 1,611 names is cheap either way;
+/// what this avoids is the `Option` in the middle of the loop, which would have
+/// to answer "this build has no sound_event registry" twenty-six thousand
+/// times for a table that is generated and always does.
+fn sound_events() -> Registry {
+    Registry::at(index::SOUND_EVENT)
+}
+
+/// Read one row's sound group: a name this build's registry knows, and two
+/// floats that are plausibly loudnesses.
+///
+/// The range check is the weaker cousin of [`level`]'s and is honest about it.
+/// Reading the wrong *object* field throws on the Java side before anything
+/// reaches this file, and reading `pitch` where `volume` was meant is a swap no
+/// range can see. What it does catch is a float that is not one — a NaN, an
+/// infinity, or the enormous number a misaligned read produces — which is the
+/// difference between a server that refuses to start and one that plays every
+/// block at a volume the client clamps in silence.
+fn sound(
+    line: usize,
+    events: Registry,
+    name: &str,
+    volume: &str,
+    pitch: &str,
+) -> Result<PlaceSound, ConstantsError> {
+    let sound = events
+        .entry_id(name)
+        .ok_or_else(|| ConstantsError::UnknownSound {
+            line,
+            name: name.to_owned(),
+        })?;
+    Ok(PlaceSound {
+        sound,
+        volume: loudness(line, "sound_volume", volume)?,
+        pitch: loudness(line, "sound_pitch", pitch)?,
+    })
+}
+
+/// Parse one of the sound group's two floats, and refuse one that is not a
+/// number in the range Minecraft's own sound groups live in.
+fn loudness(line: usize, field: &'static str, text: &str) -> Result<f32, ConstantsError> {
+    text.parse::<f32>()
+        .ok()
+        .filter(|v| v.is_finite() && (0.0..=LOUDNESS_CEILING).contains(v))
+        .ok_or_else(|| ConstantsError::Malformed {
+            line,
+            detail: format!(
+                "{field} is {text:?}, and a sound group's is a number in 0..={LOUDNESS_CEILING}"
+            ),
+        })
+}
+
+/// The largest volume or pitch this reader will believe.
+///
+/// 1.21.1's sound groups use two volumes and two pitches between 0.3 and 1.5,
+/// so ten is not a bound derived from the data — it is a bound comfortably
+/// above anything a future version would plausibly add and comfortably below
+/// what a misread float looks like.
+const LOUDNESS_CEILING: f32 = 10.0;
+
 /// A flag is `0` or `1` and nothing else.
 fn boolean(line: usize, field: &str, text: &str) -> Result<bool, ConstantsError> {
     match text {
@@ -368,6 +581,19 @@ fn boolean_named(line: usize, field: &str, text: &str) -> Result<bool, Constants
 /// Why a constants table could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConstantsError {
+    /// A `place_sound` this build's `minecraft:sound_event` registry has no
+    /// entry for.
+    ///
+    /// Same cause as [`ConstantsError::UnknownState`] and caught by a different
+    /// column: a table extracted from a version whose sounds differ. It is
+    /// named rather than skipped because the alternative is a server that plays
+    /// nothing for one block and cannot say which.
+    UnknownSound {
+        /// One-based line number in the file.
+        line: usize,
+        /// The name that did not resolve.
+        name: String,
+    },
     /// No `#` line, so nothing says what the columns are.
     NoHeader,
     /// The header does not name a column the reader needs.
@@ -434,6 +660,10 @@ impl fmt::Display for ConstantsError {
                 "line {line}: the header does not name a `{column}` column"
             ),
             Self::Malformed { line, detail } => write!(f, "line {line}: {detail}"),
+            Self::UnknownSound { line, name } => write!(
+                f,
+                "line {line}: no sound event is called `{name}` in this build's                  registry — the table is from a different Minecraft version"
+            ),
             Self::OutOfRange { line, field, value } => write!(
                 f,
                 "line {line}: {field} is {value}, and a light level is 0..=15 — \

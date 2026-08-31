@@ -14,7 +14,7 @@
 //! means a different block than it does in this build.
 
 use dust_registry::constants::{BlockConstants, ConstantsError};
-use dust_registry::STATE_COUNT;
+use dust_registry::{Registry, STATE_COUNT};
 
 /// A complete table where state `n` has opacity `n % 16`, emits `(n * 7) % 16`
 /// and occludes on even ids. Arbitrary, and the point is that it is *complete*:
@@ -276,4 +276,152 @@ fn a_row_that_is_not_as_wide_as_the_header_is_refused() {
         matches!(error, ConstantsError::Malformed { line: 2, .. }),
         "{error}"
     );
+}
+
+/// A complete table that also carries the three sound columns.
+///
+/// The two sound names alternate so that a reader collapsing them onto one
+/// answer fails, and they are real entries in `minecraft:sound_event` because
+/// the parser resolves them there — a fixture with an invented name would be
+/// testing the refusal rather than the reading.
+fn full_with_sound() -> String {
+    let mut text = String::from(
+        "# state_id\topacity\temission\tocclude\tplace_sound\tsound_volume\tsound_pitch\tMOTION_BLOCKING\n",
+    );
+    for state in 0..STATE_COUNT {
+        let (name, volume, pitch) = sound_of(state);
+        text.push_str(&format!("{state}\t0\t0\t1\t{name}\t{volume}\t{pitch}\t1\n"));
+    }
+    text
+}
+
+/// The row [`full_with_sound`] writes for state 0, for the same reason
+/// [`ROW_ZERO`] exists: a corruption that matched some other row would still
+/// produce a passing test, and only the line number in the failure would say
+/// so.
+const SOUND_ROW_ZERO: &str = "0\t0\t0\t1\tminecraft:block.stone.place\t1\t1\t1\n";
+
+/// What [`full_with_sound`] writes for a state, so the assertions and the
+/// fixture cannot drift.
+fn sound_of(state: u32) -> (&'static str, f32, f32) {
+    if state % 2 == 0 {
+        ("minecraft:block.stone.place", 1.0, 1.0)
+    } else {
+        ("minecraft:block.wool.place", 0.3, 1.5)
+    }
+}
+
+#[test]
+fn the_first_row_of_the_sound_fixture_is_the_one_the_tests_below_corrupt() {
+    assert_eq!(
+        full_with_sound().lines().nth(1),
+        Some(SOUND_ROW_ZERO.trim_end())
+    );
+}
+
+#[test]
+fn a_table_with_the_sound_columns_reads_a_name_into_this_builds_registry() {
+    let table = BlockConstants::parse(&full_with_sound()).expect("a complete table");
+    assert!(table.has_place_sounds());
+    let events = Registry::from_name("minecraft:sound_event").expect("the registry is generated");
+    for state in [0, 1, 15, 1234, STATE_COUNT - 1] {
+        let (name, volume, pitch) = sound_of(state);
+        let sound = table.place_sound(state).expect("the column is there");
+        assert_eq!(
+            sound.sound,
+            events.entry_id(name).expect("a real sound event"),
+            "state {state} resolves to the id this build gives {name}"
+        );
+        assert_eq!(sound.volume, volume, "volume {state}");
+        assert_eq!(sound.pitch, pitch, "pitch {state}");
+    }
+    // Two names in the fixture, so a reader that answered one thing for every
+    // state — the shape a field resolved to the wrong member takes — is not
+    // what just passed.
+    assert_eq!(table.sound_groups(), 2);
+}
+
+#[test]
+fn the_sound_columns_are_not_read_as_flags() {
+    // The failure this catches is silent and specific: the flag columns are
+    // "every column that is not one of the named ones", so a reader that did
+    // not learn these three names would try to read `minecraft:block.stone.place`
+    // as a 0 or a 1 — and, if it somehow did not, would offer a
+    // `flag("place_sound")` that answers about a sound.
+    let table = BlockConstants::parse(&full_with_sound()).expect("a complete table");
+    assert_eq!(table.flags().collect::<Vec<_>>(), vec!["MOTION_BLOCKING"]);
+    assert!(table.flag("place_sound").is_none());
+    assert!(table.flag("sound_volume").is_none());
+}
+
+#[test]
+fn a_table_written_before_the_sound_columns_is_silent_rather_than_wrong() {
+    // The version this feature was added in is not the version an operator
+    // last ran the extractor in. Absent is the state a server has to keep
+    // running in, and it is distinguishable from "Minecraft says silence".
+    let table = BlockConstants::parse(&full()).expect("a complete table");
+    assert!(!table.has_place_sounds());
+    assert_eq!(table.place_sound(0), None);
+    assert_eq!(table.sound_groups(), 0);
+}
+
+#[test]
+fn a_state_the_sound_table_does_not_reach_is_silent() {
+    let table = BlockConstants::parse(&full_with_sound()).expect("a complete table");
+    assert_eq!(table.place_sound(STATE_COUNT), None);
+}
+
+#[test]
+fn two_of_the_three_sound_columns_is_refused_and_names_the_missing_one() {
+    // A half-run oracle, or a hand-edited file. Reading what is there would
+    // give every block a sound at whatever loudness the reader defaulted to,
+    // which is a server that is audibly wrong and says nothing.
+    for (drop, expected) in [
+        ("place_sound", "place_sound"),
+        ("sound_volume", "sound_volume"),
+        ("sound_pitch", "sound_pitch"),
+    ] {
+        let text = full_with_sound().replacen(&format!("\t{drop}"), "\tsomething_else", 1);
+        let error = BlockConstants::parse(&text).expect_err("two of the three");
+        assert!(
+            matches!(error, ConstantsError::MissingColumn { column, .. } if column == expected),
+            "dropping {drop}: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_sound_this_build_has_no_entry_for_names_the_version_skew() {
+    // The sound registry's own version-skew case, and the reason the column
+    // holds a name. An id would have been a number in range and would have
+    // played whatever this build's registry has at that position.
+    let text = full_with_sound().replacen(
+        SOUND_ROW_ZERO,
+        "0\t0\t0\t1\tminecraft:block.dust.place\t1\t1\t1\n",
+        1,
+    );
+    let error = BlockConstants::parse(&text).expect_err("a sound this build has never heard of");
+    assert!(
+        matches!(&error, ConstantsError::UnknownSound { name, .. } if name == "minecraft:block.dust.place"),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("different Minecraft version"),
+        "the message has to say what it actually means: {error}"
+    );
+}
+
+#[test]
+fn a_volume_that_is_not_a_loudness_is_refused() {
+    for bad in ["NaN", "inf", "-1.0", "1e30", "loud"] {
+        let text = full_with_sound().replacen(
+            SOUND_ROW_ZERO,
+            &format!("0\t0\t0\t1\tminecraft:block.stone.place\t{bad}\t1\t1\n"),
+            1,
+        );
+        let error = BlockConstants::parse(&text).expect_err("a volume that is not one");
+        let message = error.to_string();
+        assert!(message.contains("sound_volume"), "{bad}: {message}");
+        assert!(message.contains("line 2"), "{bad}: {message}");
+    }
 }
