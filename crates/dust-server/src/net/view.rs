@@ -30,7 +30,9 @@ use dust_world::coords::ChunkPos;
 pub struct View {
     loaded: BTreeSet<(i32, i32)>,
     centre: Option<ChunkPos>,
-    /// How far this view reaches, in columns.
+    /// How far this view reaches, in columns. Settable, because a player may
+    /// change their render distance without reconnecting; see
+    /// [`View::set_radius`].
     ///
     /// Held here rather than passed to every [`View::move_to`], because a view
     /// that could be moved at a radius other than the one it was built for is
@@ -70,6 +72,18 @@ impl View {
             // below would then produce an empty view that forgets everything.
             radius: i32::try_from(radius.clamp(1, 32)).expect("clamped to 1..=32"),
         }
+    }
+
+    /// Change how far this view reaches.
+    ///
+    /// Nothing is sent or forgotten here. The next [`View::move_to`] does both,
+    /// from the same difference it already computes — which is the whole reason
+    /// this is one line: a shrinking view forgets what fell outside it and a
+    /// growing one sends what came in, and neither is a special case.
+    ///
+    /// Clamped like [`View::with_radius`], for the same reason.
+    pub fn set_radius(&mut self, radius: u32) {
+        self.radius = i32::try_from(radius.clamp(1, 32)).expect("clamped to 1..=32");
     }
 
     /// Move the view to `centre`, and say what that costs.

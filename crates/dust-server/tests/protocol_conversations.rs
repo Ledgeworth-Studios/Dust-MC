@@ -2004,3 +2004,53 @@ fn a_client_asking_for_a_longer_view_is_held_to_the_server_s() {
     drop(stream);
     running.finish();
 }
+
+/// A player who turns their render distance down mid-game is served less.
+///
+/// The setting a client sends during configuration is honoured at the join; it
+/// may send the packet again at any point afterwards, and until the streaming
+/// was paced there was nothing cheap to do about it. Now the view simply
+/// forgets what fell outside the new square, on its next move, out of the same
+/// difference it already computes.
+#[test]
+fn a_render_distance_lowered_mid_game_forgets_what_fell_outside_it() {
+    let running = start("view_distance = 4\n");
+    let addr = running.addr;
+    let mut stream = connect(addr);
+    let mut joined = join_asking_for_view_distance(&mut stream, addr, "Shrinking", 4);
+    joined.drain_until_quiet(&mut stream);
+    assert_eq!(joined.chunks, 81, "nine by nine to begin with");
+    let forgotten_before = joined.forgets;
+
+    // Ask for one — three by three — with `client_information`, id 0x0a in
+    // play on 1.21.1. Written by hand like every other packet here.
+    let mut settings = Vec::new();
+    write_string("en_gb", &mut settings);
+    settings.push(1); // view distance
+    write_var_int(0, &mut settings); // chat mode
+    settings.push(1); // chat colours
+    settings.push(0x7f); // skin parts
+    write_var_int(1, &mut settings); // main hand
+    settings.push(0); // text filtering
+    settings.push(1); // server listings
+    send_compressed_frame(&mut stream, 0x0a, &settings);
+
+    // A move, so the view recomputes. One block is enough: the difference is
+    // taken against the new radius, not against how far the player went.
+    let mut walk = Vec::new();
+    walk.extend_from_slice(&1.5f64.to_be_bytes());
+    walk.extend_from_slice(&(-59.0f64).to_be_bytes());
+    walk.extend_from_slice(&1.5f64.to_be_bytes());
+    walk.push(1);
+    send_compressed_frame(&mut stream, 26, &walk);
+
+    joined.drain_until_quiet(&mut stream);
+    assert!(
+        joined.forgets - forgotten_before >= 72,
+        "eighty-one columns down to nine is seventy-two forgotten; saw {}",
+        joined.forgets - forgotten_before
+    );
+
+    drop(stream);
+    running.finish();
+}
