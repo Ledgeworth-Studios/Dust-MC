@@ -1309,7 +1309,7 @@ mod tests {
         sink: Arc<Mutex<Vec<u8>>>,
     }
 
-    /// A config for a test, with a listener that cannot collide.
+    /// A config for a test: a listener that cannot collide, and no Mojang.
     ///
     /// Every boot now takes a real port, and two things follow that the tests
     /// have to say out loud. The bind is **loopback**, so a unit test never
@@ -1319,16 +1319,35 @@ mod tests {
     /// alone and fail together, which is the shape of flakiness that costs the
     /// most to diagnose.
     ///
-    /// A config text that names `bind` itself is left alone: those tests are
-    /// about the bind.
-    fn with_test_bind(config_text: &str) -> String {
-        if config_text.contains("bind") {
+    /// `online_mode` is set for a reason of the same shape and a bigger bill.
+    /// It defaults to `true`, and [`Server::start_network`] answers that by
+    /// loading the system root certificates and generating an RSA key pair
+    /// *before* it binds — by a prime search its own comment calls "slow and
+    /// unbounded". Every test here that did not say otherwise was paying
+    /// seconds for a key pair it never used and taking on a dependency on the
+    /// host's certificate store to get it. Both arrived: these boots ran four
+    /// to five seconds each, four of them overran the thirty-second wait on a
+    /// busy machine and reported "stuck at 0" with an empty log, and on a Mac
+    /// whose keychain refused a trust-settings read they failed outright with
+    /// a certificate error two phases away from anything under test.
+    ///
+    /// A config text that names either setting itself is left alone: those
+    /// tests are about that setting.
+    fn with_test_defaults(config_text: &str) -> String {
+        let mut settings = String::new();
+        if !config_text.contains("bind") {
+            settings.push_str("bind = \"127.0.0.1:0\"\n");
+        }
+        if !config_text.contains("online_mode") {
+            settings.push_str("online_mode = false\n");
+        }
+        if settings.is_empty() {
             return config_text.to_owned();
         }
         if let Some(rest) = config_text.strip_prefix("[server]\n") {
-            format!("[server]\nbind = \"127.0.0.1:0\"\n{rest}")
+            format!("[server]\n{settings}{rest}")
         } else {
-            format!("[server]\nbind = \"127.0.0.1:0\"\n{config_text}")
+            format!("[server]\n{settings}{config_text}")
         }
     }
 
@@ -1341,7 +1360,7 @@ mod tests {
             Level::Info,
             Arc::clone(&clock) as Arc<dyn Clock>,
         );
-        let config_path = write_config(&with_test_bind(config_text));
+        let config_path = write_config(&with_test_defaults(config_text));
         let mut options = ServerOptions {
             config_path: config_path.clone(),
             // A directory of this run's own. The default is `world`, which is

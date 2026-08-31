@@ -40,7 +40,7 @@ fn test_world_dir() -> PathBuf {
     ))
 }
 
-/// A unique temp file per call, always with a listener that cannot collide.
+/// A unique temp file per call, always with the test defaults applied.
 ///
 /// The bind is applied *here* rather than left to each caller, because one
 /// caller forgot. `[server].bind` defaults to `0.0.0.0:25565`, so a test that
@@ -56,7 +56,7 @@ fn write_config(text: &str) -> PathBuf {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::SeqCst),
     ));
-    std::fs::write(&path, with_test_bind(text)).expect("write the temp config");
+    std::fs::write(&path, with_test_defaults(text)).expect("write the temp config");
     path
 }
 
@@ -85,19 +85,43 @@ impl TickParticipant for Counter {
     }
 }
 
-/// A config for a test, with a listener that cannot collide.
+/// A config for a test: a listener that cannot collide, and no Mojang.
 ///
 /// Booting now takes a real port. Loopback so no test opens a port to the
 /// network, and port 0 so the operating system picks a free one — these tests
 /// run in parallel with each other and with the crate's unit tests, and a
 /// fixed port would make the suite pass alone and fail together.
-fn with_test_bind(config_text: &str) -> String {
-    if config_text.contains("bind") {
+///
+/// **And `online_mode = false`, for a reason of the same shape.** It defaults
+/// to `true`, and phase 3 answers that by loading the system root certificates
+/// and generating an RSA key pair before it binds — the key pair by a prime
+/// search whose own comment says it is "slow and unbounded". So every test
+/// here that did not say otherwise paid seconds for a key it never used, and
+/// bought a dependency on the host's certificate store along with it. Both
+/// showed up: boots took four to five seconds each, occasionally overran the
+/// thirty-second wait, and on a Mac whose keychain refused a trust-settings
+/// read they failed outright with a certificate error two phases away from
+/// anything the test was about. `protocol_conversations.rs` had already
+/// written `online_mode = false` into every one of its configs by hand, which
+/// is the same "a rule every caller has to remember" that the bind is here to
+/// answer.
+///
+/// A config that names either setting itself is left alone: those tests are
+/// about that setting.
+fn with_test_defaults(config_text: &str) -> String {
+    let mut settings = String::new();
+    if !config_text.contains("bind") {
+        settings.push_str("bind = \"127.0.0.1:0\"\n");
+    }
+    if !config_text.contains("online_mode") {
+        settings.push_str("online_mode = false\n");
+    }
+    if settings.is_empty() {
         return config_text.to_owned();
     }
     match config_text.strip_prefix("[server]\n") {
-        Some(rest) => format!("[server]\nbind = \"127.0.0.1:0\"\n{rest}"),
-        None => format!("[server]\nbind = \"127.0.0.1:0\"\n{config_text}"),
+        Some(rest) => format!("[server]\n{settings}{rest}"),
+        None => format!("[server]\n{settings}{config_text}"),
     }
 }
 
@@ -116,7 +140,7 @@ struct Running {
 fn start(config_text: &str, extras: Vec<Box<dyn TickParticipant>>) -> Running {
     let clock = Arc::new(ManualClock::new());
     let options = ServerOptions {
-        config_path: write_config(&with_test_bind(config_text)),
+        config_path: write_config(config_text),
         world_dir: test_world_dir(),
         clock: Arc::clone(&clock) as Arc<dyn Clock>,
         loop_parker: stepping(clock, TICK_NS),
@@ -135,32 +159,48 @@ fn start(config_text: &str, extras: Vec<Box<dyn TickParticipant>>) -> Running {
     }
 }
 
-/// Wait for progress without sleeping: bounded cooperative spinning, panics
-/// if the server stalls short of `minimum`.
-fn wait_for(running: &Running, minimum_ticks: u64) {
-    for _ in 0..50_000_000 {
+/// Wait for progress, panicking if the server stalls short of `minimum`.
+///
+/// The same two corrections its sibling [`wait_for_ticks`] already carries,
+/// applied here because this one was missed both times.
+///
+/// The deadline is in **seconds and not in iterations**. The earlier version
+/// spun fifty million times on `yield_now`, which measures patience in yields
+/// — and a yield costs almost nothing on an idle machine and a scheduling
+/// quantum on a busy one, so the wait was *shortest* when nothing else was
+/// running. Thirty seconds is patience with the OS scheduler, not tolerance
+/// for a slow loop: this loop parks on a virtual clock and does no real work.
+///
+/// And a boot that failed is **joined and reported**, not described. A server
+/// that never started leaves the tick count at zero, which to any waiting loop
+/// is indistinguishable from one that is merely slow; noticing the thread has
+/// finished turns a thirty-second timeout into a failure in milliseconds, and
+/// joining it turns "the boot failed" into the phase error that actually
+/// happened. Saying only the former cost an evening: the cause was two phases
+/// away, in a certificate load this test had no idea it was doing.
+fn wait_for(running: &mut Running, minimum_ticks: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
         if running.metrics.ticks_observed() >= minimum_ticks {
             return;
         }
-        // A server whose boot failed never ticks, and to a spin loop that is
-        // indistinguishable from one that is merely slow. The run thread has
-        // already finished in that case, and saying so turns "stuck at 0" —
-        // which names no cause at all — into the phase error that actually
-        // happened.
         if running
             .worker
             .as_ref()
             .is_some_and(std::thread::JoinHandle::is_finished)
         {
+            let outcome = running.worker.take().map(std::thread::JoinHandle::join);
             panic!(
                 "the run thread exited before reaching {minimum_ticks} tick(s); \
-                 the boot failed rather than stalled"
+                 the boot failed rather than stalled: {outcome:?}"
             );
         }
-        std::thread::yield_now();
+        // Sleeping rather than yielding: this thread has nothing to do until
+        // the loop has run, and a spin denies it the core it is waiting on.
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
     panic!(
-        "the server never reached {minimum_ticks} tick(s); stuck at {}",
+        "the server never reached {minimum_ticks} tick(s) in 30s; stuck at {}",
         running.metrics.ticks_observed()
     );
 }
@@ -182,8 +222,8 @@ fn boot_ticks_simulated_ctrl_c_and_shutdown_follow_the_documented_order() {
     let counter: Box<dyn TickParticipant> = Box::new(Counter {
         log: Arc::clone(&tick_log),
     });
-    let running = start("[server]\nshutdown_timeout_secs = 600\n", vec![counter]);
-    wait_for(&running, 10);
+    let mut running = start("[server]\nshutdown_timeout_secs = 600\n", vec![counter]);
+    wait_for(&mut running, 10);
 
     // A simulated ctrl-C is indistinguishable from the real keypress: the
     // same handle, the same flag, the same between-ticks observation.
