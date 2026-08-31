@@ -100,14 +100,23 @@ impl Default for ServerConfig {
             online_mode: true,
             max_catchup_ticks: 20,
             shutdown_timeout_secs: 10,
-            // Eight, which is what a great many servers run and what a
-            // client sees as a reasonable distance. Not vanilla's ten: a join
-            // sends every column in one burst here, and 289 of them is already
-            // a second of work on a slow machine where 441 is nearly two. The
-            // number goes up when the streaming has a per-tick budget, which
-            // is Phase 17's, and the setting is the thing that will not have
-            // to be invented then.
-            view_distance: 8,
+            // Ten, which is Minecraft's own default.
+            //
+            // It was eight while a join sent every column in one burst, on the
+            // reasoning that 441 of them was nearly two seconds of stall where
+            // 289 was one. The burst is gone: the loading screen ends after the
+            // near twenty-five and the rest arrives from the play loop a batch
+            // at a time, so **what a player waits for no longer depends on this
+            // number at all**. Measured, screen-to-first-keep-alive at three
+            // distances: 404/421 ms at 8, 396/415 ms at 10, 376/394 ms at 12.
+            //
+            // What it still costs is the streaming behind them — 441 columns
+            // finish in about two and a half seconds against 289 in under two —
+            // and the memory of holding them. That is a bill a player pays
+            // while playing rather than while waiting, which is what makes
+            // vanilla's number the right default now and made it the wrong one
+            // before.
+            view_distance: 10,
             log_level: LogLevel::default(),
             world_source: String::new(),
             favicon: String::new(),

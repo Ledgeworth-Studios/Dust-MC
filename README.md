@@ -33,6 +33,11 @@ The same work, in the same order, finishing at the same moment — with the
 session answering throughout instead of at the end. A player who joins and walks
 immediately used to have their movement packets sit in the socket for a second.
 
+**What a player waits for no longer depends on the view distance**, which is why
+the default is Minecraft's own ten: 404/421 ms at a distance of 8, 396/415 at
+10, 376/394 at 12. What the number still costs is the streaming behind them and
+the memory of holding it — a bill paid while playing rather than while waiting.
+
 **Tags go out, all thirteen registries of them** — 514 tags flattened to
 6,362 registry ids, which is exactly what a real 1.21.1 server sends, compared
 tag by tag and id by id against one. Nothing went out while five of the
