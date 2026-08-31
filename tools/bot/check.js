@@ -313,6 +313,59 @@ async function main () {
     const after = watcher.blockAt(under)
     refused = { before, after, heard: heardPlace }
   }
+  // Reaching across the map. Fifty blocks east of where the actor stands is a
+  // column it has been streamed and can name, and one no arm reaches. Both
+  // verbs are tried, because they are two packets down two paths and a check
+  // that only covered one would pass while the other stayed open.
+  //
+  // The block is read from the *other* player, before and after, so what is
+  // checked is what reached the world rather than what either client believes.
+  const distant = actor.blockAt(stood.offset(50, -1, 0))
+  let unreached = null
+  if (distant) {
+    const before = watcher.blockAt(distant.position)
+    actor._client.write('block_dig', {
+      status: 0,
+      location: {
+        x: distant.position.x,
+        y: distant.position.y,
+        z: distant.position.z
+      },
+      face: 1,
+      sequence: sequence++
+    })
+    actor._client.write('block_place', {
+      hand: 0,
+      location: {
+        x: distant.position.x,
+        y: distant.position.y,
+        z: distant.position.z
+      },
+      direction: 1,
+      cursorX: 0.5,
+      cursorY: 1.0,
+      cursorZ: 0.5,
+      insideBlock: false,
+      sequence: sequence++
+    })
+    await wait(SETTLE_MS)
+    unreached = {
+      before,
+      after: watcher.blockAt(distant.position),
+      above: watcher.blockAt(distant.position.offset(0, 1, 0))
+    }
+  }
+  check(
+    'a player cannot break or place fifty blocks away',
+    Boolean(unreached) && unreached.before && unreached.after && unreached.above &&
+      unreached.before.name === unreached.after.name &&
+      unreached.above.name === 'air',
+    unreached && unreached.before && unreached.after && unreached.above
+      ? `${unreached.before.name} -> ${unreached.after.name}, ` +
+        `above it ${unreached.above.name}`
+      : 'no distant block to aim at'
+  )
+
   check(
     'a block is not placed into one that is already there',
     Boolean(refused) && refused.before && refused.after &&

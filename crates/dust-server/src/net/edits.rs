@@ -18,12 +18,19 @@
 //!
 //! # What is deliberately not here
 //!
-//! No physics, no block updates, no drops, no tool checks, and no reach
-//! validation — a player may break bedrock from across the map. Every one of
+//! No physics, no block updates, no drops and no tool checks. Every one of
 //! those is a rule about *the game* rather than about the world's storage, and
 //! the place they go is between this and the session, not inside either. The
 //! gap is worth stating because "you can place blocks" invites the assumption
 //! that placing them follows any rules at all.
+//!
+//! **Reach is the first of them to be built, and it went where that sentence
+//! said it would**: `dust-guard`, checked in the session before either verb
+//! reaches this module. A player no longer breaks bedrock from across the map.
+//! What still has no check at all is *movement* — the position a reach is
+//! measured from is whatever the client last claimed — so the rule this
+//! enforces is "you may not act far from where you say you are" and not "you
+//! may not act far from where you are".
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};

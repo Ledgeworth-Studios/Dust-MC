@@ -17,6 +17,8 @@ path = "src/main.rs"
 [dependencies]
 ctrlc.workspace = true
 dust-config.workspace = true
+# The rules a client's claim is checked against; see src/net/session.rs.
+dust-guard.workspace = true
 # The `tls` feature is on because online mode needs it: verifying a player
 # against Mojang means a real HTTPS request, and a server that silently ran
 # offline because the feature was off would let anybody join as anybody. See
