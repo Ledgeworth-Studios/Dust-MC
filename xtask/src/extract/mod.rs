@@ -107,6 +107,13 @@ pub enum Domain {
     Packets,
     /// Worldgen: the ore baseline in `dust-gen`.
     Worldgen,
+    /// The light constants, asked of the game itself.
+    ///
+    /// Reads nothing either generator produced. Runs a small Java program on
+    /// the jar's own classpath and prints what Minecraft says a block state's
+    /// opacity and emission are — the numbers decision record 0008 exists
+    /// because no report and no data pack carries them.
+    Light,
     /// The obfuscated-name table an oracle needs to call into the jar.
     ///
     /// The odd one out, and it says so: every other domain reads what the data
@@ -130,6 +137,7 @@ pub const ALL_DOMAINS: &[Domain] = &[
     Domain::Packets,
     Domain::Worldgen,
     Domain::Mappings,
+    Domain::Light,
 ];
 
 impl Domain {
@@ -148,6 +156,7 @@ impl Domain {
             Self::Packets => "packets",
             Self::Worldgen => "worldgen",
             Self::Mappings => "mappings",
+            Self::Light => "light",
         }
     }
 
@@ -405,6 +414,7 @@ pub fn run(options: &Options, workspace_root: &Path) -> Result<(), String> {
                 worldgen_domain(registries.as_ref().expect("parsed above"), &context)?
             }
             Domain::Mappings => mappings_domain(&context)?,
+            Domain::Light => light_domain(&context)?,
         };
         println!("({} in {:.1}s)", outcome, begun.elapsed().as_secs_f64());
         results.push((*domain, begun.elapsed(), outcome));
@@ -819,7 +829,27 @@ fn synced_domain(context: &Context) -> Result<Outcome, String> {
 /// called today. See decision record 0008.
 fn mappings_domain(context: &Context) -> Result<Outcome, String> {
     let cache = context.workspace_root.join(CACHE_DIR);
-    let path = download::server_mappings(context.version, &cache)?;
+    let out = mappings_table(context, &cache)?;
+    let table = std::fs::read_to_string(&out)
+        .map_err(|e| format!("could not read {}: {e}", out.display()))?;
+    for line in table.lines().filter(|l| !l.starts_with('#')) {
+        println!("  {line}");
+    }
+    Ok(format!(
+        "{} name(s) resolved for the light oracle",
+        mappings::LIGHT_ORACLE.len()
+    ))
+}
+
+/// Resolve the oracle's names and write them, returning where they landed.
+///
+/// Shared by the `mappings` domain, which exists to do exactly this and print
+/// it, and by `light`, which needs the file and should not require a reader to
+/// have run the other domain first. **`--only light` on a clean checkout
+/// works**, and a domain that failed with "no names.properties" would be one
+/// that only works for whoever already knew the order.
+fn mappings_table(context: &Context, cache: &Path) -> Result<PathBuf, String> {
+    let path = download::server_mappings(context.version, cache)?;
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("could not read {}: {e}", path.display()))?;
     let mappings = mappings::Mappings::parse(&text)?;
@@ -843,15 +873,217 @@ fn mappings_domain(context: &Context) -> Result<Outcome, String> {
     let out = out_dir.join("names.properties");
     std::fs::write(&out, &table).map_err(|e| format!("could not write {}: {e}", out.display()))?;
     println!("wrote {}", out.display());
-    for line in table.lines().filter(|l| !l.starts_with('#')) {
-        println!("  {line}");
+    Ok(out)
+}
+
+/// Ask the game what a block state's opacity and emission are.
+///
+/// # Why this runs Java instead of reading a file
+///
+/// Every other domain reads what Mojang's data generators produced. These two
+/// numbers were never in that output, in any version: they are constants in
+/// Java code, reachable only by asking the code. Decision record 0008 is the
+/// standing account, and this is its option 1.
+///
+/// # The three steps, and the one that is not obvious
+///
+/// The jar is a *bundle*: Minecraft's classes and its libraries are jars
+/// nested inside it, and a nested jar cannot go on a classpath. The bundler
+/// unpacks them, and it has a mode that does only that —
+/// `-DbundlerMainClass=` with an empty value prints "Empty main class
+/// specified, exiting" and leaves `libraries/` and `versions/` behind. That is
+/// step one; the alternative is a second implementation of the unpacking, and
+/// Mojang's own is right here.
+///
+/// **What does not work, and it is worth writing down because it looks like it
+/// should**: passing our class as `-DbundlerMainClass` and putting it on the
+/// `-cp`. The bundler builds a `URLClassLoader` over the jars it unpacked and
+/// nothing else, so the class it is told to start is not visible to it —
+/// `ClassNotFoundException` on our own class, from a classpath that plainly
+/// contains it.
+///
+/// So: unpack, then compile the oracle, then run it with a classpath we build.
+fn light_domain(context: &Context) -> Result<Outcome, String> {
+    let cache = context.workspace_root.join(CACHE_DIR);
+    let names = mappings_table(context, &cache)?;
+    let jar = absolute(context.jar)?;
+
+    let repo = cache.join(format!("oracle-{}/jvm", context.version));
+    std::fs::create_dir_all(&repo)
+        .map_err(|e| format!("could not create {}: {e}", repo.display()))?;
+
+    // Step one. Cheap to repeat and safe to skip, but skipping it on a
+    // half-unpacked directory would fail later with a missing class rather
+    // than here with a missing jar, so it runs whenever the marker is absent.
+    if !repo.join("versions").is_dir() {
+        println!("unpacking the bundled jar (Mojang's own unpacker, main class empty)");
+        run_java(
+            &repo,
+            &[
+                "-DbundlerMainClass=".to_owned(),
+                "-jar".to_owned(),
+                jar.display().to_string(),
+            ],
+            "unpacking the server jar",
+        )?;
     }
 
-    Ok(format!(
-        "{} classes, {} name(s) resolved for the light oracle",
-        mappings.len(),
-        mappings::LIGHT_ORACLE.len()
-    ))
+    // Step two.
+    let classes = cache.join(format!("oracle-{}/classes", context.version));
+    std::fs::create_dir_all(&classes)
+        .map_err(|e| format!("could not create {}: {e}", classes.display()))?;
+    let sources = context.workspace_root.join("xtask/oracle/dustoracle");
+    let mut javac: Vec<String> = vec!["-d".to_owned(), classes.display().to_string()];
+    for name in ["Names.java", "LightOracle.java"] {
+        javac.push(sources.join(name).display().to_string());
+    }
+    println!("compiling the oracle");
+    run_tool("javac", &repo, &javac, "compiling the oracle")?;
+
+    // Step three.
+    let mut classpath = jars_under(&repo)?;
+    classpath.push(classes.clone());
+    let joined = classpath
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(":");
+    let out = cache.join(format!("oracle-{}/light.tsv", context.version));
+    println!("asking Minecraft for every state's opacity and emission");
+    run_java(
+        &repo,
+        &[
+            "-cp".to_owned(),
+            joined,
+            "dustoracle.LightOracle".to_owned(),
+            names.display().to_string(),
+            out.display().to_string(),
+        ],
+        "running the light oracle",
+    )?;
+
+    let table = std::fs::read_to_string(&out)
+        .map_err(|e| format!("could not read {}: {e}", out.display()))?;
+    let rows = table.lines().filter(|l| !l.starts_with('#')).count();
+    if rows == 0 {
+        return Err(format!(
+            "{} holds no states; the oracle ran and found nothing, which means \
+             `Bootstrap` did not populate the registry",
+            out.display()
+        ));
+    }
+    println!("wrote {}", out.display());
+
+    let summary = LightSummary::of(&table);
+    print!("  opacity:");
+    for (value, count) in &summary.opacity {
+        print!(" {value}={count}");
+    }
+    println!();
+    println!("  {} state(s) emit light", summary.emitting);
+
+    // Every light level Minecraft has is 0..=15, so a value outside that did
+    // not come from the field or method this asked for — it came from a
+    // different member that shares an obfuscated letter. That is the exact
+    // failure the parameter-keyed lookup in `mappings` exists to prevent, and
+    // this is the place it would show up if it ever got through: a table full
+    // of plausible-looking integers that are something else entirely.
+    if let Some(bad) = summary.opacity.keys().find(|v| **v > 15) {
+        return Err(format!(
+            "the oracle reported an opacity of {bad}, and light levels are 0..=15.              Something resolved to the wrong member; check the names in              {}/names.properties against this version's mappings.",
+            out.parent().unwrap_or(&out).display()
+        ));
+    }
+
+    Ok(format!("{rows} block states, opacity and emission"))
+}
+
+/// The distributions in an extracted light table.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LightSummary {
+    /// How many states take each opacity. **1.21.1 gives exactly three values
+    /// — 0, 1 and 15** — and printing the distribution rather than a total is
+    /// what lets a reader see that at a glance, and see it change.
+    opacity: std::collections::BTreeMap<u32, u64>,
+    /// How many states emit any light at all.
+    emitting: u64,
+}
+
+impl LightSummary {
+    /// Read a table the oracle wrote.
+    ///
+    /// Malformed rows are skipped rather than refused: this is a summary for a
+    /// human, and the row count beside it — taken from the same file by the
+    /// caller — is what would disagree if rows were being lost.
+    fn of(table: &str) -> Self {
+        let mut summary = Self::default();
+        for line in table.lines().filter(|l| !l.starts_with('#')) {
+            let mut fields = line.split('\t');
+            let (Some(_), Some(opacity), Some(emission)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            if let Ok(opacity) = opacity.parse::<u32>() {
+                *summary.opacity.entry(opacity).or_default() += 1;
+            }
+            if emission.parse::<u32>().is_ok_and(|e| e > 0) {
+                summary.emitting += 1;
+            }
+        }
+        summary
+    }
+}
+
+/// Every `.jar` under a directory, in a stable order.
+///
+/// A walk rather than a read of the bundle's own `classpath-joined`, because
+/// every jar the bundler unpacked belongs on the classpath and the order
+/// between libraries does not matter here. Sorted so two runs build the same
+/// string.
+fn jars_under(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|e| format!("could not read {}: {e}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("could not read {}: {e}", dir.display()))?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "jar") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Run `java` in `dir`, failing with a message that names what was being done.
+fn run_java(dir: &Path, args: &[String], doing: &str) -> Result<(), String> {
+    run_tool("java", dir, args, doing)
+}
+
+fn run_tool(tool: &str, dir: &Path, args: &[String], doing: &str) -> Result<(), String> {
+    let status = std::process::Command::new(tool)
+        .current_dir(dir)
+        .args(args)
+        .status()
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                format!("{tool} was not found on PATH, and {doing} needs a JDK of 21 or newer.")
+            }
+            _ => format!("could not run {tool}: {e}"),
+        })?;
+    if !status.success() {
+        return Err(format!(
+            "{doing} failed ({status}). If the message above mentions a class version, the \
+             JDK on PATH is older than 21."
+        ));
+    }
+    Ok(())
 }
 
 fn packets_domain(context: &Context) -> Result<Outcome, String> {
@@ -1285,4 +1517,84 @@ fn top_level_entries(directory: &Path) -> Result<std::collections::BTreeSet<Stri
                 .map_err(|e| format!("could not read {}: {e}", directory.display()))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rows in the shape the oracle writes them. Not read from a captured
+    /// file: what the oracle produces is Mojang's data, and nothing of theirs
+    /// is committed — the same rule the harness's own readers are tested
+    /// under.
+    const TABLE: &str = "\
+# state_id\topacity\temission\tocclude
+0\t0\t0\t0
+1\t15\t0\t1
+2\t1\t0\t0
+3\t0\t14\t0
+4\t15\t15\t1
+";
+
+    #[test]
+    fn a_light_table_summarises_to_its_distributions() {
+        let summary = LightSummary::of(TABLE);
+        assert_eq!(
+            summary.opacity,
+            [(0, 2), (1, 1), (15, 2)].into_iter().collect()
+        );
+        assert_eq!(summary.emitting, 2, "only the two with a non-zero emission");
+    }
+
+    #[test]
+    fn the_header_is_not_a_state() {
+        // It begins with `#`, like every comment in the files this project
+        // writes. Counting it would put a state at opacity `opacity`, which
+        // parses as nothing and would quietly vanish instead — a row lost
+        // rather than a row wrong, which is harder to notice.
+        assert_eq!(LightSummary::of(TABLE).opacity.values().sum::<u64>(), 5);
+    }
+
+    #[test]
+    fn a_truncated_row_is_skipped_rather_than_guessed_at() {
+        let summary = LightSummary::of("0\t0\n1\t15\t0\t1\n");
+        assert_eq!(summary.opacity, [(15, 1)].into_iter().collect());
+    }
+
+    #[test]
+    fn jars_are_found_at_any_depth_and_in_a_stable_order() {
+        // The bundler nests libraries several directories deep, so a
+        // single-level read would build a classpath holding Minecraft and none
+        // of what it needs — which fails at run time inside a class the stack
+        // trace names by a letter.
+        let dir = std::env::temp_dir().join(format!("dust-jars-{}", std::process::id()));
+        let deep = dir.join("libraries/org/slf4j/slf4j-api/2.0.9");
+        std::fs::create_dir_all(&deep).expect("temp dirs");
+        std::fs::create_dir_all(dir.join("versions/1.21.1")).expect("temp dirs");
+        std::fs::write(deep.join("slf4j-api-2.0.9.jar"), b"").expect("writable");
+        std::fs::write(dir.join("versions/1.21.1/server-1.21.1.jar"), b"").expect("writable");
+        std::fs::write(dir.join("not-a-jar.txt"), b"").expect("writable");
+
+        let found = jars_under(&dir).expect("readable");
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .expect("a file")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        // Sorted by full path, so `libraries/` comes before `versions/`. What
+        // matters is that it is the same on every run: an unsorted walk returns
+        // directory order, which is the file system's business and not
+        // repeatable across machines.
+        assert_eq!(names, ["slf4j-api-2.0.9.jar", "server-1.21.1.jar"]);
+        assert_eq!(jars_under(&dir).expect("readable"), found, "twice the same");
+        assert!(
+            !names.iter().any(|n| n.ends_with(".txt")),
+            "only jars belong on a classpath"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
