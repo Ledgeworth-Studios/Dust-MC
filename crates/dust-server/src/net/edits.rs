@@ -148,7 +148,8 @@ impl EditedWorld {
     /// column with every position — and built where it cannot. The caller
     /// sends it and does not keep it, so a borrow is worth having: it is the
     /// difference between a clone per column per viewer and none at all, on
-    /// the path every join takes twenty-five times.
+    /// the path every join takes once per column in view — 289 times at the
+    /// default view distance.
     pub fn template(&self, pos: ChunkPos) -> Column<'_> {
         self.generated.column(pos)
     }

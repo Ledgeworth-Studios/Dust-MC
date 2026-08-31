@@ -21,7 +21,8 @@
 //! needs to know where the sky reaches in the four columns around it. That is
 //! a [`SkyFloor`] — sixteen by sixteen integers, a kilobyte — and it is
 //! nothing like a chunk. So those are cached even though the chunks are not:
-//! at a view distance of ten the whole working set is four hundred kilobytes,
+//! at the default view distance of eight the whole working set is under three
+//! hundred kilobytes,
 //! and without it every column would read its four neighbours off disk to ask
 //! them one question.
 //!
@@ -64,7 +65,8 @@ type OpenRegions = HashMap<(i32, i32), Option<RegionFile<FileStore>>>;
 ///
 /// The two variants differ in size by about a megabyte, and that is the point
 /// rather than an oversight: the borrowed one is what a flat world hands out
-/// twenty-five times per join without allocating, and boxing it to even the
+/// once per column per join without allocating — 289 times at the default view
+/// distance — and boxing it to even the
 /// variants out would put an allocation on exactly the path the borrow exists
 /// to keep free. The value is a temporary — a caller sends the column and drops
 /// it — so the large variant never sits in a collection.
