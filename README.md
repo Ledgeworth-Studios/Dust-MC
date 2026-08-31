@@ -19,9 +19,19 @@ up. That distance is a ceiling: the client asks for one of its own during
 configuration and is served the smaller of the two.
 
 The loading screen ends once the near square has arrived rather than once the
-whole view has. Measured A/B on one binary at the default distance: **668 ms
-against 1,757 ms**, with the last of the 289 columns arriving at the same moment
-either way. It shortens the wait and not the work.
+whole view has, and the rest of the view is sent by the play loop a batch at a
+time instead of in one burst. Measured A/B on one binary at the default
+distance, timing the first keep-alive *after* the screen ends:
+
+```text
+           screen ends   first keep-alive after it   all 289 columns
+  burst        648 ms       1,733 ms (1.1 s later)        1,731 ms
+  batched      411 ms          428 ms (17 ms later)       1,768 ms
+```
+
+The same work, in the same order, finishing at the same moment — with the
+session answering throughout instead of at the end. A player who joins and walks
+immediately used to have their movement packets sit in the socket for a second.
 
 **Tags go out, all thirteen registries of them** — 514 tags flattened to
 6,362 registry ids, which is exactly what a real 1.21.1 server sends, compared

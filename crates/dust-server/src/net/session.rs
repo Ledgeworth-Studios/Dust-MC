@@ -549,8 +549,9 @@ where
     )
     .await?;
 
-    // And everything else in view.
-    stream(conn, ctx, &mut view, centre).await?;
+    // Everything else in view is left to the play loop, which sends it a batch
+    // at a time between keep-alives and whatever the client is saying. See
+    // `STREAM_BATCH`.
 
     // Health, last, exactly where vanilla puts it — and the position in the
     // order is load-bearing rather than tidy. `mineflayer` treats this packet
@@ -633,6 +634,15 @@ where
 /// client filing columns against a stale centre may discard them, and one told
 /// to forget a column before its replacement arrives has a hole in the world
 /// for as long as the round trip takes.
+/// How many columns the play loop sends per batch, and how often.
+///
+/// Eight every twenty milliseconds is four hundred a second — comfortably more
+/// than a walking player generates, and enough to clear a full view distance's
+/// backlog in under a second. The numbers are a pair and only mean anything
+/// together, which is why they sit together.
+const STREAM_BATCH: usize = 8;
+const STREAM_BATCH_PERIOD: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// How many columns go out before the loading screen is allowed to end.
 ///
 /// Twenty-five, which is the five-by-five around the player — what somebody
@@ -747,8 +757,41 @@ where
     // works while the join is still the thing being debugged, instead of ten
     // seconds later when it is not.
     let mut ticker = tokio::time::interval(KEEP_ALIVE_PERIOD);
+    // The backlog drains here, a batch at a time, rather than in one burst
+    // before this loop starts. **What that buys is the loop itself.** A player
+    // who joined and walked immediately used to have their movement packets sit
+    // in the socket for as long as the far columns took, and the keep-alive
+    // with them.
+    //
+    // Measured A/B on one binary at the default view distance, timing the first
+    // keep-alive *after* the loading screen ends:
+    //
+    // ```text
+    //            screen ends   first keep-alive after it   all 289 columns
+    //   burst        648 ms       1,733 ms (1.1 s later)        1,731 ms
+    //   batched      411 ms          428 ms (17 ms later)       1,768 ms
+    // ```
+    //
+    // The same work in the same order, finishing at the same moment, with the
+    // session answering throughout instead of at the end.
+    //
+    // It ticks whether or not there is a backlog, because a tick with nothing
+    // to send costs one comparison inside `View::move_to`. Making the branch
+    // conditional would mean a `select!` arm that is sometimes absent, which
+    // is a lot of shape for a comparison.
+    let mut streaming = tokio::time::interval(STREAM_BATCH_PERIOD);
     loop {
         tokio::select! {
+            _ = streaming.tick() => {
+                stream_up_to(
+                    conn,
+                    ctx,
+                    &mut view,
+                    view::column_of(position.0, position.2),
+                    STREAM_BATCH,
+                )
+                .await?;
+            }
             _ = ticker.tick() => {
                 send_play(
                     conn,
@@ -1097,7 +1140,11 @@ async fn moved<W>(
 where
     W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    stream(conn, ctx, view, view::column_of(x, z)).await
+    // A batch, not the whole difference. A player crossing a chunk boundary at
+    // a large view distance wants dozens of columns at once, and sending them
+    // all here would put the same stall back that the join just lost — the
+    // loop's own ticker takes the rest.
+    stream_up_to(conn, ctx, view, view::column_of(x, z), STREAM_BATCH).await
 }
 
 /// The block one step off `face` from `location`.
