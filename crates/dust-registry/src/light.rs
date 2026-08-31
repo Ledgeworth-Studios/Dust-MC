@@ -81,9 +81,15 @@ impl LightTable {
     /// Whether `state` occludes, which is Minecraft's `canOcclude()`.
     ///
     /// Read by the oracle and carried here because it is the third constant of
-    /// the same kind and comes off the same object in the same pass. Sky light
-    /// wants it: a state may cost nothing to enter and still not let daylight
-    /// fall straight through it.
+    /// the same kind and comes off the same object in the same pass. **Nothing
+    /// consumes it**, and the reason is worth keeping: it was carried on the
+    /// guess that sky light would want it — a state may cost nothing to enter
+    /// and still not let daylight fall straight through it — and the guess was
+    /// wrong. `cargo xtask harness light` reaches a hundred per cent agreement
+    /// with Minecraft's own light without it, on both seeds. What sky light
+    /// actually wanted from this direction was the `MOTION_BLOCKING` heightmap
+    /// predicate, which is a different question off the same object; see
+    /// decision record 0010.
     #[must_use]
     pub fn occludes(&self, state: u32) -> bool {
         self.occludes.get(state as usize).copied().unwrap_or(true)

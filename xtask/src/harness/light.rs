@@ -76,28 +76,64 @@
 //! data through the same walk — which is this harness's whole argument, made
 //! once more and from a direction nobody was watching.
 //!
-//! # Which gap is left, and the shape says which one it is
+//! # The ladder: four inputs, one engine
 //!
-//! Sky light has two known gaps and a percentage cannot say which one it is
-//! reporting, so the report splits the shortfall by how far each cell sits from
-//! its column's edge. Light arriving from a neighbouring column enters at a
-//! face and loses a level per step inward; opacity has no reason to care where
-//! in a column a cell is. A rate that falls towards the middle is the first; a
-//! flat one is the second.
+//! Sky light has four inputs and only one of them is Dust's lighting. The verb
+//! measures them as a ladder — four models over the same chunks in the same
+//! run, each row the one above it plus a single named change — because a table
+//! like that is what says which input owns which part of the gap. A single
+//! percentage cannot, and twice now it has been read as saying something it
+//! was not.
+//!
+//! ```text
+//! seed 0, radius 2                              short   sweep
+//!   air only, one column, Dust's heightmap     14,276    102 ms
+//!   + Minecraft's own opacity                     611    101 ms
+//!   + a 3x3 volume of columns                     179    611 ms
+//!   + the heightmaps Minecraft wrote                0    544 ms
+//! ```
+//!
+//! **The last row is a hundred per cent, on both seeds.** 2,457,600 cells and
+//! 4,816,896 cells, and not one disagrees with the light Minecraft computed. So
+//! the walks are right, and everything above that row is something Dust is
+//! *told* about the world rather than something it does with what it is told.
+//!
+//! The last rung is not a mode a server could run in: a chunk somebody has
+//! edited has a heightmap its file does not. It is there to take the last input
+//! out of the measurement.
+//!
+//! **`--volume 2` buys exactly nothing** — the same 179, not fewer — which is
+//! the argument for a finite volume confirmed rather than assumed. Light loses
+//! a level a block and a chunk is sixteen of them, so one ring of neighbours is
+//! not an approximation of the infinite volume; it is the infinite volume.
+//!
+//! Decision record 0010 is why the 3x3 is measured here and not adopted in the
+//! engine: it closes 432 of the 611 for six times the work, and the heightmap
+//! predicate closes the other 179 for a column in a table Dust already reads.
+//!
+//! # The ring histogram, and what it can and cannot separate
+//!
+//! The shortfall is split by how far each cell sits from its column's edge.
+//! Light arriving from a neighbouring column enters at a face and loses a level
+//! per step inward; opacity has no reason to care where in a column a cell is.
+//! A rate that falls towards the middle is the first; a flat one is not.
 //!
 //! ```text
 //! distance from a face    0      1      2      3      4      5      6      7
 //! seed 0, air only     0.660  0.595  0.561  0.548  0.530  0.510  0.530  0.581
 //! seed 0, Minecraft's  0.072  0.021  0.008  0.007  0.005  0.005  0.006  0.018
+//! seed 0, + 3x3        0.009  0.009  0.006  0.006  0.005  0.005  0.006  0.018
 //! ```
 //!
-//! **The shape changes with the model, and that is the measurement.** Under the
-//! stand-in it is flat, because opacity owned the gap. Under Minecraft's own
-//! numbers it falls by an order of magnitude from the face inwards — the shape
-//! a neighbour effect makes, and the first time this verb has seen one. What is
-//! left of seed 0's 611 cells is the multi-column light volume: 400 of them are
-//! standing in air, and the remaining block list is grass, leaves and flowers
-//! near an edge.
+//! Flat under the stand-in; falling by an order of magnitude once opacity is
+//! Minecraft's, which is the shape a neighbour effect makes and was the first
+//! time this verb had seen one; flat again once the volume has taken that away,
+//! leaving a third thing that is neither.
+//!
+//! **What it cannot do is separate a cause nobody proposed.** It read "flat,
+//! therefore opacity" and was right, and was equally right about a step cost
+//! that doubled every opacity that was not 0 or 15. It is a discriminator
+//! between two named hypotheses and not a detector.
 //!
 //! **The rate and not the count is the whole measurement.** A 16x16 column has
 //! `60 - 8d` columns at distance `d` — sixty at the face and four in the
@@ -174,6 +210,10 @@ none of it leaves .dust-extract/.
 
   --version <v>   Minecraft version, e.g. 1.21.1.
   --seed <n>      The provisioned world's seed. Default 0.
+  --volume <k>    Also light each column inside a (2k+1)x(2k+1) block of
+                  columns and report what that buys. Default 1, so a 3x3 is
+                  measured; 0 turns it off. Needs a world generated k chunks
+                  wider than --radius, or the edge chunks are skipped.
   --radius <r>    Chunks either side of the origin. Default 2 (a 5x5).
                   The origin and not the world's spawn point: `expected_chunks`
                   is centred on chunk 0,0. Those were the same place only
@@ -185,12 +225,16 @@ pub struct Options {
     pub version: String,
     pub seed: i64,
     pub radius: i32,
+    /// The widest multi-column volume to measure, in chunks either side. `0`
+    /// measures none of them; `1` adds a 3x3, `2` adds a 5x5 as well.
+    pub volume: i32,
 }
 
 pub fn parse(args: &[String]) -> Result<Options, String> {
     let mut version = None;
     let mut seed = 0i64;
     let mut radius = 2i32;
+    let mut volume = 1i32;
     let mut seen: Vec<(&'static str, String)> = Vec::new();
     let mut at = 0;
     while at < args.len() {
@@ -207,6 +251,15 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
                     .1
                     .parse()
                     .map_err(|_| "--seed needs a signed 64-bit integer")?;
+            }
+            "--volume" => {
+                at = super::take_value(&mut seen, "--volume", args, at + 1)?;
+                volume = seen
+                    .last()
+                    .expect("just stored")
+                    .1
+                    .parse()
+                    .map_err(|_| "--volume needs a whole number")?;
             }
             "--radius" => {
                 at = super::take_value(&mut seen, "--radius", args, at + 1)?;
@@ -225,6 +278,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
             .ok_or_else(|| format!("light needs --version, e.g. `--version 1.21.1`\n\n{USAGE}"))?,
         seed,
         radius,
+        volume,
     })
 }
 
@@ -343,28 +397,36 @@ fn measure(options: &Options) -> Result<(), String> {
     // was air. A comparison that measures the harness's shortcut instead of
     // the engine is worse than no comparison, because the number looks like an
     // answer.
-    let mut floors: BTreeMap<(i32, i32), SkyFloor> = BTreeMap::new();
-    for &(x, z) in &expected {
-        for (nx, nz) in [(x, z), (x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)] {
-            if floors.contains_key(&(nx, nz)) {
-                continue;
-            }
-            // Only from a neighbour vanilla finished. **A neighbour below
-            // `full` has different blocks than the ones vanilla lit against**,
-            // so its sky floor is a different world's — and the column beside
-            // it comes out brighter than vanilla, because Dust is told there
-            // is open sky where the finished world has terrain. That is what
-            // the last thirty-two over-lit cells were: every one of them
-            // within a step of a chunk edge, in a fading gradient, each
-            // exactly one brighter than vanilla.
-            //
-            // A column with a neighbour missing from this map is skipped
-            // below rather than lit against a guess.
-            if !is_full(&region_dir, nx, nz)? {
-                continue;
-            }
-            if let Ok(chunk) = dust_chunk(&region_dir, nx, nz, height, &names, air) {
-                floors.insert((nx, nz), SkyFloor::of(&chunk));
+    //
+    // One map per heightmap mode, because the sky floor *is* the heightmap and
+    // a run that lit a column against its own recomputed floors and its
+    // neighbours' written ones would be measuring the difference between the
+    // two rather than either.
+    let mut floors: BTreeMap<Heightmaps, BTreeMap<(i32, i32), SkyFloor>> = BTreeMap::new();
+    for mode in [Heightmaps::Recomputed, Heightmaps::AsWritten] {
+        let floors = floors.entry(mode).or_default();
+        for &(x, z) in &expected {
+            for (nx, nz) in [(x, z), (x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)] {
+                if floors.contains_key(&(nx, nz)) {
+                    continue;
+                }
+                // Only from a neighbour vanilla finished. **A neighbour below
+                // `full` has different blocks than the ones vanilla lit against**,
+                // so its sky floor is a different world's — and the column beside
+                // it comes out brighter than vanilla, because Dust is told there
+                // is open sky where the finished world has terrain. That is what
+                // the last thirty-two over-lit cells were: every one of them
+                // within a step of a chunk edge, in a fading gradient, each
+                // exactly one brighter than vanilla.
+                //
+                // A column with a neighbour missing from this map is skipped
+                // below rather than lit against a guess.
+                if !is_full(&region_dir, nx, nz)? {
+                    continue;
+                }
+                if let Ok(chunk) = dust_chunk(&region_dir, nx, nz, height, &names, air, mode) {
+                    floors.insert((nx, nz), SkyFloor::of(&chunk));
+                }
             }
         }
     }
@@ -390,118 +452,331 @@ fn measure(options: &Options) -> Result<(), String> {
         ),
     }
 
-    let mut models = vec![(
-        "air only, the stand-in",
-        false,
-        world::opacity_of(air, None),
-    )];
+    // **A ladder, and each rung adds exactly one thing.** Sky light has four
+    // inputs and only one of them is the engine; a table of four numbers where
+    // each row differs from the one above it in a single named way is what
+    // says which input owns which part of the gap. Two of the four turned out
+    // not to be what this project thought they were, and both times it was a
+    // row of this table that said so.
+    let mut models = vec![Model {
+        name: "air only, one column, Dust's heightmap".to_owned(),
+        from_minecraft: false,
+        opacity: world::opacity_of(air, None),
+        volume: Volume::Column,
+        heightmaps: Heightmaps::Recomputed,
+    }];
     if let Some((_, table)) = &table {
-        models.push((
-            "Minecraft's own opacity, from the operator's jar",
-            true,
-            world::opacity_of(air, Some(table)),
-        ));
+        let real = world::opacity_of(air, Some(table));
+        models.push(Model {
+            name: "+ Minecraft's own opacity, from the operator's jar".to_owned(),
+            from_minecraft: true,
+            opacity: real.clone(),
+            volume: Volume::Column,
+            heightmaps: Heightmaps::Recomputed,
+        });
+        for k in 1..=options.volume {
+            let side = 2 * k + 1;
+            models.push(Model {
+                name: format!("+ a {side}x{side} volume of columns"),
+                from_minecraft: true,
+                opacity: real.clone(),
+                volume: Volume::Area(k),
+                heightmaps: Heightmaps::Recomputed,
+            });
+        }
+        // The last rung, and the only one no server could stand on: a chunk
+        // that has been edited has a heightmap its file does not. It is here
+        // to take the last input out of the measurement and leave the engine.
+        models.push(Model {
+            name: "+ the heightmaps Minecraft wrote (no server can do this)".to_owned(),
+            from_minecraft: true,
+            opacity: real,
+            volume: if options.volume >= 1 {
+                Volume::Area(options.volume)
+            } else {
+                Volume::Column
+            },
+            heightmaps: Heightmaps::AsWritten,
+        });
     }
 
-    let mut first = true;
-    for (name, from_minecraft, opacity) in &models {
+    // **One chunk set for every model.** A wider volume needs more of its
+    // neighbourhood finished than a single column does, so letting each model
+    // pick its own eligible chunks would compare two percentages of two
+    // different worlds — which is exactly the confound the ring histogram
+    // exists to avoid, one level up.
+    let reach = models
+        .iter()
+        .map(|model| match model.volume {
+            Volume::Column => 1,
+            Volume::Area(k) => k,
+        })
+        .max()
+        .unwrap_or(1);
+    let mut comparable = Vec::new();
+    for &(x, z) in &expected {
+        let mut ok = true;
+        for dx in -reach..=reach {
+            for dz in -reach..=reach {
+                // A neighbour vanilla has not finished has different blocks
+                // than the ones it lit against, and a column lit against those
+                // is measuring the harness rather than the engine.
+                if !is_full(&region_dir, x + dx, z + dz)? {
+                    ok = false;
+                }
+            }
+        }
+        // The column model also needs its four orthogonal floors, which is a
+        // subset of the square above but is checked separately because it is a
+        // different question: `floors` also drops a chunk that would not read.
+        for mode in floors.values() {
+            for key in [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)] {
+                if !mode.contains_key(&key) {
+                    ok = false;
+                }
+            }
+        }
+        if ok {
+            comparable.push((x, z));
+        }
+    }
+    let skipped = expected.len() - comparable.len();
+    if skipped > 0 {
+        // Said, not swallowed, and said once: which chunks are comparable is a
+        // fact about the world vanilla wrote, not about the model.
+        println!(
+            "{skipped} of {} chunk(s) skipped: vanilla has not finished them or a \
+             neighbour within {reach} of them, so its own light for them is unfinished",
+            expected.len()
+        );
+    }
+    if comparable.is_empty() {
+        return Err(
+            "every chunk was skipped; capture a wider world or ask for a smaller radius".to_owned(),
+        );
+    }
+
+    let mut ladder: Vec<Rung> = Vec::new();
+    for model in &models {
         println!();
-        println!("--- {name} ---");
-        let sweep = sweep(&Sweep {
+        println!("--- {} ---", model.name);
+        let started = std::time::Instant::now();
+        let tally = sweep(&Sweep {
             region_dir: &region_dir,
-            expected: &expected,
-            floors: &floors,
+            comparable: &comparable,
+            floors: floors
+                .get(&model.heightmaps)
+                .expect("both heightmap modes were built"),
             height,
             names: &names,
             air,
-            opacity,
+            model,
         })?;
-        if first && sweep.skipped > 0 {
-            // Said, not swallowed. A run that quietly compared a hundred
-            // chunks when it was asked about a hundred and sixty-nine would be
-            // reporting a percentage of something the caller did not name.
-            //
-            // Once, because which chunks are skipped is a fact about the world
-            // vanilla wrote and not about the model being measured.
-            println!(
-                "{} chunk(s) skipped: not generated to `full`, or missing a \
-                 neighbour — vanilla's own light for those is unfinished",
-                sweep.skipped
-            );
-        }
-        first = false;
-        if sweep.tally.cells == 0 {
-            return Err(
-                "every chunk was skipped; capture a wider world or ask for a smaller radius"
-                    .to_owned(),
-            );
-        }
-        report(&sweep.tally, *from_minecraft);
+        ladder.push(Rung {
+            name: &model.name,
+            agree: tally.agree,
+            cells: tally.cells,
+            took: started.elapsed(),
+        });
+        report(&tally, model);
     }
+
+    ladder_summary(&ladder);
     Ok(())
+}
+
+/// One rung of the ladder: what it agreed on, and what it cost.
+struct Rung<'a> {
+    name: &'a str,
+    agree: u64,
+    cells: u64,
+    /// Wall time for the whole sweep — reading the chunks and lighting them.
+    ///
+    /// **Not a benchmark and it says so below.** It reads every chunk from
+    /// disk for every rung, so a wider volume pays for `(2k+1)²` reads a
+    /// server would not repeat. What it is good for is the ratio between two
+    /// rows of one run, which is the only comparison anybody makes here.
+    took: std::time::Duration,
+}
+
+/// The four numbers side by side, after the four reports.
+///
+/// The reports say what each model's disagreements are standing on; this says
+/// what each rung *bought*, which is a different question and the one anybody
+/// reading the verb's output actually came for. Printed last because it is the
+/// conclusion and not the evidence.
+fn ladder_summary(ladder: &[Rung]) {
+    if ladder.len() < 2 {
+        return;
+    }
+    println!();
+    println!("what each one buys, over the same chunks:");
+    println!();
+    for rung in ladder {
+        #[expect(clippy::cast_precision_loss, reason = "counts here are far below 2^53")]
+        let percent = rung.agree as f64 * 100.0 / rung.cells as f64;
+        println!(
+            "  {percent:8.3}%  {:>8} short  {:>7} ms   {}",
+            rung.cells - rung.agree,
+            rung.took.as_millis(),
+            rung.name
+        );
+    }
+    println!();
+    println!("  Each row is the one above it plus a single named change, and only one");
+    println!("  of those changes is to Dust's lighting: the volume. The others are");
+    println!("  inputs — what a block does to light, and where the sky starts.");
+    println!();
+    println!("  The milliseconds are this verb's, not a server's: every rung re-reads");
+    println!("  every chunk, and a wider volume re-reads its neighbours once per");
+    println!("  centre. Read the ratio between rows and not the numbers.");
+}
+
+/// Where a column's heightmaps come from, which is where its sky floor comes
+/// from.
+///
+/// Ordered so `BTreeMap` can key on it, and that is the only reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Heightmaps {
+    /// Recomputed from the blocks with "anything that is not air blocks
+    /// motion", which is what a server does and is an approximation of
+    /// vanilla's `MOTION_BLOCKING` — see `dust_chunk` for what it costs.
+    Recomputed,
+    /// Taken from the chunk as Minecraft wrote it. Not a mode a server can
+    /// run in; a diagnostic that takes the predicate out of the measurement.
+    AsWritten,
+}
+
+/// How much of the world around a column enters the walk that lights it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Volume {
+    /// One column, with its four neighbours' sky floors as sources along the
+    /// faces — what a running Dust server does.
+    Column,
+    /// A `(2k+1)²` block of columns lit together, with only the centre read
+    /// back. See `super::area` for why this lives in the harness.
+    Area(i32),
+}
+
+/// One thing to measure: a name, an opacity model and a volume.
+struct Model {
+    name: String,
+    /// Whether the opacity is Minecraft's own, which changes which gaps the
+    /// report is allowed to blame.
+    from_minecraft: bool,
+    opacity: dust_world::propagation::OpacityModel,
+    volume: Volume,
+    heightmaps: Heightmaps,
 }
 
 /// Everything one pass over the square needs, so the pass takes one argument
 /// rather than eight.
 struct Sweep<'a> {
     region_dir: &'a Path,
-    expected: &'a [(i32, i32)],
+    /// The chunks every model compares — the same list for all of them.
+    comparable: &'a [(i32, i32)],
     floors: &'a BTreeMap<(i32, i32), SkyFloor>,
     height: WorldHeight,
     names: &'a RegistryNames,
     air: u32,
-    opacity: &'a dust_world::propagation::OpacityModel,
+    model: &'a Model,
 }
 
-/// What one pass produced.
-struct Swept {
-    tally: Tally,
-    skipped: usize,
-}
-
-/// Light every chunk of the square with one opacity model and compare it with
-/// what vanilla wrote.
-fn sweep(run: &Sweep) -> Result<Swept, String> {
+/// Light every comparable chunk with one model and compare it with what
+/// vanilla wrote.
+fn sweep(run: &Sweep) -> Result<Tally, String> {
     let mut tally = Tally::default();
-    let mut skipped = 0usize;
-    for &(x, z) in run.expected {
-        // A column whose neighbours are not all generated cannot be lit the
-        // way the server would light it, so comparing it measures the
-        // harness's fallback rather than the engine.
-        if [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)]
-            .iter()
-            .any(|key| !run.floors.contains_key(key))
-        {
-            skipped += 1;
-            continue;
-        }
+    for &(x, z) in run.comparable {
         let Some(root) = read(run.region_dir, x, z)? else {
             return Err(format!("chunk {x},{z} has never been generated"));
         };
-        // Vanilla lights a chunk when it reaches `full`, and a world holds
-        // partly-generated chunks around whatever was forced — spawn chunks
-        // that got as far as `surface` and stopped. **This was found by
-        // widening the radius**: at radius 2, where `harness capture` forces
-        // every chunk to `full`, every disagreement was Dust being darker; at
-        // radius 5 the agreement fell from 99.4% to 98.1% and 167,000 cells
-        // came back *brighter*, and the engine had not changed. Comparing
-        // against light vanilla had not finished computing measures nothing.
-        let status = root.get("Status").and_then(nbt::Node::as_str).unwrap_or("");
-        if status != "minecraft:full" && status != "full" {
-            skipped += 1;
-            continue;
-        }
         let vanilla = vanilla_light(&root, run.height)
             .map_err(|e| format!("chunk {x},{z}: reading Minecraft's light: {e}"))?;
 
-        let mut chunk = dust_chunk(run.region_dir, x, z, run.height, run.names, run.air)?;
-        let skirt = skirt_for(run.floors, x, z, run.height);
-        let dust = dust_light(&mut chunk, skirt, run.height, run.opacity);
+        let (chunk, dust) = match run.model.volume {
+            Volume::Column => {
+                let mut chunk = dust_chunk(
+                    run.region_dir,
+                    x,
+                    z,
+                    run.height,
+                    run.names,
+                    run.air,
+                    run.model.heightmaps,
+                )?;
+                let skirt = skirt_for(run.floors, x, z, run.height);
+                let dust = dust_light(&mut chunk, skirt, run.height, &run.model.opacity);
+                (chunk, dust)
+            }
+            Volume::Area(k) => area_light(run, x, z, k)?,
+        };
 
         compare(&chunk, &vanilla, &dust, run.height, &mut tally);
     }
-    Ok(Swept { tally, skipped })
+    Ok(tally)
 }
+
+/// Light a `(2k+1)²` block of columns together and read the centre back.
+///
+/// The whole block is read from disk for every centre, which is `(2k+1)²`
+/// times the reading. That is affordable here and is precisely the cost a
+/// server would have to think about, which is why the number is worth taking
+/// before anything is moved into the engine.
+fn area_light(
+    run: &Sweep,
+    x: i32,
+    z: i32,
+    k: i32,
+) -> Result<(dust_world::chunk::Chunk, Column), String> {
+    let side = 2 * k + 1;
+    let mut chunks = Vec::with_capacity((side * side) as usize);
+    for cz in -k..=k {
+        for cx in -k..=k {
+            chunks.push(dust_chunk(
+                run.region_dir,
+                x + cx,
+                z + cz,
+                run.height,
+                run.names,
+                run.air,
+                run.model.heightmaps,
+            )?);
+        }
+    }
+    let _ = super::area::AreaSkyLight::seed(
+        &mut chunks,
+        side,
+        &run.model.opacity,
+        dust_world::propagation::Budget::new(AREA_LIGHT_BUDGET),
+    );
+
+    let centre = &chunks[((k) + (k) * side) as usize];
+    let mut column = Column::empty(run.height);
+    for y in run.height.min_y()..run.height.min_y() + run.height.height() as i32 {
+        let row = (y - run.height.min_y()) as u32 % 16;
+        let section = centre.section(y);
+        for cx in 0..16usize {
+            for cz in 0..16usize {
+                column.set(
+                    cx,
+                    y,
+                    cz,
+                    section.sky_light().get(cx as u32, row, cz as u32),
+                );
+            }
+        }
+    }
+    let centre = chunks.swap_remove(((k) + (k) * side) as usize);
+    Ok((centre, column))
+}
+
+/// How much work lighting one block of columns may do.
+///
+/// The server's per-column budget times a generous factor for the widest
+/// volume this verb offers, because a walk that ran out would report a shortfall
+/// that is the budget rather than the volume — a measurement measuring its own
+/// limit, which is the failure this whole file keeps finding.
+const AREA_LIGHT_BUDGET: u64 = 1 << 30;
 
 /// The light table `cargo xtask extract --only light` wrote for this version,
 /// if this checkout has one.
@@ -630,6 +905,7 @@ fn dust_chunk(
     height: WorldHeight,
     names: &RegistryNames,
     air: u32,
+    heightmaps: Heightmaps,
 ) -> Result<dust_world::chunk::Chunk, String> {
     let path = region::region_file_path(region_dir, x, z);
     let bytes =
@@ -645,7 +921,22 @@ fn dust_chunk(
     };
     let mut chunk =
         dust_world::anvil::chunk(root, height, names).map_err(|e| format!("chunk {x},{z}: {e}"))?;
-    chunk.recompute_heightmaps(|_, state| state != air);
+    // **The fourth input, and the last one that is not Minecraft's.**
+    //
+    // Dust recomputes the heightmaps rather than trusting the file, because a
+    // server that has edited a block has a heightmap the file does not — and
+    // the predicate it recomputes with is "anything that is not air", where
+    // vanilla's `MOTION_BLOCKING` is "blocks motion, or holds a fluid". Short
+    // grass and flowers are the difference: vanilla lets daylight fall through
+    // them at fifteen and Dust puts its sky floor above them, so the cell they
+    // stand in comes out at fourteen.
+    //
+    // `Heightmaps::AsWritten` is not a mode a server could run in — it cannot
+    // know the heightmap of a chunk it has changed. It is here to take the
+    // predicate out of the measurement, so that what is left is the engine.
+    if heightmaps == Heightmaps::Recomputed {
+        chunk.recompute_heightmaps(|_, state| state != air);
+    }
     let _ = ChunkPos::new(x, z);
     Ok(chunk)
 }
@@ -793,7 +1084,7 @@ fn histogram(blocks: &BTreeMap<String, u64>) {
     }
 }
 
-fn report(tally: &Tally, opacity_from_minecraft: bool) {
+fn report(tally: &Tally, model: &Model) {
     let disagree = tally.cells - tally.agree;
     let percent = |n: u64| {
         if tally.cells == 0 {
@@ -828,18 +1119,20 @@ fn report(tally: &Tally, opacity_from_minecraft: bool) {
         // mean something else is wrong, which is why this is a sentence and
         // not a silence.
         println!(
-            "every one of them is Dust being darker, which is the direction both \
-             known gaps point in"
+            "every one of them is Dust being darker, which is the direction every \
+             known gap points in"
         );
-        // Said every time, because the percentage above is the first thing
-        // anybody will quote and — under the stand-in especially — it is a
-        // fact about the world rather than about the engine: seed 0 reads
-        // 99.4% and seed 1, which spawns in deep ocean, reads 96.5% with the
-        // same server.
-        println!(
-            "the percentage is how much of *this* world is made of those blocks; \
-             run another seed before quoting it"
-        );
+        // Under the stand-in the percentage is a fact about the world rather
+        // than about the engine — seed 0 reads 99.4% and seed 1, which spawns
+        // in deep ocean, reads 96.5% with the same server — so it is said on
+        // that rung and not on the others, where opacity has stopped making
+        // the answer depend on how much water is in view.
+        if !model.from_minecraft {
+            println!(
+                "the percentage is how much of *this* world is made of those blocks; \
+                 run another seed before quoting it"
+            );
+        }
     }
 
     let darker: u64 = tally.darker.values().sum();
@@ -848,14 +1141,28 @@ fn report(tally: &Tally, opacity_from_minecraft: bool) {
     println!();
     println!("  {darker} cell(s) darker in Dust than in Minecraft");
     // Which gaps are actually in force under *this* model, rather than a
-    // sentence that names both whatever is running. Under Minecraft's own
-    // numbers the opacity gap is closed, and a report that still blamed it
-    // would be pointing at the wrong half of its own ring histogram.
-    if opacity_from_minecraft {
-        println!("      (light does not travel through a neighbouring column)");
+    // sentence that names all of them whatever is running. A report that still
+    // blamed opacity under Minecraft's own numbers would be pointing at the
+    // wrong rung of its own ladder.
+    let mut gaps: Vec<&str> = Vec::new();
+    if !model.from_minecraft {
+        gaps.push("every block but air is fully opaque here");
+    }
+
+    if model.volume == Volume::Column {
+        gaps.push("light does not travel through a neighbouring column");
+    }
+    if model.heightmaps == Heightmaps::Recomputed {
+        gaps.push("the sky floor is `not air` where vanilla's is `blocks motion`");
+    }
+    if gaps.is_empty() {
+        println!("      (every known gap is closed in this model, so these are a fourth thing)");
     } else {
-        println!("      (every block but air is fully opaque here, and light does");
-        println!("       not travel through a neighbouring column)");
+        for (at, gap) in gaps.iter().enumerate() {
+            let open = if at == 0 { "(" } else { " " };
+            let close = if at + 1 == gaps.len() { ")" } else { "," };
+            println!("      {open}{gap}{close}");
+        }
     }
     for (by, count) in tally.darker.iter().rev().take(5) {
         println!("      short by {by:>2}: {count}");
@@ -865,12 +1172,12 @@ fn report(tally: &Tally, opacity_from_minecraft: bool) {
 
     if brighter > 0 {
         // Printed loudly and with its own block list rather than folded into
-        // the totals. Both known gaps under-light, so an over-lit cell is a
-        // third thing — and a shared list would let a hundred unexplained
+        // the totals. Every known gap under-lights, so an over-lit cell is
+        // something else — and a shared list would let a hundred unexplained
         // cells hide inside ten thousand explained ones.
         println!();
         println!("  {brighter} cell(s) BRIGHTER in Dust than in Minecraft");
-        println!("      both known gaps under-light, so these are a third thing");
+        println!("      every known gap under-lights, so these are something else");
         for (by, count) in tally.brighter.iter().rev().take(5) {
             println!("      over by  {by:>2}: {count}");
         }
