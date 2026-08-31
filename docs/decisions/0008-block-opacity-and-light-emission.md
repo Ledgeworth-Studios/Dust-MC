@@ -1,8 +1,10 @@
 # D8 — The block constants Minecraft keeps in code
 
-**Status:** Open, with the options costed and the cost of the gap measured.
-Decided when somebody chooses a source; nothing is blocked on it that is not
-already stated as a known gap.
+**Status:** Decided, 2026-08-31. The numbers come from the operator's own jar,
+asked of Minecraft by an oracle (option 1), and reach a running server as a file
+in `[data] path` (option 3). Both are built. What the decision bought is
+measured below, and it turned out to be larger than this record predicted, for
+a reason this record had no way to see.
 
 ## Context
 
@@ -73,6 +75,69 @@ part: a column has `60 - 8d` columns at distance `d`, sixty at the face against
 four in the middle. Counted raw, a perfectly uniform cause reads as "it is all
 at the edges". The histogram would have confirmed the impression it was built
 to test.
+
+### And then it was measured, and it was not what this record thought (2026-08-31)
+
+`harness light` now runs **both** opacity models over the same chunks in the
+same run. Adopting Minecraft's own numbers, on their own, moved seed 0 from
+99.419% to **99.423%** — a hundred and seven cells of fourteen thousand.
+
+That is not a small win. It is a **wrong prediction by this record**, and what
+was wrong with it is worth more than the number.
+
+The cells were still short. What changed was *how* short: 6,128 cells short by
+fourteen became nineteen cells short by thirteen. Light was reaching under the
+water and into the leaves after all, and arriving at half the level Minecraft
+says it should. The cause was in the engine, not the data —
+`dust_world::propagation` charged `1 + opacity` for a step where Minecraft
+charges `max(1, opacity)`, so every block of opacity one cost two.
+
+**Nothing could see it while the only opacity model answered 0 or 15**, because
+the two rules agree at both ends: at 0 they are both one, and at 15 they both
+take everything. A wrong constant hidden by another wrong constant, for the
+whole of the light engine's life.
+
+With both fixed:
+
+```text
+                          agree      cells short
+  seed 0, radius 2
+    air only, stand-in   99.419%          14,276
+    Minecraft's own      99.975%             611
+  seed 1, radius 3
+    air only, stand-in   96.482%         169,480
+    Minecraft's own     100.000%               0
+```
+
+**Seed 1 is exact** — 4,816,896 sky-light cells of an ocean world, and not one
+of them disagrees with the light Minecraft wrote. The world that was *worst*
+under the stand-in is the one that comes out right.
+
+And the residual has changed identity, which the ring histogram says out loud:
+
+```text
+distance from a face    0      1      2      3      4      5      6      7
+seed 0, air only     0.660  0.595  0.561  0.548  0.530  0.510  0.530  0.581
+seed 0, Minecraft's  0.072  0.021  0.008  0.007  0.005  0.005  0.006  0.018
+```
+
+Flat under the stand-in, because opacity does not care where in a column a cell
+is. Falling by an order of magnitude from the face inwards under Minecraft's
+numbers, which is the shape a **neighbour** effect makes and the first time this
+verb has seen one. Seed 0's remaining 611 cells are 400 cells of air near an
+edge with some grass and leaves beside them, and they belong to the multi-column
+light volume — the other outstanding item, which this record had costed at "five
+per cent of the gap" and which is now very nearly all of what is left of it.
+
+**The transferable part is not about lighting.** The ring measurement above was
+built to separate two known causes and it did that correctly. It could not
+separate either of them from a *third* cause nobody had proposed, and it read
+"flat, therefore opacity" — which was true, and which was also true of a step
+cost that doubled every opacity that was not 0 or 15. The stand-in did not just
+under-light the world; it made a second defect unobservable, because it never
+produced the input under which the two rules differ. A guard can only fail on a
+question somebody thought to ask, and a stand-in can only expose the defects its
+own range reaches.
 
 ## Options
 
@@ -179,31 +244,25 @@ file, which is nobody.
 **4. Leave it.** What is happening now. Sky light is 99.41% right, wrong in one
 direction, and wrong in a way that is written down where the code lives.
 
-## Why this is not decided here
+## Why it was not decided here for so long
 
-**Read the costing above first, and then note that option 1 now exists.** The
-reason this record sat open was that option 1 was the right answer nobody had
-priced, which left options 2 and 3 — the ones that need a judgement — looking
-like the only live ones. It is built, it runs in seconds, and it produces
-Mojang's own numbers from the operator's own jar without committing any of
-them.
+Kept because the shape of the delay is the useful part. Option 1 was the right
+answer nobody had priced, which left options 2 and 3 — the ones that need a
+judgement — looking like the only live ones, and a judgement is easy to
+postpone. Pricing option 1 took an afternoon and found that everything it needed
+was in the published mappings; building it took another and produced Mojang's
+own numbers in six and a half seconds.
 
-**So there is no judgement left to make between the options**, and what remains
-is a smaller and different question: whether `opacity_of` should consume the
-table when one is present, and what a server with no `[data]`-side table should
-do — which is the ordinary question every other operator-supplied input in this
-project has already answered. The paragraphs below are kept because they are
-the reasoning that got here, not because the choice is still open.
+Option 2, deriving opacity from tags, was rejected as a *silent* approximation
+and stays rejected — not because the objection held (it weakened the day
+`harness light` could report a derived table's accuracy as a percentage) but
+because it stopped being needed. A wrong number that nobody can see is the
+hazard D6 and D7 legislate against, and the whole point of the oracle is that
+there is no number to invent.
 
-Option 2 is an afternoon's work and would visibly improve the world a player
-sees. It is also the one that puts numbers in this repository that no
-measurement produced and no extraction justified, against two decision records
-that say values come from the operator's own copy of the game. That is a
-judgement about the project's line and not about lighting, and it wants a
-decision rather than a commit.
-
-The measurement is the input. This record consumes it, exactly as D4 waits on
-Phase 10's.
+The measurement was the input. This record consumed it, exactly as D4 waits on
+Phase 10's — and then the measurement corrected the record, which is the section
+above.
 
 ## The same wall, one block over: sounds
 
@@ -218,71 +277,91 @@ the emission, so a server without it can either say nothing or play the same
 noise for glass and gravel. Dust says nothing.
 
 That is worth recording here rather than in its own file because it is not a
-second decision. It is the same decision, and whichever way it goes, it goes the
-same way for all three.
+second decision. It is the same decision, and it went the same way for all
+three: the oracle already holds the object a `SoundType` hangs off, and the
+route the numbers travel is settled below. What is left for sound is a column in
+the oracle's output and a place to read it, which is work rather than a
+judgement.
 
-## The one question left, stated precisely
-
-Option 1 exists and produces Minecraft's numbers. What is *not* settled is how
-those numbers reach a **server operator**, and it is worth being exact about why
-that is a real question rather than a step nobody has typed yet.
+## How the numbers reach an operator — decided
 
 `cargo xtask extract --only light` is a **developer** command. It runs from a
-Rust checkout of this repository. An operator has a `dust` binary, a
-`dust.toml`, and — per D7 — a `[data] path` directory they produced with
-Minecraft's own `--server` generator. **They have a JDK and a jar already**, so
-the oracle is not asking anything new of them; what it is asking is a *route*,
-and there are four:
+Rust checkout. An operator has a `dust` binary, a `dust.toml`, and — per D7 — a
+`[data] path` directory they produced with Minecraft's own `--server`
+generator. They have a JDK and a jar already, so the oracle asks nothing new of
+them; what it needed was a *route*, and there were four.
 
-**1. A new `dust` subcommand** that runs the oracle. Honest and discoverable.
-Costs the thing `cli.rs` opens by stating: the grammar is "one subcommand with
-three flags, and nothing composes". A second subcommand is not fatal, but it is
-the first crack in a deliberate simplicity, and it drags the Java sources and a
-`javac` dependency into the shipped artefact.
+**1. A new `dust` subcommand** that runs the oracle. Honest and discoverable,
+and it costs the thing `cli.rs` opens by stating: the grammar is "one
+subcommand with three flags, and nothing composes". It also drags the Java
+sources and a `javac` dependency into the shipped artefact.
 
-**2. The server runs the oracle at boot**, given a jar path in `dust.toml`.
-No new grammar. Puts a JDK, a `javac` and a subprocess on the boot path of every
-server that wants correct light, and turns a class of Java failures into a
-class of server-start failures.
+**2. The server runs the oracle at boot**, given a jar path in `dust.toml`. No
+new grammar, but it puts a JDK, a `javac` and a subprocess on the boot path of
+every server that wants correct light, and turns a class of Java failures into
+a class of server-start failures.
 
-**3. The table travels with `[data] path`.** One more file in a directory the
-operator already populates, read at boot if present and absent otherwise —
-which is exactly how `[data] path` itself behaves. Costs nothing at run time
-and needs no grammar. **The open end is who generates it**: option 3 is a
-*format* decision that still needs one of 1, 2 or 4 to produce the file.
+**3. The table travels with `[data] path`. — TAKEN.** One more file in a
+directory the operator already populates, read at boot if present and absent
+otherwise, which is exactly how `[data] path` itself behaves. Costs nothing at
+run time and needs no grammar. Its open end was who generates the file, and the
+answer is option 1 today and option 4 the day there are releases — the *format*
+decision and the *producer* decision are separate, and only the format had to be
+made now.
 
-**4. Publish the oracle as a small standalone jar** beside each release.
-An operator runs `java -jar dust-oracle.jar <server.jar> <out>` once. No Rust
+**4. Publish the oracle as a small standalone jar** beside each release. An
+operator runs `java -jar dust-oracle.jar <server.jar> <out>` once. No Rust
 checkout, no new `dust` grammar, nothing Mojang's in the release. Costs a second
-release artefact and a second thing to version.
+release artefact and a second thing to version — and there are no releases yet,
+so it could not be the answer to "how does an operator do this today".
 
-**This record does not choose**, and the reason is the same as before: it is a
-judgement about what Dust asks of an operator and what it ships, not a judgement
-about lighting. What has changed is that it is now a question about *packaging*
-rather than about principle — the numbers exist, they are Mojang's, and no
-option above puts one of them in this repository.
+### What was built
 
-**What is blocked on it:** nothing that is not already stated as a known gap.
-`opacity_of` treats every block but air as a wall today, `harness light` says
-that costs 0.6% of cells on seed 0 and 3.5% on seed 1, and the ring measurement
-says opacity is very nearly all of it. Reading a table is a small change to one
-function whenever a route to the table exists.
+The file is `dust-light.tsv`, beside `minecraft/` rather than inside it:
+everything under `minecraft/` is Minecraft's own output in Minecraft's own
+layout, and a bare `light.tsv` in there would look like one more of them. The
+name says who wrote it and who reads it.
 
-## Consequences of leaving it
+```text
+<[data] path>/
+  dust-light.tsv
+  minecraft/
+    worldgen/biome/…
+```
+
+Absent is not an error, and the server says which case it is in at boot with the
+measured cost of going without. **Present and wrong is** an error that stops the
+server: the alternative is a server that reads the operator's file, puts it
+down, and runs with lighting quietly worse than they asked for. `xtask extract
+--only light` prints the one `cp` line that puts the file where it belongs, at
+the moment somebody has just produced one.
+
+Nothing about this ships a Mojang value. The repository holds the question, the
+oracle that asks it, and the reader for the answer.
+
+**What is left:** block light and block-place sounds, which are the same two
+paragraphs below and are now waiting on code rather than on data — the table
+already carries emission for 1,588 of 26,684 states. Sky light is done: a server
+with a table lights an ocean world exactly as Minecraft does.
+
+## What is still consequent
 
 - **No block light at all.** Torches, lava and glowstone light nothing, and
   there is no engine work outstanding for it — `dust_world::propagation` runs
   the same walks vanilla does. It is waiting on emission values and nothing
-  else.
-- **Sky light stops at the surface of an ocean and under a tree**, which is
-  visible to a player and is nearly all of the shortfall. On an ocean spawn it
-  is 3.5% of every cell in view.
+  else, and the table now carries them: 1,588 of 26,684 states emit. Read the
+  measurement above before believing that second sentence, though. The same was
+  said about opacity, and the data was the smaller half of it.
+- **Sky light stops at the surface of an ocean and under a tree** on a server
+  with no table, and that is now a configuration state rather than a property of
+  Dust: 3.5% of every cell in view on an ocean spawn without one, and nothing at
+  all with one.
 - **No sound when a block is placed**, for the reason above. Breaking one is
   fine — the break effect carries the block's *state* and the client picks the
   sound itself, which is why that could be built and this cannot.
 - **`opacity_of` is the one place this is decided** for light, and it says so.
-  Whichever option is taken changes that function, the emission model beside it,
-  and a block-to-sound table, and nothing else.
+  It now takes the table; what is still to be written is the emission model
+  beside it and a block-to-sound table, and nothing else.
 
 ## Related
 

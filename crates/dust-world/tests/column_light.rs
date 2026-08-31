@@ -10,7 +10,7 @@ use dust_world::chunk::Chunk;
 use dust_world::column_light::ColumnSkyLight;
 use dust_world::coords::ChunkPos;
 use dust_world::heightmap::WorldHeight;
-use dust_world::propagation::{Budget, DefaultOpacity};
+use dust_world::propagation::{Budget, OpacityModel};
 
 const AIR: u32 = 0;
 const STONE: u32 = 1;
@@ -33,7 +33,7 @@ fn column(lid_y: i32) -> Chunk {
 }
 
 fn seed(chunk: &mut Chunk) {
-    let opacity = DefaultOpacity::transparent_only([AIR]);
+    let opacity = OpacityModel::transparent_only([AIR]);
     ColumnSkyLight::seed(chunk, &opacity, Budget::new(4_000_000)).expect("within budget");
 }
 
@@ -149,7 +149,7 @@ mod agreement {
     use dust_world::propagation::{seed_skylight, LightGraph};
 
     /// The implementation this replaced: seed every cell the sky reaches.
-    fn seed_the_slow_way(chunk: &mut Chunk, opacity: &DefaultOpacity) {
+    fn seed_the_slow_way(chunk: &mut Chunk, opacity: &OpacityModel) {
         let min_y = chunk.world().min_y();
         let max_y = min_y + chunk.world().height() as i32;
         let mut columns = Vec::with_capacity(16 * 16);
@@ -202,7 +202,7 @@ mod agreement {
 
     #[test]
     fn the_two_seedings_agree_cell_for_cell_on_broken_terrain() {
-        let opacity = DefaultOpacity::transparent_only([AIR]);
+        let opacity = OpacityModel::transparent_only([AIR]);
 
         let mut fast = broken_terrain();
         ColumnSkyLight::seed(&mut fast, &opacity, Budget::new(400_000_000)).expect("budget");
@@ -232,7 +232,7 @@ mod agreement {
         // boundary is one layer. Worth its own test because it is the shape
         // the server actually sends, and because an off-by-one in "which cells
         // are on the edge" would show here and nowhere else.
-        let opacity = DefaultOpacity::transparent_only([AIR]);
+        let opacity = OpacityModel::transparent_only([AIR]);
         let mut fast = column(0);
         ColumnSkyLight::seed(&mut fast, &opacity, Budget::new(400_000_000)).expect("budget");
         let mut slow = column(0);
@@ -247,7 +247,7 @@ mod agreement {
         // number is deterministic. Ten times fewer is a loose bound around a
         // difference that is nearer a hundred, chosen so this fails on a
         // regression rather than on noise.
-        let opacity = DefaultOpacity::transparent_only([AIR]);
+        let opacity = OpacityModel::transparent_only([AIR]);
 
         let mut fast = column(0);
         let fast_edges =
@@ -420,7 +420,7 @@ fn skirt_open() -> dust_world::column_light::Skirt {
 }
 
 fn seed_with(chunk: &mut Chunk, skirt: dust_world::column_light::Skirt) {
-    let opacity = DefaultOpacity::transparent_only([AIR]);
+    let opacity = OpacityModel::transparent_only([AIR]);
     ColumnSkyLight::seed_with_neighbours(chunk, &opacity, skirt, Budget::new(4_000_000))
         .expect("within budget");
 }

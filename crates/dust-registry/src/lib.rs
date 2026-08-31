@@ -12,6 +12,19 @@
 //!   passing one where another belongs is a mistake worth making impossible;
 //!   the rest are reached through [`Registry`] by registry id.
 //!
+//! # One table here is not generated
+//!
+//! [`light::LightTable`] is the exception to the first sentence above, and it
+//! is an exception on purpose. How much light a block state costs to enter and
+//! how much it gives off are Java code in Minecraft — in no report, no data
+//! pack and nothing `xtask extract`'s generators can reach — so decision
+//! record 0008 says they arrive at run time from the operator's own jar, the
+//! same rule D6 and D7 set for ore density and registry contents. What lives
+//! here is the reader and the shape; the numbers live on the operator's disk.
+//! It is in this crate because a table keyed by block-state id is meaningless
+//! without [`STATE_COUNT`], and that is what refuses a table extracted from a
+//! different version of the game.
+//!
 //! `minecraft:block` is in the flat report too and is deliberately not in
 //! [`Registry`]: a block's protocol id is its position in the block table, so a
 //! second list of block names would be a second answer to the same question.
@@ -33,6 +46,7 @@ pub mod flat;
 pub mod fluids;
 pub mod generated;
 pub mod items;
+pub mod light;
 pub mod loot;
 pub mod recipes;
 pub mod registry;
@@ -45,6 +59,7 @@ pub use generated::blocks::{DATA_VERSION, STATE_COUNT, STATE_SAMPLES};
 pub use generated::items::COMPONENT_SAMPLES;
 pub use generated::registries::{ENTRY_COUNT, ENTRY_SAMPLES};
 pub use items::{ComponentValue, Components, Rarity};
+pub use light::{LightTable, LightTableError};
 pub use registry::{Registry, RegistryDef};
 
 /// One property of a block, and the values it may take, in id order.

@@ -24,10 +24,18 @@
 //!   Pure, and every refusal names the path that reached it.
 //! * [`source`] — reading a directory of the operator's own data. The values
 //!   live there and not here; see decision record 0007.
+//!
+//! And one file that is not about registry contents at all but is about the
+//! same directory: [`light`], which reads the block-state light table an
+//! operator drops in beside `minecraft/`. It is here because `[data] path` is
+//! what this module owns, and a second reader of one setting in a second place
+//! is how two answers to one question start.
 
 pub mod convert;
+pub mod light;
 pub mod schema;
 pub mod source;
 
 pub use convert::{ConvertError, ErrorKind};
+pub use light::LightError;
 pub use source::{load, Contents, EntryError, LoadError, Loaded};

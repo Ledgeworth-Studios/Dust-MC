@@ -30,6 +30,19 @@ that a client acknowledging no data packs can be served at all. Without that
 path the server refuses the connection and says so, which the check reports as
 a failure rather than as a crash.
 
+**Serve a real world from a release build.** Every check that involves a
+*second* bot has a deadline, and a debug build streaming a real Minecraft world
+misses them: pointed at seed 1's ocean spawn, `cargo build`'s binary fails five
+of the nine and `cargo build --release`'s passes all nine, on the same commit
+and the same world. That was measured on this checkout and again on `main`
+before it, which is the only reason it is written down as a build fact rather
+than chased as a regression. Against the flat world a debug build passes nine
+of nine, so the deadline is the chunk streaming and not the protocol.
+
+A failing check is either a defect or a deadline, and the two look identical
+from here. If the failures are the second-bot ones and nothing else, rebuild
+with `--release` before believing them.
+
 ## What it checks
 
 1. It **joins** — through login, configuration and into the world.

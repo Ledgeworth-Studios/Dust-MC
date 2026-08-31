@@ -34,76 +34,94 @@
 //! daylight rather than darkness is above the terrain. That case was found by
 //! this verb refusing to guess about it rather than by reading it somewhere.
 //!
-//! # What a difference means, and what it does not
+//! # Two models, one run
 //!
-//! Dust's light is known to be approximate, and this exists to put a number on
-//! it rather than to pass. Two causes are known going in:
-//!
-//! * **Opacity.** Dust treats every block but air as fully opaque. Vanilla
-//!   gives water, leaves, glass and ice an opacity of one or two, so light
-//!   reaches under a tree and into the top of an ocean here and stops dead
-//!   there. Light emission and opacity are code constants in Minecraft, in no
-//!   report and no data pack, so there is nothing to extract yet.
-//! * **Light through a neighbour.** A column is lit with its neighbours' sky
-//!   floors as sources, which is exact where a neighbour is open to the sky
-//!   and under-lights where the light would have to travel *through* one.
-//!   **This one is now measured, and it is very nearly nothing** — see the
-//!   ring report below.
-//!
-//! Both under-light rather than over-light, so a cell where Dust is *brighter*
-//! than vanilla is a third thing and is counted separately: it means light
-//! arriving where vanilla says none does, which neither gap explains.
-//!
-//! # Which of the two gaps is bigger, answered
-//!
-//! That question had an impression for an answer — "the smaller of the two by
-//! a wide margin" — until the report grew a ring histogram. Light arriving
-//! from a neighbour enters at a face and loses a level per step inward, so a
-//! shortfall it causes leans towards the edge; opacity has no reason to care
-//! where in a column it is. The shortfall *rate* per ring separates them.
+//! Opacity is not one of Dust's numbers. Minecraft keeps `getLightBlock` as
+//! Java code; `cargo xtask extract --only light` asks the game for it against
+//! the operator's own jar; and this verb measures **both** that answer and the
+//! stand-in that stood in for it — over the same chunks of the same world, in
+//! the same run. Two runs of one verb with a flag between them would be two
+//! numbers taken under conditions nobody held fixed, which is the mistake the
+//! ring histogram below exists to avoid.
 //!
 //! ```text
-//! distance from a face   0      1      2      3      4      5      6      7
-//! seed 0, radius 2    0.660  0.595  0.561  0.548  0.530  0.510  0.530  0.581
-//! seed 1, radius 3    3.522  3.521  3.521  3.516  3.512  3.513  3.516  3.516
+//!                            agree     cells short
+//!   seed 0, radius 2
+//!     air only, stand-in    99.419%         14,276
+//!     Minecraft's own       99.975%            611
+//!   seed 1, radius 3
+//!     air only, stand-in    96.482%        169,480
+//!     Minecraft's own      100.000%              0
 //! ```
 //!
-//! **Flat, on both worlds.** Seed 1 spans 0.006 of a percentage point from the
-//! face to the middle. Seed 0 falls by a tenth of a point and then *rises
-//! again* at the centre, which is not a shape a neighbour effect can produce.
-//! Taking seed 0's interior rate as the opacity floor, everything the edge
-//! carries above it is about 750 cells of 14,276 — **five per cent of the gap,
-//! and not shown to be neighbour transit even so.**
+//! **Seed 1 is exact**: 4,816,896 sky-light cells of an ocean world, and not
+//! one of them disagrees with the light Minecraft wrote.
 //!
-//! So the multi-column volume is worth what that five per cent is worth, and
-//! opacity owns the rest. D8 was already the record that mattered; this is how
-//! much it matters.
+//! # What the second model found, which was not opacity
+//!
+//! Minecraft's numbers on their own moved seed 0 from 99.419% to **99.423%**,
+//! which is a hundred and seven cells. What they changed was not how many
+//! cells were short but *how short*: 6,128 cells short by fourteen became
+//! nineteen cells short by thirteen. Light was reaching under the water and
+//! into the leaves and arriving at half the level it should.
+//!
+//! The cause was in the engine. `dust_world::propagation` charged `1 + opacity`
+//! for a step where Minecraft charges `max(1, opacity)`, so every block with an
+//! opacity of one cost two. **Nothing could see it while the only opacity model
+//! answered 0 or 15**, because the two rules agree at both ends. See
+//! `propagation::step_cost`; fixing it is what takes seed 0 to 99.975% and
+//! seed 1 to exact.
+//!
+//! A wrong constant hidden by another wrong constant, found by putting the real
+//! data through the same walk — which is this harness's whole argument, made
+//! once more and from a direction nobody was watching.
+//!
+//! # Which gap is left, and the shape says which one it is
+//!
+//! Sky light has two known gaps and a percentage cannot say which one it is
+//! reporting, so the report splits the shortfall by how far each cell sits from
+//! its column's edge. Light arriving from a neighbouring column enters at a
+//! face and loses a level per step inward; opacity has no reason to care where
+//! in a column a cell is. A rate that falls towards the middle is the first; a
+//! flat one is the second.
+//!
+//! ```text
+//! distance from a face    0      1      2      3      4      5      6      7
+//! seed 0, air only     0.660  0.595  0.561  0.548  0.530  0.510  0.530  0.581
+//! seed 0, Minecraft's  0.072  0.021  0.008  0.007  0.005  0.005  0.006  0.018
+//! ```
+//!
+//! **The shape changes with the model, and that is the measurement.** Under the
+//! stand-in it is flat, because opacity owned the gap. Under Minecraft's own
+//! numbers it falls by an order of magnitude from the face inwards — the shape
+//! a neighbour effect makes, and the first time this verb has seen one. What is
+//! left of seed 0's 611 cells is the multi-column light volume: 400 of them are
+//! standing in air, and the remaining block list is grass, leaves and flowers
+//! near an edge.
 //!
 //! **The rate and not the count is the whole measurement.** A 16x16 column has
 //! `60 - 8d` columns at distance `d` — sixty at the face and four in the
 //! middle, fifteen to one — so a raw count reads as "it is all at the edges"
 //! for any cause whatsoever, including one that is perfectly uniform. A
-//! histogram without its denominator would have confirmed the impression it
-//! was built to test.
+//! histogram without its denominator would have confirmed the impression it was
+//! built to test.
 //!
-//! # The percentage is a property of the world, not of the engine
+//! # The stand-in's percentage is a property of the world, not of the engine
 //!
-//! Seed 0 reads **99.4%**. Seed 1 reads **96.4%**, and the engine is the same
-//! engine: seed 1 spawns in deep ocean, and 168,428 of its 169,480 shortfalls
-//! are water — an even 12,544 cells at each level from 14 downwards, which is
-//! one cell per column per level, the water column marching down. A single
-//! headline number would be a number about whichever world somebody captured.
+//! Under the stand-in, seed 0 reads **99.4%** and seed 1 reads **96.5%** with
+//! the same server: seed 1 spawns in deep ocean, and 168,428 of its 169,480
+//! shortfalls are water — an even 12,544 cells at each level from 14 downwards,
+//! which is one cell per column per level, the water column marching down. A
+//! single headline number would be a number about whichever world somebody
+//! captured.
 //!
-//! **What is invariant is the shape, and that is what to read.** Every
-//! disagreement, on both seeds and at every radius, is Dust being *darker*; and
-//! the shortfalls are one block list — water, leaves, grass, seagrass, kelp —
-//! every one a block Minecraft gives an opacity of one or two. That is the
-//! claim the verb supports. The percentage is how much of *this* world is made
-//! of them.
+//! That is why both seeds are quoted, and it is also why the second model's
+//! numbers are worth more than one seed of them: the world that was *worst*
+//! under the stand-in is the one that comes out exact.
 //!
-//! **There are no over-lit cells, at any radius or either seed, and getting to
-//! that took three corrections — every one of them to this harness rather than
-//! to the engine.**
+//! **There are no over-lit cells, at any radius, either seed or either model,
+//! and getting to that took three corrections — every one of them to this
+//! harness rather than to the engine.**
 //!
 //! 1. It lit each column against *itself* on all four sides. A column lower
 //!    than its neighbour was told the neighbour was as low as it, so light
@@ -112,21 +130,15 @@
 //!    partly-generated chunks around whatever was forced, and vanilla lights a
 //!    chunk when it reaches `full`: 167,000 more, and the agreement fell to
 //!    98.1% with no change to the engine.
-//! 3. It took sky floors from *neighbours* vanilla had not finished. A
-//!    neighbour below `full` has different blocks than the ones vanilla lit
-//!    against, so Dust was told there was open sky where the finished world
-//!    has terrain: the last thirty-two, every one within a step of a chunk
-//!    edge, in a fading gradient, each exactly one brighter than vanilla.
+//! 3. It took sky floors from *neighbours* vanilla had not finished, so Dust
+//!    was told there was open sky where the finished world has terrain: the
+//!    last thirty-two, every one within a step of a chunk edge.
 //!
 //! Every one was caught by the same thing — the report separates over-lighting
 //! from under-lighting, and both known gaps under-light — and the last was
 //! found by printing the coordinates and seeing that all thirty-two sat on an
 //! edge. A single "0.6% disagree" line would have hidden all three inside a
 //! number that already looked good.
-//!
-//! Which is the same reason to run it on more than one seed: the first one
-//! agreed 99.4% and the second 96.4%, and nothing about the server had
-//! changed.
 //!
 //! # Exit codes
 //!
@@ -136,10 +148,11 @@
 //! red every time it ran, which teaches people to stop running it.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use dust_server::net::source::RegistryNames;
+use dust_server::net::world;
 use dust_world::column_light::{Skirt, SkyFloor};
 use dust_world::coords::ChunkPos;
 use dust_world::heightmap::WorldHeight;
@@ -152,6 +165,12 @@ harness light --version <v> [--seed <n>] [--radius <r>]
 Reads a world Minecraft generated and lit, lights the same chunks with Dust's
 own engine, and compares the sky light cell by cell. Prints how much agrees and
 names what the disagreements are standing on.
+
+Measured twice where this checkout has a light table — once with Minecraft's
+own opacity for every block state and once with the stand-in that treats
+everything but air as a wall — over the same chunks in the same run. Write one
+with `cargo xtask extract --version <v> --only light`; nothing is committed and
+none of it leaves .dust-extract/.
 
   --version <v>   Minecraft version, e.g. 1.21.1.
   --seed <n>      The provisioned world's seed. Default 0.
@@ -350,20 +369,113 @@ fn measure(options: &Options) -> Result<(), String> {
         }
     }
 
+    // The table, if this checkout has one. **Both models are measured in one
+    // run**, because the number that matters is not "Minecraft's opacity gets
+    // 99.9%" — it is the difference between the two on the same chunks of the
+    // same world, and two runs of one verb with a flag between them invites
+    // exactly the mistake the ring histogram was built to avoid: comparing
+    // numbers taken under conditions nobody held fixed.
+    let table = light_table(&options.version)?;
+    match &table {
+        Some((path, table)) => println!(
+            "light table: {} — {} states, {} of them emitting",
+            path.display(),
+            table.len(),
+            table.emitting()
+        ),
+        None => println!(
+            "no light table in this checkout, so only the stand-in is measured; \
+             `cargo xtask extract --version {} --only light` writes one",
+            options.version
+        ),
+    }
+
+    let mut models = vec![(
+        "air only, the stand-in",
+        false,
+        world::opacity_of(air, None),
+    )];
+    if let Some((_, table)) = &table {
+        models.push((
+            "Minecraft's own opacity, from the operator's jar",
+            true,
+            world::opacity_of(air, Some(table)),
+        ));
+    }
+
+    let mut first = true;
+    for (name, from_minecraft, opacity) in &models {
+        println!();
+        println!("--- {name} ---");
+        let sweep = sweep(&Sweep {
+            region_dir: &region_dir,
+            expected: &expected,
+            floors: &floors,
+            height,
+            names: &names,
+            air,
+            opacity,
+        })?;
+        if first && sweep.skipped > 0 {
+            // Said, not swallowed. A run that quietly compared a hundred
+            // chunks when it was asked about a hundred and sixty-nine would be
+            // reporting a percentage of something the caller did not name.
+            //
+            // Once, because which chunks are skipped is a fact about the world
+            // vanilla wrote and not about the model being measured.
+            println!(
+                "{} chunk(s) skipped: not generated to `full`, or missing a \
+                 neighbour — vanilla's own light for those is unfinished",
+                sweep.skipped
+            );
+        }
+        first = false;
+        if sweep.tally.cells == 0 {
+            return Err(
+                "every chunk was skipped; capture a wider world or ask for a smaller radius"
+                    .to_owned(),
+            );
+        }
+        report(&sweep.tally, *from_minecraft);
+    }
+    Ok(())
+}
+
+/// Everything one pass over the square needs, so the pass takes one argument
+/// rather than eight.
+struct Sweep<'a> {
+    region_dir: &'a Path,
+    expected: &'a [(i32, i32)],
+    floors: &'a BTreeMap<(i32, i32), SkyFloor>,
+    height: WorldHeight,
+    names: &'a RegistryNames,
+    air: u32,
+    opacity: &'a dust_world::propagation::OpacityModel,
+}
+
+/// What one pass produced.
+struct Swept {
+    tally: Tally,
+    skipped: usize,
+}
+
+/// Light every chunk of the square with one opacity model and compare it with
+/// what vanilla wrote.
+fn sweep(run: &Sweep) -> Result<Swept, String> {
     let mut tally = Tally::default();
     let mut skipped = 0usize;
-    for &(x, z) in &expected {
+    for &(x, z) in run.expected {
         // A column whose neighbours are not all generated cannot be lit the
         // way the server would light it, so comparing it measures the
         // harness's fallback rather than the engine.
         if [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)]
             .iter()
-            .any(|key| !floors.contains_key(key))
+            .any(|key| !run.floors.contains_key(key))
         {
             skipped += 1;
             continue;
         }
-        let Some(root) = read(&region_dir, x, z)? else {
+        let Some(root) = read(run.region_dir, x, z)? else {
             return Err(format!("chunk {x},{z} has never been generated"));
         };
         // Vanilla lights a chunk when it reaches `full`, and a world holds
@@ -379,33 +491,42 @@ fn measure(options: &Options) -> Result<(), String> {
             skipped += 1;
             continue;
         }
-        let vanilla = vanilla_light(&root, height)
+        let vanilla = vanilla_light(&root, run.height)
             .map_err(|e| format!("chunk {x},{z}: reading Minecraft's light: {e}"))?;
 
-        let mut chunk = dust_chunk(&region_dir, x, z, height, &names, air)?;
-        let skirt = skirt_for(&floors, x, z, height);
-        let dust = dust_light(&mut chunk, skirt, height);
+        let mut chunk = dust_chunk(run.region_dir, x, z, run.height, run.names, run.air)?;
+        let skirt = skirt_for(run.floors, x, z, run.height);
+        let dust = dust_light(&mut chunk, skirt, run.height, run.opacity);
 
-        compare(&chunk, &vanilla, &dust, height, &mut tally);
+        compare(&chunk, &vanilla, &dust, run.height, &mut tally);
     }
+    Ok(Swept { tally, skipped })
+}
 
-    if skipped > 0 {
-        // Said, not swallowed. A run that quietly compared a hundred chunks
-        // when it was asked about a hundred and sixty-nine would be reporting
-        // a percentage of something the caller did not name.
-        println!(
-            "{skipped} chunk(s) skipped: not generated to `full`, or missing a \
-             neighbour — vanilla's own light for those is unfinished"
-        );
+/// The light table `cargo xtask extract --only light` wrote for this version,
+/// if this checkout has one.
+///
+/// **A developer route and deliberately only that.** The oracle runs from a
+/// Rust checkout against a jar in the extractor's cache; how the same numbers
+/// reach a *server operator* is the question decision record 0008 has left, and
+/// this verb existing does not answer it. What it does is put a number on what
+/// answering it would buy.
+///
+/// Absent is not an error — most of the reasons to run this verb do not need
+/// one, and the run says which models it measured.
+fn light_table(version: &str) -> Result<Option<(PathBuf, dust_registry::LightTable)>, String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask lives one level below the workspace root")
+        .join(format!(".dust-extract/oracle-{version}/light.tsv"));
+    if !path.is_file() {
+        return Ok(None);
     }
-    if tally.cells == 0 {
-        return Err(
-            "every chunk was skipped; capture a wider world or ask for a smaller radius".to_owned(),
-        );
-    }
-
-    report(&tally);
-    Ok(())
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    let table =
+        dust_registry::LightTable::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Some((path, table)))
 }
 
 /// Whether vanilla finished generating — and therefore lighting — this chunk.
@@ -551,13 +672,13 @@ fn skirt_for(
 }
 
 /// Light a column with Dust's own engine and read the result back out.
-fn dust_light(chunk: &mut dust_world::chunk::Chunk, skirt: Skirt, height: WorldHeight) -> Column {
-    let air = dust_registry::Block::from_name("minecraft:air")
-        .expect("checked at startup")
-        .default_state()
-        .id();
-    let opacity = dust_server::net::world::opacity_of(air);
-    let _ = dust_server::net::world::light_column(chunk, &opacity, skirt);
+fn dust_light(
+    chunk: &mut dust_world::chunk::Chunk,
+    skirt: Skirt,
+    height: WorldHeight,
+    opacity: &dust_world::propagation::OpacityModel,
+) -> Column {
+    let _ = dust_server::net::world::light_column(chunk, opacity, skirt);
 
     let mut column = Column::empty(height);
     for y in height.min_y()..height.min_y() + height.height() as i32 {
@@ -672,7 +793,7 @@ fn histogram(blocks: &BTreeMap<String, u64>) {
     }
 }
 
-fn report(tally: &Tally) {
+fn report(tally: &Tally, opacity_from_minecraft: bool) {
     let disagree = tally.cells - tally.agree;
     let percent = |n: u64| {
         if tally.cells == 0 {
@@ -711,9 +832,10 @@ fn report(tally: &Tally) {
              known gaps point in"
         );
         // Said every time, because the percentage above is the first thing
-        // anybody will quote and it is a fact about the world rather than
-        // about the engine: seed 0 reads 99.4% and seed 1, which spawns in
-        // deep ocean, reads 96.4% with the same server.
+        // anybody will quote and — under the stand-in especially — it is a
+        // fact about the world rather than about the engine: seed 0 reads
+        // 99.4% and seed 1, which spawns in deep ocean, reads 96.5% with the
+        // same server.
         println!(
             "the percentage is how much of *this* world is made of those blocks; \
              run another seed before quoting it"
@@ -725,8 +847,16 @@ fn report(tally: &Tally) {
 
     println!();
     println!("  {darker} cell(s) darker in Dust than in Minecraft");
-    println!("      (every block but air is fully opaque here, and light does");
-    println!("       not travel through a neighbouring column)");
+    // Which gaps are actually in force under *this* model, rather than a
+    // sentence that names both whatever is running. Under Minecraft's own
+    // numbers the opacity gap is closed, and a report that still blamed it
+    // would be pointing at the wrong half of its own ring histogram.
+    if opacity_from_minecraft {
+        println!("      (light does not travel through a neighbouring column)");
+    } else {
+        println!("      (every block but air is fully opaque here, and light does");
+        println!("       not travel through a neighbouring column)");
+    }
     for (by, count) in tally.darker.iter().rev().take(5) {
         println!("      short by {by:>2}: {count}");
     }
