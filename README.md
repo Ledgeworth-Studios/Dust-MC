@@ -9,7 +9,9 @@ Dust is being built from nothing and is not finished — but you can play on it.
 **Two people can connect, walk around a shared world, break and place blocks,
 see each other doing it, and talk.** They place what they are holding — any of
 the nine hundred and twenty-five blocks Minecraft has an item for, picked out of
-the creative menu — and they see each other swing, crouch and break blocks,
+the creative menu — where Minecraft would put it: into the tall grass they aimed
+at, and not into the wall behind the face they clicked. They see each other
+swing, crouch and break blocks,
 particles and sound out of the block that broke, and hear each other put blocks
 down, each block with its own sound. What they change is still there after a
 restart, along with where they were standing. The world is lit the way Minecraft
@@ -91,9 +93,10 @@ section codec, the chunk packet, the light engine.
 **Not yet**, and each of these is stated where the code for it would go: no
 physics, block updates, drops, tool checks or reach validation, so a player may
 break bedrock from across the map; no inventory beyond the nine hotbar slots a
-creative client writes, so nothing is stored, nothing is carried between
-sessions, and a block goes down in its default state rather than facing the way
-the player stood; light that
+creative client writes, so nothing is stored and nothing is carried between
+sessions; no placement *context*, so a block goes down in its default state
+rather than facing the way the player stood, and eight layers of snow are
+replaced where Minecraft would refuse; light that
 crosses a chunk boundary — sky light from a neighbour it would have to travel
 *through*, and any light at all from a torch on the far side of one — which is
 an engine gap and not a data one, and is now the *only* thing between a served
@@ -126,13 +129,14 @@ cp .dust-extract/oracle-1.21.1/items.tsv     <[data] path>/dust-items.tsv
 ```
 
 How much light a block stops, how much it gives off, which of the six heightmaps
-count it, what it sounds like going down, and which block each item puts down are
-Java code inside Minecraft rather than data, so they are in no report, no data
+count it, whether a block placed there goes into it, what it sounds like going
+down, and which block each item puts down are Java code inside Minecraft rather than data, so they are in no report, no data
 pack and no copy here — the extractor asks your own server jar for them and
 writes them to your own disk. Without the files, every block but air stops sky
 light, the sky starts above the grass rather than through it, a placed block
-makes no sound, and a right-click puts down the world's own surface block
-whatever the player is holding; the server says so at boot. Decision record
+makes no sound, and a right-click puts the world's own surface block on the face
+it clicked whatever the player is holding and whatever is already there; the
+server says so at boot. Decision record
 [0008](docs/decisions/0008-block-opacity-and-light-emission.md) is why they
 arrive this way rather than in the binary — including why both tables key on
 *names* rather than registry ids, and why sixteen items on 1.21.1 make the
@@ -242,7 +246,7 @@ about. `tools/bot/check.js` joins, checks that the dimension it was told about
 is the one it is in, that it has all sixty-four biomes, that it can read a
 block, that a second bot's chat line arrives with the sender's name on it, and
 that its swing, crouch, block-break and block-place all reach the first —
-fifteen checks, exit 0 or 1. `tools/bot/README.md` has the list and what it has
+sixteen checks, exit 0 or 1. `tools/bot/README.md` has the list and what it has
 caught.
 
 `just soak <port> <minutes>` is the long version, and a different question:

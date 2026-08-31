@@ -425,3 +425,66 @@ fn a_volume_that_is_not_a_loudness_is_refused() {
         assert!(message.contains("line 2"), "{bad}: {message}");
     }
 }
+
+/// A complete table carrying the `replaceable` column, with even states
+/// replaceable and odd ones not.
+fn full_with_replaceable() -> String {
+    let mut text = String::from("# state_id\topacity\temission\tocclude\treplaceable\n");
+    for state in 0..STATE_COUNT {
+        text.push_str(&format!(
+            "{state}\t0\t0\t1\t{}\n",
+            u32::from(state % 2 == 0)
+        ));
+    }
+    text
+}
+
+#[test]
+fn the_replaceable_column_is_read_per_state_and_not_as_a_flag() {
+    let table = BlockConstants::parse(&full_with_replaceable()).expect("a complete table");
+    assert!(table.has_replaceable());
+    assert!(table.replaceable(0));
+    assert!(!table.replaceable(1));
+    assert!(table.replaceable(1234));
+    assert_eq!(
+        table.replaceable_count(),
+        (STATE_COUNT as usize).div_ceil(2)
+    );
+    // And it is a named column, so it is not offered as one of the heightmap
+    // flags — a caller asking `flag("replaceable")` is asking the wrong
+    // question and gets no answer rather than a coincidental one.
+    assert!(table.flag("replaceable").is_none());
+    assert_eq!(table.flags().count(), 0);
+}
+
+#[test]
+fn a_table_written_before_the_replaceable_column_replaces_everything() {
+    // The direction the default has to point. Before the column existed every
+    // right-click replaced whatever it landed on, so an operator whose table
+    // predates it keeps the server they had; the other default refuses every
+    // placement, which is a server that looks broken because a file is old.
+    let table = BlockConstants::parse(&full()).expect("a complete table");
+    assert!(!table.has_replaceable());
+    assert!(table.replaceable(0));
+    assert!(table.replaceable(STATE_COUNT - 1));
+    assert_eq!(
+        table.replaceable_count(),
+        0,
+        "nothing is *known* replaceable, which is not the same as nothing being replaceable"
+    );
+}
+
+#[test]
+fn a_state_the_replaceable_column_does_not_reach_is_replaceable() {
+    let table = BlockConstants::parse(&full_with_replaceable()).expect("a complete table");
+    assert!(table.replaceable(STATE_COUNT));
+}
+
+#[test]
+fn a_replaceable_value_that_is_not_a_flag_names_its_column() {
+    let text = full_with_replaceable().replacen("0\t0\t0\t1\t1\n", "0\t0\t0\t1\t7\n", 1);
+    let error = BlockConstants::parse(&text).expect_err("7 is not a flag");
+    let message = error.to_string();
+    assert!(message.contains("replaceable"), "{message}");
+    assert!(message.contains("0 or 1"), "{message}");
+}

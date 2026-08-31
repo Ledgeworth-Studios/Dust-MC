@@ -827,10 +827,20 @@ impl Server {
                 "dust::data",
                 format!(
                     "block constants: Minecraft's own answers for {} block states, \
-                     {} of them emitting, {} heightmap predicate(s), and {}",
+                     {} of them emitting, {} heightmap predicate(s), {}, and {}",
                     table.len(),
                     table.emitting(),
                     table.flags().count(),
+                    // Both ends of this one read as a sentence rather than a
+                    // number, because "everything" is what an absent column
+                    // means and no version of Minecraft says it.
+                    if table.has_replaceable() {
+                        format!("{} a placement replaces", table.replaceable_count())
+                    } else {
+                        "no replaceable column, so a placement replaces whatever it \
+                         lands on"
+                            .to_owned()
+                    },
                     // Named apart from the rest because the answer is not
                     // always yes: a table extracted before the sound columns
                     // existed is still a whole table and still lights the world

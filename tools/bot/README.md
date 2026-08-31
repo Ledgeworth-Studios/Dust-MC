@@ -121,6 +121,13 @@ it is right.**
     Each cell is broken before it is placed into, because this server keeps its
     edits across a restart and a placement into a cell that already holds that
     block is correctly silent.
+11. **A block is not placed into one that is already there.** The bot clicks
+    the *down* face of a buried block, whose far side is more ground, and the
+    first bot reads that cell before and after. It must not change and no sound
+    must arrive. This used to replace it, silently, for every solid cell in the
+    world — a player could hollow a wall out from the outside without breaking
+    anything. Watched to fail: with the rule taken out the check reports
+    `dirt -> wheat, and a sound was heard`.
 
 ## The long one
 

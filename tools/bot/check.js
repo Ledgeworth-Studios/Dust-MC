@@ -285,6 +285,44 @@ async function main () {
       : 'no sound_effect arrived'
   )
 
+  // Clicking a face whose far side is solid. The block behind it must not
+  // change, and nothing must be heard: this used to replace it, silently, for
+  // every solid cell in the world — a player could hollow out a wall from the
+  // outside without breaking anything.
+  //
+  // Down, into ground, which every world this runs against has under its
+  // spawn. The block that would be replaced is read before and after, from the
+  // *other* player, so what is checked is what actually reached the world.
+  const buried = actor.blockAt(stood.offset(6, -2, 0))
+  let refused = null
+  if (buried) {
+    const under = buried.position.offset(0, -1, 0)
+    const before = watcher.blockAt(under)
+    heardPlace = null
+    actor._client.write('block_place', {
+      hand: 0,
+      location: { x: buried.position.x, y: buried.position.y, z: buried.position.z },
+      direction: 0,
+      cursorX: 0.5,
+      cursorY: 0.0,
+      cursorZ: 0.5,
+      insideBlock: false,
+      sequence: sequence++
+    })
+    await wait(SETTLE_MS)
+    const after = watcher.blockAt(under)
+    refused = { before, after, heard: heardPlace }
+  }
+  check(
+    'a block is not placed into one that is already there',
+    Boolean(refused) && refused.before && refused.after &&
+      refused.before.name === refused.after.name && !refused.heard,
+    refused && refused.before && refused.after
+      ? `${refused.before.name} -> ${refused.after.name}` +
+        (refused.heard ? ', and a sound was heard' : '')
+      : 'no block underground to click into'
+  )
+
   try { actor.quit() } catch (e) { /* already gone */ }
   try { watcher.quit() } catch (e) { /* already gone */ }
 }
