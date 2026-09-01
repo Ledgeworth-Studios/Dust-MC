@@ -165,6 +165,44 @@ Option 3.
 single one of Minecraft's answers** — same rule as D6, D7 and D8, for the same
 reason, and this time the answers are far too large to want here anyway.
 
+## What the first three rules bought (2026-09-01)
+
+`dust_sim::placement` handles three shapes: a pillar's `axis` from the clicked
+face, a slab's `type` from the half the click landed in, and a stair's `facing`
+and `half` together. Scored over the same survey, before and after:
+
+```text
+                                    before    after
+  situations Minecraft placed        6,323    6,324
+  Dust would place the same state    4,530    4,983
+                                     71.6%    78.8%
+  items wrong in at least one          481      310
+```
+
+**Three rules, a hundred and seventy-one items.** They are keyed on the property
+*shape* rather than on names, so they cover every log, every wood, the chains,
+sixty-odd slabs and forty-odd stairs without a list of any of them.
+
+What is left, by the property that disagrees:
+
+```text
+   140  facing            furnaces, chests, doors, repeaters, banners,
+                          and the wall-mounted family beside them
+    55  a connection      fences, walls, panes, redstone — neighbours, not
+                          the click
+    43  a different block  a torch becomes a `wall_torch`, a sign a
+                          `wall_sign`: the item places one of two blocks
+    22  waterlogged       the fifth input, and the arena is dry
+    15  face              buttons and levers: floor, wall or ceiling
+    10  persistent        leaves
+```
+
+`facing` is the next one to write and it is the one this record already said
+needs care: a stair faces where the player looks, a furnace faces back at them,
+a ladder faces the block it hangs on, and a piston faces where the player looks
+including the vertical. Four rules over one property name, and the property
+table cannot tell them apart.
+
 ## What follows from it
 
 - **The order the rules go in is the order the counts give.** The face is 169
