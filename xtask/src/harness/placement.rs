@@ -358,6 +358,14 @@ fn parse_answers(text: &str) -> Result<Vec<Answer>, String> {
         };
         let result = match fields[5] {
             "REFUSED" => Outcome::Refused,
+            // Air is the other spelling of a refusal: the client predicted a
+            // block and the server answered with what is really in the cell,
+            // which for one the arena just cleared is air. The measuring tool
+            // makes the same substitution — this is the same rule applied on
+            // the reading side rather than a workaround for the writing one,
+            // and it is what keeps a file written by a tool that forgot from
+            // scoring a thousand refusals as a thousand wrong answers.
+            "minecraft:air" | "air" => Outcome::Refused,
             other if other.starts_with("ARENA") => Outcome::Unmeasured,
             state => Outcome::Placed(state.to_owned()),
         };
@@ -455,6 +463,20 @@ minecraft:torch\t4\t0\t90\t0.25\tARENA DID NOT SETTLE\t-
         // Not a finding about either server, and told apart from a refusal so
         // that it cannot quietly become one.
         assert_eq!(answers[2].result, Outcome::Unmeasured);
+    }
+
+    #[test]
+    fn air_is_the_other_spelling_of_a_refusal() {
+        // No item places air, so a row saying air is a row where nothing was
+        // placed. Scored as a wrong answer instead, one measuring tool's
+        // oversight becomes a thousand findings about a server that did
+        // nothing wrong.
+        let text = "\
+# item\tface\tyaw\tpitch\tcursor_y\tresult\tsurvived
+minecraft:allium\t1\t0\t0\t0.25\tminecraft:air\tstood
+";
+        let answers = parse_answers(text).expect("one well-formed row");
+        assert_eq!(answers[0].result, Outcome::Refused);
     }
 
     #[test]

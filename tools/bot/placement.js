@@ -40,7 +40,9 @@
 //
 //   * **A refusal arrives as air.** The client predicted a block; the server
 //     answers by telling it what is really there. No item places air, so there
-//     is nothing to confuse it with.
+//     is nothing to confuse it with — and the reader on the other side applies
+//     the same rule, because a comparison of `minecraft:air` against anything
+//     is a comparison against a placement that did not happen.
 //
 //   * The **first** change after a placement is the placement, and the last one
 //     may not be: a door with nothing under it is put down and breaks on the
@@ -163,9 +165,19 @@ function properties (stateId, registry) {
     rest = Math.floor(rest / n)
     // prismarine orders a bool's values true-then-false, which is the opposite
     // of the reading order and is worth the extra line rather than the bug.
+    //
+    // **An int is looked up in `values` like an enum, and printing `v` is
+    // wrong.** `v` is the index and the values need not start at zero:
+    // `snow[layers]` runs 1..8, `candle[candles]` 1..4, a leaf's `distance`
+    // 1..7. Printing the index reported `snow[layers=0]`, which is not a state
+    // Minecraft has, and the run then disagreed with a server that was right.
+    // Nineteen blocks were scored against Dust that way before it was found,
+    // and the control could not catch it: stone has no properties.
     props[state.name] = state.type === 'bool'
       ? (v === 0 ? 'true' : 'false')
-      : state.type === 'enum' ? state.values[v] : String(v)
+      : state.values
+        ? state.values[v]
+        : String(v)
   }
   return { name: block.name, props }
 }
@@ -398,7 +410,7 @@ function main () {
         // no `REFUSED` either would be a run where nothing was ever refused,
         // which `torch` alone disproves: it cannot hang from a ceiling.
         const first = got ? describe(got[0], registry) : null
-        const result = first === null || first === 'air'
+        const result = first === null || first === 'minecraft:air'
           ? 'REFUSED\t-'
           : first + (got.length > 1 && got[got.length - 1] !== got[0] ? '\tbroke' : '\tstood')
         if (item === CONTROL) seen.push(`${face}/${yaw}/${pitch}/${cursorY} -> ${result}`)
