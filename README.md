@@ -10,8 +10,11 @@ Dust is being built from nothing and is not finished — but you can play on it.
 see each other doing it, and talk.** They place what they are holding — any of
 the nine hundred and twenty-five blocks Minecraft has an item for, picked out of
 the creative menu — where Minecraft would put it: into the tall grass they aimed
-at, and not into the wall behind the face they clicked. Stairs and slabs and
-logs go down the way they were placed rather than in one fixed state. They see each other
+at, and not into the wall behind the face they clicked. **What goes down is the
+state Minecraft would put there for 89.5% of the ways a block can be placed**,
+measured against a real server rather than claimed: a stair faces the way you
+stood, a furnace faces back at you, a lever takes the wall it is on, a piston
+points where you looked and an observer looks back. They see each other
 swing, crouch and break blocks,
 particles and sound out of the block that broke, and hear each other put blocks
 down, each block with its own sound. What they change is still there after a
@@ -102,16 +105,13 @@ physics, block updates, drops or tool checks, and nothing that validates
 *movement*, so the position a reach is measured from is whatever the client
 last claimed; no inventory beyond the nine hotbar slots a
 creative client writes, so nothing is stored and nothing is carried between
-sessions; **placement rules for three shapes and not the rest** — a stair faces the way
-you stood and takes the half you clicked, a slab likewise, a log lies along
-the face — while everything else still goes down in its default state, which
-is the wrong one for most of what is left. How much is left is a number
-`cargo xtask harness placement` reports rather than a thing this paragraph
-claims, and decision record
-[0011](docs/decisions/0011-how-a-placed-block-gets-its-state.md) is how it is
-measured. A block placed into water still replaces it rather than
-waterlogging, player-placed leaves still decay, and eight layers of snow are
-replaced where Minecraft would refuse; light that
+sessions; **no neighbour rules**, so a fence does not connect to what it touches,
+a rail does not bend and a stair does not become a corner — sixty-one of the
+hundred and sixty blocks Dust still places wrongly are that, and the number is
+`cargo xtask harness placement`'s rather than this paragraph's; a block placed
+into water replaces it rather than waterlogging, player-placed leaves decay,
+a sign never becomes a wall sign, and eight layers of snow are replaced where
+Minecraft would refuse; light that
 crosses a chunk boundary — sky light from a neighbour it would have to travel
 *through*, and any light at all from a torch on the far side of one — which is
 an engine gap and not a data one, and is now the *only* thing between a served
