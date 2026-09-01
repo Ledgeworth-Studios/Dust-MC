@@ -138,6 +138,110 @@ it is right.**
     `interaction_range = 5000.0` in the server's `dust.toml` it reports
     `grass_block -> wheat`.
 
+## Asking Minecraft what it places
+
+```
+# start vanilla with its console on a pipe
+mkfifo /tmp/mc-console
+( tail -f /tmp/mc-console | java -jar server.jar nogui > /tmp/mc.log 2>&1 & )
+
+# then, from here
+DUST_SERVER_CONSOLE=/tmp/mc-console node placement.js 25565 > answers.tsv
+DUST_SERVER_CONSOLE=/tmp/mc-console node placement.js 25565 items.txt --survey
+```
+
+`placement.js` asks a **vanilla** server what state it puts down for a given
+item, clicked face, cursor position and player look — one placement at a time,
+reading the answer out of the block-change packets the server pushes back.
+
+It exists because that answer is out of reach any other way.
+`Block.getStateForPlacement` needs a `Level`, `Level` is an abstract class
+rather than an interface, and so the reflection the block oracle uses — which
+got the light, sound, replaceable and item-to-block tables out of the same jar —
+cannot construct one. A running server can be asked instead.
+
+What it writes is Minecraft's own answers, so it belongs on the operator's disk
+under the same rule as everything else the extractor produces, and no row of it
+is committed here. Point it at **vanilla and only vanilla**: comparing Dust
+against the answers is a different job, and a measurement that also has an
+opinion is not a measurement.
+
+`--survey` trades the full 144-situation grid for eight, chosen to answer only
+"does this block's placement read anything at all?" — the question worth asking
+of every placeable item where the full grid is worth asking of a handful.
+
+### The control, and why there is one
+
+Every run measures `minecraft:stone` first, whatever else it was asked for.
+Stone has one state, so every situation has to give the same answer, and a run
+where they do not stops before printing anything else. It is not a test of the
+server; it is a test of *this tool*, and it has caught every one of the faults
+below before anything downstream could be believed.
+
+### Six things that cost time
+
+Each is a comment in the file too, so the next person does not pay again.
+
+- **Read both block-change packets.** A server sends `block_change` when exactly
+  one block in a section changed in a tick and `multi_block_change` when more
+  than one did. So the arena's own `/fill` arrives the second way — and so does
+  a **door**, which puts down two blocks. Listening to one of them makes every
+  door read as refused and every arena read as never settling.
+- **Read the packet, never `bot.blockAt`.** The bot's own world lags a placement
+  by an unbounded amount; read that way the tool reported the *previous*
+  sample's block, convincingly.
+- **The first change is the placement; the last one may not be.** A door with
+  nothing under it is put down and then breaks. Reading the last change recorded
+  `air` for forty-seven of a door's situations. Whether the block survived is a
+  support rule and not a placement rule, so it is a column of its own.
+- **A refusal arrives as air.** The client predicted a block and the server
+  answers by telling it what is really there. No item places air, so there is
+  nothing to confuse it with.
+- **Forget the arena before changing it, not after.** The barrier is "wait until
+  the support turns to stone", and console changes arrive in the order the
+  console ran them, so seeing that means the fill before it has landed too.
+  Waiting *without* forgetting first matches the support's stone from the
+  previous sample and returns immediately, which put `air` in twenty-two rows of
+  a run — every one a down-face placement, because that is the cell the fill
+  happened to reach last.
+- **Turn as rarely as possible, and set the look with `bot.look()`.**
+  mineflayer's physics loop sends a position every tick and overwrites a
+  hand-written `position_look`, so a hand-written one makes every stair face the
+  same way whatever was asked for. And a look reaches the server on the next
+  physics tick, so a placement sent too soon after one is measured against the
+  *previous* sample's rotation: the first version of this tool turned before
+  every sample and produced exactly one poisoned row in 2,448 — a piston facing
+  west, which is where the sample before it had been looking. The rotation is
+  now the outer loop and the face the inner one.
+
+The arena is built from the server console rather than by the bot, which is why
+the pipe is needed: the bot is not opped and does not need to be.
+
+### The question to ask of the answers
+
+"Does the placed state depend on the four numbers a right-click carries" is the
+question `--survey` answers, and it is **not** the question that matters. The
+one that matters is "is the placed state the block's *default* state", because
+the default is what Dust puts down.
+
+They are different, and twenty-six blocks live in the gap: ten kinds of leaves
+go down with `persistent=true` where the default is `false`, thirteen corals and
+conduits and sea pickles default to `waterlogged=true` and are placed dry,
+`scaffolding` and `redstone_wire` read their neighbours and `weeping_vines` rolls
+a random age. Every one of them reads none of the four numbers, so the first
+question calls them fixed — and every one of them is a block Dust currently gets
+wrong. Decision record 0011 has the counts.
+
+### What it does not measure
+
+The arena is one stone block in a cleared volume, so nothing here varies a
+block's **surroundings**. A stair's `shape` comes from the stairs beside it, a
+chest becomes half of a double chest next to another, a fence connects to what
+it touches, and redstone wire reads all four neighbours. A block this tool calls
+context-free is one whose *placement* reads nothing — it may still owe a
+neighbour rule, which is a different problem worth measuring separately rather
+than folding in and losing.
+
 ## The long one
 
 ```
