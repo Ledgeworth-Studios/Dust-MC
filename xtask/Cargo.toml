@@ -31,6 +31,9 @@ dust-nbt.workspace = true
 # Minecraft wrote and what Dust's own engine produced, and this table only
 # turns a state id into a word somebody can read.
 dust-registry.workspace = true
+# The placement rules this scores. Called rather than reimplemented: a checker
+# with its own copy of the rule agrees with itself under any rule.
+dust-sim.workspace = true
 dust-server.workspace = true
 dust-world.workspace = true
 serde.workspace = true

@@ -60,6 +60,12 @@
 //     does a *door*, which puts down two blocks. Listening to one of them makes
 //     every door read as REFUSED and every arena read as never settling.
 //
+//   * **The rotation written down is the one taken off the wire**, not the one
+//     `bot.look` was given: mineflayer's convention and the protocol's differ by
+//     a sign and a half turn. Recorded as the request, the file cannot tell "a
+//     furnace faces where you look" from "a furnace faces back at you" — both
+//     fit the same rows under different guesses about the convention.
+//
 //   * Yaw is set with `bot.look()` and not by writing `position_look`.
 //     mineflayer's physics loop sends a position every tick and overwrites a
 //     hand-written one, which makes every stair come out facing the same way
@@ -154,6 +160,13 @@ const DEFAULT_ITEMS = [
 
 const wait = ms => new Promise(r => setTimeout(r, ms))
 
+/// A rotation as a whole number of degrees.
+///
+/// The wire carries a float and the four the grid asks for come back as
+/// -0.00001 and 179.99998; a reader grouping rows by rotation wants the four
+/// and not eight thousand.
+const round = degrees => Math.round(degrees * 100) / 100
+
 function properties (stateId, registry) {
   const block = registry.blocksByStateId[stateId]
   if (!block) return { name: `state:${stateId}`, props: {} }
@@ -238,6 +251,25 @@ function main () {
   // placement and the last one may not be: a door with nothing under it is put
   // down and breaks on the next tick, and a tool that read the last change
   // recorded `air` for forty-seven of a door's situations.
+  // The rotation the server was actually told, taken off the wire.
+  //
+  // **Not the number `bot.look` was given.** mineflayer's yaw and pitch are its
+  // own convention and the protocol's are Minecraft's, and the two differ by a
+  // sign and a half turn. Recording the request left the reader unable to tell
+  // "a furnace faces where you look" from "a furnace faces back at you": both
+  // fit the same rows under different guesses about the convention, which is a
+  // measurement that cannot answer the question it was taken for. What a rule
+  // in Dust has to work from is what arrives on the wire, so that is what this
+  // writes down.
+  let sent = { yaw: 0, pitch: 0 }
+  const write = bot._client.write.bind(bot._client)
+  bot._client.write = (name, params) => {
+    if (params && typeof params.yaw === 'number' && typeof params.pitch === 'number') {
+      sent = { yaw: params.yaw, pitch: params.pitch }
+    }
+    return write(name, params)
+  }
+
   const changes = new Map()
   const at = p => `${p.x},${p.y},${p.z}`
   const record = (position, state) => {
@@ -381,7 +413,8 @@ function main () {
         // the order the commands ran.
         if (!await settles(support, 'stone', registry)) {
           process.stdout.write(
-            `minecraft:${item}\t${face}\t${yaw}\t${pitch}\t${cursorY}\tARENA DID NOT SETTLE\t-\n`
+            `minecraft:${item}\t${face}\t${round(sent.yaw)}\t${round(sent.pitch)}\t` +
+            `${cursorY}\tARENA DID NOT SETTLE\t-\n`
           )
           continue
         }
@@ -415,7 +448,8 @@ function main () {
           : first + (got.length > 1 && got[got.length - 1] !== got[0] ? '\tbroke' : '\tstood')
         if (item === CONTROL) seen.push(`${face}/${yaw}/${pitch}/${cursorY} -> ${result}`)
         process.stdout.write(
-          `minecraft:${item}\t${face}\t${yaw}\t${pitch}\t${cursorY}\t${result}\n`
+          `minecraft:${item}\t${face}\t${round(sent.yaw)}\t${round(sent.pitch)}\t` +
+          `${cursorY}\t${result}\n`
         )
       }
 

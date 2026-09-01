@@ -796,6 +796,12 @@ where
         .expect("the position map is never poisoned")
         .insert(profile_id, position);
 
+    // Where this player is looking, in the protocol's own degrees. Kept
+    // because a placement reads it: a stair faces the way the player was
+    // standing. Starts at the spawn's rotation and is replaced by the first
+    // packet that carries one, which arrives within a tick of joining.
+    let mut rotation = (me.yaw, me.pitch);
+
     // What this player is holding. Empty on join and filled by the client:
     // there is no saved inventory, so a player who relogs is holding nothing
     // until they pick something out of the creative menu again.
@@ -1064,6 +1070,7 @@ where
                     }
                     Ok(play::serverbound::Packet::MovePlayerPosRot(m)) => {
                         position = (m.x, m.y, m.z);
+                        rotation = (m.yaw, m.pitch);
                         record(ctx, profile_id, position);
                         ctx.roster
                             .moved(me.entity_id, m.x, m.y, m.z, m.yaw, m.pitch);
@@ -1137,6 +1144,7 @@ where
                     // stream — but it is what everybody else sees, so it does
                     // reach the roster.
                     Ok(play::serverbound::Packet::MovePlayerRot(m)) => {
+                        rotation = (m.yaw, m.pitch);
                         ctx.roster.moved(
                             me.entity_id,
                             position.0,
@@ -1189,6 +1197,8 @@ where
                             ctx.item_blocks.as_deref(),
                             hotbar.held(),
                             ctx.blocks.placeable,
+                            &use_on.hit,
+                            rotation,
                         );
                         // Reach is checked against the block that was
                         // *clicked* and not the one the placement lands in.
@@ -1270,10 +1280,10 @@ where
 
 /// The block state a right-click puts down.
 ///
-/// The held item's block, in its **default** state — a stair placed this way
-/// faces north whichever way the player was standing, because the state a real
-/// placement computes needs a context nothing here has. That is a gap in
-/// placement rules and not in this lookup, and it lives with the rest of them.
+/// The held item's block, in the state `dust_sim::placement` computes for the
+/// click — the face, where on it the cursor was, and which way the player is
+/// looking. What that crate has no rule for keeps its default state, and
+/// `cargo xtask harness placement` is what says how many of those there are.
 ///
 /// Falls back to [`PlaceableBlocks::placeable`] when there is nothing to look
 /// up with: no table beside the data, an empty hand, or an item that places no
@@ -1284,11 +1294,30 @@ fn held_block(
     table: Option<&dust_registry::ItemBlocks>,
     held: Option<dust_registry::Item>,
     fallback: u32,
+    hit: &play::serverbound::BlockHit,
+    rotation: (f32, f32),
 ) -> u32 {
-    table
-        .zip(held)
-        .and_then(|(table, item)| table.places(item))
-        .map_or(fallback, |block| block.default_state().id())
+    let Some(block) = table.zip(held).and_then(|(table, item)| table.places(item)) else {
+        return fallback;
+    };
+    // A face the protocol does not have is one this server has no answer for;
+    // vanilla refuses the packet outright and `offset` has already decided to
+    // treat it as the clicked block, so the least surprising thing left is to
+    // place the block's own default and let the rest of the click be as wrong
+    // as it already is.
+    let Some(face) = dust_sim::placement::Face::from_protocol(hit.face) else {
+        return block.default_state().id();
+    };
+    dust_sim::placement::state_for(
+        block,
+        dust_sim::placement::Click {
+            face,
+            cursor_y: hit.cursor_y,
+            yaw: rotation.0,
+            pitch: rotation.1,
+        },
+    )
+    .id()
 }
 
 /// Whether a player at `feet` may act on the block at `location`.
@@ -1587,6 +1616,21 @@ mod tests {
     /// rather than matching some real block by accident.
     const FALLBACK: u32 = u32::MAX;
 
+    /// A click on the top of a block, looking south, low on the face.
+    ///
+    /// The situation the placement rules answer most plainly, so a test about
+    /// *which block* goes down is not also a test about which state.
+    fn on_top() -> play::serverbound::BlockHit {
+        play::serverbound::BlockHit {
+            location: Position { x: 0, y: 0, z: 0 },
+            face: 1,
+            cursor_x: 0.5,
+            cursor_y: 0.5,
+            cursor_z: 0.5,
+            inside_block: false,
+        }
+    }
+
     /// A flat world to click at, and what is in it.
     fn world() -> super::super::edits::EditedWorld {
         let palette = super::world::Palette::resolve().expect("the block table");
@@ -1738,6 +1782,27 @@ mod tests {
     }
 
     #[test]
+    fn a_stair_goes_down_facing_the_way_the_player_stood() {
+        // The rules crate has its own tests; this one is about the wiring —
+        // that the click and the rotation reach it at all. Placed with the
+        // player looking west, a stair faces west, and the same click with a
+        // default state would have faced north.
+        let table = table();
+        let stairs = Block::from_name("minecraft:oak_stairs").expect("this build has stairs");
+        let placed = held_block(
+            Some(&table),
+            Some(item("minecraft:oak_stairs")),
+            FALLBACK,
+            &on_top(),
+            (90.0, 0.0),
+        );
+        assert_ne!(placed, stairs.default_state().id(), "not the default state");
+        let state = dust_registry::BlockState::from_id(placed).expect("a real state");
+        assert_eq!(state.property("facing"), Some("west"));
+        assert_eq!(state.property("half"), Some("bottom"));
+    }
+
+    #[test]
     fn a_held_block_item_places_its_own_block() {
         let table = table();
         let expected = Block::from_name("minecraft:cobblestone")
@@ -1745,7 +1810,13 @@ mod tests {
             .default_state()
             .id();
         assert_eq!(
-            held_block(Some(&table), Some(item("minecraft:cobblestone")), FALLBACK),
+            held_block(
+                Some(&table),
+                Some(item("minecraft:cobblestone")),
+                FALLBACK,
+                &on_top(),
+                (0.0, 0.0)
+            ),
             expected
         );
     }
@@ -1761,7 +1832,13 @@ mod tests {
             .default_state()
             .id();
         assert_eq!(
-            held_block(Some(&table), Some(item("minecraft:wheat_seeds")), FALLBACK),
+            held_block(
+                Some(&table),
+                Some(item("minecraft:wheat_seeds")),
+                FALLBACK,
+                &on_top(),
+                (0.0, 0.0)
+            ),
             wheat
         );
         assert_ne!(wheat, FALLBACK, "and it is not the fallback wearing a hat");
@@ -1770,12 +1847,17 @@ mod tests {
     #[test]
     fn an_empty_hand_and_an_item_that_places_nothing_both_fall_back() {
         let table = table();
-        assert_eq!(held_block(Some(&table), None, FALLBACK), FALLBACK);
+        assert_eq!(
+            held_block(Some(&table), None, FALLBACK, &on_top(), (0.0, 0.0)),
+            FALLBACK
+        );
         assert_eq!(
             held_block(
                 Some(&table),
                 Some(item("minecraft:diamond_sword")),
-                FALLBACK
+                FALLBACK,
+                &on_top(),
+                (0.0, 0.0)
             ),
             FALLBACK,
             "a sword places nothing, and nothing is the fallback and not air"
@@ -1789,7 +1871,13 @@ mod tests {
         // not a refusal: a right-click that did nothing would read as a
         // dropped packet.
         assert_eq!(
-            held_block(None, Some(item("minecraft:cobblestone")), FALLBACK),
+            held_block(
+                None,
+                Some(item("minecraft:cobblestone")),
+                FALLBACK,
+                &on_top(),
+                (0.0, 0.0)
+            ),
             FALLBACK
         );
     }
