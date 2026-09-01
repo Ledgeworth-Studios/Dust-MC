@@ -170,10 +170,18 @@ function properties (stateId, registry) {
   return { name: block.name, props }
 }
 
+/// A state in the spelling everything on the Rust side uses: the namespaced
+/// name, then the properties in name order.
+///
+/// Namespaced because that is what `dust_registry::Block::name` returns and
+/// what the reader of this file will compare against — prismarine drops the
+/// namespace and a comparison that had to put it back would be one more place
+/// for the two vocabularies to disagree.
 function describe (stateId, registry) {
   const { name, props } = properties(stateId, registry)
+  const qualified = name.includes(':') ? name : `minecraft:${name}`
   const kv = Object.entries(props).map(([k, v]) => `${k}=${v}`).sort().join(',')
-  return kv ? `${name}[${kv}]` : name
+  return kv ? `${qualified}[${kv}]` : qualified
 }
 
 /// Every situation to try, grouped so that the look changes as rarely as
@@ -361,7 +369,7 @@ function main () {
         // the order the commands ran.
         if (!await settles(support, 'stone', registry)) {
           process.stdout.write(
-            `${item}\t${face}\t${yaw}\t${pitch}\t${cursorY}\tARENA DID NOT SETTLE\t-\n`
+            `minecraft:${item}\t${face}\t${yaw}\t${pitch}\t${cursorY}\tARENA DID NOT SETTLE\t-\n`
           )
           continue
         }
@@ -395,7 +403,7 @@ function main () {
           : first + (got.length > 1 && got[got.length - 1] !== got[0] ? '\tbroke' : '\tstood')
         if (item === CONTROL) seen.push(`${face}/${yaw}/${pitch}/${cursorY} -> ${result}`)
         process.stdout.write(
-          `${item}\t${face}\t${yaw}\t${pitch}\t${cursorY}\t${result}\n`
+          `minecraft:${item}\t${face}\t${yaw}\t${pitch}\t${cursorY}\t${result}\n`
         )
       }
 
@@ -407,7 +415,7 @@ function main () {
         const states = new Set(
           seen.map(s => s.split(' -> ')[1].split('\t')[0]).filter(r => r !== 'REFUSED')
         )
-        if (states.size !== 1 || !states.has(CONTROL)) {
+        if (states.size !== 1 || !states.has(`minecraft:${CONTROL}`)) {
           process.stderr.write(
             `the control disagreed with itself, so nothing below it is worth reading.\n` +
             `${CONTROL} has one state and this run saw ${states.size}:\n  ` +

@@ -170,6 +170,11 @@ opinion is not a measurement.
 "does this block's placement read anything at all?" — the question worth asking
 of every placeable item where the full grid is worth asking of a handful.
 
+What comes out is scored by `cargo xtask harness placement --answers <file>`,
+which asks Dust the same questions and counts. That verb is the whole point of
+this one: decision record 0011 chose rules in Dust over a table on the
+operator's disk, and rules are worth exactly what their check says they are.
+
 ### The control, and why there is one
 
 Every run measures `minecraft:stone` first, whatever else it was asked for.
@@ -216,6 +221,11 @@ Each is a comment in the file too, so the next person does not pay again.
 
 The arena is built from the server console rather than by the bot, which is why
 the pipe is needed: the bot is not opped and does not need to be.
+
+**One run at a time per server.** Both runs share a username, so a second one
+kicks the first with `multiplayer.disconnect.duplicate_login` — which is the
+right outcome and not a bug to fix: two bots on one server would share one arena
+and quietly corrupt each other's samples, where a kick is loud and immediate.
 
 ### The question to ask of the answers
 
