@@ -8,6 +8,8 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+# The block table: which properties a block has and what they may be.
+dust-registry.workspace = true
 
 [lints]
 workspace = true

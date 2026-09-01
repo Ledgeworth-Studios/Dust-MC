@@ -21,18 +21,18 @@
 //!
 //! # What it is comparing against
 //!
-//! Today, the block's **default state**, because that is what
-//! `dust_server::net::session` puts down. This file deliberately does not
-//! reimplement that choice: it calls the same `dust_registry` the server calls,
-//! so the day the server computes something better this verb reports the
-//! improvement without being edited. A checker with its own copy of the rule
-//! agrees with itself.
+//! `dust_sim::placement`, which is the same function the server calls. This
+//! file deliberately does not reimplement it: a checker with its own copy of
+//! the rule agrees with itself under any rule, including a wrong one. A rule
+//! written there shows up here without this being edited, which is the whole
+//! arrangement.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use dust_registry::{Block, Item, ItemBlocks};
+use dust_sim::placement::{Click, Face};
 
 /// What `harness placement` was asked to do.
 #[derive(Debug)]
@@ -50,8 +50,8 @@ pub struct Options {
 struct Answer {
     item: String,
     face: u8,
-    yaw: i32,
-    pitch: i32,
+    yaw: f32,
+    pitch: f32,
     cursor_y: String,
     /// The state Minecraft put down, `REFUSED`, or a row the tool could not
     /// take.
@@ -152,7 +152,7 @@ impl Score {
             Outcome::Placed(state) => state,
         };
 
-        let Some(theirs) = dust_state(&answer.item, items) else {
+        let Some(theirs) = dust_state(answer, items) else {
             self.unresolved += 1;
             self.first_unresolved
                 .get_or_insert_with(|| answer.item.clone());
@@ -257,8 +257,8 @@ fn percent(part: u64, whole: u64) -> String {
 ///
 /// `None` when the item is one this build has no block for, which is a version
 /// skew between the answers and the build rather than a disagreement.
-fn dust_state(item: &str, items: &Option<ItemBlocks>) -> Option<String> {
-    let item = Item::from_name(item)?;
+fn dust_state(answer: &Answer, items: &Option<ItemBlocks>) -> Option<String> {
+    let item = Item::from_name(&answer.item)?;
     let block = match items {
         // With the item table, the block is Minecraft's own answer to "what
         // does this item place".
@@ -268,12 +268,17 @@ fn dust_state(item: &str, items: &Option<ItemBlocks>) -> Option<String> {
         // Reported rather than silently assumed: `measure` says which it used.
         None => Block::from_name(item.name())?,
     };
-    Some(render(block))
+    let click = Click {
+        face: Face::from_protocol(answer.face)?,
+        cursor_y: answer.cursor_y.parse().ok()?,
+        yaw: answer.yaw,
+        pitch: answer.pitch,
+    };
+    Some(render(dust_sim::placement::state_for(block, click)))
 }
 
-/// A block's default state, in the answers file's spelling.
-fn render(block: Block) -> String {
-    let state = block.default_state();
+/// A state, in the answers file's spelling.
+fn render(state: dust_registry::BlockState) -> String {
     let mut properties: Vec<String> = state
         .properties()
         .into_iter()
@@ -283,10 +288,11 @@ fn render(block: Block) -> String {
     // order is the property order of the block table and means nothing to a
     // reader; agreeing on *an* order is what lets two strings be compared.
     properties.sort();
+    let name = state.block().name();
     if properties.is_empty() {
-        block.name().to_owned()
+        name.to_owned()
     } else {
-        format!("{}[{}]", block.name(), properties.join(","))
+        format!("{name}[{}]", properties.join(","))
     }
 }
 
@@ -352,7 +358,7 @@ fn parse_answers(text: &str) -> Result<Vec<Answer>, String> {
                 fields.len()
             ));
         }
-        let number = |what: &str, text: &str| -> Result<i32, String> {
+        let number = |what: &str, text: &str| -> Result<f32, String> {
             text.parse()
                 .map_err(|_| format!("line {at}: {what} is {text:?}, which is not a number"))
         };
@@ -371,8 +377,11 @@ fn parse_answers(text: &str) -> Result<Vec<Answer>, String> {
         };
         out.push(Answer {
             item: fields[0].to_owned(),
-            face: u8::try_from(number("face", fields[1])?)
-                .map_err(|_| format!("line {at}: face {} is not one of the six", fields[1]))?,
+            face: fields[1]
+                .parse::<u8>()
+                .ok()
+                .filter(|face| *face < 6)
+                .ok_or_else(|| format!("line {at}: face {} is not one of the six", fields[1]))?,
             yaw: number("yaw", fields[2])?,
             pitch: number("pitch", fields[3])?,
             cursor_y: fields[4].to_owned(),
@@ -427,10 +436,10 @@ mod tests {
         // brackets — and no brackets at all for a block that has no
         // properties, because `stone[]` is a different string from `stone`.
         let stone = Block::from_name("minecraft:stone").expect("this build has stone");
-        assert_eq!(render(stone), "minecraft:stone");
+        assert_eq!(render(stone.default_state()), "minecraft:stone");
 
         let stairs = Block::from_name("minecraft:oak_stairs").expect("this build has stairs");
-        let rendered = render(stairs);
+        let rendered = render(stairs.default_state());
         assert!(rendered.starts_with("minecraft:oak_stairs["), "{rendered}");
         assert!(rendered.ends_with(']'), "{rendered}");
         let inside = rendered
@@ -491,10 +500,23 @@ minecraft:allium\t1\t0\t0\t0.25\tminecraft:air\tstood
     fn a_run_with_no_item_table_falls_back_to_the_name() {
         // And is right about stone, which is one of the 909 the fallback gets
         // right. The sixteen it does not are why `--items` exists.
+        let placed = |item: &str| {
+            dust_state(
+                &Answer {
+                    item: item.to_owned(),
+                    face: 1,
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    cursor_y: "0.25".to_owned(),
+                    result: Outcome::Refused,
+                },
+                &None,
+            )
+        };
         assert_eq!(
-            dust_state("minecraft:stone", &None),
+            placed("minecraft:stone"),
             Some("minecraft:stone".to_owned())
         );
-        assert_eq!(dust_state("minecraft:diamond_sword", &None), None);
+        assert_eq!(placed("minecraft:diamond_sword"), None);
     }
 }

@@ -369,6 +369,7 @@ dependencies = [
  "dust-net",
  "dust-protocol",
  "dust-registry",
+ "dust-sim",
  "dust-world",
  "flate2",
  "serde",
@@ -379,6 +380,9 @@ dependencies = [
 [[package]]
 name = "dust-sim"
 version = "0.0.0"
+dependencies = [
+ "dust-registry",
+]
 
 [[package]]
 name = "dust-world"
@@ -1249,6 +1253,7 @@ dependencies = [
  "dust-nbt",
  "dust-registry",
  "dust-server",
+ "dust-sim",
  "dust-world",
  "flate2",
  "serde",

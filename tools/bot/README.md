@@ -123,14 +123,20 @@ it is right.**
     Each cell is broken before it is placed into, because this server keeps its
     edits across a restart and a placement into a cell that already holds that
     block is correctly silent.
-11. **A block is not placed into one that is already there.** The bot clicks
+15. **A block is not placed into one that is already there.** The bot clicks
     the *down* face of a buried block, whose far side is more ground, and the
     first bot reads that cell before and after. It must not change and no sound
     must arrive. This used to replace it, silently, for every solid cell in the
     world — a player could hollow a wall out from the outside without breaking
     anything. Watched to fail: with the rule taken out the check reports
     `dirt -> wheat, and a sound was heard`.
-12. **A player cannot break or place fifty blocks away.** Both verbs, because
+12. **A stair faces the way the player was standing**, and is the bottom half
+    because the top of a block was clicked. The bot looks **west** on purpose:
+    a stair's default state faces north, so a check that expected north would
+    pass against a server that had never read the click at all.
+13. **The hole the break check dug is filled back in**, which is what makes a
+    run leave the world as it found it — see the note below.
+14. **A player cannot break or place fifty blocks away.** Both verbs, because
     they are two packets down two paths and a check covering one would pass
     while the other stayed open. The block is read from the first bot before
     and after, so what is checked is what reached the world rather than what
@@ -288,3 +294,20 @@ it is indistinguishable from "it sat there".
 development tool that is npm-installed by whoever runs it, ships in no
 artefact, and is linked into nothing. Nothing here is vendored: `package.json`
 names a version range and `node_modules/` is ignored.
+
+## Why the run puts the world back
+
+This server keeps its edits across a restart *and* remembers where each player
+left, and both of those turn a repeated check into a drifting one.
+
+The break check used to dig the block under the actor's own feet. The actor
+dropped a block, that position was saved, and the next run started a block
+lower. After enough runs against one world the actor is standing on bedrock,
+and the checks that read the terrain around it are reading somewhere else
+entirely — one of them had quietly become vacuous and still said `ok`.
+
+So the run now digs *beside* the actor and fills the hole back in, and the
+checks that need a particular arrangement of blocks **build it** rather than
+look for it. Run it three times in a row against one world and it says 21/21
+three times; that is the property being aimed for, and it is worth more than it
+sounds, because a check that decays over runs decays into a green tick.

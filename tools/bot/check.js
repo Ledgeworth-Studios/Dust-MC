@@ -108,10 +108,18 @@ async function main () {
   actor.setControlState('sneak', true)
   await wait(500)
 
-  // Breaking the block underfoot. `dig` waits for the server to confirm; the
-  // server answers a start-digging as a finished break, which is what a
-  // creative client sends and what this server honours.
-  const target = actor.blockAt(actor.entity.position.offset(0, -1, 0))
+  // Breaking a block **beside** the actor rather than under it. `dig` waits
+  // for the server to confirm; the server answers a start-digging as a
+  // finished break, which is what a creative client sends and what this server
+  // honours.
+  //
+  // Beside, because this server keeps its edits *and* remembers where a player
+  // left. Digging underfoot drops the actor a block, that position is saved,
+  // and the next run starts a block lower — after thirty runs against one
+  // world the actor is at bedrock and half these checks are reading terrain
+  // that is not there any more. The hole is filled back in below, which makes
+  // the whole run leave the world as it found it.
+  const target = actor.blockAt(stood.offset(1, -1, 0))
   if (target) {
     try { await actor.dig(target) } catch (e) { /* the effect is the check */ }
   }
@@ -285,23 +293,139 @@ async function main () {
       : 'no sound_effect arrived'
   )
 
+  // A stair, and which way it ends up facing. The block that goes down is no
+  // longer the block's default state: `dust_sim::placement` reads the click,
+  // and this is the check that the click reaches it across the wire at all.
+  //
+  // **Looking west on purpose, because a stair's default state faces north.**
+  // A check that expected north would pass against a server that had never
+  // read the click at all, which is what this whole thing is about.
+  //
+  // `bot.look(PI/2, 0)` is a protocol yaw of 90 — mineflayer's convention and
+  // the wire's differ by a sign and a half turn — which is looking west, and a
+  // stair faces the way the player looks. Measured against a real server by
+  // `placement.js`, not remembered: a furnace with the same four values faces
+  // back at the player instead.
+  let stair = null
+  const stairId = actor.registry.itemsByName.oak_stairs
+  if (stairId) {
+    actor._client.write('set_creative_slot', {
+      slot: 38,
+      item: {
+        itemCount: 1,
+        itemId: stairId.id,
+        addedComponentCount: 0,
+        removedComponentCount: 0,
+        components: [],
+        removeComponents: []
+      }
+    })
+    actor._client.write('held_item_slot', { slotId: 2 })
+    await actor.look(Math.PI / 2, 0, true)
+    await wait(400)
+    const on = actor.blockAt(stood.offset(-2, -1, 0))
+    if (on) {
+      const at = on.position.offset(0, 1, 0)
+      actor._client.write('block_dig', {
+        status: 0,
+        location: { x: at.x, y: at.y, z: at.z },
+        face: 1,
+        sequence: sequence++
+      })
+      await wait(400)
+      actor._client.write('block_place', {
+        hand: 0,
+        location: { x: on.position.x, y: on.position.y, z: on.position.z },
+        direction: 1,
+        cursorX: 0.5,
+        cursorY: 1.0,
+        cursorZ: 0.5,
+        insideBlock: false,
+        sequence: sequence++
+      })
+      await wait(SETTLE_MS)
+      stair = watcher.blockAt(at)
+    }
+  }
+  const stairProps = stair && stair.getProperties ? stair.getProperties() : {}
+  check(
+    'a stair faces the way the player was standing',
+    Boolean(stair) && stair.name === 'oak_stairs' && stairProps.facing === 'west',
+    stair ? `${stair.name} facing ${stairProps.facing}` : 'nothing was placed'
+  )
+  // And the half, which comes from the face rather than from the look: clicked
+  // on the top of a block, a stair is the bottom half whatever the cursor said.
+  check(
+    'and is the bottom half, because the top of a block was clicked',
+    Boolean(stair) && stairProps.half === 'bottom',
+    stair ? `half ${stairProps.half}` : 'nothing was placed'
+  )
+
+  // Fill the hole back in, so the next run against this world starts where
+  // this one did. The block below the hole is still there, so its top face is
+  // what to click.
+  if (target) {
+    actor._client.write('held_item_slot', { slotId: 0 })
+    await wait(200)
+    const under = target.position.offset(0, -1, 0)
+    actor._client.write('block_place', {
+      hand: 0,
+      location: { x: under.x, y: under.y, z: under.z },
+      direction: 1,
+      cursorX: 0.5,
+      cursorY: 1.0,
+      cursorZ: 0.5,
+      insideBlock: false,
+      sequence: sequence++
+    })
+    await wait(SETTLE_MS)
+  }
+  check(
+    'and the hole it dug is filled back in',
+    Boolean(target) && Boolean(watcher.blockAt(target.position)) &&
+      watcher.blockAt(target.position).name !== 'air',
+    target && watcher.blockAt(target.position)
+      ? watcher.blockAt(target.position).name
+      : 'nothing to check'
+  )
+
   // Clicking a face whose far side is solid. The block behind it must not
   // change, and nothing must be heard: this used to replace it, silently, for
   // every solid cell in the world — a player could hollow out a wall from the
   // outside without breaking anything.
   //
-  // Down, into ground, which every world this runs against has under its
-  // spawn. The block that would be replaced is read before and after, from the
-  // *other* player, so what is checked is what actually reached the world.
-  const buried = actor.blockAt(stood.offset(6, -2, 0))
+  // **The situation is built rather than found.** Reading it off the terrain
+  // made the check depend on where the actor happened to be standing, and this
+  // server keeps its edits: the actor digs under its own feet at the start of
+  // every run and sinks a block each time, so a cell that was underground on
+  // one run is open air on the tenth and the check passes without testing
+  // anything. So: put a block on the floor, then click its underside, whose
+  // far side is the floor.
+  const floor = actor.blockAt(stood.offset(6, -1, 0))
   let refused = null
-  if (buried) {
-    const under = buried.position.offset(0, -1, 0)
-    const before = watcher.blockAt(under)
-    heardPlace = null
+  if (floor) {
+    actor._client.write('held_item_slot', { slotId: 0 })
+    await wait(200)
     actor._client.write('block_place', {
       hand: 0,
-      location: { x: buried.position.x, y: buried.position.y, z: buried.position.z },
+      location: { x: floor.position.x, y: floor.position.y, z: floor.position.z },
+      direction: 1,
+      cursorX: 0.5,
+      cursorY: 1.0,
+      cursorZ: 0.5,
+      insideBlock: false,
+      sequence: sequence++
+    })
+    await wait(SETTLE_MS)
+    const perch = floor.position.offset(0, 1, 0)
+    const standing = watcher.blockAt(perch)
+    const before = watcher.blockAt(floor.position)
+    heardPlace = null
+    // The underside of the block just placed. Beyond it is the floor, which is
+    // solid, so nothing may happen.
+    actor._client.write('block_place', {
+      hand: 0,
+      location: { x: perch.x, y: perch.y, z: perch.z },
       direction: 0,
       cursorX: 0.5,
       cursorY: 0.0,
@@ -310,9 +434,20 @@ async function main () {
       sequence: sequence++
     })
     await wait(SETTLE_MS)
-    const after = watcher.blockAt(under)
-    refused = { before, after, heard: heardPlace }
+    refused = {
+      standing,
+      before,
+      after: watcher.blockAt(floor.position),
+      heard: heardPlace
+    }
   }
+  // The precondition is asserted rather than assumed: if the block the check
+  // clicks was never placed, everything below it is vacuous.
+  check(
+    'the block this check needs is where it was put',
+    Boolean(refused) && refused.standing && refused.standing.name === 'cobblestone',
+    refused && refused.standing ? refused.standing.name : 'nothing was placed'
+  )
   // Reaching across the map. Fifty blocks east of where the actor stands is a
   // column it has been streamed and can name, and one no arm reaches. Both
   // verbs are tried, because they are two packets down two paths and a check
@@ -324,6 +459,7 @@ async function main () {
   let unreached = null
   if (distant) {
     const before = watcher.blockAt(distant.position)
+    const aboveBefore = watcher.blockAt(distant.position.offset(0, 1, 0))
     actor._client.write('block_dig', {
       status: 0,
       location: {
@@ -352,17 +488,26 @@ async function main () {
     unreached = {
       before,
       after: watcher.blockAt(distant.position),
-      above: watcher.blockAt(distant.position.offset(0, 1, 0))
+      aboveBefore,
+      aboveAfter: watcher.blockAt(distant.position.offset(0, 1, 0))
     }
   }
+  // Both cells compared before and after, rather than asserting the one above
+  // is air. It is not always air: this server keeps its edits, the actor digs
+  // under its own feet at the start of every run and sinks a block each time,
+  // so fifty blocks out `stood.y - 1` eventually lands under the surface. What
+  // is being checked is that *nothing changed*, and that is true whatever the
+  // terrain happens to be.
   check(
     'a player cannot break or place fifty blocks away',
-    Boolean(unreached) && unreached.before && unreached.after && unreached.above &&
+    Boolean(unreached) && unreached.before && unreached.after &&
+      unreached.aboveBefore && unreached.aboveAfter &&
       unreached.before.name === unreached.after.name &&
-      unreached.above.name === 'air',
-    unreached && unreached.before && unreached.after && unreached.above
+      unreached.aboveBefore.name === unreached.aboveAfter.name,
+    unreached && unreached.before && unreached.after
       ? `${unreached.before.name} -> ${unreached.after.name}, ` +
-        `above it ${unreached.above.name}`
+        `above it ${unreached.aboveBefore && unreached.aboveBefore.name} -> ` +
+        `${unreached.aboveAfter && unreached.aboveAfter.name}`
       : 'no distant block to aim at'
   )
 
