@@ -165,6 +165,58 @@ Option 3.
 single one of Minecraft's answers** — same rule as D6, D7 and D8, for the same
 reason, and this time the answers are far too large to want here anyway.
 
+## Where the rules stand (2026-09-01, evening)
+
+```text
+                                  none    three   with facing
+  situations Minecraft placed    6,323    6,324    6,324
+  agree with Minecraft           4,530    4,983    5,658
+                                 71.6%    78.8%    89.5%
+  items wrong somewhere            481      310      160
+```
+
+The `facing` family turned out to be **seven** rules and not four, and every one
+of them was read off the answers:
+
+```text
+  a stair, a door, a fence gate, a bed   the way the player looks
+  a furnace, a chest, a repeater         back at the player
+  an anvil                               a quarter turn clockwise
+  a lever, a button, a grindstone        the wall it is on, or the player
+  a trapdoor                             the wall it hangs on, or back at
+                                         the player
+  a bell                                 the wall it hangs on, facing *out*
+  a piston, a barrel, a dispenser        away from the look, the vertical
+                                         included
+  an observer                            *at* the look
+  a shulker box, an end rod              the clicked face
+  a hopper                               away from the clicked face, and
+                                         never up
+```
+
+A lever faces **into** the wall it is on and a bell faces **out of** it; a
+piston points away from the look and an observer at it. Neither pair is
+distinguishable from the property table and neither would have survived being
+written from memory. Two of the ten were wrong on the first attempt and the
+score is what said so — the trapdoor, which takes the wall it hangs on and not
+the player, and the bed, which faces the player and not away.
+
+What is left, and it is a different class of thing:
+
+```text
+    55  fences, walls, panes    connection properties, from the neighbours
+    43  signs, banners          the item places one of *two* blocks
+    22  corals, conduit         `waterlogged`, and the arena is dry
+    10  leaves                  `persistent`
+     7  skulls                  `rotation`, sixteen of them
+     6  facing                  what is left of it
+     4  rails                   `shape`, from the neighbours
+```
+
+Sixty-one of the remaining hundred and sixty are **neighbour** rules, which no
+amount of reading the click can answer, and twenty-two are the fluid already in
+the cell. Both are named in this record already as things the arena cannot see.
+
 ## What the first three rules bought (2026-09-01)
 
 `dust_sim::placement` handles three shapes: a pillar's `axis` from the clicked
