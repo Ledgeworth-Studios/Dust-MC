@@ -217,6 +217,21 @@ Each is a comment in the file too, so the next person does not pay again.
 The arena is built from the server console rather than by the bot, which is why
 the pipe is needed: the bot is not opped and does not need to be.
 
+### The question to ask of the answers
+
+"Does the placed state depend on the four numbers a right-click carries" is the
+question `--survey` answers, and it is **not** the question that matters. The
+one that matters is "is the placed state the block's *default* state", because
+the default is what Dust puts down.
+
+They are different, and twenty-six blocks live in the gap: ten kinds of leaves
+go down with `persistent=true` where the default is `false`, thirteen corals and
+conduits and sea pickles default to `waterlogged=true` and are placed dry,
+`scaffolding` and `redstone_wire` read their neighbours and `weeping_vines` rolls
+a random age. Every one of them reads none of the four numbers, so the first
+question calls them fixed — and every one of them is a block Dust currently gets
+wrong. Decision record 0011 has the counts.
+
 ### What it does not measure
 
 The arena is one stone block in a cleared volume, so nothing here varies a

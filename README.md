@@ -101,10 +101,13 @@ physics, block updates, drops or tool checks, and nothing that validates
 *movement*, so the position a reach is measured from is whatever the client
 last claimed; no inventory beyond the nine hotbar slots a
 creative client writes, so nothing is stored and nothing is carried between
-sessions; no placement *context*, so a block goes down in its default state
-rather than facing the way the player stood, a block placed into water
-replaces it rather than waterlogging, and eight layers of snow are replaced
-where Minecraft would refuse; light that
+sessions; no placement *context*, so a block goes down in its default state — which
+is the wrong state for **481 of the 925 blocks a player can place**, measured
+against a real server and written down in decision record
+[0011](docs/decisions/0011-how-a-placed-block-gets-its-state.md): a stair
+faces north whichever way you stood, a block placed into water replaces it
+rather than waterlogging, and player-placed leaves decay. Eight layers of
+snow are replaced where Minecraft would refuse, too; light that
 crosses a chunk boundary — sky light from a neighbour it would have to travel
 *through*, and any light at all from a torch on the far side of one — which is
 an engine gap and not a data one, and is now the *only* thing between a served
@@ -489,9 +492,11 @@ The reasoning behind the things that are hard to change later is in
 [`docs/decisions/`](docs/decisions/): why Dust is written from scratch, why it is
 GPL-3.0, why it targets 1.21.1 first, why it is Rust throughout, why ore
 density is configured the way it is, which of Minecraft's numbers may live here
-rather than on the operator's disk, and how wide a volume the sky light is
-computed over — the last of those being a record of a thing measured and
-deliberately *not* built.
+rather than on the operator's disk, how wide a volume the sky light is computed
+over — a record of a thing measured and deliberately *not* built — and how a
+placed block gets its state, which is the first value the oracle route cannot
+carry and the first one to be answered with rules and a check instead of a
+table.
 
 ## Licence
 
