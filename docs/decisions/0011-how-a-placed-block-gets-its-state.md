@@ -49,6 +49,35 @@ every sapling, flower, crop, mushroom, cactus and lily pad refuses, and five mor
 are the command blocks, the jigsaw and the structure block, which need an
 operator.
 
+### Scored, and scored twice
+
+`cargo xtask harness placement --answers <file>` is the verb that reads those
+answers, asks Dust the same questions and counts. On the same survey:
+
+```text
+  6,323  situations where Minecraft placed a block
+  4,530  of them Dust would place the same state (71.6%)
+  1,793  of them it would not (28.4%)
+  1,076  Minecraft refused, so there is nothing to compare
+
+  481 of the 856 items that placed anything come out wrong in at least
+  one situation
+```
+
+**481 both times, from two readings that share no code.** They did not agree at
+first, and what separated them was a fault in the measuring tool rather than in
+either server: a state is decoded out of its id by dividing through each
+property's value count, which gives an *index*, and for an `int` property whose
+values do not start at zero the index is not the value. `snow[layers]` runs
+1..8. The tool printed `snow[layers=0]`, a state Minecraft does not have, and
+then disagreed with a server placing the one it does — nineteen blocks, every
+candle among them.
+
+The control could not have caught it. `minecraft:stone` has no properties, so a
+decoder wrong about every property in the game still agrees with itself over
+stone. **A control's blind spot is a list of the defects it will let through**,
+and what caught this one was two readings of the same file disagreeing.
+
 ## The 455, by what they read
 
 ```text
