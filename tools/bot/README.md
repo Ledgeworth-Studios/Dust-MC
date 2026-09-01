@@ -170,13 +170,28 @@ opinion is not a measurement.
 "does this block's placement read anything at all?" — the question worth asking
 of every placeable item where the full grid is worth asking of a handful.
 
-### The control, and why there is one
+What comes out is scored by `cargo xtask harness placement --answers <file>`,
+which asks Dust the same questions and counts. That verb is the whole point of
+this one: decision record 0011 chose rules in Dust over a table on the
+operator's disk, and rules are worth exactly what their check says they are.
+
+### The control, and what it cannot catch
 
 Every run measures `minecraft:stone` first, whatever else it was asked for.
 Stone has one state, so every situation has to give the same answer, and a run
 where they do not stops before printing anything else. It is not a test of the
 server; it is a test of *this tool*, and it has caught every one of the faults
 below before anything downstream could be believed.
+
+**Stone has no properties, and that is the shape of what the control misses.** A
+state is decoded out of its id by dividing through each property's value count,
+and an `int` property's values need not start at zero — `snow[layers]` runs 1..8,
+`candle[candles]` 1..4, a leaf's `distance` 1..7. Printing the *index* instead of
+the value reported `snow[layers=0]`, which is not a state Minecraft has, and a
+run then disagreed with a server that was right about all nineteen of them. The
+control could not see it and never will. What did see it was the score
+disagreeing with a second, independent reading of the same file — which is the
+argument for having two.
 
 ### Six things that cost time
 
@@ -216,6 +231,11 @@ Each is a comment in the file too, so the next person does not pay again.
 
 The arena is built from the server console rather than by the bot, which is why
 the pipe is needed: the bot is not opped and does not need to be.
+
+**One run at a time per server.** Both runs share a username, so a second one
+kicks the first with `multiplayer.disconnect.duplicate_login` — which is the
+right outcome and not a bug to fix: two bots on one server would share one arena
+and quietly corrupt each other's samples, where a kick is loud and immediate.
 
 ### The question to ask of the answers
 

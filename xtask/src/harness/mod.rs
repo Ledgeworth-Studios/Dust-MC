@@ -63,6 +63,7 @@ pub mod digest;
 pub mod light;
 mod nbt;
 mod outline;
+mod placement;
 mod properties;
 mod provision;
 mod rcon;
@@ -132,6 +133,14 @@ outside the repository (override with DUST_HARNESS_CACHE).
       Dust's own engine, and compare the sky light cell by cell. Prints how
       much agrees and what the disagreements are standing in. A measurement
       and not a gate: exit 0 unless the run itself failed.
+
+  placement --answers <file> [--items <file>] [--verbose]
+      Score Dust's placed block states against the answers
+      `tools/bot/placement.js` asked of a real Minecraft server. Prints how
+      many situations agree, how many items come out wrong in at least one of
+      them, and a worklist of what each one places instead. A measurement and
+      not a gate, for the same reason `light` is: exit 0 unless the run itself
+      failed. Decision record 0011 is why this exists.
 ";
 
 /// Which verb was selected, with its parsed options.
@@ -144,6 +153,7 @@ enum Verb {
     Rewrite(rewrite::Options),
     Registries(registries::Options),
     Light(light::Options),
+    Placement(placement::Options),
 }
 
 /// Parse and run one harness verb.
@@ -177,6 +187,7 @@ pub fn dispatch(args: &[String]) -> Result<ExitCode, String> {
         Verb::Rewrite(options) => Ok(rewrite::run(&options)),
         Verb::Registries(options) => Ok(registries::run(&options)),
         Verb::Light(options) => Ok(light::run(&options)),
+        Verb::Placement(options) => Ok(placement::run(&options)),
     }
 }
 
@@ -193,6 +204,7 @@ fn parse(args: &[String]) -> Result<Verb, String> {
         "rewrite" => rewrite::parse(rest).map(Verb::Rewrite),
         "registries" => registries::parse(rest).map(Verb::Registries),
         "light" => light::parse(rest).map(Verb::Light),
+        "placement" => placement::parse(rest).map(Verb::Placement),
         other => Err(format!(
             "unknown harness verb `{other}`\n\nThe verbs are: provision, rcon, capture, \
              compare, rewrite, registries, light."
