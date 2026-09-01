@@ -26,14 +26,30 @@
 //! is a shape, not a list of names, so it needs no table and covers blocks this
 //! version has never heard of.
 //!
-//! **Where the shape is not enough, nothing is guessed.** `minecraft:ladder`
-//! and `minecraft:furnace` both have a four-valued `facing` and one other
-//! property, and a ladder takes its facing from the clicked face while a
-//! furnace takes it from the player. There is no way to tell them apart from
-//! the table, so neither is handled here yet and both keep the default state
-//! they had — which the score reports rather than hides. A rule that guessed
-//! would be right about ninety blocks and wrong about a dozen, which is the
-//! trap decision record 0008's item table already argues about at length.
+//! **Where the shape is not enough, the blocks are named and the naming is
+//! small.** Three anvils turn the direction a quarter, and six blocks read the
+//! player's look including the vertical where everything else of their shape
+//! reads the clicked face. Both lists were read off the measurement, both are
+//! spelled out below with what they do, and everything not in them falls to the
+//! rule its shape implies. A name list is what a from-scratch server's
+//! behaviour looks like — the same kind of thing as `PARTICLES_DESTROY_BLOCK`
+//! being 2001 — and it is not a table of Mojang's data.
+//!
+//! # The direction a block faces is four different rules
+//!
+//! Every one of these is `facing` over the same four horizontal values, and the
+//! property table cannot tell them apart:
+//!
+//! ```text
+//!   a stair, a door, a fence gate    the way the player is looking
+//!   a furnace, a chest, a trapdoor   back at the player
+//!   an anvil                         a quarter turn clockwise from the look
+//!   a lever on a wall                the face that was clicked
+//! ```
+//!
+//! What separates them is the *rest* of the shape — a `shape`, a `hinge`, an
+//! `in_wall`, a `face` — which is why the rules below read like a list of other
+//! people's properties.
 
 use dust_registry::{Block, BlockState};
 
@@ -124,7 +140,254 @@ pub fn state_for(block: Block, click: Click) -> BlockState {
     if let Some(state) = as_stairs(block, state, click) {
         return state;
     }
+    if let Some(state) = as_attached(block, state, click) {
+        return state;
+    }
+    if let Some(state) = as_bell(block, state, click) {
+        return state;
+    }
+    if let Some(state) = as_horizontal(block, state, click) {
+        return state;
+    }
+    if let Some(state) = as_directional(block, state, click) {
+        return state;
+    }
+    if let Some(state) = as_hopper(block, state, click) {
+        return state;
+    }
     state
+}
+
+/// A lever, a button or a grindstone: a `face` of floor, wall or ceiling.
+///
+/// The face says which surface it is stuck to, and that decides where `facing`
+/// comes from — the clicked face when it is on a wall, and the player's look
+/// when it is on the floor or the ceiling, because a lever on the ground has no
+/// wall to take a direction from.
+fn as_attached(block: Block, state: BlockState, click: Click) -> Option<BlockState> {
+    let attachment = values_of(block, "face")?;
+    if !same_set(attachment, &["floor", "wall", "ceiling"]) {
+        return None;
+    }
+    if !same_set(values_of(block, "facing")?, HORIZONTAL) {
+        return None;
+    }
+    let (surface, facing) = match click.face {
+        Face::Up => ("floor", looking(click.yaw)),
+        Face::Down => ("ceiling", looking(click.yaw)),
+        other => ("wall", other.direction()),
+    };
+    state
+        .with("face", surface)
+        .and_then(|state| state.with("facing", facing))
+}
+
+/// Everything else with a four-valued `facing`.
+///
+/// Three rules and a list of three blocks, and which one applies is read off
+/// the rest of the shape:
+///
+/// * a `hinge` is a door and an `in_wall` is a fence gate, and both face **the
+///   way the player is looking**, as a stair does;
+/// * the anvils turn it **a quarter clockwise**, which nothing else does and
+///   nothing in the property table hints at;
+/// * everything else faces **back at the player** — a furnace, a chest, a
+///   trapdoor, a repeater, every glazed terracotta.
+///
+/// A trapdoor also takes the half the click landed in, which is the slab's own
+/// rule and is why it is applied here rather than given a rule of its own.
+///
+/// **A door goes down as its lower half and nothing else.** Minecraft puts two
+/// blocks down and this puts one, which was already true before this rule and
+/// is not made worse by it: the second block is a placement that writes
+/// somewhere the click did not name, and nothing here can do that yet.
+fn as_horizontal(block: Block, state: BlockState, click: Click) -> Option<BlockState> {
+    if !same_set(values_of(block, "facing")?, HORIZONTAL) {
+        return None;
+    }
+    let look = looking(click.yaw);
+    // A trapdoor is a lever with a different answer: hung on a wall it takes
+    // the face, and set into a floor or a ceiling it takes the player. What
+    // says it is one is a `half` with no `shape` — a stair has both and a
+    // furnace has neither.
+    let trapdoor = matches!(values_of(block, "half"), Some(values) if same_set(values, &["top", "bottom"]))
+        && values_of(block, "shape").is_none();
+    let facing = if values_of(block, "hinge").is_some()
+        || values_of(block, "in_wall").is_some()
+        || values_of(block, "part").is_some()
+    {
+        look
+    } else if ANVILS.contains(&block.name()) {
+        clockwise(look)
+    } else if trapdoor && !matches!(click.face, Face::Up | Face::Down) {
+        click.face.direction()
+    } else {
+        opposite(look)
+    };
+    let state = state.with("facing", facing)?;
+    if trapdoor {
+        return state.with("half", half(click));
+    }
+    Some(state)
+}
+
+/// A bell: an `attachment` rather than a `face`, and its own answer again.
+///
+/// On the floor or the ceiling it faces the player, like a lever. On a wall it
+/// faces **away** from the wall, unlike a lever, which faces into it. One block
+/// and three sentences, which is what it costs to be right about it.
+///
+/// `double_wall` — a bell slung between two blocks — is a neighbour rule and is
+/// not reachable from a click alone, so it is never chosen here.
+fn as_bell(block: Block, state: BlockState, click: Click) -> Option<BlockState> {
+    let attachment = values_of(block, "attachment")?;
+    if !same_set(
+        attachment,
+        &["floor", "ceiling", "single_wall", "double_wall"],
+    ) {
+        return None;
+    }
+    let (hung, facing) = match click.face {
+        Face::Up => ("floor", looking(click.yaw)),
+        Face::Down => ("ceiling", looking(click.yaw)),
+        other => ("single_wall", opposite(other.direction())),
+    };
+    state
+        .with("attachment", hung)
+        .and_then(|state| state.with("facing", facing))
+}
+
+/// A block whose `facing` can point any of the six ways.
+///
+/// Most of them take the clicked face: a shulker box opens away from what it is
+/// stuck to, an end rod points out of it, so do a lightning rod and an amethyst
+/// cluster. **Six do not**, and they are named because nothing in the property
+/// table separates them — they read where the player is looking, the vertical
+/// included, which is how a piston ends up pointing at the ceiling when you
+/// place it looking up.
+fn as_directional(block: Block, state: BlockState, click: Click) -> Option<BlockState> {
+    let facing = values_of(block, "facing")?;
+    if !same_set(facing, ALL_SIX) {
+        return None;
+    }
+    let name = block.name();
+    let direction = if LOOKS_AWAY.contains(&name) {
+        opposite(nearest_looking(click))
+    } else if LOOKS_AT.contains(&name) {
+        nearest_looking(click)
+    } else {
+        click.face.direction()
+    };
+    state.with("facing", direction)
+}
+
+/// A hopper: a `facing` of five, every direction but up.
+///
+/// It points away from the face that was clicked so that it feeds the block it
+/// was put against — and clicking the *top* of a block gives `down`, because
+/// there is no `up` for it to take. The five-valued facing is the shape and
+/// nothing else in the game has one.
+fn as_hopper(block: Block, state: BlockState, click: Click) -> Option<BlockState> {
+    let facing = values_of(block, "facing")?;
+    if !same_set(facing, &["down", "north", "south", "west", "east"]) {
+        return None;
+    }
+    let direction = match click.face {
+        Face::Up | Face::Down => "down",
+        other => opposite(other.direction()),
+    };
+    state.with("facing", direction)
+}
+
+/// The three anvils, which turn the player's direction a quarter clockwise.
+///
+/// Named because the property table cannot say it: an anvil is `facing` and
+/// nothing else, which is the same shape as a carved pumpkin, and a pumpkin
+/// faces back at the player.
+const ANVILS: [&str; 3] = [
+    "minecraft:anvil",
+    "minecraft:chipped_anvil",
+    "minecraft:damaged_anvil",
+];
+
+/// Six-way blocks that point **away** from where the player is looking.
+///
+/// A piston pushes away from you, a barrel opens away from you, a dispenser
+/// fires away from you. Named because the shape they share — a six-valued
+/// `facing` — is the same one a shulker box has, and a shulker box takes the
+/// clicked face.
+const LOOKS_AWAY: [&str; 5] = [
+    "minecraft:piston",
+    "minecraft:sticky_piston",
+    "minecraft:barrel",
+    "minecraft:dispenser",
+    "minecraft:dropper",
+];
+
+/// Six-way blocks that point **at** where the player is looking.
+///
+/// One, and it is the reason this is a second list rather than a flag on the
+/// first: an observer placed looking down faces down where a piston placed the
+/// same way faces up.
+const LOOKS_AT: [&str; 1] = ["minecraft:observer"];
+
+/// Every direction a `facing` can take.
+const ALL_SIX: &[&str] = &["north", "south", "west", "east", "up", "down"];
+
+/// The direction the player is looking, the vertical included.
+///
+/// Minecraft's own `getNearestLookingDirection`: the axis with the largest
+/// share of the look vector wins. Written as the vector rather than as an angle
+/// threshold because the threshold is where the horizontal and vertical
+/// components cross, and a number written for that is a number to be wrong
+/// about.
+fn nearest_looking(click: Click) -> &'static str {
+    let yaw = click.yaw.to_radians();
+    let pitch = click.pitch.to_radians();
+    let (x, y, z) = (
+        -yaw.sin() * pitch.cos(),
+        -pitch.sin(),
+        yaw.cos() * pitch.cos(),
+    );
+    if y.abs() >= x.abs() && y.abs() >= z.abs() {
+        if y > 0.0 {
+            "up"
+        } else {
+            "down"
+        }
+    } else if x.abs() >= z.abs() {
+        if x > 0.0 {
+            "east"
+        } else {
+            "west"
+        }
+    } else if z > 0.0 {
+        "south"
+    } else {
+        "north"
+    }
+}
+
+/// The direction facing the other way.
+fn opposite(direction: &str) -> &'static str {
+    match direction {
+        "north" => "south",
+        "south" => "north",
+        "west" => "east",
+        "east" => "west",
+        "up" => "down",
+        _ => "up",
+    }
+}
+
+/// A quarter turn clockwise, seen from above. Only the anvils want it.
+fn clockwise(direction: &str) -> &'static str {
+    match direction {
+        "north" => "east",
+        "east" => "south",
+        "south" => "west",
+        _ => "north",
+    }
 }
 
 /// A log, a pillar or a chain: `axis` and nothing else that orients it.
@@ -372,10 +635,10 @@ mod tests {
 
     #[test]
     fn a_shape_no_rule_recognises_keeps_the_default_state() {
-        // The fallback that makes every rule a strict improvement. A furnace
-        // and a ladder are the two blocks this file deliberately does not
-        // handle, because their shapes are the same and their rules are not.
-        for name in ["minecraft:furnace", "minecraft:ladder", "minecraft:stone"] {
+        // The fallback that makes a rule an improvement rather than a trade.
+        // Leaves and stone have nothing here to key on and go down exactly as
+        // they did before this file existed.
+        for name in ["minecraft:stone", "minecraft:oak_leaves", "minecraft:glass"] {
             let block = block(name);
             assert_eq!(
                 state_for(block, click(Face::North, 90.0, 0.75)),
@@ -386,13 +649,181 @@ mod tests {
     }
 
     #[test]
-    fn a_trapdoor_is_not_mistaken_for_a_stair() {
-        // It has `facing` and `half` and no `shape`, and its rules are not the
-        // stair's. Left alone rather than half-handled.
-        let block = block("minecraft:oak_trapdoor");
+    fn a_furnace_faces_back_at_the_player_where_a_stair_faces_away() {
+        // The pair the whole measurement was taken to settle. Same property,
+        // same four values, opposite answers — and nothing in the property
+        // table says which is which.
+        let stair = state("minecraft:oak_stairs", Face::Up, 0.0, 0.25);
+        let furnace = state("minecraft:furnace", Face::Up, 0.0, 0.25);
+        assert_eq!(value(&stair, "facing"), "south", "the way the player looks");
+        assert_eq!(value(&furnace, "facing"), "north", "back at the player");
+    }
+
+    #[test]
+    fn a_trapdoor_takes_the_wall_it_is_hung_on_and_the_player_otherwise() {
+        // A lever with a different answer, and the case that was wrong first
+        // time: hung on a wall it faces the way the wall does, and set into a
+        // floor it faces back at the player like a furnace.
+        let wall = state("minecraft:oak_trapdoor", Face::North, 0.0, 0.75);
+        assert_eq!(value(&wall, "facing"), "north", "the face it hangs on");
         assert_eq!(
-            state_for(block, click(Face::North, 90.0, 0.75)),
-            block.default_state()
+            value(&wall, "half"),
+            "top",
+            "and the half the cursor was in"
+        );
+
+        let floor = state("minecraft:oak_trapdoor", Face::Up, 0.0, 0.75);
+        assert_eq!(
+            value(&floor, "facing"),
+            "north",
+            "back at a player looking south"
+        );
+        assert_eq!(value(&floor, "half"), "bottom", "the face, not the cursor");
+    }
+
+    #[test]
+    fn a_bed_faces_the_way_the_player_looks() {
+        // A four-valued facing with a `part`, which is what says it is not a
+        // furnace. It goes down as its foot and no head, for the same reason a
+        // door goes down as its lower half: the second block is somewhere the
+        // click did not name.
+        let placed = state("minecraft:black_bed", Face::Up, 0.0, 0.25);
+        assert_eq!(value(&placed, "facing"), "south");
+        assert_eq!(value(&placed, "part"), "foot");
+    }
+
+    #[test]
+    fn a_bell_hangs_the_other_way_round_from_a_lever() {
+        // Both take a surface from the clicked face, and on a wall a lever
+        // faces into it while a bell faces out of it.
+        let wall = state("minecraft:bell", Face::North, 0.0, 0.25);
+        assert_eq!(value(&wall, "attachment"), "single_wall");
+        assert_eq!(value(&wall, "facing"), "south", "away from the wall");
+        assert_eq!(
+            value(&state("minecraft:lever", Face::North, 0.0, 0.25), "facing"),
+            "north",
+            "and a lever faces into it"
+        );
+
+        let floor = state("minecraft:bell", Face::Up, 0.0, 0.25);
+        assert_eq!(value(&floor, "attachment"), "floor");
+        assert_eq!(
+            value(&floor, "facing"),
+            "south",
+            "the player, as a lever does"
+        );
+    }
+
+    #[test]
+    fn a_door_and_a_fence_gate_face_the_way_a_stair_does() {
+        // Both have a four-valued facing and neither is a stair; what says so
+        // is the `hinge` on one and the `in_wall` on the other.
+        assert_eq!(
+            value(&state("minecraft:oak_door", Face::Up, 0.0, 0.25), "facing"),
+            "south"
+        );
+        assert_eq!(
+            value(
+                &state("minecraft:oak_fence_gate", Face::Up, 0.0, 0.25),
+                "facing"
+            ),
+            "south"
+        );
+    }
+
+    #[test]
+    fn an_anvil_turns_a_quarter_and_a_pumpkin_does_not() {
+        // The pair that makes the anvils a named list. Both are `facing` and
+        // nothing else; the anvil turns clockwise from the look and the
+        // pumpkin faces back at the player.
+        assert_eq!(
+            value(&state("minecraft:anvil", Face::Up, 0.0, 0.25), "facing"),
+            "west",
+            "a quarter clockwise from south"
+        );
+        assert_eq!(
+            value(
+                &state("minecraft:carved_pumpkin", Face::Up, 0.0, 0.25),
+                "facing"
+            ),
+            "north",
+            "back at a player looking south"
+        );
+    }
+
+    #[test]
+    fn a_lever_takes_the_wall_it_is_on_and_the_direction_that_follows() {
+        let floor = state("minecraft:lever", Face::Up, 0.0, 0.25);
+        assert_eq!(value(&floor, "face"), "floor");
+        assert_eq!(value(&floor, "facing"), "south", "no wall, so the look");
+
+        let wall = state("minecraft:lever", Face::West, 0.0, 0.25);
+        assert_eq!(value(&wall, "face"), "wall");
+        assert_eq!(value(&wall, "facing"), "west", "the face it is stuck to");
+
+        assert_eq!(
+            value(&state("minecraft:lever", Face::Down, 0.0, 0.25), "face"),
+            "ceiling"
+        );
+    }
+
+    #[test]
+    fn a_piston_points_away_and_an_observer_points_at() {
+        // The reason there are two lists. Placed looking straight down, a
+        // piston faces up and an observer faces down.
+        let down = Click {
+            face: Face::Up,
+            cursor_y: 0.25,
+            yaw: 0.0,
+            pitch: 90.0,
+        };
+        assert_eq!(
+            value(
+                &state_for(block("minecraft:piston"), down).properties(),
+                "facing"
+            ),
+            "up"
+        );
+        assert_eq!(
+            value(
+                &state_for(block("minecraft:observer"), down).properties(),
+                "facing"
+            ),
+            "down"
+        );
+    }
+
+    #[test]
+    fn a_six_way_block_nobody_named_takes_the_clicked_face() {
+        // The majority of that shape: a shulker box opens away from what it is
+        // stuck to, and so do an end rod and a lightning rod.
+        for name in [
+            "minecraft:shulker_box",
+            "minecraft:end_rod",
+            "minecraft:lightning_rod",
+        ] {
+            assert_eq!(
+                value(&state(name, Face::West, 0.0, 0.25), "facing"),
+                "west",
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hopper_points_away_from_the_face_and_never_up() {
+        assert_eq!(
+            value(&state("minecraft:hopper", Face::North, 0.0, 0.25), "facing"),
+            "south"
+        );
+        assert_eq!(
+            value(&state("minecraft:hopper", Face::Up, 0.0, 0.25), "facing"),
+            "down",
+            "there is no up for it to take"
+        );
+        assert_eq!(
+            value(&state("minecraft:hopper", Face::Down, 0.0, 0.25), "facing"),
+            "down"
         );
     }
 
