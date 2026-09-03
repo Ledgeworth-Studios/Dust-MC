@@ -315,7 +315,11 @@ impl Recipes {
             }
             rows.push(row);
         }
-        let width = rows.iter().map(|row| row.chars().count()).max().unwrap_or(0);
+        let width = rows
+            .iter()
+            .map(|row| row.chars().count())
+            .max()
+            .unwrap_or(0);
 
         // Rows are padded to the widest, exactly as Minecraft pads a short row
         // with spaces: `["#", "##"]` is a two-wide pattern whose first row has
@@ -417,7 +421,9 @@ impl Recipes {
             .map_err(|_| Refusal::Malformed("`result`'s `count` does not fit a stack"))?,
         };
         if count == 0 || count > item.max_stack_size() {
-            return Err(Refusal::Malformed("`result`'s `count` does not fit a stack"));
+            return Err(Refusal::Malformed(
+                "`result`'s `count` does not fit a stack",
+            ));
         }
         Ok((item, count))
     }
@@ -455,7 +461,9 @@ impl Recipes {
             .as_object()
             .ok_or(Refusal::Malformed("an ingredient is not an object"))?;
         if object.len() != 1 {
-            return Err(Refusal::Malformed("an ingredient is not one of item or tag"));
+            return Err(Refusal::Malformed(
+                "an ingredient is not one of item or tag",
+            ));
         }
         if let Some(name) = object.get("item").and_then(serde_json::Value::as_str) {
             let item = Item::from_name(name).ok_or_else(|| Refusal::Unknown(name.to_owned()))?;
@@ -473,7 +481,9 @@ impl Recipes {
                 .extend(members.iter().map(|item| item.protocol_id() as u16));
             return Ok(());
         }
-        Err(Refusal::Malformed("an ingredient is not one of item or tag"))
+        Err(Refusal::Malformed(
+            "an ingredient is not one of item or tag",
+        ))
     }
 
     fn push(&mut self, recipe: Recipe) {
@@ -596,7 +606,13 @@ impl Recipes {
         None
     }
 
-    fn matches(&self, recipe: &Recipe, width: usize, height: usize, cells: &[Option<Item>]) -> bool {
+    fn matches(
+        &self,
+        recipe: &Recipe,
+        width: usize,
+        height: usize,
+        cells: &[Option<Item>],
+    ) -> bool {
         match &recipe.kind {
             Kind::Shaped {
                 width: rw,
@@ -677,7 +693,13 @@ impl Recipes {
         let mut taken = [usize::MAX; MAX_GRID * MAX_GRID];
         for ingredient in 0..ingredients.len() {
             let mut visited = [false; MAX_GRID * MAX_GRID];
-            if !self.assign(ingredient, ingredients, &items[..count], &mut taken, &mut visited) {
+            if !self.assign(
+                ingredient,
+                ingredients,
+                &items[..count],
+                &mut taken,
+                &mut visited,
+            ) {
                 return false;
             }
         }
@@ -729,7 +751,11 @@ fn choices_of(recipe: &Recipe) -> impl Iterator<Item = &Choice> {
 
 /// The box the grid's stacks occupy: left, top, width, height. `None` for an
 /// empty grid.
-fn bounds(width: usize, height: usize, cells: &[Option<Item>]) -> Option<(usize, usize, usize, usize)> {
+fn bounds(
+    width: usize,
+    height: usize,
+    cells: &[Option<Item>],
+) -> Option<(usize, usize, usize, usize)> {
     let (mut left, mut top) = (usize::MAX, usize::MAX);
     let (mut right, mut bottom) = (0usize, 0usize);
     for y in 0..height {
@@ -789,4 +815,338 @@ fn dedup(values: &mut [u16]) -> usize {
         }
     }
     kept
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(name: &str) -> Item {
+        Item::from_name(name).expect("the generated item table has it")
+    }
+
+    fn tags() -> ItemTags {
+        let mut tags = ItemTags::new();
+        tags.insert(
+            "minecraft:planks".to_owned(),
+            vec![item("minecraft:oak_planks"), item("minecraft:birch_planks")],
+        );
+        tags.insert(
+            "minecraft:logs".to_owned(),
+            vec![item("minecraft:oak_log"), item("minecraft:birch_log")],
+        );
+        tags
+    }
+
+    fn compiled(files: &[(&str, &str)]) -> Recipes {
+        let tags = tags();
+        let mut recipes = Recipes::default();
+        for (id, json) in files {
+            let value: serde_json::Value = serde_json::from_str(json).expect("valid json");
+            recipes.add(id, &value, &tags).expect("compiles");
+        }
+        recipes.index();
+        recipes
+    }
+
+    fn grid(width: usize, height: usize, names: &[&str]) -> Vec<Option<Item>> {
+        assert_eq!(names.len(), width * height);
+        names
+            .iter()
+            .map(|name| (!name.is_empty()).then(|| item(name)))
+            .collect()
+    }
+
+    /// The shape of a shaped recipe travels with it, and a grid that holds the
+    /// same items in the wrong arrangement makes nothing.
+    #[test]
+    fn a_shaped_recipe_wants_its_own_shape() {
+        let recipes = compiled(&[(
+            "minecraft:stick",
+            r####"{"type":"minecraft:crafting_shaped","pattern":["#","#"],
+                "key":{"#":{"tag":"minecraft:planks"}},
+                "result":{"id":"minecraft:stick","count":4}}"####,
+        )]);
+        let stacked = grid(
+            2,
+            2,
+            &["minecraft:oak_planks", "", "minecraft:oak_planks", ""],
+        );
+        assert_eq!(
+            recipes.find(2, 2, &stacked).map(Recipe::id),
+            Some("minecraft:stick")
+        );
+        let beside = grid(
+            2,
+            2,
+            &["minecraft:oak_planks", "minecraft:oak_planks", "", ""],
+        );
+        assert!(recipes.find(2, 2, &beside).is_none());
+    }
+
+    /// The same pattern anywhere in the grid, which is what trimming both
+    /// sides to their own bounding box buys.
+    #[test]
+    fn a_pattern_matches_wherever_it_sits_in_the_grid() {
+        let recipes = compiled(&[(
+            "minecraft:stick",
+            r####"{"type":"minecraft:crafting_shaped","pattern":["#","#"],
+                "key":{"#":{"item":"minecraft:oak_planks"}},
+                "result":{"id":"minecraft:stick","count":4}}"####,
+        )]);
+        let right = grid(
+            2,
+            2,
+            &["", "minecraft:oak_planks", "", "minecraft:oak_planks"],
+        );
+        assert!(recipes.find(2, 2, &right).is_some());
+        let low = grid(
+            3,
+            3,
+            &[
+                "",
+                "",
+                "",
+                "",
+                "",
+                "minecraft:oak_planks",
+                "",
+                "",
+                "minecraft:oak_planks",
+            ],
+        );
+        assert!(recipes.find(3, 3, &low).is_some());
+    }
+
+    /// A shaped recipe matches mirrored, which is `ShapedRecipePattern`'s own
+    /// rule: a left-handed door is the same door.
+    #[test]
+    fn a_shaped_recipe_matches_mirrored() {
+        let recipes = compiled(&[(
+            "test:corner",
+            r####"{"type":"minecraft:crafting_shaped","pattern":["ab","a "],
+                "key":{"a":{"item":"minecraft:oak_planks"},"b":{"item":"minecraft:stick"}},
+                "result":{"id":"minecraft:torch","count":1}}"####,
+        )]);
+        let same = grid(
+            2,
+            2,
+            &[
+                "minecraft:oak_planks",
+                "minecraft:stick",
+                "minecraft:oak_planks",
+                "",
+            ],
+        );
+        assert!(recipes.find(2, 2, &same).is_some());
+        let mirrored = grid(
+            2,
+            2,
+            &[
+                "minecraft:stick",
+                "minecraft:oak_planks",
+                "",
+                "minecraft:oak_planks",
+            ],
+        );
+        assert!(recipes.find(2, 2, &mirrored).is_some());
+    }
+
+    /// Two ingredients that overlap, assigned the only way that works.
+    ///
+    /// This is the case a greedy pass gets wrong: `#logs` can take the oak log
+    /// and `#planks` cannot take anything else, so an assignment that hands
+    /// `#planks` its item first is the only one that succeeds — and a matcher
+    /// that assigned in ingredient order without backing up would refuse a
+    /// recipe that plainly matches.
+    #[test]
+    fn a_shapeless_recipe_backs_up_rather_than_refusing() {
+        let recipes = compiled(&[(
+            "test:pair",
+            r####"{"type":"minecraft:crafting_shapeless",
+                "ingredients":[{"tag":"minecraft:logs"},{"item":"minecraft:oak_log"}],
+                "result":{"id":"minecraft:stick","count":1}}"####,
+        )]);
+        // Both cells are oak logs: `#logs` must take one and the literal the
+        // other, in whichever order the search reaches them.
+        let both = grid(2, 2, &["minecraft:oak_log", "minecraft:oak_log", "", ""]);
+        assert!(recipes.find(2, 2, &both).is_some());
+        // The one a greedy pass gets wrong, and the order is the whole test.
+        // `#logs` is asked first and the oak log is the first cell, so a
+        // matcher that never backs up hands the oak log to `#logs` and then
+        // has only a birch log left for an ingredient that names oak. The
+        // assignment that works exists — `#logs` takes the birch — and finding
+        // it is the difference between a recipe that crafts and one that
+        // silently does not.
+        let mixed = grid(2, 2, &["minecraft:oak_log", "minecraft:birch_log", "", ""]);
+        assert!(recipes.find(2, 2, &mixed).is_some());
+        // Two birch logs cannot satisfy the literal at all.
+        let neither = grid(
+            2,
+            2,
+            &["minecraft:birch_log", "minecraft:birch_log", "", ""],
+        );
+        assert!(recipes.find(2, 2, &neither).is_none());
+    }
+
+    /// A shapeless recipe wants exactly as many stacks as it has ingredients.
+    #[test]
+    fn a_spare_item_in_the_grid_stops_a_shapeless_recipe() {
+        let recipes = compiled(&[(
+            "minecraft:oak_planks",
+            r####"{"type":"minecraft:crafting_shapeless",
+                "ingredients":[{"tag":"minecraft:logs"}],
+                "result":{"id":"minecraft:oak_planks","count":4}}"####,
+        )]);
+        let alone = grid(2, 2, &["minecraft:oak_log", "", "", ""]);
+        assert!(recipes.find(2, 2, &alone).is_some());
+        let crowded = grid(2, 2, &["minecraft:oak_log", "minecraft:stick", "", ""]);
+        assert!(recipes.find(2, 2, &crowded).is_none());
+    }
+
+    /// A shaped recipe wider than the grid it is asked about does not match,
+    /// which is the whole difference between the 2x2 a player carries and the
+    /// 3x3 a table opens.
+    #[test]
+    fn a_three_wide_recipe_does_not_fit_a_two_wide_grid() {
+        let recipes = compiled(&[(
+            "minecraft:bread",
+            r####"{"type":"minecraft:crafting_shaped","pattern":["###"],
+                "key":{"#":{"item":"minecraft:wheat"}},
+                "result":{"id":"minecraft:bread","count":1}}"####,
+        )]);
+        let two = grid(2, 2, &["minecraft:wheat", "minecraft:wheat", "", ""]);
+        assert!(recipes.find(2, 2, &two).is_none());
+        let three = grid(
+            3,
+            3,
+            &[
+                "minecraft:wheat",
+                "minecraft:wheat",
+                "minecraft:wheat",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ],
+        );
+        assert!(recipes.find(3, 3, &three).is_some());
+    }
+
+    /// The thirteen markers and everything that is not a grid recipe are
+    /// refused by their declared type, named apart, and never guessed at.
+    #[test]
+    fn the_code_recipes_and_the_furnace_ones_are_refused_by_type() {
+        let tags = tags();
+        let mut recipes = Recipes::default();
+        let special: serde_json::Value = serde_json::from_str(
+            r####"{"type":"minecraft:crafting_special_firework_rocket","category":"misc"}"####,
+        )
+        .unwrap();
+        assert!(matches!(
+            recipes.add("minecraft:firework_rocket", &special, &tags),
+            Err(Refusal::Special(_))
+        ));
+        let smelting: serde_json::Value = serde_json::from_str(
+            r####"{"type":"minecraft:smelting","ingredient":{"item":"minecraft:sand"},
+                "result":"minecraft:glass","experience":0.1,"cookingtime":200}"####,
+        )
+        .unwrap();
+        assert!(matches!(
+            recipes.add("minecraft:glass", &smelting, &tags),
+            Err(Refusal::NotAGrid(_))
+        ));
+        assert!(recipes.is_empty());
+    }
+
+    /// A result carrying more than a stack is refused rather than served
+    /// plain. A recipe that promises an enchanted book and hands over a book
+    /// has taken the ingredients for something the player did not get.
+    #[test]
+    fn a_result_with_components_is_refused() {
+        let tags = tags();
+        let mut recipes = Recipes::default();
+        let value: serde_json::Value = serde_json::from_str(
+            r####"{"type":"minecraft:crafting_shapeless",
+                "ingredients":[{"item":"minecraft:oak_log"}],
+                "result":{"id":"minecraft:stick","count":1,
+                          "components":{"minecraft:custom_name":"'Bob'"}}}"####,
+        )
+        .unwrap();
+        assert!(matches!(
+            recipes.add("test:named", &value, &tags),
+            Err(Refusal::Malformed(_))
+        ));
+    }
+
+    /// An ingredient naming a tag the data pack does not define is refused and
+    /// says which tag, rather than compiling into a recipe nothing satisfies.
+    #[test]
+    fn an_unknown_tag_is_named_rather_than_swallowed() {
+        let mut recipes = Recipes::default();
+        let value: serde_json::Value = serde_json::from_str(
+            r####"{"type":"minecraft:crafting_shapeless",
+                "ingredients":[{"tag":"minecraft:nothing_like_this"}],
+                "result":{"id":"minecraft:stick","count":1}}"####,
+        )
+        .unwrap();
+        assert_eq!(
+            recipes.add("test:missing", &value, &ItemTags::new()),
+            Err(Refusal::Unknown("#minecraft:nothing_like_this".to_owned()))
+        );
+    }
+
+    /// A milk bucket leaves a bucket. Written out because the relation is a
+    /// Java constant; checked because a wrong entry here destroys an item.
+    #[test]
+    fn a_filled_bucket_leaves_an_empty_one_and_a_plank_leaves_nothing() {
+        assert_eq!(
+            remainder(item("minecraft:milk_bucket")),
+            Some(item("minecraft:bucket"))
+        );
+        assert_eq!(
+            remainder(item("minecraft:honey_bottle")),
+            Some(item("minecraft:glass_bottle"))
+        );
+        assert_eq!(remainder(item("minecraft:oak_planks")), None);
+        assert_eq!(remainder(item("minecraft:bucket")), None);
+    }
+
+    /// Every name in the remainder table resolves, both halves of it. A typo
+    /// here would be a silent hole rather than an error.
+    #[test]
+    fn every_remainder_names_two_real_items() {
+        for (from, to) in REMAINDERS {
+            assert!(Item::from_name(from).is_some(), "{from}");
+            assert!(Item::from_name(to).is_some(), "{to}");
+        }
+    }
+
+    /// The index answers with the recipes an item can be in, and an item in no
+    /// recipe at all short-circuits the whole lookup.
+    #[test]
+    fn an_item_in_no_recipe_makes_nothing() {
+        let recipes = compiled(&[(
+            "minecraft:stick",
+            r####"{"type":"minecraft:crafting_shaped","pattern":["#","#"],
+                "key":{"#":{"item":"minecraft:oak_planks"}},
+                "result":{"id":"minecraft:stick","count":4}}"####,
+        )]);
+        let bedrock = grid(2, 2, &["minecraft:bedrock", "", "minecraft:bedrock", ""]);
+        assert!(recipes.find(2, 2, &bedrock).is_none());
+    }
+
+    /// An empty grid makes nothing, and asks the index nothing.
+    #[test]
+    fn an_empty_grid_makes_nothing() {
+        let recipes = compiled(&[(
+            "minecraft:stick",
+            r####"{"type":"minecraft:crafting_shaped","pattern":["#","#"],
+                "key":{"#":{"item":"minecraft:oak_planks"}},
+                "result":{"id":"minecraft:stick","count":4}}"####,
+        )]);
+        assert!(recipes.find(2, 2, &[None, None, None, None]).is_none());
+    }
 }

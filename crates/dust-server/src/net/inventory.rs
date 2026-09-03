@@ -744,12 +744,10 @@ impl Inventory {
             *cell = self.slots[slot].as_ref().map(|stack| stack.item);
         }
         let height = cells.len() / CRAFTING_WIDTH;
-        let made = recipes
-            .find(CRAFTING_WIDTH, height, &cells)
-            .map(|recipe| {
-                let (item, count) = recipe.result();
-                Stack::new(item, count)
-            });
+        let made = recipes.find(CRAFTING_WIDTH, height, &cells).map(|recipe| {
+            let (item, count) = recipe.result();
+            Stack::new(item, count)
+        });
         if self.slots[CRAFTING_OUTPUT] != made {
             self.slots[CRAFTING_OUTPUT] = made;
             changed.mark(CRAFTING_OUTPUT);
@@ -1502,7 +1500,13 @@ impl Inventory {
         // the same order and collecting one would be an allocation on every
         // shift-click.
         let (start, end) = (range.start, range.end);
-        let at = |step: usize| if reverse { end - 1 - step } else { start + step };
+        let at = |step: usize| {
+            if reverse {
+                end - 1 - step
+            } else {
+                start + step
+            }
+        };
         let steps = end.saturating_sub(start);
         if stack.item.max_stack_size() > 1 {
             for index in (0..steps).map(at) {
@@ -1750,6 +1754,45 @@ mod tests {
         }
     }
 
+    /// Two recipes, written here rather than read: a shapeless one log into
+    /// four planks, and a shaped 2x2 of planks into a crafting table. Neither
+    /// is Minecraft's file — they are the two shapes this container has to
+    /// handle, spelled in the language the operator's files are written in.
+    fn recipes() -> std::sync::Arc<Recipes> {
+        let mut recipes = Recipes::default();
+        let planks = serde_json::json!({
+            "type": "minecraft:crafting_shapeless",
+            "ingredients": [{"item": "minecraft:oak_log"}],
+            "result": {"id": "minecraft:oak_planks", "count": 4}
+        });
+        recipes
+            .add("test:oak_planks", &planks, &Default::default())
+            .expect("compiles");
+        let table = serde_json::json!({
+            "type": "minecraft:crafting_shaped",
+            "pattern": ["##", "##"],
+            "key": {"#": {"item": "minecraft:oak_planks"}},
+            "result": {"id": "minecraft:crafting_table", "count": 1}
+        });
+        recipes
+            .add("test:crafting_table", &table, &Default::default())
+            .expect("compiles");
+        recipes.index();
+        std::sync::Arc::new(recipes)
+    }
+
+    fn crafting(pairs: &[(usize, Item, u8)]) -> Inventory {
+        with(pairs).crafting_with(recipes())
+    }
+
+    fn log() -> Item {
+        item("minecraft:oak_log")
+    }
+
+    fn planks() -> Item {
+        item("minecraft:oak_planks")
+    }
+
     fn with(pairs: &[(usize, Item, u8)]) -> Inventory {
         let mut inventory = Inventory::default();
         for &(index, item, count) in pairs {
@@ -1782,11 +1825,20 @@ mod tests {
         // 36 is hotbar slot 0 and 44 is slot 8; 5 is the helmet and 45 the
         // offhand. All four are slots the old hotbar dropped on the floor.
         let mut inventory = Inventory::default();
-        assert!(inventory.set_creative(36, &wire(stone(), 1)).unwrap().has(36));
+        assert!(inventory
+            .set_creative(36, &wire(stone(), 1))
+            .unwrap()
+            .has(36));
         assert_eq!(inventory.held(), Some(stone()), "slot 0 is selected");
-        assert!(inventory.set_creative(44, &wire(dirt(), 5)).unwrap().has(44));
+        assert!(inventory
+            .set_creative(44, &wire(dirt(), 5))
+            .unwrap()
+            .has(44));
         assert!(inventory.set_creative(9, &wire(dirt(), 64)).unwrap().has(9));
-        assert!(inventory.set_creative(45, &wire(bucket(), 1)).unwrap().has(45));
+        assert!(inventory
+            .set_creative(45, &wire(bucket(), 1))
+            .unwrap()
+            .has(45));
         assert_eq!(inventory.slot(9).map(|s| s.count), Some(64));
         assert_eq!(inventory.slot(45).map(|s| s.item), Some(bucket()));
         assert!(inventory.select(8));
@@ -1803,23 +1855,233 @@ mod tests {
         assert_eq!(inventory.set_creative(37, &wire(stone(), 65)), Err(37));
         assert_eq!(inventory.slot(37).cloned(), None);
         // And the ones that are fine stay fine.
-        assert!(inventory.set_creative(38, &wire(stone(), 64)).unwrap().has(38));
-        assert!(inventory.set_creative(39, &wire(item("minecraft:ender_pearl"), 16)).unwrap().has(39));
+        assert!(inventory
+            .set_creative(38, &wire(stone(), 64))
+            .unwrap()
+            .has(38));
+        assert!(inventory
+            .set_creative(39, &wire(item("minecraft:ender_pearl"), 16))
+            .unwrap()
+            .has(39));
         assert_eq!(
             inventory.set_creative(40, &wire(item("minecraft:ender_pearl"), 17)),
             Err(40)
         );
     }
 
+    /// The output follows the grid, and it follows it back to empty.
+    #[test]
+    fn the_output_fills_when_the_grid_makes_something() {
+        let mut inventory = crafting(&[(MAIN_START, log(), 1)]);
+        assert_eq!(inventory.slot(CRAFTING_OUTPUT), None);
+        // Pick the log up and put it in the grid.
+        inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
+        let changed = inventory.click(ClickMode::Pickup, CRAFTING_START as i16, 0);
+        assert!(
+            changed.has(CRAFTING_OUTPUT),
+            "the output moved with the grid"
+        );
+        assert_eq!(
+            inventory.slot(CRAFTING_OUTPUT).cloned(),
+            Some(Stack::new(planks(), 4))
+        );
+        // Take it back out again and the output empties.
+        let changed = inventory.click(ClickMode::Pickup, CRAFTING_START as i16, 0);
+        assert!(changed.has(CRAFTING_OUTPUT));
+        assert_eq!(inventory.slot(CRAFTING_OUTPUT), None);
+    }
+
+    /// A container with no recipe table has no opinion, which is the server
+    /// this was before crafting and the server an operator with no `[data]
+    /// path` still has.
+    #[test]
+    fn without_recipes_the_output_never_fills() {
+        let mut inventory = with(&[(CRAFTING_START, log(), 1)]);
+        inventory.click(ClickMode::Pickup, CRAFTING_START as i16, 1);
+        assert_eq!(inventory.slot(CRAFTING_OUTPUT), None);
+    }
+
+    /// Taking the result spends the grid exactly once, and both buttons take
+    /// the whole of it.
+    #[test]
+    fn taking_the_result_spends_one_of_each_ingredient() {
+        for button in [0, 1] {
+            let mut inventory = crafting(&[(CRAFTING_START, log(), 3)]);
+            // A click that moves nothing still has to leave the output right,
+            // so the grid is refreshed by the constructor.
+            assert_eq!(
+                inventory.slot(CRAFTING_OUTPUT).cloned(),
+                Some(Stack::new(planks(), 4))
+            );
+            inventory.click(ClickMode::Pickup, CRAFTING_OUTPUT as i16, button);
+            assert_eq!(inventory.cursor().cloned(), Some(Stack::new(planks(), 4)));
+            assert_eq!(
+                inventory.slot(CRAFTING_START).cloned(),
+                Some(Stack::new(log(), 2)),
+                "one log, not three and not none"
+            );
+            assert_eq!(
+                inventory.slot(CRAFTING_OUTPUT).cloned(),
+                Some(Stack::new(planks(), 4)),
+                "two logs left, so there is still something to take"
+            );
+        }
+    }
+
+    /// Nothing may be put into the output, by any gesture.
+    #[test]
+    fn the_output_takes_nothing_a_player_puts_there() {
+        let mut inventory = crafting(&[(MAIN_START, planks(), 4)]);
+        inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
+        let changed = inventory.click(ClickMode::Pickup, CRAFTING_OUTPUT as i16, 0);
+        assert!(changed.is_empty());
+        assert_eq!(inventory.cursor().cloned(), Some(Stack::new(planks(), 4)));
+        assert_eq!(inventory.slot(CRAFTING_OUTPUT), None);
+    }
+
+    /// A cursor already holding the result takes the next craft onto it; one
+    /// holding something else, or holding too many, is left alone rather than
+    /// having the grid spent underneath it.
+    #[test]
+    fn the_result_pours_onto_a_cursor_holding_the_same_thing() {
+        let mut inventory = crafting(&[(CRAFTING_START, log(), 2), (MAIN_START, planks(), 60)]);
+        inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
+        inventory.click(ClickMode::Pickup, CRAFTING_OUTPUT as i16, 0);
+        assert_eq!(inventory.cursor().map(|s| s.count), Some(64));
+        assert_eq!(inventory.slot(CRAFTING_START).map(|s| s.count), Some(1));
+        // 64 on the cursor and four more coming: no room for the whole result,
+        // so nothing happens and the log is still there.
+        let changed = inventory.click(ClickMode::Pickup, CRAFTING_OUTPUT as i16, 0);
+        assert!(changed.is_empty());
+        assert_eq!(inventory.slot(CRAFTING_START).map(|s| s.count), Some(1));
+    }
+
+    /// Shift-clicking the output crafts as many times as the inputs allow.
+    /// One pass is the defect this is here to catch.
+    #[test]
+    fn shift_clicking_the_output_crafts_until_the_grid_runs_out() {
+        let mut inventory = crafting(&[(CRAFTING_START, log(), 16)]);
+        inventory.click(ClickMode::QuickMove, CRAFTING_OUTPUT as i16, 0);
+        assert_eq!(inventory.slot(CRAFTING_START), None, "every log spent");
+        assert_eq!(inventory.slot(CRAFTING_OUTPUT), None);
+        let planks: u32 = (MAIN_START..HOTBAR_END)
+            .filter_map(|slot| inventory.slot(slot))
+            .filter(|stack| stack.item == planks())
+            .map(|stack| u32::from(stack.count))
+            .sum();
+        assert_eq!(planks, 64, "sixteen logs are sixteen crafts of four");
+    }
+
+    /// A crafted stack lands in the hotbar before the main inventory, which is
+    /// `InventoryMenu.quickMoveStack`'s `moveItemStackTo(stack, 9, 45, true)`
+    /// and the only slot in the container that reverses.
+    #[test]
+    fn a_shift_crafted_stack_fills_the_hotbar_from_the_right() {
+        let mut inventory = crafting(&[(CRAFTING_START, log(), 1)]);
+        inventory.click(ClickMode::QuickMove, CRAFTING_OUTPUT as i16, 0);
+        assert_eq!(
+            inventory.slot(HOTBAR_END - 1).cloned(),
+            Some(Stack::new(planks(), 4))
+        );
+        assert!(inventory.slot(MAIN_START).is_none());
+    }
+
+    /// The last craft that does not fit whole is not performed. Vanilla moves
+    /// what it can and spends the grid anyway; this leaves the ingredients
+    /// where the player can see them.
+    #[test]
+    fn a_craft_that_does_not_fit_is_not_made() {
+        // Every slot but one full of something else, and that one slot holding
+        // 61 planks: the first craft fits (61 + 4 > 64 is false at 61 + 3, so
+        // fill to exactly 64) and the second does not.
+        let mut inventory = crafting(&[(CRAFTING_START, log(), 4)]);
+        for slot in MAIN_START..HOTBAR_END {
+            inventory.slots[slot] = Some(Stack::new(stone(), 64));
+        }
+        inventory.slots[HOTBAR_END - 1] = Some(Stack::new(planks(), 60));
+        inventory.click(ClickMode::QuickMove, CRAFTING_OUTPUT as i16, 0);
+        assert_eq!(
+            inventory.slot(HOTBAR_END - 1).map(|s| s.count),
+            Some(64),
+            "one craft fitted"
+        );
+        assert_eq!(
+            inventory.slot(CRAFTING_START).map(|s| s.count),
+            Some(3),
+            "three logs still in the grid, not spent for nothing"
+        );
+    }
+
+    /// A number key over the output takes the result into an empty hotbar
+    /// slot, and does nothing at all when that slot is occupied — there is
+    /// nothing to swap with, because nothing may be put into the output.
+    #[test]
+    fn a_number_key_over_the_output_takes_the_result() {
+        let mut inventory = crafting(&[(CRAFTING_START, log(), 2)]);
+        inventory.click(ClickMode::Swap, CRAFTING_OUTPUT as i16, 0);
+        assert_eq!(
+            inventory.slot(HOTBAR_START).cloned(),
+            Some(Stack::new(planks(), 4))
+        );
+        assert_eq!(inventory.slot(CRAFTING_START).map(|s| s.count), Some(1));
+        // Slot 0 of the hotbar is full now, so the second press does nothing.
+        let changed = inventory.click(ClickMode::Swap, CRAFTING_OUTPUT as i16, 0);
+        assert!(changed.is_empty());
+        assert_eq!(inventory.slot(CRAFTING_START).map(|s| s.count), Some(1));
+    }
+
+    /// Closing the window clears the output rather than handing it over. It
+    /// was a picture of what the grid would make, never a crafted item.
+    #[test]
+    fn closing_the_window_clears_the_output_it_never_made() {
+        let mut inventory = crafting(&[(CRAFTING_START, log(), 1)]);
+        assert!(inventory.slot(CRAFTING_OUTPUT).is_some());
+        inventory.closed();
+        assert_eq!(inventory.slot(CRAFTING_OUTPUT), None);
+        assert_eq!(
+            inventory.slot(MAIN_START).cloned(),
+            Some(Stack::new(log(), 1)),
+            "the log went back to the player"
+        );
+    }
+
+    /// A creative write into the grid moves the output too, and the caller is
+    /// told which slot it did not write.
+    #[test]
+    fn a_creative_write_into_the_grid_fills_the_output() {
+        let mut inventory = Inventory::default().crafting_with(recipes());
+        let changed = inventory
+            .set_creative(CRAFTING_START as i16, &wire(log(), 1))
+            .expect("accepted");
+        assert!(changed.has(CRAFTING_START));
+        assert!(changed.has(CRAFTING_OUTPUT));
+        assert_eq!(
+            inventory.slot(CRAFTING_OUTPUT).cloned(),
+            Some(Stack::new(planks(), 4))
+        );
+    }
+
     #[test]
     fn the_crafting_output_is_not_writable_and_neither_is_a_slot_off_the_end() {
         let mut inventory = Inventory::default();
-        assert!(inventory.set_creative(0, &wire(stone(), 1)).unwrap().is_empty());
-        assert!(inventory.set_creative(46, &wire(stone(), 1)).unwrap().is_empty());
-        assert!(inventory.set_creative(-2, &wire(stone(), 1)).unwrap().is_empty());
+        assert!(inventory
+            .set_creative(0, &wire(stone(), 1))
+            .unwrap()
+            .is_empty());
+        assert!(inventory
+            .set_creative(46, &wire(stone(), 1))
+            .unwrap()
+            .is_empty());
+        assert!(inventory
+            .set_creative(-2, &wire(stone(), 1))
+            .unwrap()
+            .is_empty());
         // -1 is the creative menu's "throw this away", which is a real
         // instruction and not a refusal.
-        assert!(inventory.set_creative(-1, &wire(stone(), 1)).unwrap().is_empty());
+        assert!(inventory
+            .set_creative(-1, &wire(stone(), 1))
+            .unwrap()
+            .is_empty());
         assert!(inventory.slots().iter().all(Option::is_none));
     }
 
@@ -1843,7 +2105,10 @@ mod tests {
     #[test]
     fn a_selection_outside_the_hotbar_leaves_the_one_in_hand_alone() {
         let mut inventory = Inventory::default();
-        assert!(inventory.set_creative(36, &wire(stone(), 1)).unwrap().has(36));
+        assert!(inventory
+            .set_creative(36, &wire(stone(), 1))
+            .unwrap()
+            .has(36));
         assert!(!inventory.select(9));
         assert!(!inventory.select(-1));
         assert_eq!(inventory.held(), Some(stone()));
