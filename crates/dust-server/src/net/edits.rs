@@ -419,6 +419,13 @@ impl EditedWorld {
         self.generated.residency()
     }
 
+    /// How many of `columns`, counted from the front, the server has already
+    /// built. See [`super::source::Source::built_prefix`].
+    #[must_use]
+    pub fn built_prefix(&self, columns: &[ChunkPos]) -> usize {
+        self.generated.built_prefix(columns)
+    }
+
     /// See [`super::source::Source::warming`].
     #[must_use]
     pub fn warming(&self) -> Option<std::sync::mpsc::Sender<Vec<ChunkPos>>> {

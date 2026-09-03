@@ -149,11 +149,7 @@ fn ladder(world_name: &str, world: &EditedWorld, order: &[ChunkPos]) {
             let packet = if world.is_edited(*pos) {
                 dust_server::net::play::chunk_packet(&world.chunk(*pos), *pos, VERSION)
             } else {
-                dust_server::net::play::chunk_packet(
-                    world.template(*pos).as_chunk(),
-                    *pos,
-                    VERSION,
-                )
+                dust_server::net::play::chunk_packet(world.template(*pos).as_chunk(), *pos, VERSION)
             };
             std::hint::black_box(packet.is_ok());
             worst = worst.max(at.elapsed());

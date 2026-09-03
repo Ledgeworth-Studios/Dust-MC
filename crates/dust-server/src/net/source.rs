@@ -199,6 +199,18 @@ impl ColumnStore {
             warming,
         }
     }
+
+    /// How many of `columns`, counted from the front, are built. See
+    /// [`Source::built_prefix`], which is where the rule is written down.
+    fn built_prefix(&self, columns: &[ChunkPos]) -> usize {
+        if self.wanted.is_none() {
+            return columns.len();
+        }
+        columns
+            .iter()
+            .take_while(|pos| self.residency.resident(**pos).is_some())
+            .count()
+    }
 }
 
 impl std::fmt::Debug for ColumnStore {
@@ -441,6 +453,28 @@ impl Source {
     #[must_use]
     pub fn warming(&self) -> Option<std::sync::mpsc::Sender<Vec<ChunkPos>>> {
         self.store().and_then(|store| store.wanted.clone())
+    }
+
+    /// How many of `columns`, counted **from the front**, this world has
+    /// already built.
+    ///
+    /// The chunk stream's back-pressure and its ordering rule in one number.
+    /// A session sends this many and no more, so it never builds a column on
+    /// its own task and never sends the far corner of a view before the ground
+    /// under the player's feet: a prefix has no holes in it, and a client
+    /// renders what it has.
+    ///
+    /// Two worlds answer `columns.len()` and neither of them is a shortcut.
+    /// **A flat world** lends one template column to every position, so there
+    /// is nothing to wait for. **A world whose warming thread would not
+    /// start** has nobody to wait *on*, and a stream that paced itself against
+    /// a thread that does not exist would be a player looking at a hole in the
+    /// world forever; it builds its own columns instead, which is what every
+    /// caller did before any of this existed.
+    #[must_use]
+    pub fn built_prefix(&self, columns: &[ChunkPos]) -> usize {
+        self.store()
+            .map_or(columns.len(), |store| store.built_prefix(columns))
     }
 
     /// How many columns the server is keeping. Zero on a flat world.
@@ -864,7 +898,14 @@ mod tests {
     impl Columns for Counted {
         fn column(&self, pos: ChunkPos) -> Chunk {
             self.built.fetch_add(1, Ordering::SeqCst);
-            Chunk::uniform(pos, dust_world::heightmap::WorldHeight::new(-64, 384), 2, 2, 0, 0)
+            Chunk::uniform(
+                pos,
+                dust_world::heightmap::WorldHeight::new(-64, 384),
+                2,
+                2,
+                0,
+                0,
+            )
         }
     }
 
@@ -888,6 +929,47 @@ mod tests {
         });
         let store = ColumnStore::new(Arc::clone(&core) as Arc<dyn Columns>);
         (core, store)
+    }
+
+    /// The one answer that must not be "wait": a flat world builds nothing, so
+    /// a stream that paced itself against its store would never send a column
+    /// at all.
+    #[test]
+    fn a_flat_world_has_every_column_ready_because_it_builds_none() {
+        let palette = super::super::world::Palette::resolve().expect("the block table");
+        let source = Source::Flat(Box::new(FlatWorld::new(palette, 0, 64)));
+        let columns: Vec<ChunkPos> = (0..9).map(|x| ChunkPos::new(x, 0)).collect();
+        assert_eq!(source.built_prefix(&columns), 9);
+        assert!(source.residency().is_none());
+    }
+
+    #[test]
+    fn a_store_answers_with_the_built_prefix_and_never_past_a_gap() {
+        let (_core, store) = store();
+        let columns: Vec<ChunkPos> = (0..4).map(|x| ChunkPos::new(x, 0)).collect();
+        store.residency.hold_columns(&columns);
+        // The first two and the fourth. A stream that sent what was *ready*
+        // rather than what was ready *in order* would put the fourth column on
+        // the wire before the third and leave a hole in front of the player.
+        for pos in [columns[0], columns[1], columns[3]] {
+            store.residency.fill(
+                pos,
+                Chunk::uniform(
+                    pos,
+                    dust_world::heightmap::WorldHeight::new(-64, 384),
+                    2,
+                    2,
+                    0,
+                    0,
+                ),
+            );
+        }
+        assert_eq!(store.built_prefix(&columns), 2);
+        assert_eq!(
+            store.built_prefix(&columns[3..]),
+            1,
+            "and it counts from the front"
+        );
     }
 
     #[test]
@@ -940,9 +1022,7 @@ mod tests {
         // Three requests, one build. This is the guarantee a third caller for
         // the chunk stream depends on: asking for a column the store has costs
         // a hash lookup, not a world.
-        assert!(!within_a_second(
-            || core.built.load(Ordering::SeqCst) > 1
-        ));
+        assert!(!within_a_second(|| core.built.load(Ordering::SeqCst) > 1));
         assert_eq!(core.built.load(Ordering::SeqCst), 1);
     }
 }

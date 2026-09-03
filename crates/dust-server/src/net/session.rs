@@ -644,8 +644,31 @@ where
     // stream below is about to send — so the stream finds them resident and
     // the warm costs the join nothing it was not already paying.
     let mut residence = super::residency::Residence::new(ctx.world.residency());
-    if residence.move_to(centre) {
-        ctx.world.warm(centre);
+    residence.move_to(centre);
+
+    // The stream's own claim on the store: the columns it is about to send,
+    // plus a bounded runway. See `stream_inner`, which is where it is rolled
+    // forward, and decision record 0031 for why a stream holds anything at all.
+    let mut ahead = super::residency::ColumnClaim::new(ctx.world.residency(), ctx.world.warming());
+
+    // The first twenty-five built before the loading screen ends, **and not on
+    // this task**. A join that blocks its tokio worker blocks every other
+    // session that worker is running, and on a generated world that is 95 ms
+    // of noise — `benches/join.rs` measures a column at 3.8 ms. `spawn_blocking`
+    // is the right door here and the wrong one everywhere else in this server:
+    // a session runs on tokio and the item loop does not.
+    //
+    // Claimed first, because a column nobody is keeping is built and thrown
+    // away — see `residency::Residency::fill`.
+    let first = view.peek(centre, JOIN_FIRST_COLUMNS);
+    ahead.set(&mut first.clone());
+    if ctx.world.residency().is_some() {
+        let world = std::sync::Arc::clone(&ctx.world);
+        // A blocking task that could not be spawned leaves the columns to the
+        // world's own warming thread, which already has them: the claim above
+        // asked for them. The stream then paces itself against that thread
+        // instead, which is slower and not wrong.
+        let _ = tokio::task::spawn_blocking(move || world.warm_columns(&first)).await;
     }
 
     // The near square first, then the loading screen ends, then the rest.
@@ -661,7 +684,7 @@ where
     // last of the 289 columns arrives at the same moment either way. This
     // shortens the wait rather than the work; a per-tick streaming budget is a
     // different change and is Phase 17's.
-    stream_up_to(conn, ctx, &mut view, centre, JOIN_FIRST_COLUMNS).await?;
+    stream_up_to(conn, ctx, &mut view, &mut ahead, centre, JOIN_FIRST_COLUMNS).await?;
 
     // The ground is there; this is what tells the client to stop looking at
     // the loading screen and start rendering it.
@@ -751,6 +774,7 @@ where
         profile_id,
         start,
         &mut residence,
+        &mut ahead,
     )
     .await;
 
@@ -778,6 +802,22 @@ where
 const STREAM_BATCH: usize = 8;
 const STREAM_BATCH_PERIOD: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// How many columns beyond the batch a session claims and asks the world to
+/// build, so the store has something to work on while the batch is on the wire.
+///
+/// The runway, and the whole of the memory this costs. A session holds at most
+/// its batch plus this — 24 columns, **2.7 MB** at the 111 KB a column of a
+/// real world measures — and releases each one as it goes out. Decision record
+/// 0025 declined a claim the size of the view for exactly this reason: 289
+/// columns is 32 MB a player, and a stream does not need to hold what it has
+/// already sent.
+///
+/// Sixteen is two batches. It is a bound on how far ahead the world is asked
+/// to run, not a target: on a generated world the store builds about five of
+/// these in the twenty milliseconds between batches, so the runway is never
+/// empty and never long.
+const STREAM_AHEAD: usize = 16;
+
 /// How many columns go out before the loading screen is allowed to end.
 ///
 /// Twenty-five, which is the five-by-five around the player — what somebody
@@ -796,38 +836,65 @@ async fn stream_up_to<W>(
     conn: &mut Conn<W>,
     ctx: &SessionContext,
     view: &mut View,
+    ahead: &mut super::residency::ColumnClaim,
     centre: ChunkPos,
     limit: usize,
 ) -> Result<(), SessionError>
 where
     W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    stream_inner(conn, ctx, view, centre, Some(limit)).await
+    stream_inner(conn, ctx, view, ahead, centre, limit).await
 }
 
-async fn stream<W>(
-    conn: &mut Conn<W>,
-    ctx: &SessionContext,
-    view: &mut View,
-    centre: ChunkPos,
-) -> Result<(), SessionError>
-where
-    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    stream_inner(conn, ctx, view, centre, None).await
-}
-
+/// Send the columns a move to `centre` needs — **at most `limit`, and only the
+/// ones the world has already built.**
+///
+/// This is the whole of decision record 0031 and it is three rules that only
+/// work together:
+///
+/// 1. **Nearest first**, which [`View`] has always done. A client renders what
+///    it has, and the column under the player's feet arriving before the far
+///    corner is the difference between walking and waiting.
+/// 2. **A claim on a bounded window ahead of the send point.** The columns
+///    this pass is about to send, plus [`STREAM_AHEAD`] more, are held in the
+///    server's one column store and handed to its warming thread. Held, so
+///    that a column built for this session is *kept* — a second player joining
+///    beside the first finds them there. Bounded, so a stream never pins a
+///    view's worth of world.
+/// 3. **A prefix, never a hole.** `built_prefix` counts how many of the window
+///    the store has ready, counted from the front, and this sends exactly that
+///    many. **The session's own task never builds a column**, which is what a
+///    join used to do 289 times: 2,293.9 ms of a tokio worker on a generated
+///    world, and every other session on that worker waiting behind it.
+///
+/// Rule 3 is also the back-pressure. The window only advances over columns
+/// that have actually gone out, so a client that cannot keep up, or a player
+/// who outruns the store, leaves the window where it is and asks for nothing
+/// new. There is no queue to grow.
 async fn stream_inner<W>(
     conn: &mut Conn<W>,
     ctx: &SessionContext,
     view: &mut View,
+    ahead: &mut super::residency::ColumnClaim,
     centre: ChunkPos,
-    limit: Option<usize>,
+    limit: usize,
 ) -> Result<(), SessionError>
 where
     W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let change = view.move_to_limited(centre, limit);
+    // The window: what this pass may send, and the runway behind it. Peeked
+    // rather than taken, because `View`'s record is a statement about what the
+    // client holds and a column that has only been *asked for* is not held by
+    // anybody.
+    let window = view.peek(centre, limit + STREAM_AHEAD);
+    // Refcounts and a channel send; no file is opened and no noise is
+    // evaluated, which is what makes this safe on the task that just judged a
+    // movement packet. The claim gives up whatever fell out of the window.
+    let mut wanted = window.clone();
+    ahead.set(&mut wanted);
+    let ready = ctx.world.built_prefix(&window).min(limit);
+
+    let change = view.move_to_limited(centre, Some(ready));
     if change.recentre {
         send_play(
             conn,
@@ -880,6 +947,7 @@ async fn play_loop<W>(
     profile_id: [u8; 16],
     start: (f64, f64, f64),
     residence: &mut super::residency::Residence,
+    ahead: &mut super::residency::ColumnClaim,
 ) -> Result<(), SessionError>
 where
     W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1030,6 +1098,7 @@ where
                     conn,
                     ctx,
                     &mut view,
+                    ahead,
                     view::column_of(position.0, position.2),
                     STREAM_BATCH,
                 )
@@ -1216,8 +1285,14 @@ where
                             format!("a session missed {missed} block change(s); resending its columns"),
                         );
                         let centre = view.centre().unwrap_or_else(|| ChunkPos::new(0, 0));
-                        view = View::default();
-                        stream(conn, ctx, &mut view, centre).await?;
+                        // The radius is carried over. `View::default()` is a
+                        // view that reaches nowhere, and a session that
+                        // rebuilt one here would spend the rest of its life
+                        // holding a single column: everything else in range
+                        // would be outside every later `move_to`, so it would
+                        // never be resent and never be missed.
+                        view = View::with_radius(view.radius().unsigned_abs());
+                        stream_up_to(conn, ctx, &mut view, ahead, centre, STREAM_BATCH).await?;
                     }
                 }
             }
@@ -1384,7 +1459,7 @@ where
                                     me.yaw,
                                     me.pitch,
                                 );
-                                moved(conn, ctx, &mut view, residence, position.0, position.2)
+                                moved(conn, ctx, &mut view, ahead, residence, position.0, position.2)
                                     .await?;
                             }
                             dust_guard::Claim::Ignored => {}
@@ -1423,7 +1498,7 @@ where
                                     m.yaw,
                                     m.pitch,
                                 );
-                                moved(conn, ctx, &mut view, residence, position.0, position.2)
+                                moved(conn, ctx, &mut view, ahead, residence, position.0, position.2)
                                     .await?;
                             }
                             dust_guard::Claim::Ignored => {}
@@ -1518,6 +1593,7 @@ where
                                     conn,
                                     ctx,
                                     &mut view,
+                                    ahead,
                                     view::column_of(position.0, position.2),
                                     STREAM_BATCH,
                                 )
@@ -1981,6 +2057,7 @@ async fn moved<W>(
     conn: &mut Conn<W>,
     ctx: &SessionContext,
     view: &mut View,
+    ahead: &mut super::residency::ColumnClaim,
     residence: &mut super::residency::Residence,
     x: f64,
     z: f64,
@@ -2007,7 +2084,7 @@ where
     // a large view distance wants dozens of columns at once, and sending them
     // all here would put the same stall back that the join just lost — the
     // loop's own ticker takes the rest.
-    stream_up_to(conn, ctx, view, centre, STREAM_BATCH).await
+    stream_up_to(conn, ctx, view, ahead, centre, STREAM_BATCH).await
 }
 
 /// The block state a right-click puts down.
