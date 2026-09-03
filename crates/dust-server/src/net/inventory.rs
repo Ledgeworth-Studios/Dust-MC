@@ -156,6 +156,24 @@ pub const OFFHAND: usize = 45;
 /// How many hotbar slots there are. Vanilla's `Inventory.SELECTION_SIZE`.
 pub const HOTBAR_SLOTS: usize = 9;
 
+/// The crafting table's own 3x3, `46..=54` in this container's *storage*.
+///
+/// Not slots any window numbers: a crafting table's grid belongs to the table
+/// menu, which numbers it `1..=9`, and the player's own window cannot see it
+/// at all. Storing it here rather than in a menu of its own is what lets one
+/// implementation of the seven click modes serve both windows — see
+/// [`Window`].
+pub const TABLE_GRID_START: usize = 46;
+/// One past the table's grid.
+pub const TABLE_GRID_END: usize = 55;
+/// The table's output, which is [`CRAFTING_OUTPUT`]'s opposite number.
+pub const TABLE_OUTPUT: usize = 55;
+/// How wide a crafting table's grid is.
+pub const TABLE_WIDTH: usize = 3;
+/// Every slot this container stores: the player's forty-six and the ten a
+/// crafting table adds while one is open.
+pub const STORAGE: usize = 56;
+
 /// The slot number a click outside the window carries.
 pub const OUTSIDE: i16 = -999;
 
@@ -332,13 +350,29 @@ fn slot_limit(index: usize, item: Item) -> u8 {
 /// cobblestone into slot 45, which is measured in `tools/bot/clicks.js` and is
 /// not a guess about what looks sensible.
 fn may_place(index: usize, item: Item) -> bool {
-    if index == CRAFTING_OUTPUT {
+    if index == CRAFTING_OUTPUT || index == TABLE_OUTPUT {
         return false;
     }
     if (ARMOUR_START..ARMOUR_END).contains(&index) {
         return worn_in(item) == Some(index);
     }
     true
+}
+
+/// Where one pass of a shift-click may send a stack, in order, with whether
+/// each is filled from the far end.
+///
+/// Two at most, because vanilla's longest arm is two `moveItemStackTo` calls
+/// and a fixed array costs no allocation on a path that runs per click.
+type Destinations = [Option<(std::ops::Range<usize>, bool)>; 2];
+
+/// Whether a click may write this storage slot at all.
+///
+/// The two crafting outputs are not among them: a click there takes the result
+/// of a recipe and pays for it out of the grid, which is
+/// [`Inventory::pickup_result`] and not a write.
+fn writable(index: usize) -> bool {
+    index != CRAFTING_OUTPUT && index != TABLE_OUTPUT && index < STORAGE
 }
 
 /// One stack: an item, how many of it, and what makes it that one.
@@ -417,9 +451,80 @@ impl Stack {
 /// The slots of one player's container.
 pub type Slots = [Option<Stack>; SLOTS];
 
+/// Which window a click names, and therefore what its slot numbers mean.
+///
+/// A window is a *numbering*, not a container. Both of these are views onto
+/// the same [`Inventory`], which is why the seven click modes are written once
+/// — they work in storage indices, and the only thing a window changes is
+/// which storage index a wire slot number reaches and where a shift-click
+/// sends it. A second implementation of the modes for the crafting table would
+/// be two readers of one set of rules, and the pair would drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Window {
+    /// The player's own container, `0..=45`, which is always open.
+    Player,
+    /// A crafting table: `0` the result, `1..=9` the grid, `10..=36` the
+    /// player's main inventory and `37..=45` their hotbar. No armour and no
+    /// offhand — a crafting table cannot see either.
+    Table,
+}
+
+impl Window {
+    /// How many slots this window numbers. Forty-six for both, and they are
+    /// not the same forty-six.
+    #[must_use]
+    pub fn slot_count(self) -> usize {
+        SLOTS
+    }
+
+    /// The storage index a wire slot number reaches, or `None` for a number
+    /// this window does not have.
+    #[must_use]
+    pub fn storage(self, slot: usize) -> Option<usize> {
+        match self {
+            Self::Player => (slot < SLOTS).then_some(slot),
+            Self::Table => Some(match slot {
+                0 => TABLE_OUTPUT,
+                1..=9 => TABLE_GRID_START + slot - 1,
+                10..=36 => MAIN_START + slot - 10,
+                37..=45 => HOTBAR_START + slot - 37,
+                _ => return None,
+            }),
+        }
+    }
+
+    /// The wire slot number a storage index appears at, or `None` for a slot
+    /// this window cannot see — the armour and the offhand, to a table.
+    #[must_use]
+    pub fn wire(self, storage: usize) -> Option<usize> {
+        match self {
+            Self::Player => (storage < SLOTS).then_some(storage),
+            Self::Table => Some(match storage {
+                TABLE_OUTPUT => 0,
+                TABLE_GRID_START..=54 => storage - TABLE_GRID_START + 1,
+                MAIN_START..=35 => storage - MAIN_START + 10,
+                HOTBAR_START..=44 => storage - HOTBAR_START + 37,
+                _ => return None,
+            }),
+        }
+    }
+
+    /// The output slot this window's grid fills, and the grid that fills it.
+    fn crafting(self) -> (usize, std::ops::Range<usize>, usize) {
+        match self {
+            Self::Player => (
+                CRAFTING_OUTPUT,
+                CRAFTING_START..CRAFTING_END,
+                CRAFTING_WIDTH,
+            ),
+            Self::Table => (TABLE_OUTPUT, TABLE_GRID_START..TABLE_GRID_END, TABLE_WIDTH),
+        }
+    }
+}
+
 /// Which slots a click moved, as a bitmask.
 ///
-/// Forty-six slots fit in a `u64` with room to spare, so "what changed" is a
+/// Fifty-six slots fit in a `u64` with room to spare, so "what changed" is a
 /// register rather than a `Vec`. That is not a micro-optimisation for its own
 /// sake: this is returned from every click, and a click that allocated to
 /// report that one slot moved would allocate once per click per player.
@@ -431,7 +536,7 @@ pub struct Changed {
 
 impl Changed {
     fn mark(&mut self, slot: usize) {
-        debug_assert!(slot < SLOTS);
+        debug_assert!(slot < STORAGE);
         self.slots |= 1u64 << slot;
     }
 
@@ -442,7 +547,7 @@ impl Changed {
     /// Whether this slot moved.
     #[must_use]
     pub fn has(self, slot: usize) -> bool {
-        slot < SLOTS && self.slots & (1u64 << slot) != 0
+        slot < STORAGE && self.slots & (1u64 << slot) != 0
     }
 
     /// Whether the cursor moved.
@@ -459,7 +564,7 @@ impl Changed {
 
     /// The slots that moved, in ascending order.
     pub fn iter(self) -> impl Iterator<Item = usize> {
-        (0..SLOTS).filter(move |slot| self.has(*slot))
+        (0..STORAGE).filter(move |slot| self.has(*slot))
     }
 }
 
@@ -499,7 +604,7 @@ impl Drag {
 /// Everything one player is carrying.
 #[derive(Debug, Clone)]
 pub struct Inventory {
-    slots: Slots,
+    slots: [Option<Stack>; STORAGE],
     /// What the player has picked up with the mouse. Not a slot: it belongs to
     /// the click protocol rather than the container, and it is sent in its own
     /// field of every packet that carries the container.
@@ -540,11 +645,14 @@ impl Inventory {
     /// An inventory holding what was saved.
     #[must_use]
     pub fn restored(slots: Slots, selected: u8) -> Self {
-        Self {
-            slots,
+        let mut inventory = Self {
             selected: usize::from(selected).min(HOTBAR_SLOTS - 1),
             ..Self::default()
+        };
+        for (index, stack) in slots.into_iter().enumerate() {
+            inventory.slots[index] = stack;
         }
+        inventory
     }
 
     /// The same container, able to craft.
@@ -557,15 +665,45 @@ impl Inventory {
         // A restored container can have something already in its grid: a
         // player who logged out mid-craft comes back to the output they left,
         // rather than to an empty slot that fills only once they touch it.
-        self.refresh_output(&mut Changed::default());
+        self.refresh_output(Window::Player, &mut Changed::default());
         self
     }
 
-    /// Every slot, in vanilla's numbering. Borrowed, never copied: this is read
-    /// to build the join packet and to write the save.
+    /// The player's own forty-six slots, in vanilla's numbering. Borrowed,
+    /// never copied: this is read to build the join packet and to write the
+    /// save.
+    ///
+    /// The ten a crafting table adds are deliberately not among them. They are
+    /// the table's, not the player's, and a save that wrote them would restore
+    /// a player holding the contents of a block they were standing at.
     #[must_use]
-    pub fn slots(&self) -> &Slots {
-        &self.slots
+    pub fn slots(&self) -> &[Option<Stack>] {
+        &self.slots[..SLOTS]
+    }
+
+    /// The same forty-six as an array, for the save record that holds one —
+    /// **with anything in an open crafting table's grid folded back in.**
+    ///
+    /// A player who is dropped mid-craft never gets a close packet, and the
+    /// nine slots of a table's grid are not theirs to save under their own
+    /// name. Folding is the only reading of "what this player owns" that
+    /// cannot lose an item: the fold is a projection and is never written back
+    /// here, so a player who *does* close the window has the same items moved
+    /// into the same slots and recorded again, with nothing doubled.
+    ///
+    /// The fold costs a clone of the container and only happens when the grid
+    /// holds something, which is a few seconds of a session at most.
+    #[must_use]
+    pub fn saved(&self) -> Slots {
+        if self.slots[TABLE_GRID_START..TABLE_GRID_END]
+            .iter()
+            .all(Option::is_none)
+        {
+            return std::array::from_fn(|index| self.slots[index].clone());
+        }
+        let mut folded = self.clone();
+        folded.closed(Window::Table);
+        std::array::from_fn(|index| folded.slots[index].clone())
     }
 
     /// What one slot holds. Borrowed: a stack carries its components and a
@@ -685,7 +823,7 @@ impl Inventory {
         // already draws that one; slot 0 it did not write, so the caller sends
         // that one back.
         if (CRAFTING_START..CRAFTING_END).contains(&index) {
-            self.refresh_output(&mut changed);
+            self.refresh_output(Window::Player, &mut changed);
         }
         Ok(changed)
     }
@@ -700,7 +838,7 @@ impl Inventory {
     /// and reports nothing changed. That is deliberate and it is the safe
     /// direction: the caller re-syncs on a click it did not understand, which
     /// costs a packet, where guessing costs the player an item.
-    pub fn click(&mut self, mode: ClickMode, slot: i16, button: i8) -> Changed {
+    pub fn click(&mut self, window: Window, mode: ClickMode, slot: i16, button: i8) -> Changed {
         let mut changed = Changed::default();
         // Any click that is not the next step of a drag ends the drag. Vanilla
         // does the same, and the reason is that the drag's three packets are
@@ -710,22 +848,35 @@ impl Inventory {
         if mode != ClickMode::QuickCraft && self.drag.active {
             self.drag.reset();
         }
+        // Every mode below works in *storage* indices; the window is what
+        // turns a wire number into one. A number this window does not have
+        // reaches nothing and changes nothing.
+        let named = usize::try_from(slot)
+            .ok()
+            .and_then(|slot| window.storage(slot));
         match mode {
-            ClickMode::Pickup => self.pickup(slot, button, &mut changed),
-            ClickMode::QuickMove => self.quick_move(slot, &mut changed),
-            ClickMode::Swap => self.swap(slot, button, &mut changed),
-            ClickMode::Clone => self.clone_slot(slot, &mut changed),
-            ClickMode::Throw => self.throw(slot, button, &mut changed),
-            ClickMode::QuickCraft => self.quick_craft(slot, button, &mut changed),
-            ClickMode::PickupAll => self.pickup_all(button, &mut changed),
+            ClickMode::Pickup => self.pickup(window, slot, named, button, &mut changed),
+            ClickMode::QuickMove => self.quick_move(window, named, &mut changed),
+            ClickMode::Swap => self.swap(window, named, button, &mut changed),
+            ClickMode::Clone => self.clone_slot(named, &mut changed),
+            ClickMode::Throw => self.throw(window, named, button, &mut changed),
+            ClickMode::QuickCraft => self.quick_craft(window, named, button, &mut changed),
+            ClickMode::PickupAll => self.pickup_all(window, button, &mut changed),
         }
         // The output is a function of the grid, so it is recomputed whenever
         // the grid moved and never otherwise. A player arranging ingredients
         // makes one lookup per click that touches a grid slot, and none at all
         // for the other forty-one slots — which is the difference between an
         // index and a scan of every recipe on every click.
-        if (CRAFTING_START..CRAFTING_END).any(|slot| changed.has(slot)) {
-            self.refresh_output(&mut changed);
+        //
+        // Both grids are asked, not just the open window's: the player's own
+        // 2x2 keeps whatever was in it while a table is open, and a click that
+        // somehow moved it has to leave its output right.
+        for window in [Window::Player, Window::Table] {
+            let (_, grid, _) = window.crafting();
+            if grid.clone().any(|slot| changed.has(slot)) {
+                self.refresh_output(window, &mut changed);
+            }
         }
         changed
     }
@@ -735,22 +886,28 @@ impl Inventory {
     /// A container with no recipes leaves the slot alone rather than emptying
     /// it: it has no opinion, and clearing a slot it cannot fill would be a
     /// server with no data path deleting whatever a save had put there.
-    fn refresh_output(&mut self, changed: &mut Changed) {
+    fn refresh_output(&mut self, window: Window, changed: &mut Changed) {
         let Some(recipes) = self.recipes.as_ref() else {
             return;
         };
-        let mut cells = [None; CRAFTING_END - CRAFTING_START];
-        for (cell, slot) in cells.iter_mut().zip(CRAFTING_START..CRAFTING_END) {
-            *cell = self.slots[slot].as_ref().map(|stack| stack.item);
+        let (output, grid, width) = window.crafting();
+        // Nine at most, and a 2x2 uses the first four. A fixed array rather
+        // than a `Vec`, because this runs on every click that moves a grid
+        // slot and a lookup that allocated would allocate per keystroke.
+        let mut cells = [None; TABLE_WIDTH * TABLE_WIDTH];
+        let mut filled = 0;
+        for slot in grid {
+            cells[filled] = self.slots[slot].as_ref().map(|stack| stack.item);
+            filled += 1;
         }
-        let height = cells.len() / CRAFTING_WIDTH;
-        let made = recipes.find(CRAFTING_WIDTH, height, &cells).map(|recipe| {
+        let height = filled / width;
+        let made = recipes.find(width, height, &cells[..filled]).map(|recipe| {
             let (item, count) = recipe.result();
             Stack::new(item, count)
         });
-        if self.slots[CRAFTING_OUTPUT] != made {
-            self.slots[CRAFTING_OUTPUT] = made;
-            changed.mark(CRAFTING_OUTPUT);
+        if self.slots[output] != made {
+            self.slots[output] = made;
+            changed.mark(output);
         }
     }
 
@@ -761,8 +918,9 @@ impl Inventory {
     /// there is no path on which the grid is spent and nothing comes back —
     /// which is the one failure crafting must not have. See decision record
     /// 0031.
-    fn take_result(&mut self, changed: &mut Changed) {
-        for index in CRAFTING_START..CRAFTING_END {
+    fn take_result(&mut self, window: Window, changed: &mut Changed) {
+        let (_, grid, _) = window.crafting();
+        for index in grid {
             let Some(mut stack) = self.slots[index].clone() else {
                 continue;
             };
@@ -787,7 +945,7 @@ impl Inventory {
                 Some(_) => self.give(left, changed),
             }
         }
-        self.refresh_output(changed);
+        self.refresh_output(window, changed);
     }
 
     /// What a player's window close does to what they were holding.
@@ -797,13 +955,14 @@ impl Inventory {
     /// where they fit — which is better for the player than deleting them and
     /// is the only difference from vanilla in this file. What does not fit is
     /// lost, and there is nowhere else for it to go.
-    pub fn closed(&mut self) -> Changed {
+    pub fn closed(&mut self, window: Window) -> Changed {
         let mut changed = Changed::default();
         if let Some(stack) = self.cursor.take() {
             changed.mark_cursor();
             self.give(stack, &mut changed);
         }
-        for index in CRAFTING_START..CRAFTING_END {
+        let (output, grid, _) = window.crafting();
+        for index in grid {
             if let Some(stack) = self.slots[index].take() {
                 changed.mark(index);
                 self.give(stack, &mut changed);
@@ -814,8 +973,8 @@ impl Inventory {
         // was only ever a picture of what *would* be, and handing it over
         // would be a free item for every player who opened their inventory,
         // put a log in and closed it again.
-        if self.slots[CRAFTING_OUTPUT].take().is_some() {
-            changed.mark(CRAFTING_OUTPUT);
+        if self.slots[output].take().is_some() {
+            changed.mark(output);
         }
         changed
     }
@@ -904,7 +1063,14 @@ impl Inventory {
 
     // -- the seven modes ---------------------------------------------------
 
-    fn pickup(&mut self, slot: i16, button: i8, changed: &mut Changed) {
+    fn pickup(
+        &mut self,
+        window: Window,
+        slot: i16,
+        named: Option<usize>,
+        button: i8,
+        changed: &mut Changed,
+    ) {
         if slot == OUTSIDE {
             // Clicked the world behind the window with something on the
             // cursor. Left drops it all, right drops one.
@@ -922,13 +1088,16 @@ impl Inventory {
             }
             return;
         }
-        if slot == CRAFTING_OUTPUT as i16 {
-            self.pickup_result(button, changed);
-            return;
-        }
-        let Some(index) = self.writable(slot) else {
+        let Some(index) = named else {
             return;
         };
+        if index == window.crafting().0 {
+            self.pickup_result(window, button, changed);
+            return;
+        }
+        if !writable(index) {
+            return;
+        }
         match button {
             0 => self.pickup_left(index, changed),
             1 => self.pickup_right(index, changed),
@@ -952,11 +1121,11 @@ impl Inventory {
     /// hands over four. Priority 1: a click that silently deletes half a craft
     /// is the single worst thing an inventory can do to a player, and no
     /// player has ever right-clicked the output *wanting* half.
-    fn pickup_result(&mut self, button: i8, changed: &mut Changed) {
+    fn pickup_result(&mut self, window: Window, button: i8, changed: &mut Changed) {
         if !(0..=1).contains(&button) {
             return;
         }
-        let Some(made) = self.slots[CRAFTING_OUTPUT].clone() else {
+        let Some(made) = self.slots[window.crafting().0].clone() else {
             return;
         };
         match self.cursor.clone() {
@@ -975,7 +1144,7 @@ impl Inventory {
             }
         }
         changed.mark_cursor();
-        self.take_result(changed);
+        self.take_result(window, changed);
     }
 
     fn pickup_left(&mut self, index: usize, changed: &mut Changed) {
@@ -1084,25 +1253,32 @@ impl Inventory {
     /// to the hotbar. A single pass leaves eight heads sitting in the slot the
     /// player shift-clicked, which is what this did until a real server was
     /// asked.
-    fn quick_move(&mut self, slot: i16, changed: &mut Changed) {
-        let Ok(index) = usize::try_from(slot) else {
+    fn quick_move(&mut self, window: Window, named: Option<usize>, changed: &mut Changed) {
+        let Some(index) = named else {
             return;
         };
-        if index >= SLOTS {
-            return;
-        }
-        if index == CRAFTING_OUTPUT {
-            self.quick_move_result(changed);
+        if index == window.crafting().0 {
+            self.quick_move_result(window, changed);
             return;
         }
         loop {
             let Some(mut stack) = self.slots[index].clone() else {
                 return;
             };
-            let destination = self.quick_move_destination(index, stack.item);
+            let destinations = self.quick_move_destination(window, index, stack.item);
             self.slots[index] = None;
             let before = stack.count;
-            self.move_to(destination, &mut stack, changed);
+            // Vanilla writes this as `if (!moveItemStackTo(a)) moveItemStackTo(b)`,
+            // and the `!` is the rule: the second destination is tried only
+            // when the first took *nothing*, not when it took some. A
+            // shift-clicked stack that half fits into a crafting grid does not
+            // spill its other half into the hotbar.
+            for destination in destinations.into_iter().flatten() {
+                self.move_into(destination.0, &mut stack, changed, destination.1);
+                if stack.count != before {
+                    break;
+                }
+            }
             if stack.count == before {
                 // Nowhere for any of it to go. Vanilla leaves the slot alone
                 // and so does this: a shift-click that moves nothing must not
@@ -1142,9 +1318,9 @@ impl Inventory {
     /// shrink its own inputs.
     ///
     /// [`quick_move`]: Inventory::quick_move
-    fn quick_move_result(&mut self, changed: &mut Changed) {
+    fn quick_move_result(&mut self, window: Window, changed: &mut Changed) {
         loop {
-            let Some(made) = self.slots[CRAFTING_OUTPUT].clone() else {
+            let Some(made) = self.slots[window.crafting().0].clone() else {
                 return;
             };
             // Tried against a copy first. `move_to` mutates what it is given
@@ -1163,7 +1339,7 @@ impl Inventory {
             // planks expects them under their hand.
             self.move_to_reversed(MAIN_START..HOTBAR_END, &mut stack, changed);
             debug_assert_eq!(stack.count, 0, "room_for said the whole stack fits");
-            self.take_result(changed);
+            self.take_result(window, changed);
         }
     }
 
@@ -1204,7 +1380,35 @@ impl Inventory {
     /// - the main inventory goes to the hotbar,
     /// - the hotbar goes to the main inventory,
     /// - anything else — the offhand — goes to the inventory as a whole.
-    fn quick_move_destination(&self, index: usize, item: Item) -> std::ops::Range<usize> {
+    fn quick_move_destination(&self, window: Window, index: usize, item: Item) -> Destinations {
+        match window {
+            Window::Player => [Some((self.player_destination(index, item), false)), None],
+            // `CraftingMenu.quickMoveStack`, arm for arm. The grid is tried
+            // *first* for anything coming out of the player's half, which is
+            // the arm a player feels: shift-clicking planks with a table open
+            // lays them into the grid rather than shuffling them between the
+            // hotbar and the inventory.
+            Window::Table => {
+                if (TABLE_GRID_START..TABLE_GRID_END).contains(&index) {
+                    [Some((MAIN_START..HOTBAR_END, false)), None]
+                } else if (MAIN_START..MAIN_END).contains(&index) {
+                    [
+                        Some((TABLE_GRID_START..TABLE_GRID_END, false)),
+                        Some((HOTBAR_START..HOTBAR_END, false)),
+                    ]
+                } else {
+                    [
+                        Some((TABLE_GRID_START..TABLE_GRID_END, false)),
+                        Some((MAIN_START..MAIN_END, false)),
+                    ]
+                }
+            }
+        }
+    }
+
+    /// `InventoryMenu.quickMoveStack`, which is the arm the player's own
+    /// window uses and the only one with an opinion about armour.
+    fn player_destination(&self, index: usize, item: Item) -> std::ops::Range<usize> {
         if index < ARMOUR_END {
             return MAIN_START..HOTBAR_END;
         }
@@ -1227,9 +1431,14 @@ impl Inventory {
     /// in hotbar slot 0 does nothing at all, and pressing it with a helmet
     /// there swaps. A real server does exactly that, and a server that swapped
     /// anyway is a player wearing a block.
-    fn swap(&mut self, slot: i16, button: i8, changed: &mut Changed) {
-        let named = usize::try_from(slot).ok().filter(|index| *index < SLOTS);
+    fn swap(&mut self, window: Window, named: Option<usize>, button: i8, changed: &mut Changed) {
+        // The button numbers the *player's* hotbar however a table renumbers
+        // everything else, because it is a key press and not a slot: pressing
+        // 1 with a crafting table open still means the first hotbar slot.
         let other = if button == SWAP_OFFHAND_BUTTON {
+            // Which a crafting table cannot reach at all: F over a table menu
+            // swaps with the offhand on a real server because the offhand is
+            // still the player's, and the menu's own numbering never names it.
             OFFHAND
         } else if (0..HOTBAR_SLOTS as i8).contains(&button) {
             HOTBAR_START + button as usize
@@ -1241,8 +1450,11 @@ impl Inventory {
         // because nothing may be put into the output. Vanilla's `doClick`
         // reaches the same place by asking `mayPlace` of the hotbar's stack
         // and finding it false.
-        if named == Some(CRAFTING_OUTPUT) {
-            let Some(made) = self.slots[CRAFTING_OUTPUT].clone() else {
+        let Some(index) = named else {
+            return;
+        };
+        if index == window.crafting().0 {
+            let Some(made) = self.slots[index].clone() else {
                 return;
             };
             if self.slots[other].is_some() {
@@ -1250,12 +1462,12 @@ impl Inventory {
             }
             self.slots[other] = Some(made);
             changed.mark(other);
-            self.take_result(changed);
+            self.take_result(window, changed);
             return;
         }
-        let Some(index) = self.writable(slot) else {
+        if !writable(index) {
             return;
-        };
+        }
         if other == index {
             return;
         }
@@ -1299,8 +1511,8 @@ impl Inventory {
     /// Every player on this server is in creative, which is the condition
     /// vanilla gates this on. The count is the item's maximum and not 64 —
     /// middle-clicking a bucket gives one bucket.
-    fn clone_slot(&mut self, slot: i16, changed: &mut Changed) {
-        let Some(index) = self.writable(slot) else {
+    fn clone_slot(&mut self, named: Option<usize>, changed: &mut Changed) {
+        let Some(index) = named.filter(|index| writable(*index)) else {
             return;
         };
         if self.cursor.is_some() {
@@ -1317,7 +1529,7 @@ impl Inventory {
     }
 
     /// Q and control-Q. The item is destroyed: see this module's header.
-    fn throw(&mut self, slot: i16, button: i8, changed: &mut Changed) {
+    fn throw(&mut self, window: Window, named: Option<usize>, button: i8, changed: &mut Changed) {
         if self.cursor.is_some() {
             // Vanilla ignores a throw while something is on the cursor — that
             // gesture is the outside-click drop instead.
@@ -1329,18 +1541,21 @@ impl Inventory {
         // matches it. What reaches the floor differs between the two buttons
         // on a real server and reaches no floor at all here, which is what
         // every other Q in this file already does.
-        if slot == CRAFTING_OUTPUT as i16 && (0..=1).contains(&button) {
-            if self.slots[CRAFTING_OUTPUT].is_none() {
-                return;
-            }
-            self.slots[CRAFTING_OUTPUT] = None;
-            changed.mark(CRAFTING_OUTPUT);
-            self.take_result(changed);
-            return;
-        }
-        let Some(index) = self.writable(slot) else {
+        let Some(index) = named else {
             return;
         };
+        if index == window.crafting().0 && (0..=1).contains(&button) {
+            if self.slots[index].is_none() {
+                return;
+            }
+            self.slots[index] = None;
+            changed.mark(index);
+            self.take_result(window, changed);
+            return;
+        }
+        if !writable(index) {
+            return;
+        }
         let Some(mut there) = self.slots[index].clone() else {
             return;
         };
@@ -1361,7 +1576,13 @@ impl Inventory {
     /// where step 0 starts, 1 adds a slot and 2 ends. Anything out of order
     /// resets, which is vanilla's rule and the one that keeps a dropped packet
     /// from turning into items nobody placed.
-    fn quick_craft(&mut self, slot: i16, button: i8, changed: &mut Changed) {
+    fn quick_craft(
+        &mut self,
+        _window: Window,
+        named: Option<usize>,
+        button: i8,
+        changed: &mut Changed,
+    ) {
         let (kind, step) = (button / 4, button % 4);
         if !(0..=2).contains(&kind) || !(0..=2).contains(&step) {
             self.drag.reset();
@@ -1379,7 +1600,7 @@ impl Inventory {
                     self.drag.reset();
                     return;
                 }
-                let Some(index) = self.writable(slot) else {
+                let Some(index) = named.filter(|index| writable(*index)) else {
                     return;
                 };
                 // A slot only joins the drag if the cursor's item could go
@@ -1471,7 +1692,7 @@ impl Inventory {
     /// Two passes, because vanilla makes two: partial stacks first, so that
     /// double-clicking with a half stack tidies the loose ones up instead of
     /// breaking a full stack somewhere else in the inventory.
-    fn pickup_all(&mut self, button: i8, changed: &mut Changed) {
+    fn pickup_all(&mut self, window: Window, button: i8, changed: &mut Changed) {
         let Some(mut held) = self.cursor.clone() else {
             return;
         };
@@ -1480,11 +1701,21 @@ impl Inventory {
         }
         let max = held.item.max_stack_size();
         for pass in 0..2 {
-            for step in 0..SLOTS {
+            for step in 0..window.slot_count() {
                 // Button 1 is the same gesture from the other end of the
-                // container, which is what vanilla's `reverse` flag means.
-                let index = if button == 1 { SLOTS - 1 - step } else { step };
-                if index == CRAFTING_OUTPUT {
+                // container, which is what vanilla's `reverse` flag means —
+                // and the end it starts from is the *window's*, so a
+                // double-click with a table open gathers across the table's
+                // numbering and never touches the armour.
+                let slot = if button == 1 {
+                    window.slot_count() - 1 - step
+                } else {
+                    step
+                };
+                let Some(index) = window.storage(slot) else {
+                    continue;
+                };
+                if !writable(index) {
                     continue;
                 }
                 let Some(mut there) = self.slots[index].clone() else {
@@ -1523,11 +1754,6 @@ impl Inventory {
     ///
     /// The crafting output is not one: a click there in vanilla takes the
     /// result of a recipe, and there is no recipe here to have produced it.
-    fn writable(&self, slot: i16) -> Option<usize> {
-        let index = usize::try_from(slot).ok()?;
-        (index != CRAFTING_OUTPUT && index < SLOTS).then_some(index)
-    }
-
     /// Vanilla's `AbstractContainerMenu.moveItemStackTo`, which is what every
     /// shift-click and every put-it-back is made of.
     ///
@@ -1541,10 +1767,6 @@ impl Inventory {
     /// Both passes ask [`slot_limit`] rather than the item's own maximum, and
     /// the second asks [`may_place`]. Neither matters for a range inside the
     /// inventory; both matter for the one-slot range an armour move uses.
-    fn move_to(&mut self, range: std::ops::Range<usize>, stack: &mut Stack, changed: &mut Changed) {
-        self.move_into(range, stack, changed, false);
-    }
-
     /// The same, from the far end. Vanilla's `reverse` flag, and slot 0's
     /// shift-click is the one caller that sets it — see [`quick_move_result`].
     ///
@@ -1846,6 +2068,17 @@ mod tests {
         recipes
             .add("test:crafting_table", &table, &Default::default())
             .expect("compiles");
+        // Three wide, so it cannot be made in the 2x2 a player carries. This
+        // is the recipe the crafting table exists for.
+        let chest = serde_json::json!({
+            "type": "minecraft:crafting_shaped",
+            "pattern": ["###", "# #", "###"],
+            "key": {"#": {"item": "minecraft:oak_planks"}},
+            "result": {"id": "minecraft:chest", "count": 1}
+        });
+        recipes
+            .add("test:chest", &chest, &Default::default())
+            .expect("compiles");
         recipes.index();
         std::sync::Arc::new(recipes)
     }
@@ -1944,8 +2177,8 @@ mod tests {
         let mut inventory = crafting(&[(MAIN_START, log(), 1)]);
         assert_eq!(inventory.slot(CRAFTING_OUTPUT), None);
         // Pick the log up and put it in the grid.
-        inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
-        let changed = inventory.click(ClickMode::Pickup, CRAFTING_START as i16, 0);
+        inventory.click(Window::Player, ClickMode::Pickup, MAIN_START as i16, 0);
+        let changed = inventory.click(Window::Player, ClickMode::Pickup, CRAFTING_START as i16, 0);
         assert!(
             changed.has(CRAFTING_OUTPUT),
             "the output moved with the grid"
@@ -1955,7 +2188,7 @@ mod tests {
             Some(Stack::new(planks(), 4))
         );
         // Take it back out again and the output empties.
-        let changed = inventory.click(ClickMode::Pickup, CRAFTING_START as i16, 0);
+        let changed = inventory.click(Window::Player, ClickMode::Pickup, CRAFTING_START as i16, 0);
         assert!(changed.has(CRAFTING_OUTPUT));
         assert_eq!(inventory.slot(CRAFTING_OUTPUT), None);
     }
@@ -1966,7 +2199,7 @@ mod tests {
     #[test]
     fn without_recipes_the_output_never_fills() {
         let mut inventory = with(&[(CRAFTING_START, log(), 1)]);
-        inventory.click(ClickMode::Pickup, CRAFTING_START as i16, 1);
+        inventory.click(Window::Player, ClickMode::Pickup, CRAFTING_START as i16, 1);
         assert_eq!(inventory.slot(CRAFTING_OUTPUT), None);
     }
 
@@ -1982,7 +2215,12 @@ mod tests {
                 inventory.slot(CRAFTING_OUTPUT).cloned(),
                 Some(Stack::new(planks(), 4))
             );
-            inventory.click(ClickMode::Pickup, CRAFTING_OUTPUT as i16, button);
+            inventory.click(
+                Window::Player,
+                ClickMode::Pickup,
+                CRAFTING_OUTPUT as i16,
+                button,
+            );
             assert_eq!(inventory.cursor().cloned(), Some(Stack::new(planks(), 4)));
             assert_eq!(
                 inventory.slot(CRAFTING_START).cloned(),
@@ -2001,8 +2239,8 @@ mod tests {
     #[test]
     fn the_output_takes_nothing_a_player_puts_there() {
         let mut inventory = crafting(&[(MAIN_START, planks(), 4)]);
-        inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
-        let changed = inventory.click(ClickMode::Pickup, CRAFTING_OUTPUT as i16, 0);
+        inventory.click(Window::Player, ClickMode::Pickup, MAIN_START as i16, 0);
+        let changed = inventory.click(Window::Player, ClickMode::Pickup, CRAFTING_OUTPUT as i16, 0);
         assert!(changed.is_empty());
         assert_eq!(inventory.cursor().cloned(), Some(Stack::new(planks(), 4)));
         assert_eq!(inventory.slot(CRAFTING_OUTPUT), None);
@@ -2014,13 +2252,13 @@ mod tests {
     #[test]
     fn the_result_pours_onto_a_cursor_holding_the_same_thing() {
         let mut inventory = crafting(&[(CRAFTING_START, log(), 2), (MAIN_START, planks(), 60)]);
-        inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
-        inventory.click(ClickMode::Pickup, CRAFTING_OUTPUT as i16, 0);
+        inventory.click(Window::Player, ClickMode::Pickup, MAIN_START as i16, 0);
+        inventory.click(Window::Player, ClickMode::Pickup, CRAFTING_OUTPUT as i16, 0);
         assert_eq!(inventory.cursor().map(|s| s.count), Some(64));
         assert_eq!(inventory.slot(CRAFTING_START).map(|s| s.count), Some(1));
         // 64 on the cursor and four more coming: no room for the whole result,
         // so nothing happens and the log is still there.
-        let changed = inventory.click(ClickMode::Pickup, CRAFTING_OUTPUT as i16, 0);
+        let changed = inventory.click(Window::Player, ClickMode::Pickup, CRAFTING_OUTPUT as i16, 0);
         assert!(changed.is_empty());
         assert_eq!(inventory.slot(CRAFTING_START).map(|s| s.count), Some(1));
     }
@@ -2030,7 +2268,12 @@ mod tests {
     #[test]
     fn shift_clicking_the_output_crafts_until_the_grid_runs_out() {
         let mut inventory = crafting(&[(CRAFTING_START, log(), 16)]);
-        inventory.click(ClickMode::QuickMove, CRAFTING_OUTPUT as i16, 0);
+        inventory.click(
+            Window::Player,
+            ClickMode::QuickMove,
+            CRAFTING_OUTPUT as i16,
+            0,
+        );
         assert_eq!(inventory.slot(CRAFTING_START), None, "every log spent");
         assert_eq!(inventory.slot(CRAFTING_OUTPUT), None);
         let planks: u32 = (MAIN_START..HOTBAR_END)
@@ -2047,7 +2290,12 @@ mod tests {
     #[test]
     fn a_shift_crafted_stack_fills_the_hotbar_from_the_right() {
         let mut inventory = crafting(&[(CRAFTING_START, log(), 1)]);
-        inventory.click(ClickMode::QuickMove, CRAFTING_OUTPUT as i16, 0);
+        inventory.click(
+            Window::Player,
+            ClickMode::QuickMove,
+            CRAFTING_OUTPUT as i16,
+            0,
+        );
         assert_eq!(
             inventory.slot(HOTBAR_END - 1).cloned(),
             Some(Stack::new(planks(), 4))
@@ -2068,7 +2316,12 @@ mod tests {
             inventory.slots[slot] = Some(Stack::new(stone(), 64));
         }
         inventory.slots[HOTBAR_END - 1] = Some(Stack::new(planks(), 60));
-        inventory.click(ClickMode::QuickMove, CRAFTING_OUTPUT as i16, 0);
+        inventory.click(
+            Window::Player,
+            ClickMode::QuickMove,
+            CRAFTING_OUTPUT as i16,
+            0,
+        );
         assert_eq!(
             inventory.slot(HOTBAR_END - 1).map(|s| s.count),
             Some(64),
@@ -2087,14 +2340,14 @@ mod tests {
     #[test]
     fn a_number_key_over_the_output_takes_the_result() {
         let mut inventory = crafting(&[(CRAFTING_START, log(), 2)]);
-        inventory.click(ClickMode::Swap, CRAFTING_OUTPUT as i16, 0);
+        inventory.click(Window::Player, ClickMode::Swap, CRAFTING_OUTPUT as i16, 0);
         assert_eq!(
             inventory.slot(HOTBAR_START).cloned(),
             Some(Stack::new(planks(), 4))
         );
         assert_eq!(inventory.slot(CRAFTING_START).map(|s| s.count), Some(1));
         // Slot 0 of the hotbar is full now, so the second press does nothing.
-        let changed = inventory.click(ClickMode::Swap, CRAFTING_OUTPUT as i16, 0);
+        let changed = inventory.click(Window::Player, ClickMode::Swap, CRAFTING_OUTPUT as i16, 0);
         assert!(changed.is_empty());
         assert_eq!(inventory.slot(CRAFTING_START).map(|s| s.count), Some(1));
     }
@@ -2105,7 +2358,7 @@ mod tests {
     fn closing_the_window_clears_the_output_it_never_made() {
         let mut inventory = crafting(&[(CRAFTING_START, log(), 1)]);
         assert!(inventory.slot(CRAFTING_OUTPUT).is_some());
-        inventory.closed();
+        inventory.closed(Window::Player);
         assert_eq!(inventory.slot(CRAFTING_OUTPUT), None);
         assert_eq!(
             inventory.slot(HOTBAR_START).cloned(),
@@ -2127,6 +2380,164 @@ mod tests {
         assert_eq!(
             inventory.slot(CRAFTING_OUTPUT).cloned(),
             Some(Stack::new(planks(), 4))
+        );
+    }
+
+    /// The two windows number the same container differently, and every number
+    /// either has resolves back to itself.
+    #[test]
+    fn a_window_and_its_numbering_round_trip() {
+        for window in [Window::Player, Window::Table] {
+            for slot in 0..window.slot_count() {
+                let index = window.storage(slot).expect("every slot resolves");
+                assert_eq!(window.wire(index), Some(slot), "{window:?} slot {slot}");
+            }
+        }
+        // A table's numbering reaches ten slots the player's own cannot see,
+        // and cannot see six the player's own has.
+        assert_eq!(Window::Table.storage(0), Some(TABLE_OUTPUT));
+        assert_eq!(Window::Table.storage(1), Some(TABLE_GRID_START));
+        assert_eq!(Window::Table.storage(10), Some(MAIN_START));
+        assert_eq!(Window::Table.storage(37), Some(HOTBAR_START));
+        assert_eq!(Window::Table.wire(ARMOUR_HEAD), None);
+        assert_eq!(Window::Table.wire(OFFHAND), None);
+        assert_eq!(Window::Table.wire(CRAFTING_OUTPUT), None);
+    }
+
+    /// A three-wide recipe is made in the table and nowhere else.
+    #[test]
+    fn the_table_makes_what_the_players_own_grid_cannot() {
+        let mut inventory = Inventory::default().crafting_with(recipes());
+        // Eight planks around an empty middle, in the table's own numbering.
+        for slot in [1, 2, 3, 4, 6, 7, 8, 9] {
+            let index = Window::Table.storage(slot).expect("a grid slot");
+            inventory.slots[index] = Some(Stack::new(planks(), 1));
+        }
+        let mut changed = Changed::default();
+        inventory.refresh_output(Window::Table, &mut changed);
+        assert_eq!(
+            inventory.slot(TABLE_OUTPUT).map(|stack| stack.item),
+            Item::from_name("minecraft:chest")
+        );
+        // And the player's own 2x2 makes nothing of it.
+        assert_eq!(inventory.slot(CRAFTING_OUTPUT), None);
+    }
+
+    /// Taking the table's result spends the table's grid, not the player's.
+    #[test]
+    fn the_table_pays_out_of_its_own_grid() {
+        let mut inventory = Inventory::default().crafting_with(recipes());
+        inventory.slots[CRAFTING_START] = Some(Stack::new(log(), 4));
+        for slot in [1, 2, 3, 4, 6, 7, 8, 9] {
+            let index = Window::Table.storage(slot).expect("a grid slot");
+            inventory.slots[index] = Some(Stack::new(planks(), 2));
+        }
+        let mut changed = Changed::default();
+        inventory.refresh_output(Window::Player, &mut changed);
+        inventory.refresh_output(Window::Table, &mut changed);
+        // Slot 0 of the table's numbering is the chest.
+        inventory.click(Window::Table, ClickMode::Pickup, 0, 0);
+        assert_eq!(
+            inventory.cursor().map(|stack| stack.item),
+            Item::from_name("minecraft:chest")
+        );
+        assert_eq!(
+            inventory.slot(TABLE_GRID_START).map(|s| s.count),
+            Some(1),
+            "one plank out of each table slot"
+        );
+        assert_eq!(
+            inventory.slot(CRAFTING_START).map(|s| s.count),
+            Some(4),
+            "the player's own grid is untouched"
+        );
+        assert_eq!(
+            inventory.slot(CRAFTING_OUTPUT).cloned(),
+            Some(Stack::new(planks(), 4)),
+            "and its output still says what it makes"
+        );
+    }
+
+    /// Shift-clicking with a table open lays the stack into the grid first,
+    /// which is `CraftingMenu.quickMoveStack`'s own first arm and the one a
+    /// player uses constantly.
+    #[test]
+    fn shift_click_into_an_open_table_fills_its_grid() {
+        let mut inventory = Inventory::default().crafting_with(recipes());
+        inventory.slots[MAIN_START] = Some(Stack::new(planks(), 3));
+        // Menu slot 10 is the first slot of the player's main inventory.
+        inventory.click(Window::Table, ClickMode::QuickMove, 10, 0);
+        assert_eq!(inventory.slot(MAIN_START), None);
+        // The whole stack into one grid slot, not one plank per slot: a
+        // crafting grid slot holds a full stack and `moveItemStackTo` fills
+        // the first empty one it finds and stops. That is what a real server
+        // does with a shift-clicked stack of planks and it is why laying out a
+        // recipe is still a per-slot job.
+        assert_eq!(
+            inventory.slot(TABLE_GRID_START).cloned(),
+            Some(Stack::new(planks(), 3))
+        );
+        assert_eq!(
+            (TABLE_GRID_START..TABLE_GRID_END)
+                .filter(|slot| inventory.slot(*slot).is_some())
+                .count(),
+            1
+        );
+    }
+
+    /// Closing the table hands the grid back and clears its output; the
+    /// player's own 2x2 is left where it was, because closing a table is not
+    /// closing their inventory.
+    #[test]
+    fn closing_the_table_gives_the_grid_back() {
+        let mut inventory = Inventory::default().crafting_with(recipes());
+        inventory.slots[CRAFTING_START] = Some(Stack::new(log(), 1));
+        inventory.slots[TABLE_GRID_START] = Some(Stack::new(planks(), 5));
+        inventory.closed(Window::Table);
+        assert_eq!(inventory.slot(TABLE_GRID_START), None);
+        assert_eq!(
+            inventory.slot(HOTBAR_START).cloned(),
+            Some(Stack::new(planks(), 5))
+        );
+        assert_eq!(
+            inventory.slot(CRAFTING_START).cloned(),
+            Some(Stack::new(log(), 1)),
+            "the player's own grid belongs to the other window"
+        );
+    }
+
+    /// A player dropped mid-craft owns what is in the table's grid. The saved
+    /// form folds it in, and folding it does not move it.
+    #[test]
+    fn what_is_saved_includes_an_open_tables_grid() {
+        let mut inventory = Inventory::default().crafting_with(recipes());
+        inventory.slots[TABLE_GRID_START] = Some(Stack::new(planks(), 7));
+        let saved = inventory.saved();
+        assert_eq!(saved[HOTBAR_START].clone(), Some(Stack::new(planks(), 7)));
+        assert_eq!(
+            inventory.slot(TABLE_GRID_START).cloned(),
+            Some(Stack::new(planks(), 7)),
+            "the fold is a projection and never a move"
+        );
+        // And the ten a table adds are not among the forty-six either way.
+        assert_eq!(saved.len(), SLOTS);
+    }
+
+    /// A double-click with a table open gathers across the table's numbering
+    /// and never reaches the armour.
+    #[test]
+    fn a_double_click_in_a_table_cannot_reach_the_armour() {
+        let mut inventory = Inventory::default().crafting_with(recipes());
+        inventory.slots[ARMOUR_HEAD] = Some(Stack::new(item("minecraft:player_head"), 1));
+        inventory.slots[MAIN_START] = Some(Stack::new(item("minecraft:player_head"), 3));
+        inventory.slots[MAIN_START + 1] = Some(Stack::new(item("minecraft:player_head"), 3));
+        inventory.click(Window::Table, ClickMode::Pickup, 10, 0);
+        inventory.click(Window::Table, ClickMode::PickupAll, 10, 0);
+        assert_eq!(inventory.cursor().map(|s| s.count), Some(6));
+        assert_eq!(
+            inventory.slot(ARMOUR_HEAD).map(|s| s.count),
+            Some(1),
+            "the head on the player's head is behind the screen"
         );
     }
 
@@ -2188,23 +2599,23 @@ mod tests {
         let mut inventory = with(&[(9, stone(), 30), (10, stone(), 50), (11, dirt(), 1)]);
 
         // Take.
-        let changed = inventory.click(ClickMode::Pickup, 9, 0);
+        let changed = inventory.click(Window::Player, ClickMode::Pickup, 9, 0);
         assert_eq!(inventory.cursor().map(|s| s.count), Some(30));
         assert_eq!(inventory.slot(9).cloned(), None);
         assert!(changed.has(9) && changed.cursor());
 
         // Merge: 30 into a stack of 50 leaves 16 in hand and 64 in the slot.
-        inventory.click(ClickMode::Pickup, 10, 0);
+        inventory.click(Window::Player, ClickMode::Pickup, 10, 0);
         assert_eq!(inventory.slot(10).map(|s| s.count), Some(64));
         assert_eq!(inventory.cursor().map(|s| s.count), Some(16));
 
         // Swap: a different item.
-        inventory.click(ClickMode::Pickup, 11, 0);
+        inventory.click(Window::Player, ClickMode::Pickup, 11, 0);
         assert_eq!(inventory.slot(11).cloned(), Some(Stack::new(stone(), 16)));
         assert_eq!(inventory.cursor().cloned(), Some(Stack::new(dirt(), 1)));
 
         // Put down.
-        inventory.click(ClickMode::Pickup, 12, 0);
+        inventory.click(Window::Player, ClickMode::Pickup, 12, 0);
         assert_eq!(inventory.slot(12).cloned(), Some(Stack::new(dirt(), 1)));
         assert_eq!(inventory.cursor().cloned(), None);
     }
@@ -2212,7 +2623,7 @@ mod tests {
     #[test]
     fn right_click_takes_half_rounded_up_and_puts_one_down() {
         let mut inventory = with(&[(9, stone(), 3)]);
-        inventory.click(ClickMode::Pickup, 9, 1);
+        inventory.click(Window::Player, ClickMode::Pickup, 9, 1);
         assert_eq!(
             inventory.cursor().map(|s| s.count),
             Some(2),
@@ -2220,11 +2631,11 @@ mod tests {
         );
         assert_eq!(inventory.slot(9).map(|s| s.count), Some(1));
 
-        inventory.click(ClickMode::Pickup, 10, 1);
+        inventory.click(Window::Player, ClickMode::Pickup, 10, 1);
         assert_eq!(inventory.slot(10).map(|s| s.count), Some(1));
         assert_eq!(inventory.cursor().map(|s| s.count), Some(1));
 
-        inventory.click(ClickMode::Pickup, 10, 1);
+        inventory.click(Window::Player, ClickMode::Pickup, 10, 1);
         assert_eq!(inventory.slot(10).map(|s| s.count), Some(2));
         assert_eq!(inventory.cursor().cloned(), None);
     }
@@ -2232,7 +2643,7 @@ mod tests {
     #[test]
     fn right_click_on_a_single_leaves_the_slot_empty_rather_than_a_stack_of_nothing() {
         let mut inventory = with(&[(9, bucket(), 1)]);
-        inventory.click(ClickMode::Pickup, 9, 1);
+        inventory.click(Window::Player, ClickMode::Pickup, 9, 1);
         assert_eq!(inventory.slot(9).cloned(), None);
         assert_eq!(inventory.cursor().cloned(), Some(Stack::new(bucket(), 1)));
     }
@@ -2240,11 +2651,11 @@ mod tests {
     #[test]
     fn shift_click_sends_the_hotbar_to_the_inventory_and_back() {
         let mut inventory = with(&[(36, stone(), 20)]);
-        inventory.click(ClickMode::QuickMove, 36, 0);
+        inventory.click(Window::Player, ClickMode::QuickMove, 36, 0);
         assert_eq!(inventory.slot(36).cloned(), None);
         assert_eq!(inventory.slot(9).cloned(), Some(Stack::new(stone(), 20)));
 
-        inventory.click(ClickMode::QuickMove, 9, 0);
+        inventory.click(Window::Player, ClickMode::QuickMove, 9, 0);
         assert_eq!(inventory.slot(9).cloned(), None);
         assert_eq!(inventory.slot(36).cloned(), Some(Stack::new(stone(), 20)));
     }
@@ -2257,7 +2668,7 @@ mod tests {
         // fill pass and not one or the other. A server that only filled would
         // put 40 in slot 10 and leave 34 loose.
         let mut inventory = with(&[(36, stone(), 40), (9, stone(), 34)]);
-        inventory.click(ClickMode::QuickMove, 36, 0);
+        inventory.click(Window::Player, ClickMode::QuickMove, 36, 0);
         assert_eq!(inventory.slot(9).map(|s| s.count), Some(64));
         assert_eq!(inventory.slot(10).map(|s| s.count), Some(10));
         assert_eq!(inventory.slot(36).cloned(), None);
@@ -2273,7 +2684,7 @@ mod tests {
             inventory.slots[index] = Some(Stack::new(dirt(), 64));
         }
         inventory.slots[36] = Some(Stack::new(stone(), 5));
-        let changed = inventory.click(ClickMode::QuickMove, 36, 0);
+        let changed = inventory.click(Window::Player, ClickMode::QuickMove, 36, 0);
         assert!(changed.is_empty());
         assert_eq!(inventory.slot(36).cloned(), Some(Stack::new(stone(), 5)));
     }
@@ -2281,11 +2692,11 @@ mod tests {
     #[test]
     fn a_number_key_swaps_with_that_hotbar_slot_and_f_swaps_with_the_offhand() {
         let mut inventory = with(&[(9, stone(), 4), (38, dirt(), 2)]);
-        inventory.click(ClickMode::Swap, 9, 2);
+        inventory.click(Window::Player, ClickMode::Swap, 9, 2);
         assert_eq!(inventory.slot(9).cloned(), Some(Stack::new(dirt(), 2)));
         assert_eq!(inventory.slot(38).cloned(), Some(Stack::new(stone(), 4)));
 
-        inventory.click(ClickMode::Swap, 9, SWAP_OFFHAND_BUTTON);
+        inventory.click(Window::Player, ClickMode::Swap, 9, SWAP_OFFHAND_BUTTON);
         assert_eq!(inventory.slot(9).cloned(), None);
         assert_eq!(
             inventory.slot(OFFHAND).cloned(),
@@ -2296,7 +2707,7 @@ mod tests {
     #[test]
     fn middle_click_clones_a_full_stack_of_that_items_own_maximum() {
         let mut inventory = with(&[(9, stone(), 1), (10, bucket(), 1)]);
-        inventory.click(ClickMode::Clone, 9, 2);
+        inventory.click(Window::Player, ClickMode::Clone, 9, 2);
         assert_eq!(inventory.cursor().cloned(), Some(Stack::new(stone(), 64)));
         assert_eq!(
             inventory.slot(9).cloned(),
@@ -2306,40 +2717,40 @@ mod tests {
 
         // And the number is the item's, not 64.
         let mut inventory = with(&[(10, bucket(), 1)]);
-        inventory.click(ClickMode::Clone, 10, 2);
+        inventory.click(Window::Player, ClickMode::Clone, 10, 2);
         assert_eq!(inventory.cursor().cloned(), Some(Stack::new(bucket(), 1)));
     }
 
     #[test]
     fn q_drops_one_and_control_q_drops_the_stack() {
         let mut inventory = with(&[(36, stone(), 3)]);
-        inventory.click(ClickMode::Throw, 36, 0);
+        inventory.click(Window::Player, ClickMode::Throw, 36, 0);
         assert_eq!(inventory.slot(36).map(|s| s.count), Some(2));
-        inventory.click(ClickMode::Throw, 36, 1);
+        inventory.click(Window::Player, ClickMode::Throw, 36, 1);
         assert_eq!(inventory.slot(36).cloned(), None);
     }
 
     #[test]
     fn clicking_outside_the_window_drops_what_is_on_the_cursor() {
         let mut inventory = with(&[(9, stone(), 4)]);
-        inventory.click(ClickMode::Pickup, 9, 0);
-        inventory.click(ClickMode::Pickup, OUTSIDE, 1);
+        inventory.click(Window::Player, ClickMode::Pickup, 9, 0);
+        inventory.click(Window::Player, ClickMode::Pickup, OUTSIDE, 1);
         assert_eq!(inventory.cursor().map(|s| s.count), Some(3));
-        inventory.click(ClickMode::Pickup, OUTSIDE, 0);
+        inventory.click(Window::Player, ClickMode::Pickup, OUTSIDE, 0);
         assert_eq!(inventory.cursor().cloned(), None);
     }
 
     #[test]
     fn a_left_drag_splits_evenly_and_keeps_the_remainder() {
         let mut inventory = with(&[(9, stone(), 10)]);
-        inventory.click(ClickMode::Pickup, 9, 0);
+        inventory.click(Window::Player, ClickMode::Pickup, 9, 0);
         assert_eq!(inventory.cursor().map(|s| s.count), Some(10));
 
-        inventory.click(ClickMode::QuickCraft, -999, 0);
-        inventory.click(ClickMode::QuickCraft, 10, 1);
-        inventory.click(ClickMode::QuickCraft, 11, 1);
-        inventory.click(ClickMode::QuickCraft, 12, 1);
-        inventory.click(ClickMode::QuickCraft, -999, 2);
+        inventory.click(Window::Player, ClickMode::QuickCraft, -999, 0);
+        inventory.click(Window::Player, ClickMode::QuickCraft, 10, 1);
+        inventory.click(Window::Player, ClickMode::QuickCraft, 11, 1);
+        inventory.click(Window::Player, ClickMode::QuickCraft, 12, 1);
+        inventory.click(Window::Player, ClickMode::QuickCraft, -999, 2);
 
         // Three each, one left over.
         assert_eq!(inventory.slot(10).map(|s| s.count), Some(3));
@@ -2351,11 +2762,11 @@ mod tests {
     #[test]
     fn a_right_drag_puts_one_in_each() {
         let mut inventory = with(&[(9, stone(), 10)]);
-        inventory.click(ClickMode::Pickup, 9, 0);
-        inventory.click(ClickMode::QuickCraft, -999, 4);
-        inventory.click(ClickMode::QuickCraft, 10, 5);
-        inventory.click(ClickMode::QuickCraft, 11, 5);
-        inventory.click(ClickMode::QuickCraft, -999, 6);
+        inventory.click(Window::Player, ClickMode::Pickup, 9, 0);
+        inventory.click(Window::Player, ClickMode::QuickCraft, -999, 4);
+        inventory.click(Window::Player, ClickMode::QuickCraft, 10, 5);
+        inventory.click(Window::Player, ClickMode::QuickCraft, 11, 5);
+        inventory.click(Window::Player, ClickMode::QuickCraft, -999, 6);
         assert_eq!(inventory.slot(10).map(|s| s.count), Some(1));
         assert_eq!(inventory.slot(11).map(|s| s.count), Some(1));
         assert_eq!(inventory.cursor().map(|s| s.count), Some(8));
@@ -2364,13 +2775,13 @@ mod tests {
     #[test]
     fn a_drag_interrupted_by_another_click_applies_nothing() {
         let mut inventory = with(&[(9, stone(), 10)]);
-        inventory.click(ClickMode::Pickup, 9, 0);
-        inventory.click(ClickMode::QuickCraft, -999, 0);
-        inventory.click(ClickMode::QuickCraft, 10, 1);
+        inventory.click(Window::Player, ClickMode::Pickup, 9, 0);
+        inventory.click(Window::Player, ClickMode::QuickCraft, -999, 0);
+        inventory.click(Window::Player, ClickMode::QuickCraft, 10, 1);
         // A pickup arrives mid-drag. The drag is abandoned, and the end that
         // arrives after it does nothing.
-        inventory.click(ClickMode::Pickup, 20, 0);
-        inventory.click(ClickMode::QuickCraft, -999, 2);
+        inventory.click(Window::Player, ClickMode::Pickup, 20, 0);
+        inventory.click(Window::Player, ClickMode::QuickCraft, -999, 2);
         assert_eq!(inventory.slot(10).cloned(), None, "the drag never landed");
         assert_eq!(inventory.slot(20).map(|s| s.count), Some(10));
     }
@@ -2386,9 +2797,9 @@ mod tests {
             (11, stone(), 3),
             (12, stone(), 5),
         ]);
-        inventory.click(ClickMode::Pickup, 12, 0);
+        inventory.click(Window::Player, ClickMode::Pickup, 12, 0);
         assert_eq!(inventory.cursor().map(|s| s.count), Some(5));
-        inventory.click(ClickMode::PickupAll, 12, 0);
+        inventory.click(Window::Player, ClickMode::PickupAll, 12, 0);
         // 5 + 7 + 3 = 15, then 49 taken off the full stack to reach 64.
         assert_eq!(inventory.cursor().map(|s| s.count), Some(64));
         assert_eq!(inventory.slot(10).cloned(), None);
@@ -2399,9 +2810,9 @@ mod tests {
     #[test]
     fn closing_the_window_puts_the_cursor_and_the_grid_back_rather_than_deleting_them() {
         let mut inventory = with(&[(9, stone(), 4), (CRAFTING_START, dirt(), 2)]);
-        inventory.click(ClickMode::Pickup, 9, 0);
+        inventory.click(Window::Player, ClickMode::Pickup, 9, 0);
         assert_eq!(inventory.cursor().map(|s| s.count), Some(4));
-        inventory.closed();
+        inventory.closed(Window::Player);
         assert_eq!(inventory.cursor().cloned(), None);
         assert_eq!(inventory.slot(CRAFTING_START).cloned(), None);
         // Both landed somewhere in the inventory.
@@ -2418,18 +2829,22 @@ mod tests {
     fn a_click_naming_a_slot_that_is_not_one_changes_nothing() {
         let mut inventory = with(&[(9, stone(), 4)]);
         for slot in [-1i16, 46, 1000] {
-            assert!(inventory.click(ClickMode::Pickup, slot, 0).is_empty());
+            assert!(inventory
+                .click(Window::Player, ClickMode::Pickup, slot, 0)
+                .is_empty());
         }
         // And the crafting output, which is a real slot number and still not
         // one a click may take from.
-        assert!(inventory.click(ClickMode::Pickup, 0, 0).is_empty());
+        assert!(inventory
+            .click(Window::Player, ClickMode::Pickup, 0, 0)
+            .is_empty());
         assert_eq!(inventory.slot(9).cloned(), Some(Stack::new(stone(), 4)));
     }
 
     #[test]
     fn the_changed_mask_names_exactly_the_slots_that_moved() {
         let mut inventory = with(&[(9, stone(), 4)]);
-        let changed = inventory.click(ClickMode::Swap, 9, 3);
+        let changed = inventory.click(Window::Player, ClickMode::Swap, 9, 3);
         let moved: Vec<usize> = changed.iter().collect();
         assert_eq!(moved, vec![9, 39]);
         assert!(!changed.cursor());
@@ -2495,23 +2910,28 @@ mod tests {
     #[test]
     fn a_left_click_cannot_put_a_block_on_a_players_head() {
         let mut inventory = with(&[(MAIN_START, stone(), 9)]);
-        inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
-        let changed = inventory.click(ClickMode::Pickup, ARMOUR_HEAD as i16, 0);
+        inventory.click(Window::Player, ClickMode::Pickup, MAIN_START as i16, 0);
+        let changed = inventory.click(Window::Player, ClickMode::Pickup, ARMOUR_HEAD as i16, 0);
         assert!(changed.is_empty(), "a refused click changes nothing");
         assert_eq!(inventory.slot(ARMOUR_HEAD).cloned(), None);
         assert_eq!(inventory.cursor().cloned(), Some(Stack::new(stone(), 9)));
 
         // Boots into the helmet slot are refused for the same reason, and the
         // helmet slot takes the helmet.
-        inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
+        inventory.click(Window::Player, ClickMode::Pickup, MAIN_START as i16, 0);
         let mut inventory = with(&[(MAIN_START, boots(), 1), (MAIN_START + 1, helmet(), 1)]);
-        inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
+        inventory.click(Window::Player, ClickMode::Pickup, MAIN_START as i16, 0);
         assert!(inventory
-            .click(ClickMode::Pickup, ARMOUR_HEAD as i16, 0)
+            .click(Window::Player, ClickMode::Pickup, ARMOUR_HEAD as i16, 0)
             .is_empty());
-        inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
-        inventory.click(ClickMode::Pickup, (MAIN_START + 1) as i16, 0);
-        inventory.click(ClickMode::Pickup, ARMOUR_HEAD as i16, 0);
+        inventory.click(Window::Player, ClickMode::Pickup, MAIN_START as i16, 0);
+        inventory.click(
+            Window::Player,
+            ClickMode::Pickup,
+            (MAIN_START + 1) as i16,
+            0,
+        );
+        inventory.click(Window::Player, ClickMode::Pickup, ARMOUR_HEAD as i16, 0);
         assert_eq!(
             inventory.slot(ARMOUR_HEAD).cloned(),
             Some(Stack::new(helmet(), 1))
@@ -2521,7 +2941,7 @@ mod tests {
     #[test]
     fn shift_click_puts_armour_on_and_takes_it_off_again() {
         let mut inventory = with(&[(MAIN_START, helmet(), 1)]);
-        inventory.click(ClickMode::QuickMove, MAIN_START as i16, 0);
+        inventory.click(Window::Player, ClickMode::QuickMove, MAIN_START as i16, 0);
         assert_eq!(
             inventory.slot(ARMOUR_HEAD).cloned(),
             Some(Stack::new(helmet(), 1))
@@ -2529,7 +2949,7 @@ mod tests {
         assert_eq!(inventory.slot(MAIN_START).cloned(), None);
 
         // Off again, and into the inventory rather than back onto the head.
-        inventory.click(ClickMode::QuickMove, ARMOUR_HEAD as i16, 0);
+        inventory.click(Window::Player, ClickMode::QuickMove, ARMOUR_HEAD as i16, 0);
         assert_eq!(inventory.slot(ARMOUR_HEAD).cloned(), None);
         assert_eq!(
             inventory.slot(MAIN_START).cloned(),
@@ -2543,7 +2963,7 @@ mod tests {
             (ARMOUR_HEAD, helmet(), 1),
             (MAIN_START, item("minecraft:golden_helmet"), 1),
         ]);
-        inventory.click(ClickMode::QuickMove, MAIN_START as i16, 0);
+        inventory.click(Window::Player, ClickMode::QuickMove, MAIN_START as i16, 0);
         assert_eq!(
             inventory.slot(ARMOUR_HEAD).cloned(),
             Some(Stack::new(helmet(), 1))
@@ -2558,14 +2978,14 @@ mod tests {
     fn a_shield_shift_clicks_into_the_offhand_unless_it_is_taken() {
         let shield = item("minecraft:shield");
         let mut inventory = with(&[(MAIN_START, shield, 1)]);
-        inventory.click(ClickMode::QuickMove, MAIN_START as i16, 0);
+        inventory.click(Window::Player, ClickMode::QuickMove, MAIN_START as i16, 0);
         assert_eq!(
             inventory.slot(OFFHAND).cloned(),
             Some(Stack::new(shield, 1))
         );
 
         let mut inventory = with(&[(MAIN_START, shield, 1), (OFFHAND, stone(), 1)]);
-        inventory.click(ClickMode::QuickMove, MAIN_START as i16, 0);
+        inventory.click(Window::Player, ClickMode::QuickMove, MAIN_START as i16, 0);
         assert_eq!(
             inventory.slot(OFFHAND).cloned(),
             Some(Stack::new(stone(), 1))
@@ -2579,12 +2999,17 @@ mod tests {
     #[test]
     fn the_offhand_and_the_crafting_grid_empty_into_the_inventory() {
         let mut inventory = with(&[(OFFHAND, stone(), 9), (CRAFTING_START, stone(), 4)]);
-        inventory.click(ClickMode::QuickMove, OFFHAND as i16, 0);
+        inventory.click(Window::Player, ClickMode::QuickMove, OFFHAND as i16, 0);
         assert_eq!(
             inventory.slot(MAIN_START).cloned(),
             Some(Stack::new(stone(), 9))
         );
-        inventory.click(ClickMode::QuickMove, CRAFTING_START as i16, 0);
+        inventory.click(
+            Window::Player,
+            ClickMode::QuickMove,
+            CRAFTING_START as i16,
+            0,
+        );
         assert_eq!(
             inventory.slot(MAIN_START).cloned(),
             Some(Stack::new(stone(), 13))
@@ -2599,14 +3024,14 @@ mod tests {
             (HOTBAR_START, stone(), 6),
             (HOTBAR_START + 1, item("minecraft:golden_helmet"), 1),
         ]);
-        let changed = inventory.click(ClickMode::Swap, ARMOUR_HEAD as i16, 0);
+        let changed = inventory.click(Window::Player, ClickMode::Swap, ARMOUR_HEAD as i16, 0);
         assert!(changed.is_empty(), "a block cannot be swapped onto a head");
         assert_eq!(
             inventory.slot(ARMOUR_HEAD).cloned(),
             Some(Stack::new(helmet(), 1))
         );
 
-        inventory.click(ClickMode::Swap, ARMOUR_HEAD as i16, 1);
+        inventory.click(Window::Player, ClickMode::Swap, ARMOUR_HEAD as i16, 1);
         assert_eq!(
             inventory.slot(ARMOUR_HEAD).cloned(),
             Some(Stack::new(item("minecraft:golden_helmet"), 1))
@@ -2623,8 +3048,8 @@ mod tests {
         // is 1, so one goes on and the rest stays on the cursor.
         assert_eq!(head().max_stack_size(), 64);
         let mut inventory = with(&[(MAIN_START, head(), 9)]);
-        inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
-        inventory.click(ClickMode::Pickup, ARMOUR_HEAD as i16, 0);
+        inventory.click(Window::Player, ClickMode::Pickup, MAIN_START as i16, 0);
+        inventory.click(Window::Player, ClickMode::Pickup, ARMOUR_HEAD as i16, 0);
         assert_eq!(
             inventory.slot(ARMOUR_HEAD).cloned(),
             Some(Stack::new(head(), 1))
@@ -2636,7 +3061,7 @@ mod tests {
         // sends the other eight to the hotbar. Measured against a real server;
         // a single pass leaves them in the slot that was clicked.
         let mut inventory = with(&[(MAIN_START, head(), 9)]);
-        inventory.click(ClickMode::QuickMove, MAIN_START as i16, 0);
+        inventory.click(Window::Player, ClickMode::QuickMove, MAIN_START as i16, 0);
         assert_eq!(
             inventory.slot(ARMOUR_HEAD).cloned(),
             Some(Stack::new(head(), 1))
@@ -2654,11 +3079,21 @@ mod tests {
         // ordinary slot. The chest slot never joins the drag, so the share is
         // 21/1 and not 21/2 — measured against a real server.
         let mut inventory = with(&[(MAIN_START, stone(), 21)]);
-        inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
-        inventory.click(ClickMode::QuickCraft, OUTSIDE, 0);
-        inventory.click(ClickMode::QuickCraft, ARMOUR_CHEST as i16, 1);
-        inventory.click(ClickMode::QuickCraft, (MAIN_START + 8) as i16, 1);
-        inventory.click(ClickMode::QuickCraft, OUTSIDE, 2);
+        inventory.click(Window::Player, ClickMode::Pickup, MAIN_START as i16, 0);
+        inventory.click(Window::Player, ClickMode::QuickCraft, OUTSIDE, 0);
+        inventory.click(
+            Window::Player,
+            ClickMode::QuickCraft,
+            ARMOUR_CHEST as i16,
+            1,
+        );
+        inventory.click(
+            Window::Player,
+            ClickMode::QuickCraft,
+            (MAIN_START + 8) as i16,
+            1,
+        );
+        inventory.click(Window::Player, ClickMode::QuickCraft, OUTSIDE, 2);
         assert_eq!(inventory.slot(ARMOUR_CHEST).cloned(), None);
         assert_eq!(
             inventory.slot(MAIN_START + 8).cloned(),
@@ -2670,8 +3105,8 @@ mod tests {
     #[test]
     fn a_block_goes_in_the_offhand_because_the_offhand_takes_anything() {
         let mut inventory = with(&[(MAIN_START, stone(), 9), (OFFHAND, dirt(), 2)]);
-        inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
-        inventory.click(ClickMode::Pickup, OFFHAND as i16, 0);
+        inventory.click(Window::Player, ClickMode::Pickup, MAIN_START as i16, 0);
+        inventory.click(Window::Player, ClickMode::Pickup, OFFHAND as i16, 0);
         assert_eq!(
             inventory.slot(OFFHAND).cloned(),
             Some(Stack::new(stone(), 9))
@@ -2689,7 +3124,7 @@ mod tests {
         let mut inventory = Inventory::default();
         inventory.slots[MAIN_START] = Some(stone_with(named(), 16));
         inventory.cursor = Some(stone_with(named(), 16));
-        inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
+        inventory.click(Window::Player, ClickMode::Pickup, MAIN_START as i16, 0);
         assert_eq!(
             inventory.slot(MAIN_START).map(|s| s.count),
             Some(32),
@@ -2700,7 +3135,7 @@ mod tests {
         let mut inventory = Inventory::default();
         inventory.slots[MAIN_START] = Some(stone_with(named(), 16));
         inventory.cursor = Some(stone_with(ComponentPatch::EMPTY, 16));
-        inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
+        inventory.click(Window::Player, ClickMode::Pickup, MAIN_START as i16, 0);
         // A swap, which is what vanilla does with two stacks that are not the
         // same thing. Not a merge, and not a refusal.
         assert_eq!(inventory.slot(MAIN_START).map(|s| s.count), Some(16));
@@ -2723,7 +3158,7 @@ mod tests {
         inventory.slots[HOTBAR_START] = Some(stone_with(ComponentPatch::EMPTY, 60));
         inventory.slots[HOTBAR_START + 1] = Some(stone_with(worn(3), 60));
         inventory.slots[MAIN_START] = Some(stone_with(worn(3), 8));
-        inventory.click(ClickMode::QuickMove, MAIN_START as i16, 0);
+        inventory.click(Window::Player, ClickMode::QuickMove, MAIN_START as i16, 0);
         assert_eq!(inventory.slot(HOTBAR_START).map(|s| s.count), Some(60));
         assert_eq!(inventory.slot(HOTBAR_START + 1).map(|s| s.count), Some(64));
         // The four that did not fit took an empty slot rather than the plain
@@ -2741,7 +3176,7 @@ mod tests {
         inventory.slots[MAIN_START] = Some(stone_with(worn(3), 10));
         inventory.slots[MAIN_START + 1] = Some(stone_with(ComponentPatch::EMPTY, 10));
         inventory.slots[MAIN_START + 2] = Some(stone_with(worn(9), 10));
-        inventory.click(ClickMode::PickupAll, MAIN_START as i16, 0);
+        inventory.click(Window::Player, ClickMode::PickupAll, MAIN_START as i16, 0);
         assert_eq!(inventory.cursor().map(|s| s.count), Some(11));
         assert_eq!(inventory.slot(MAIN_START), None);
         assert_eq!(inventory.slot(MAIN_START + 1).map(|s| s.count), Some(10));
@@ -2758,10 +3193,15 @@ mod tests {
             ..Inventory::default()
         };
         inventory.slots[MAIN_START] = Some(stone_with(ComponentPatch::EMPTY, 1));
-        inventory.click(ClickMode::QuickCraft, OUTSIDE, 0);
-        inventory.click(ClickMode::QuickCraft, MAIN_START as i16, 1);
-        inventory.click(ClickMode::QuickCraft, (MAIN_START + 1) as i16, 1);
-        inventory.click(ClickMode::QuickCraft, OUTSIDE, 2);
+        inventory.click(Window::Player, ClickMode::QuickCraft, OUTSIDE, 0);
+        inventory.click(Window::Player, ClickMode::QuickCraft, MAIN_START as i16, 1);
+        inventory.click(
+            Window::Player,
+            ClickMode::QuickCraft,
+            (MAIN_START + 1) as i16,
+            1,
+        );
+        inventory.click(Window::Player, ClickMode::QuickCraft, OUTSIDE, 2);
         assert_eq!(inventory.slot(MAIN_START).map(|s| s.count), Some(1));
         assert_eq!(inventory.slot(MAIN_START + 1).map(|s| s.count), Some(20));
     }
@@ -2770,7 +3210,7 @@ mod tests {
     fn a_middle_click_copies_the_components_the_way_vanilla_copies_the_stack() {
         let mut inventory = Inventory::default();
         inventory.slots[MAIN_START] = Some(stone_with(named(), 1));
-        inventory.click(ClickMode::Clone, MAIN_START as i16, 0);
+        inventory.click(Window::Player, ClickMode::Clone, MAIN_START as i16, 0);
         assert_eq!(inventory.cursor().map(|s| s.count), Some(64));
         assert_eq!(
             inventory.cursor().map(|s| s.components.clone()),

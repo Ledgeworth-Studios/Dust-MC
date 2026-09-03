@@ -220,8 +220,23 @@ Dust refuses the craft. `--refuse` is the other half, because a recording of
 two servers that both stay silent agrees: it tells the lie a real client tells
 about the output slot and requires the contradiction, at **6 of 6** on both.
 Decision record
-[0033](docs/decisions/0033-what-a-grid-of-items-makes.md) has the counts, the
-three deliberate differences, and what the 3x3 still needs.
+[0033](docs/decisions/0033-what-a-grid-of-items-makes.md) has the counts and
+the three deliberate differences.
+
+**And a crafting table opens.** Right-click one and the 3x3 comes up, which is
+where a pickaxe, a bed, a chest and bread are made. A window is a *numbering*
+and not a second container: the player's forty-six slots and the ten a table
+adds are one array, and one implementation of the seven click modes serves
+both — a table calls its result 0, its grid 1..=9 and the player's hotbar
+37..=45, and cannot name the armour or the offhand at all. Shift-clicking with
+one open lays the stack into the grid first, which is what a player does all
+day. A player dropped mid-craft keeps what was in the grid, because the saved
+form folds it back in. `tools/bot/crafting.js --table` places a table,
+right-clicks it, builds a chest in it and closes it against Dust and against a
+real 1.21.1 server: **17 of 17 snapshots agree**, and 1 of 17 with the
+right-click branch removed. Decision record
+[0034](docs/decisions/0034-how-a-crafting-table-opens.md) says why there is one
+set of rules and not two.
 
 And a fence connects to what it touches, whichever way the wall was built. A
 fence, a wall, a glass pane and a stair take their shape from the six cells
@@ -315,11 +330,14 @@ that caught a bare hand being the right tool for dirt;
 them left out on purpose rather than approximated because a five-fold error
 would break the very agreement that keeps a predicted block from coming back;
 **Q still destroys a stack rather than throwing it**, and item entities are not
-saved, so a restart clears the floor; **no crafting table**, so the 2x2 a
-player carries crafts and every three-wide recipe — a pickaxe, a bed, a chest,
-bread — has nowhere to be made, because a 3x3 needs a window the server opens
-on a right-click and this container is built around the player's own
-forty-six; a stack now carries its data
+saved, so a restart clears the floor; **a crafting table stays open however far
+the player walks**, because the reach check runs when it opens and never
+again — which costs nobody an item, since the grid comes back to them
+whenever they close it; no **furnace, blast furnace,
+smoker, campfire, stonecutter or smithing table**, which is 389 of the 1,290
+recipe files an operator's data pack ships and is a different shape from a
+crafting grid — a furnace has a fuel slot and a burn timer, not a pattern; a
+stack now carries its data
 components, but **nothing in the world reads them**, so every silk-touch and
 fortune branch of every loot table takes its unenchanted side and a broken chest
 drops a chest without its contents; **armour protects from nothing**, since there is no
