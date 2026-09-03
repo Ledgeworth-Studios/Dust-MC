@@ -231,10 +231,19 @@ pub fn scan(region_dir: &Path, expected: &[(i32, i32)], seed: i64) -> Result<Dig
 
 /// The square of chunk coordinates within `radius` of origin, sorted.
 pub fn expected_chunks(radius: i32) -> Vec<(i32, i32)> {
+    expected_chunks_at(radius, (0, 0))
+}
+
+/// The square of chunk coordinates within `radius` of `centre`, sorted.
+///
+/// The centre exists because a square anywhere is a sample of one climate.
+/// Minecraft has two biomes in a 9x9 wherever it is put, so scoring a biome
+/// source needs several squares far apart rather than one wide one.
+pub fn expected_chunks_at(radius: i32, centre: (i32, i32)) -> Vec<(i32, i32)> {
     let mut out = Vec::new();
     for z in -radius..=radius {
         for x in -radius..=radius {
-            out.push((x, z));
+            out.push((x + centre.0, z + centre.1));
         }
     }
     out.sort_unstable();

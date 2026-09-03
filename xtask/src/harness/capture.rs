@@ -58,6 +58,12 @@ pub struct Options {
     pub version: String,
     pub seed: i64,
     pub radius: i32,
+    /// The chunk the square is centred on. Not a convenience: two biomes in a
+    /// 9x9 is the multi-noise field being smooth at that scale, so a biome
+    /// source cannot be *scored* on one square wherever it is put. Several
+    /// small squares far apart reach climate a wide square never would, at a
+    /// cost linear in chunks rather than in the square of the radius.
+    pub centre: (i32, i32),
     /// A jar the operator has already obtained, instead of downloading.
     pub jar: Option<PathBuf>,
     /// Whole-run budget: boot, pregeneration, stop and scan together.
@@ -69,6 +75,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
     let mut version = None;
     let mut seed = None;
     let mut radius = None;
+    let mut centre = (0i32, 0i32);
     let mut jar = None;
     let mut timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECS);
     let mut seen: Vec<(&'static str, String)> = Vec::new();
@@ -97,6 +104,21 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
                         .1
                         .parse()
                         .map_err(|_| "--radius needs a chunk count")?,
+                );
+            }
+            "--at" => {
+                at = super::take_value(&mut seen, "--at", args, at + 1)?;
+                let value = seen.last().expect("just stored").1.clone();
+                let (x, z) = value
+                    .split_once(',')
+                    .ok_or("--at needs two chunk coordinates, as `x,z`")?;
+                centre = (
+                    x.trim()
+                        .parse()
+                        .map_err(|_| "--at's x is not a whole number")?,
+                    z.trim()
+                        .parse()
+                        .map_err(|_| "--at's z is not a whole number")?,
                 );
             }
             "--jar" => {
@@ -133,6 +155,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
         version,
         seed,
         radius,
+        centre,
         jar,
         timeout,
     })
@@ -165,7 +188,12 @@ pub fn run(options: &Options) -> Result<(), String> {
         None => crate::extract::download::server_jar(&options.version, &layout.jars)?,
     };
 
-    let label = capture_label(&options.version, options.seed, options.radius);
+    let label = capture_label(
+        &options.version,
+        options.seed,
+        options.radius,
+        options.centre,
+    );
     capture_from(options, &jar, &dir, &label, &layout, started)
 }
 
@@ -190,14 +218,16 @@ pub(super) fn capture_from(
     layout: &cache::Layout,
     started: Instant,
 ) -> Result<(), String> {
-    let expected = digest::expected_chunks(options.radius);
+    let expected = digest::expected_chunks_at(options.radius, options.centre);
     println!(
-        "capturing {} seed {} from {}: {} chunks within radius {}, budget {}s",
+        "capturing {} seed {} from {}: {} chunks within radius {} of chunk {},{}, budget {}s",
         options.version,
         options.seed,
         dir.display(),
         expected.len(),
         options.radius,
+        options.centre.0,
+        options.centre.1,
         options.timeout.as_secs()
     );
 
@@ -575,8 +605,19 @@ fn jvm_flags() -> &'static [&'static str] {
 }
 
 /// The cache label one capture is filed under.
-pub(super) fn capture_label(version: &str, seed: i64, radius: i32) -> String {
-    format!("{version}-seed-{seed}-radius-{radius}")
+///
+/// A square centred on the origin keeps the label it has always had, so the
+/// captures already on disk stay findable and `rewrite`'s baseline lookup does
+/// not move. Anywhere else the centre is part of the name, because two squares
+/// of the same radius on the same seed are different worlds and a shared label
+/// would have the second silently overwrite the first.
+pub(super) fn capture_label(version: &str, seed: i64, radius: i32, centre: (i32, i32)) -> String {
+    let base = format!("{version}-seed-{seed}-radius-{radius}");
+    if centre == (0, 0) {
+        base
+    } else {
+        format!("{base}-at-{}-{}", centre.0, centre.1)
+    }
 }
 
 #[cfg(test)]
@@ -707,15 +748,22 @@ mod tests {
 
     #[test]
     fn the_label_keys_a_capture_by_every_input_that_moves_its_digest() {
-        assert_eq!(capture_label("1.21.1", 0, 2), "1.21.1-seed-0-radius-2");
+        assert_eq!(
+            capture_label("1.21.1", 0, 2, (0, 0)),
+            "1.21.1-seed-0-radius-2"
+        );
+        assert_eq!(
+            capture_label("1.21.1", 0, 2, (-400, 900)),
+            "1.21.1-seed-0-radius-2-at--400-900"
+        );
         assert_ne!(
-            capture_label("1.21.1", 0, 2),
-            capture_label("1.21.1", 1, 2),
+            capture_label("1.21.1", 0, 2, (0, 0)),
+            capture_label("1.21.1", 1, 2, (0, 0)),
             "seeds must not share a capture"
         );
         assert_ne!(
-            capture_label("1.21.1", 0, 2),
-            capture_label("1.21.1", 0, 3),
+            capture_label("1.21.1", 0, 2, (0, 0)),
+            capture_label("1.21.1", 0, 3, (0, 0)),
             "radii must not share a capture"
         );
     }

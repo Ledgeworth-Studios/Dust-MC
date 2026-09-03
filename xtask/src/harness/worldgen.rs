@@ -385,10 +385,7 @@ fn measure(options: &Options) -> Result<(), String> {
         ),
     }
 
-    let expected: Vec<(i32, i32)> = digest::expected_chunks(options.radius)
-        .into_iter()
-        .map(|(x, z)| (x + options.centre.0, z + options.centre.1))
-        .collect();
+    let expected = digest::expected_chunks_at(options.radius, options.centre);
 
     // Only chunks vanilla finished. A chunk below `full` holds a partial
     // answer that looks like a complete one, which is why `digest::scan` and
