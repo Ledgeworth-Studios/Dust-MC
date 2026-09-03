@@ -179,6 +179,7 @@ impl Terrain {
             corners,
             lerp: vec![Cell::default(); slots],
             skipped: 0,
+            skipped_open: 0,
             walked: 0,
             flow: self
                 .aquifer
@@ -216,6 +217,9 @@ pub struct Filler<'a> {
     /// rather than assumed: a skip that never fires is a slower generator with
     /// more code in it.
     skipped: u64,
+    /// Cells the skip answered *without* rock in them, which is the half that
+    /// only survives an aquifer when every candidate is the global one.
+    skipped_open: u64,
     walked: u64,
     /// The aquifer's own scratch, when the dimension has one. A [`Filler`]
     /// holds it rather than a caller because the aquifer needs the density at
@@ -272,6 +276,14 @@ impl Filler<'_> {
         (self.skipped, self.walked)
     }
 
+    /// Of the cells the bounds walk answered, how many held no rock.
+    ///
+    /// Counted apart because that half of the skip is the one an aquifer can
+    /// take away, and a number is the only thing that says whether it did.
+    pub fn open_cells(&self) -> u64 {
+        self.skipped_open
+    }
+
     fn fill_inner(
         &mut self,
         chunk_x: i32,
@@ -321,15 +333,39 @@ impl Filler<'_> {
                         self.evaluator.enter_cell(|slot| corners[slot].corner);
                         let (low, high) = self.evaluator.cell_bounds(final_density);
                         // With an aquifer running, a cell that holds no rock
-                        // still has to be walked: what fills it is a function
-                        // of the density at each block and not of its sign, so
-                        // only the all-rock half of the skip survives. That is
-                        // the cost this stage pays and decision record 0034
-                        // prices it.
-                        let whole = if aquifer { low > 0.0 } else { high <= 0.0 || low > 0.0 };
+                        // cannot be answered by its sign alone: what fills it
+                        // is a function of the density at *each* block, which
+                        // is what the pressure between two aquifers is added
+                        // to. The all-rock half of the skip is unaffected —
+                        // the aquifer's own first line is "density positive is
+                        // rock" — and the all-air half survives only where the
+                        // aquifer can be shown not to look at the density,
+                        // which is where every candidate is the dimension's
+                        // own global one. Decision record 0035 measures both
+                        // halves.
+                        let empty = high <= 0.0;
+                        let whole = if aquifer {
+                            low > 0.0
+                                || (empty && {
+                                    let lx = base_x + (cell_x * terrain.cell_width) as i32;
+                                    let lz = base_z + (cell_z * terrain.cell_width) as i32;
+                                    let span = terrain.cell_width as i32 - 1;
+                                    let flow = self.flow.as_mut().expect("checked above");
+                                    flow.box_is_global(
+                                        (lx, lx + span),
+                                        (cell_base_y, cell_base_y + height - 1),
+                                        (lz, lz + span),
+                                    )
+                                })
+                        } else {
+                            empty || low > 0.0
+                        };
                         if whole {
                             self.skipped += 1;
                             let solid = low > 0.0;
+                            if !solid {
+                                self.skipped_open += 1;
+                            }
                             let lx = cell_x * terrain.cell_width;
                             let lz = cell_z * terrain.cell_width;
                             for step_y in 0..terrain.cell_height {
@@ -688,6 +724,93 @@ mod tests {
         );
     }
 
+    /// A land world's un-jagged density: ground about seventy blocks above the
+    /// sea level, so that nothing in the fixture is under an ocean and every
+    /// aquifer has to decide its own level rather than inheriting the sea's.
+    ///
+    /// This is what `initial_density_without_jaggedness` is in a real pack,
+    /// and what the preliminary surface level — and therefore every aquifer —
+    /// is walked down.
+    const UNJAGGED: &str = r#"{
+        "type": "minecraft:add",
+        "argument1": {"type": "minecraft:y_clamped_gradient",
+                      "from_y": -64, "to_y": 600,
+                      "from_value": 1.0, "to_value": -1.0},
+        "argument2": {"type": "minecraft:mul", "argument1": 0.2,
+                      "argument2": {"type": "minecraft:noise",
+                                    "noise": "minecraft:scratch",
+                                    "xz_scale": 1.0, "y_scale": 1.0}}
+      }"#;
+
+    /// A settings file with aquifers on, the four noises they read, and
+    /// `erosion` and `depth` pinned to constants so a test can put the whole
+    /// world inside or outside the deep dark on purpose.
+    fn wet_dimension(root: &Path, erosion: f64, depth: f64) {
+        for (name, octave) in [
+            ("aq_barrier", -3),
+            ("aq_flood", -7),
+            ("aq_spread", -5),
+            ("aq_lava", -1),
+            ("aq_cave", -4),
+        ] {
+            write(
+                root,
+                &format!("minecraft/worldgen/noise/{name}.json"),
+                &format!(
+                    r#"{{"firstOctave": {octave}, "amplitudes": {amplitudes}}}"#,
+                    // The four aquifer noises are vanilla's own, octave for
+                    // octave. The cave is this fixture's, and is wide enough
+                    // to open pockets at every depth including under the lava
+                    // line.
+                    amplitudes = if name == "aq_cave" {
+                        "[1.0, 1.0, 1.0]"
+                    } else {
+                        "[1.0]"
+                    }
+                ),
+            );
+        }
+        let noise = |name: &str, y_scale: f64| {
+            format!(
+                r#"{{"type": "minecraft:noise", "noise": "minecraft:{name}",
+                     "xz_scale": 1.0, "y_scale": {y_scale}}}"#
+            )
+        };
+        write(
+            root,
+            "minecraft/worldgen/noise_settings/overworld.json",
+            &format!(
+                r#"{{"noise": {{"height": 384, "min_y": -64,
+                                "size_horizontal": 1, "size_vertical": 2}},
+                    "sea_level": 63,
+                    "default_block": {{"Name": "minecraft:stone"}},
+                    "default_fluid": {{"Name": "minecraft:water"}},
+                    "aquifers_enabled": true,
+                    "noise_router": {{"temperature": 0.0, "vegetation": 0.0,
+                                      "continents": 0.0, "ridges": 0.0,
+                                      "erosion": {erosion}, "depth": {depth},
+                                      "barrier": {barrier},
+                                      "fluid_level_floodedness": {flood},
+                                      "fluid_level_spread": {spread},
+                                      "lava": {lava},
+                                      "initial_density_without_jaggedness": {UNJAGGED},
+                                      "final_density": {{"type": "minecraft:interpolated",
+                                                         "argument": {{
+                                        "type": "minecraft:add",
+                                        "argument1": {UNJAGGED},
+                                        "argument2": {cave}}}}}}}}}"#,
+                cave = format!(
+                    r#"{{"type": "minecraft:mul", "argument1": 3.5, "argument2": {}}}"#,
+                    noise("aq_cave", 1.0)
+                ),
+                barrier = noise("aq_barrier", 0.5),
+                flood = noise("aq_flood", 0.67),
+                spread = noise("aq_spread", 0.7142857142857143),
+                lava = noise("aq_lava", 1.0),
+            ),
+        );
+    }
+
     /// Ground that falls away with height, roughened by a noise — the shape
     /// vanilla's own router has, with the y-dependence *inside* the
     /// interpolated node rather than beside it.
@@ -811,6 +934,181 @@ mod tests {
             (0, 3 * 4 * 4 * 48),
             "the control skips nothing"
         );
+    }
+
+    /// The same control on a world that has aquifers.
+    ///
+    /// The whole-cell skip has a second half there — a cell that holds no rock
+    /// may still be answered wholesale, but only when every aquifer it could
+    /// belong to is the dimension's own. That is a claim about which cells the
+    /// skip is allowed to take, and this is the check that it took no others:
+    /// the two fills must agree byte for byte.
+    ///
+    /// **Watched to fail** by making `box_is_global` answer `true` for every
+    /// box that holds no rock, which is the claim the skip would be making if
+    /// it were unsound. Narrowing its grid window by one row instead leaves
+    /// this green — a mutation that does not bite is not evidence, and the
+    /// window is defended by the byte-for-byte comparison only where a
+    /// neighbouring aquifer actually differs.
+    #[test]
+    fn the_skip_over_an_aquifer_moves_no_block_and_still_fires() {
+        let root = scratch("aquifer-skip");
+        wet_dimension(&root, 0.0, 0.0);
+        let terrain = Terrain::new(&root, "overworld", 7).expect("the pack compiles");
+        assert!(terrain.has_aquifer(), "the settings say aquifers are on");
+        let mut skipped = vec![0u8; terrain.cells_per_chunk()];
+        let mut walked = vec![0u8; terrain.cells_per_chunk()];
+        let mut fast = terrain.filler();
+        let mut slow = terrain.filler();
+        for pos in [(0, 0), (12, -30), (-400, 900)] {
+            fast.fill_with_aquifer(pos.0, pos.1, &mut skipped);
+            slow.fill_with_aquifer_without_skipping(pos.0, pos.1, &mut walked);
+            assert_eq!(skipped, walked, "the skip moved a block at {pos:?}");
+        }
+        let (skipped_cells, walked_cells) = fast.cells();
+        assert!(
+            fast.open_cells() > 0,
+            "the skip answered {skipped_cells} of {} cells and every one of them was \
+             solid rock, so the half this test is about never fired",
+            skipped_cells + walked_cells
+        );
+    }
+
+    /// An aquifer leaves a pocket dry, which is the whole point of it.
+    ///
+    /// Counted only between y -36 and the sea level, and that band is the
+    /// check rather than a convenience. The lowest aquifer centre a block at
+    /// y -36 can belong to is at -48, above the -54 the global picker starts
+    /// answering lava at, so the pre-aquifer answer for every one of these
+    /// cells is the dimension's fluid and nothing else. **A wider band made this test
+    /// vacuous**: below -54 the global status is lava at level -54, so a
+    /// generator that flooded every aquifer to its own global level would
+    /// still leave air between -54 and the sea, and the mutation that was
+    /// supposed to make this go red left it green.
+    ///
+    /// **Watched to fail** by making `surface_level` answer
+    /// `self.aquifer.sea_level`, which is the rule the noise stage alone has:
+    /// `dried` drops to zero.
+    #[test]
+    fn an_aquifer_leaves_a_pocket_below_the_sea_level_dry() {
+        let root = scratch("aquifer-dry");
+        wet_dimension(&root, 0.0, 0.0);
+        let terrain = Terrain::new(&root, "overworld", 7).expect("the pack compiles");
+        let settings = terrain.settings().clone();
+        let mut flooded = vec![0u8; terrain.cells_per_chunk()];
+        let mut aquifer = vec![0u8; terrain.cells_per_chunk()];
+        let mut plain = terrain.filler();
+        let mut wet = terrain.filler();
+        let mut dried = 0u32;
+        let mut still_wet = 0u32;
+        // Several chunks, spread far enough apart to see more than one draw of
+        // a noise whose first octave is 1/128 of a block.
+        for (chunk_x, chunk_z) in [(0, 0), (40, 40), (-300, 700), (900, -1200)] {
+            plain.fill(chunk_x, chunk_z, &mut flooded);
+            wet.fill_with_aquifer(chunk_x, chunk_z, &mut aquifer);
+            for y in -36..settings.sea_level {
+                let row = (y - settings.min_y) as usize * 256;
+                for column in 0..256 {
+                    if Material::from_code(flooded[row + column]) != Material::Fluid {
+                        continue;
+                    }
+                    match Material::from_code(aquifer[row + column]) {
+                        Material::Air => dried += 1,
+                        Material::Fluid => still_wet += 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(
+            dried > 0,
+            "every one of the {still_wet} flooded cell(s) is still flooded"
+        );
+        assert!(
+            still_wet > 0,
+            "{dried} cells dried and none stayed wet, which is not an aquifer either"
+        );
+    }
+
+    /// Under the deep dark the aquifers are switched off, so an ancient city
+    /// is not at the bottom of a lake.
+    ///
+    /// Two worlds and not one, because one is not a check. The same pack is
+    /// built twice with only `erosion` and `depth` moved — outside the deep
+    /// dark and inside it — and the test requires that the first holds the
+    /// dimension's fluid below its sea level and the second holds none at all.
+    /// **The single-world version of this test was vacuous**: this fixture's
+    /// aquifers are mostly dry anyway, so flipping either comparison in
+    /// `surface_level` left it green. The difference between the two worlds is
+    /// the only thing that can only be the deep dark.
+    ///
+    /// **Watched to fail** by flipping either comparison, and by moving either
+    /// constant past the value the fixture pins.
+    #[test]
+    fn the_deep_dark_has_no_aquifers_at_all() {
+        let mut wet = 0u32;
+        let mut dry_world_fluid = 0u32;
+        for (label, erosion, depth) in [("shallow", 0.0, 0.0), ("deep-dark", -1.0, 1.0)] {
+            let root = scratch(&format!("aquifer-{label}"));
+            wet_dimension(&root, erosion, depth);
+            let terrain = Terrain::new(&root, "overworld", 7).expect("the pack compiles");
+            let settings = terrain.settings().clone();
+            let mut materials = vec![0u8; terrain.cells_per_chunk()];
+            let mut filler = terrain.filler();
+            for (chunk_x, chunk_z) in [(0, 0), (40, 40), (-300, 700), (900, -1200)] {
+                filler.fill_with_aquifer(chunk_x, chunk_z, &mut materials);
+                // Above the lava line, so the global picker is not the thing
+                // being measured here.
+                for y in -54..settings.sea_level {
+                    let row = (y - settings.min_y) as usize * 256;
+                    for column in 0..256 {
+                        if Material::from_code(materials[row + column]) == Material::Fluid {
+                            if erosion == 0.0 {
+                                wet += 1;
+                            } else {
+                                dry_world_fluid += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            wet > 0,
+            "the world outside the deep dark holds no fluid either, so this test \
+             would pass on a generator with no aquifers at all"
+        );
+        assert_eq!(
+            dry_world_fluid, 0,
+            "the deep dark holds {dry_world_fluid} cell(s) of the dimension's fluid \
+             where the same pack outside it holds {wet}"
+        );
+    }
+
+    /// Below the level the global picker names, what is not rock is lava.
+    ///
+    /// **Watched to fail** by deleting the early `global.at(y) == Lava` branch
+    /// in `substance`: the cells come back as water.
+    #[test]
+    fn the_floor_of_the_world_is_lava_and_not_water() {
+        let root = scratch("aquifer-lava");
+        wet_dimension(&root, 0.0, 0.0);
+        let terrain = Terrain::new(&root, "overworld", 7).expect("the pack compiles");
+        let settings = terrain.settings().clone();
+        let mut materials = vec![0u8; terrain.cells_per_chunk()];
+        terrain.filler().fill_with_aquifer(0, 0, &mut materials);
+        let mut lava = 0u32;
+        for y in settings.min_y..-54 {
+            let row = (y - settings.min_y) as usize * 256;
+            for column in 0..256 {
+                match Material::from_code(materials[row + column]) {
+                    Material::Lava => lava += 1,
+                    Material::Solid => {}
+                    other => panic!("{other:?} at y {y}, below the lava level"),
+                }
+            }
+        }
+        assert!(lava > 0, "the fixture has no open cells below -54");
     }
 
     /// The lattice is the terrain, not an approximation of it.

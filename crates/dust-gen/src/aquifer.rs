@@ -288,21 +288,7 @@ impl Flow<'_> {
         for dx in 0..=1 {
             for dy in -1..=1 {
                 for dz in 0..=1 {
-                    let cell = [grid[0] + dx, grid[1] + dy, grid[2] + dz];
-                    let index = self.index(cell[0], cell[1], cell[2]);
-                    let centre = match self.location[index] {
-                        Some(centre) => centre,
-                        None => {
-                            let mut random = self.aquifer.factory.at(cell[0], cell[1], cell[2]);
-                            let centre = [
-                                cell[0] * X_SPACING + random.next_i32_below(10),
-                                cell[1] * Y_SPACING + random.next_i32_below(9),
-                                cell[2] * Z_SPACING + random.next_i32_below(10),
-                            ];
-                            self.location[index] = Some(centre);
-                            centre
-                        }
-                    };
+                    let centre = self.centre([grid[0] + dx, grid[1] + dy, grid[2] + dz]);
                     let (ox, oy, oz) = (centre[0] - x, centre[1] - y, centre[2] - z);
                     let distance = ox * ox + oy * oy + oz * oz;
                     if best[0] >= distance {
@@ -325,7 +311,7 @@ impl Flow<'_> {
             }
         }
 
-        let first = self.status_at(at[0]);
+        let first = self.status_of_centre(at[0]);
         let similarity_12 = similarity(best[0], best[1]);
         let substance = match first.at(y) {
             Some(fluid) => Substance::Fluid(fluid),
@@ -350,11 +336,11 @@ impl Flow<'_> {
         // which is what the `MutableDouble` vanilla threads through the three
         // calls is for.
         let mut barrier = None;
-        let second = self.status_at(at[1]);
+        let second = self.status_of_centre(at[1]);
         if density + similarity_12 * self.pressure(x, y, z, &mut barrier, first, second) > 0.0 {
             return Substance::Rock;
         }
-        let third = self.status_at(at[2]);
+        let third = self.status_of_centre(at[2]);
         let similarity_13 = similarity(best[0], best[2]);
         if similarity_13 > 0.0 {
             let pressure = similarity_12
@@ -438,21 +424,88 @@ impl Flow<'_> {
         2.0 * (noise + pressure)
     }
 
-    /// The status of the aquifer whose centre is at a block position, computed
-    /// once per grid cell.
-    fn status_at(&mut self, centre: [i32; 3]) -> Status {
-        let cell = [
-            grid_x(centre[0]),
-            grid_y(centre[1]),
-            grid_z(centre[2]),
-        ];
+    /// The status of the aquifer whose centre is at a block position.
+    fn status_of_centre(&mut self, centre: [i32; 3]) -> Status {
+        self.status([grid_x(centre[0]), grid_y(centre[1]), grid_z(centre[2])])
+    }
+
+    /// One grid cell's jittered centre, drawn once.
+    fn centre(&mut self, cell: [i32; 3]) -> [i32; 3] {
+        let index = self.index(cell[0], cell[1], cell[2]);
+        match self.location[index] {
+            Some(centre) => centre,
+            None => {
+                let mut random = self.aquifer.factory.at(cell[0], cell[1], cell[2]);
+                let centre = [
+                    cell[0] * X_SPACING + random.next_i32_below(10),
+                    cell[1] * Y_SPACING + random.next_i32_below(9),
+                    cell[2] * Z_SPACING + random.next_i32_below(10),
+                ];
+                self.location[index] = Some(centre);
+                centre
+            }
+        }
+    }
+
+    /// One grid cell's status, computed once. The centre is a block position
+    /// inside the cell, so the two round-trip.
+    fn status(&mut self, cell: [i32; 3]) -> Status {
         let index = self.index(cell[0], cell[1], cell[2]);
         if let Some(status) = self.status[index] {
             return status;
         }
+        let centre = self.centre(cell);
         let status = self.compute_fluid(centre[0], centre[1], centre[2]);
         self.status[index] = Some(status);
         status
+    }
+
+    /// Whether every aquifer a box of blocks could belong to is the
+    /// dimension's own global one — in which case the box's answer is the
+    /// pre-aquifer rule, block for block, and the caller need not walk it.
+    ///
+    /// **This is not an approximation and it is not a heuristic.** When every
+    /// candidate status is the same, every `pressure` between them is zero
+    /// because their levels are equal, so nothing is added to the density and
+    /// the substance is `status.at(y)` — the dimension's fluid below its sea
+    /// level and air above it. The caller still has to know that the box holds
+    /// no rock; this answers the other half.
+    ///
+    /// The `y` range must sit at or above the height the global picker starts
+    /// answering lava at, so that "the global one" is a single status.
+    pub fn box_is_global(
+        &mut self,
+        x: (i32, i32),
+        y: (i32, i32),
+        z: (i32, i32),
+    ) -> bool {
+        let global = self.aquifer.global(y.1);
+        if y.0 < self.aquifer.lava_below || self.aquifer.global(y.0) != global {
+            return false;
+        }
+        // The same window `substance` searches, widened to the whole box: the
+        // grid cell of the lowest corner through one past the grid cell of the
+        // highest.
+        let low = [
+            grid_x(x.0 - 5),
+            grid_y(y.0 + 1) - 1,
+            grid_z(z.0 - 5),
+        ];
+        let high = [
+            grid_x(x.1 - 5) + 1,
+            grid_y(y.1 + 1) + 1,
+            grid_z(z.1 - 5) + 1,
+        ];
+        for cx in low[0]..=high[0] {
+            for cy in low[1]..=high[1] {
+                for cz in low[2]..=high[2] {
+                    if self.status([cx, cy, cz]) != global {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Whether one aquifer holds anything, and what.
