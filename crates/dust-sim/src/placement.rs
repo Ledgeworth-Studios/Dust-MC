@@ -654,9 +654,7 @@ fn as_horizontal(block: Block, state: BlockState, click: Click) -> Option<BlockS
         clockwise(look)
     } else if AS_LOOKED.contains(&block.name()) {
         look
-    } else if ON_THE_WALL.contains(&block.name()) {
-        click.face.direction()
-    } else if trapdoor && !matches!(click.face, Face::Up | Face::Down) {
+    } else if on_a_wall(block, trapdoor) && !matches!(click.face, Face::Up | Face::Down) {
         click.face.direction()
     } else {
         opposite(look)
@@ -760,6 +758,16 @@ const AS_LOOKED: [&str; 4] = [
     "minecraft:decorated_pot",
     "minecraft:calibrated_sculk_sensor",
 ];
+
+/// Whether this block takes its facing from the wall it was put against.
+///
+/// A trapdoor by shape — a `half` with no `shape`, which a stair fails and a
+/// furnace fails — and a ladder and a tripwire hook by name, because their
+/// shape is `facing` and `waterlogged`, which is a decorated pot's and a
+/// chest's. Two ways in to one answer, and one place where that answer is.
+fn on_a_wall(block: Block, trapdoor: bool) -> bool {
+    trapdoor || ON_THE_WALL.contains(&block.name())
+}
 
 /// Four-way blocks that face **out of the wall they were put on**.
 ///
