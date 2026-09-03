@@ -785,3 +785,305 @@ pub fn bar_of(total: u32) -> (f32, u32) {
         level += 1;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dust_registry::Block;
+
+    fn item(name: &str) -> Item {
+        Item::from_name(name).expect("this build has it")
+    }
+
+    /// An item table where exactly one thing burns, for exactly this long.
+    ///
+    /// Written here rather than read from `dust-items.tsv`, which is Mojang's
+    /// and is not in this repository. What these tests are about is the
+    /// machine, not the numbers: 1,600 is used because it is eight smelts of
+    /// 200 exactly, which makes "a stack of coal smelts eight" an integer this
+    /// can assert on rather than a rate it would have to approximate.
+    fn fuel_table(fuel: &str, ticks: u32) -> ItemBlocks {
+        let mut text = String::from("# item_id\titem\tplaces\tburn\n");
+        for one in Item::all() {
+            let places = Block::from_name(one.name()).map_or("-", Block::name);
+            let burn = if one.name() == fuel {
+                ticks.to_string()
+            } else {
+                "-".to_owned()
+            };
+            text.push_str(&format!(
+                "{}\t{}\t{places}\t{burn}\n",
+                one.protocol_id(),
+                one.name()
+            ));
+        }
+        ItemBlocks::parse(&text).expect("a complete table")
+    }
+
+    fn smelting(ticks: u16, experience: f32) -> Cooking {
+        let mut cooking = Cooking::new();
+        cooking
+            .add(
+                &serde_json::json!({
+                    "type": "minecraft:smelting",
+                    "cookingtime": ticks,
+                    "experience": experience,
+                    "ingredient": { "item": "minecraft:raw_iron" },
+                    "result": { "id": "minecraft:iron_ingot" }
+                }),
+                &dust_sim::crafting::ItemTags::new(),
+            )
+            .expect("compiles");
+        cooking
+    }
+
+    fn loaded(input: u8, fuel: u8) -> Furnace {
+        let mut furnace = Furnace::new(Fire::Furnace);
+        if input > 0 {
+            furnace.slots[INPUT] = Some(Stack::new(item("minecraft:raw_iron"), input));
+        }
+        if fuel > 0 {
+            furnace.slots[FUEL] = Some(Stack::new(item("minecraft:coal"), fuel));
+        }
+        furnace
+    }
+
+    /// Run a furnace for `ticks` ticks and say how many outputs it produced.
+    fn run(furnace: &mut Furnace, cooking: &Cooking, fuel: &ItemBlocks, ticks: u32) {
+        for _ in 0..ticks {
+            furnace.tick(Some(cooking), Some(fuel));
+        }
+    }
+
+    fn output(furnace: &Furnace) -> u8 {
+        furnace.slots[OUTPUT]
+            .as_ref()
+            .map_or(0, |stack| stack.count)
+    }
+
+    #[test]
+    fn one_coal_smelts_exactly_eight_and_the_ninth_needs_more_coal() {
+        // The measurement a rate cannot make. 1,600 ticks of fuel at 200 ticks
+        // a smelt is eight, exactly, and the eighth completes on the tick the
+        // fuel runs out — so a furnace that consumed fuel a tick early would
+        // make seven and one that held the fire a tick late would make nine.
+        // Neither is visible in "it takes about ten seconds an ingot".
+        let cooking = smelting(200, 0.7);
+        let fuel = fuel_table("minecraft:coal", 1600);
+        let mut furnace = loaded(16, 1);
+        run(&mut furnace, &cooking, &fuel, 1600);
+        assert_eq!(output(&furnace), 8, "1,600 ticks of coal is eight smelts");
+        // **And the fire is still alight, by exactly one tick.** This
+        // assertion was written the other way round and the check caught it:
+        // the countdown runs *before* the fuel is taken, so the tick that
+        // lights a furnace is also its first cooking tick and the fuel outlives
+        // the last smelt by one. That one tick is the difference between eight
+        // ingots a coal and seven, so it is pinned here rather than described.
+        assert_eq!(furnace.lit, 1, "one tick of fuel left");
+        run(&mut furnace, &cooking, &fuel, 1);
+        assert!(!furnace.is_lit(), "and now it is spent");
+        // And a ninth does not appear from nowhere.
+        run(&mut furnace, &cooking, &fuel, 400);
+        assert_eq!(output(&furnace), 8);
+    }
+
+    #[test]
+    fn fuel_without_input_does_not_burn_and_input_without_fuel_does_not_cook() {
+        // Two states that look identical from outside — nothing happens — and
+        // are different mistakes. A furnace that lit on fuel alone would eat a
+        // player's coal for nothing; one that cooked without fuel would be a
+        // free smelter.
+        let cooking = smelting(200, 0.7);
+        let fuel = fuel_table("minecraft:coal", 1600);
+
+        let mut no_input = loaded(0, 4);
+        run(&mut no_input, &cooking, &fuel, 100);
+        assert!(!no_input.is_lit(), "no input, so nothing is lit");
+        assert_eq!(
+            no_input.slots[FUEL].as_ref().map(|s| s.count),
+            Some(4),
+            "and no coal is spent"
+        );
+
+        let mut no_fuel = loaded(4, 0);
+        run(&mut no_fuel, &cooking, &fuel, 400);
+        assert_eq!(output(&no_fuel), 0);
+        assert_eq!(no_fuel.cooking, 0, "and the arrow never moved");
+    }
+
+    #[test]
+    fn a_full_output_stalls_the_cook_and_holds_the_fuel() {
+        // Vanilla's `canBurn`. A furnace whose output is full stops *before*
+        // spending fuel, which is what lets a player leave one running
+        // overnight and come back to a full stack and the coal they did not
+        // need. A server that burned on regardless would eat the fuel.
+        let cooking = smelting(200, 0.7);
+        let fuel = fuel_table("minecraft:coal", 1600);
+        let mut furnace = loaded(4, 2);
+        furnace.slots[OUTPUT] = Some(Stack::new(item("minecraft:iron_ingot"), 64));
+        run(&mut furnace, &cooking, &fuel, 600);
+        assert!(!furnace.is_lit(), "a full output never lights the fire");
+        assert_eq!(furnace.slots[FUEL].as_ref().map(|s| s.count), Some(2));
+        assert_eq!(furnace.cooking, 0);
+        // Make room and it starts.
+        furnace.slots[OUTPUT] = None;
+        run(&mut furnace, &cooking, &fuel, 200);
+        assert_eq!(output(&furnace), 1);
+    }
+
+    #[test]
+    fn a_mid_burn_furnace_keeps_burning_and_the_arrow_retreats_when_the_fuel_ends() {
+        // The state a check that only ever asks "is there an ingot yet?"
+        // cannot see: half-cooked. Progress goes up while lit and back down at
+        // two a tick when the fire goes out, which a player watches happen.
+        let cooking = smelting(200, 0.7);
+        // 50 ticks of fuel: enough to get a quarter of the way and no further.
+        let fuel = fuel_table("minecraft:coal", 50);
+        let mut furnace = loaded(4, 1);
+        run(&mut furnace, &cooking, &fuel, 40);
+        assert!(furnace.is_lit());
+        assert_eq!(
+            furnace.cooking, 40,
+            "forty ticks of a two-hundred-tick cook"
+        );
+        run(&mut furnace, &cooking, &fuel, 11);
+        assert!(!furnace.is_lit(), "the fuel is gone");
+        let stalled = furnace.cooking;
+        assert!(stalled > 0, "and the arrow is part way, not reset");
+        run(&mut furnace, &cooking, &fuel, 5);
+        assert_eq!(
+            furnace.cooking,
+            stalled.saturating_sub(10),
+            "two a tick backwards"
+        );
+        assert_eq!(output(&furnace), 0, "and nothing was ever made");
+    }
+
+    #[test]
+    fn a_lava_bucket_leaves_the_bucket_in_the_fuel_slot() {
+        let cooking = smelting(200, 0.7);
+        let fuel = fuel_table("minecraft:lava_bucket", 20_000);
+        let mut furnace = Furnace::new(Fire::Furnace);
+        furnace.slots[INPUT] = Some(Stack::new(item("minecraft:raw_iron"), 8));
+        furnace.slots[FUEL] = Some(Stack::new(item("minecraft:lava_bucket"), 1));
+        run(&mut furnace, &cooking, &fuel, 1);
+        assert_eq!(
+            furnace.slots[FUEL].as_ref().map(|s| s.item.name()),
+            Some("minecraft:bucket"),
+            "the bucket comes back where the player looks for it"
+        );
+    }
+
+    #[test]
+    fn experience_banks_as_a_fraction_and_is_paid_once() {
+        // Eight ingots at 0.7 is 5.6 points. A server that rounded each smelt
+        // down would pay nothing at all for any of them; one that rounded up
+        // would pay eight. Both roll values are asserted, because the whole of
+        // the fraction's meaning is that it is sometimes one more.
+        let cooking = smelting(200, 0.7);
+        let fuel = fuel_table("minecraft:coal", 1600);
+        let mut furnace = loaded(16, 1);
+        run(&mut furnace, &cooking, &fuel, 1600);
+        assert!(
+            (furnace.experience - 5.6).abs() < 1e-4,
+            "{}",
+            furnace.experience
+        );
+        let mut generous = furnace.clone();
+        assert_eq!(generous.take_experience(0.9), 5, "0.9 is above the 0.6");
+        assert_eq!(
+            generous.take_experience(0.0),
+            0,
+            "and the bank is empty now"
+        );
+        assert_eq!(furnace.take_experience(0.1), 6, "0.1 is below it");
+    }
+
+    #[test]
+    fn a_furnace_with_nothing_to_do_is_not_in_the_tick_set() {
+        // The resource claim, asserted rather than described. Two furnaces:
+        // one loaded, one holding a single lump of coal and nothing to smelt.
+        let cooking = smelting(200, 0.7);
+        let fuel = fuel_table("minecraft:coal", 1600);
+        let world = Furnaces::new();
+        let busy = Position::new(0, 64, 0);
+        let idle = Position::new(1, 64, 0);
+        world.with(busy, Fire::Furnace, Some(&cooking), Some(&fuel), |f| {
+            *f = loaded(4, 4);
+        });
+        world.with(idle, Fire::Furnace, Some(&cooking), Some(&fuel), |f| {
+            f.slots[FUEL] = Some(Stack::new(item("minecraft:coal"), 1));
+        });
+        assert_eq!(world.len(), 2, "both exist");
+        assert_eq!(world.active(), 1, "and only one of them ticks");
+
+        // And membership follows the contents, not a timer.
+        world.with(idle, Fire::Furnace, Some(&cooking), Some(&fuel), |f| {
+            f.slots[INPUT] = Some(Stack::new(item("minecraft:raw_iron"), 1));
+        });
+        assert_eq!(world.active(), 2);
+    }
+
+    #[test]
+    fn an_emptied_furnace_is_forgotten_rather_than_saved_for_ever() {
+        let cooking = smelting(200, 0.7);
+        let fuel = fuel_table("minecraft:coal", 1600);
+        let world = Furnaces::new();
+        let at = Position::new(3, 64, 3);
+        world.with(at, Fire::Furnace, Some(&cooking), Some(&fuel), |f| {
+            f.slots[INPUT] = Some(Stack::new(item("minecraft:raw_iron"), 1));
+        });
+        assert_eq!(world.len(), 1);
+        world.with(at, Fire::Furnace, Some(&cooking), Some(&fuel), |f| {
+            f.slots[INPUT] = None;
+        });
+        assert_eq!(world.len(), 0, "opening a furnace does not make a save row");
+        assert!(world.snapshot().is_empty());
+    }
+
+    #[test]
+    fn a_furnace_comes_back_from_a_snapshot_exactly_where_it_was() {
+        let cooking = smelting(200, 0.7);
+        let fuel = fuel_table("minecraft:coal", 1600);
+        let world = Furnaces::new();
+        let at = Position::new(-7, 70, 12);
+        world.with(at, Fire::Furnace, Some(&cooking), Some(&fuel), |f| {
+            *f = loaded(9, 3);
+        });
+        world.tick(Some(&cooking), Some(&fuel), &mut Vec::new());
+        for _ in 0..249 {
+            world.tick(Some(&cooking), Some(&fuel), &mut Vec::new());
+        }
+        let before = world.snapshot();
+        assert_eq!(before.len(), 1);
+        let (_, mid) = before[0].clone();
+        assert!(mid.is_lit() && mid.cooking > 0, "caught mid-burn: {mid:?}");
+
+        let other = Furnaces::new();
+        assert_eq!(other.restore(before, Some(&cooking), Some(&fuel)), 1);
+        assert_eq!(other.get(at).as_ref(), Some(&mid), "tick for tick");
+        assert_eq!(other.active(), 1, "and it is burning when it comes back");
+    }
+
+    #[test]
+    fn the_experience_bar_matches_minecrafts_own_curve_at_its_two_knees() {
+        // The knees are where a fitted curve goes wrong and a straight line
+        // does not: level 15 and level 30 are where the cost per level jumps.
+        assert_eq!(points_for_level(0), 7);
+        assert_eq!(points_for_level(14), 35);
+        assert_eq!(points_for_level(15), 37);
+        assert_eq!(points_for_level(29), 107);
+        assert_eq!(points_for_level(30), 112);
+        // 16 levels of the first line: sum of 7,9,...  = 16*16 - ... walked.
+        let to_level = |target: u32| (0..target).map(points_for_level).sum::<u32>();
+        for level in [1u32, 5, 15, 16, 30, 31, 50] {
+            let total = to_level(level);
+            assert_eq!(bar_of(total), (0.0, level), "exactly at level {level}");
+            assert_eq!(
+                bar_of(total.saturating_sub(1)).1,
+                level.saturating_sub(1),
+                "one point short of {level}"
+            );
+        }
+    }
+}
