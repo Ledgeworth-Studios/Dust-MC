@@ -109,7 +109,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
                 );
             }
             "--at" => {
-                at = super::take_value(&mut seen, "--at", args, at + 1)?;
+                at = super::take_repeated_value(&mut seen, "--at", args, at + 1)?;
                 let value = seen.last().expect("just stored").1.clone();
                 let (x, z) = value
                     .split_once(',')

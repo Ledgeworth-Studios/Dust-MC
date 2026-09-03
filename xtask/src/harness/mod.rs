@@ -249,6 +249,26 @@ fn take_value(
     Ok(at + 1)
 }
 
+/// The same, for a flag that means one more of something rather than one
+/// setting of something.
+///
+/// Separate from [`take_value`] rather than a parameter on it: "refuse
+/// duplicates" is right for every flag that names a single answer and wrong for
+/// every flag that names a list, and a caller that got the wrong one would be
+/// told `--at given twice` for doing the thing `--at` exists to do.
+fn take_repeated_value(
+    seen: &mut Vec<(&'static str, String)>,
+    name: &'static str,
+    rest: &[String],
+    at: usize,
+) -> Result<usize, String> {
+    let value = rest
+        .get(at)
+        .ok_or_else(|| format!("{name} needs a value"))?;
+    seen.push((name, value.clone()));
+    Ok(at + 1)
+}
+
 // Each verb's parser lives beside its runner; the helpers below are only the
 // shared plumbing they call back into.
 

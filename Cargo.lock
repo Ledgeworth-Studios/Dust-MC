@@ -306,6 +306,7 @@ name = "dust-gen"
 version = "0.0.0"
 dependencies = [
  "dust-config",
+ "serde_json",
 ]
 
 [[package]]
