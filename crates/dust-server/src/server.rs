@@ -465,6 +465,13 @@ impl Server {
     /// Prepare a server around `options`. Construction wires handles together
     /// and touches nothing else — no files are opened until `run`.
     pub fn new(options: ServerOptions) -> Self {
+        // Before anything can decode a packet. `dust-protocol` sits below
+        // `dust-registry` in the dependency graph and cannot name a data
+        // component type on its own, so the name lookup is handed to it here,
+        // out of the registry the operator's own jar produced. Until it is,
+        // every component on the wire is refused by number rather than
+        // guessed at.
+        crate::net::inventory::install_component_types();
         let shared = Shared {
             stop: Arc::new(StopState::default()),
             complete: Arc::new(AtomicBool::new(false)),
@@ -1033,7 +1040,8 @@ impl Server {
                 let (blocks, unknown) = crate::net::save::resolve(&saved.blocks);
                 let applied = world.restore(blocks);
                 *positions.lock().expect("not poisoned") = crate::net::save::positions(&saved);
-                let (carried, unknown_items) = crate::net::save::inventories(&saved);
+                let (carried, unknown_items, dropped_components) =
+                    crate::net::save::inventories(&saved);
                 let stacks: usize = carried
                     .values()
                     .map(crate::net::save::stacks_of)
@@ -1049,6 +1057,20 @@ impl Server {
                         saved.players.len()
                     ),
                 );
+                if dropped_components > 0 {
+                    // Named rather than swallowed: the stacks came back and
+                    // their names, enchantments and contents did not, and a
+                    // player is about to find that out by looking.
+                    self.options.logger.warn(
+                        "dust::server",
+                        format!(
+                            "{dropped_components} stack(s) came back without their components: \
+                             the save wrote them for {}, this build reads {}",
+                            saved.components.as_deref().unwrap_or("no version"),
+                            dust_registry::generated::registries::DATA_VERSION
+                        ),
+                    );
+                }
                 if !unknown_items.is_empty() {
                     // Named for the same reason a block is: an operator who
                     // changed Minecraft version needs to know which item their
@@ -1364,6 +1386,8 @@ impl Server {
         let save = crate::net::save::Save {
             version: crate::net::save::SAVE_VERSION,
             blocks,
+            components: crate::net::save::components_version(&players)
+                .map(std::borrow::ToOwned::to_owned),
             players,
         };
         match crate::net::save::store(&saveable.world_dir, &save) {

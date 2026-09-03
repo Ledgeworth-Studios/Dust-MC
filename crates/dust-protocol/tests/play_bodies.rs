@@ -561,7 +561,7 @@ fn simple_slot(item_id: i32) -> dust_protocol::types::Slot {
     dust_protocol::types::Slot::Present {
         count: 1,
         item_id,
-        removed_components: vec![],
+        components: dust_protocol::components::ComponentPatch::EMPTY,
     }
 }
 

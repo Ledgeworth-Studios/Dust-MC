@@ -873,7 +873,7 @@ where
         .lock()
         .expect("the inventory map is never poisoned")
         .get(&profile_id)
-        .map(|carried| Inventory::restored(carried.slots, carried.selected))
+        .map(|carried| Inventory::restored(carried.slots.clone(), carried.selected))
         .unwrap_or_default();
 
     // And told to the client, all forty-six slots at once. This is the one
@@ -1979,7 +1979,7 @@ where
     let slots = inventory
         .slots()
         .iter()
-        .map(|stack| super::inventory::to_wire(*stack))
+        .map(|stack| super::inventory::to_wire(stack.as_ref()))
         .collect();
     send_play(
         conn,
@@ -2083,7 +2083,7 @@ where
             .iter()
             .find(|slot| usize::try_from(slot.number) == Ok(index));
         let agrees = claimed
-            .is_some_and(|slot| super::inventory::from_wire(&slot.item) == inventory.slot(index));
+            .is_some_and(|slot| super::inventory::from_wire(&slot.item).as_ref() == inventory.slot(index));
         if !agrees {
             send_slot(conn, ctx, inventory, index).await?;
         }
@@ -2095,11 +2095,11 @@ where
         if index >= super::inventory::SLOTS || changed.has(index) {
             continue;
         }
-        if super::inventory::from_wire(&slot.item) != inventory.slot(index) {
+        if super::inventory::from_wire(&slot.item).as_ref() != inventory.slot(index) {
             send_slot(conn, ctx, inventory, index).await?;
         }
     }
-    if super::inventory::from_wire(&click.cursor_item) != inventory.cursor() {
+    if super::inventory::from_wire(&click.cursor_item).as_ref() != inventory.cursor() {
         send_cursor(conn, ctx, inventory).await?;
     }
     Ok(())
@@ -2123,7 +2123,7 @@ fn record_inventory(
         .insert(
             profile_id,
             super::save::Carried {
-                slots: *inventory.slots(),
+                slots: inventory.slots().clone(),
                 selected: inventory.selected(),
             },
         );

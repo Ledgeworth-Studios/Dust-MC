@@ -83,6 +83,11 @@ pub struct SavedStack {
     /// protocol id; see the module docs.
     pub item: String,
     pub count: u8,
+    /// The stack's data-component patch, as lowercase hex of the canonical
+    /// wire bytes, or absent when the stack has none — which is almost all of
+    /// them. See [`Save::components`] for what this promises.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub components: Option<String>,
 }
 
 /// Where a player was when they left, and what they were carrying.
@@ -113,6 +118,24 @@ pub struct Save {
     pub blocks: Vec<SavedBlock>,
     #[serde(default)]
     pub players: Vec<SavedPlayer>,
+    /// Which Minecraft version's component encoding the `components` fields
+    /// are written in, or absent when no stack in the file has any.
+    ///
+    /// **This is the whole of what the component half promises, and it is
+    /// deliberately narrow.** A component patch is stored as the protocol
+    /// bytes that arrived, and those bytes only mean something against one
+    /// version's component registry: the same eleven bytes are an enchantment
+    /// in one version and a food value in the next, because the type ids are
+    /// positions in a table Minecraft regenerates. So the version is written
+    /// beside them and checked on the way back in. A file whose components
+    /// were written by another version loads with its items and **without**
+    /// their components, and says how many it dropped.
+    ///
+    /// It does not promise that a component means the same thing next year. It
+    /// promises that a component this reader cannot vouch for is dropped
+    /// loudly rather than handed back as a different one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub components: Option<String>,
 }
 
 /// The version this build writes and is willing to read.
@@ -121,6 +144,12 @@ pub struct Save {
 /// loads — the new fields default to an empty inventory, which is exactly what
 /// a save written before there were any means — and it is only the other
 /// direction that is refused.
+///
+/// Components did **not** bump it to 3. A version 2 file has no `components`
+/// keys and reads as forty-six componentless stacks, which is what it means;
+/// a version 2 reader meeting a version 2 file that has them would ignore keys
+/// it does not know, which is the one case this reasoning does not cover and
+/// is why the encoding version is written in the file rather than inferred.
 pub const SAVE_VERSION: u32 = 2;
 
 /// The file's name inside the world directory.
@@ -297,9 +326,13 @@ pub type SharedInventories = std::sync::Arc<std::sync::Mutex<Inventories>>;
 
 /// One player's container, as the live map holds it.
 ///
-/// A fixed array and a byte: `Copy`, 185 bytes, no allocation. Names are only
-/// spelled out at the file's edge.
-#[derive(Debug, Clone, Copy)]
+/// A fixed array and a byte. Names are only spelled out at the file's edge.
+///
+/// No longer `Copy`: a stack carries a refcounted component patch, so cloning
+/// this is forty-six branches and one refcount bump per stack that has
+/// components. It is cloned when a session starts and when one ends, not per
+/// packet.
+#[derive(Debug, Clone)]
 pub struct Carried {
     pub slots: crate::net::inventory::Slots,
     pub selected: u8,
@@ -312,9 +345,17 @@ pub struct Carried {
 /// discover a missing slot. The same trade as a renamed block, for the same
 /// reason: a world that refuses to load because one item was renamed is worse
 /// than one that loads and says what it lost.
-pub fn inventories(save: &Save) -> (Inventories, Vec<String>) {
+pub fn inventories(save: &Save) -> (Inventories, Vec<String>, usize) {
     let mut carried = Inventories::new();
     let mut unknown = Vec::new();
+    let mut dropped_components = 0usize;
+    // Components are only read back when the file says they were written for
+    // the version this build speaks. Anything else is another version's bytes
+    // and would decode to a different component, not to a missing one.
+    let components_readable = save
+        .components
+        .as_deref()
+        .is_some_and(|version| version == dust_registry::generated::registries::DATA_VERSION);
     for player in &save.players {
         let Some(id) = parse_id(&player.id) else {
             continue;
@@ -322,7 +363,7 @@ pub fn inventories(save: &Save) -> (Inventories, Vec<String>) {
         if player.inventory.is_empty() && player.selected == 0 {
             continue;
         }
-        let mut slots: crate::net::inventory::Slots = [None; crate::net::inventory::SLOTS];
+        let mut slots: crate::net::inventory::Slots = std::array::from_fn(|_| None);
         for saved in &player.inventory {
             let index = usize::from(saved.slot);
             if index >= crate::net::inventory::SLOTS || saved.count == 0 {
@@ -330,7 +371,27 @@ pub fn inventories(save: &Save) -> (Inventories, Vec<String>) {
             }
             match dust_registry::Item::from_name(&saved.item) {
                 Some(item) => {
-                    slots[index] = Some(crate::net::inventory::Stack::new(item, saved.count));
+                    let components = match saved.components.as_deref() {
+                        None => dust_protocol::components::ComponentPatch::EMPTY,
+                        Some(hex) if components_readable => {
+                            match dust_protocol::components::ComponentPatch::from_hex(hex) {
+                                Ok(patch) => patch,
+                                Err(_) => {
+                                    dropped_components += 1;
+                                    dust_protocol::components::ComponentPatch::EMPTY
+                                }
+                            }
+                        }
+                        Some(_) => {
+                            dropped_components += 1;
+                            dust_protocol::components::ComponentPatch::EMPTY
+                        }
+                    };
+                    slots[index] = Some(crate::net::inventory::Stack::with_components(
+                        item,
+                        saved.count,
+                        components,
+                    ));
                 }
                 None => {
                     if !unknown.contains(&saved.item) {
@@ -347,7 +408,7 @@ pub fn inventories(save: &Save) -> (Inventories, Vec<String>) {
             },
         );
     }
-    (carried, unknown)
+    (carried, unknown, dropped_components)
 }
 
 /// The slots that hold something, in slot order, ready to be written down.
@@ -357,14 +418,29 @@ pub fn stacks_of(carried: &Carried) -> Vec<SavedStack> {
         .iter()
         .enumerate()
         .filter_map(|(index, stack)| {
-            let stack = (*stack)?;
+            let stack = stack.as_ref()?;
             Some(SavedStack {
                 slot: index as u8,
                 item: stack.item.name().to_owned(),
                 count: stack.count,
+                components: stack.components.to_hex(),
             })
         })
         .collect()
+}
+
+/// The version to stamp a save's components with, or `None` when no stack in
+/// it has any.
+///
+/// `None` rather than always the version, so that a world nobody has put a
+/// named item in stays a file with no component key in it at all.
+#[must_use]
+pub fn components_version(players: &[SavedPlayer]) -> Option<&'static str> {
+    players
+        .iter()
+        .flat_map(|player| player.inventory.iter())
+        .any(|stack| stack.components.is_some())
+        .then_some(dust_registry::generated::registries::DATA_VERSION)
 }
 
 /// Read a hyphenated profile id back into its bytes.
@@ -428,6 +504,7 @@ mod tests {
         let dir = temp_dir("roundtrip");
         let save = Save {
             version: SAVE_VERSION,
+            components: None,
             blocks: vec![SavedBlock {
                 x: -1,
                 y: -60,
@@ -444,11 +521,13 @@ mod tests {
                         slot: 9,
                         item: "minecraft:cobblestone".to_owned(),
                         count: 17,
+                            components: None,
                     },
                     SavedStack {
                         slot: 45,
                         item: "minecraft:bucket".to_owned(),
                         count: 1,
+                            components: None,
                     },
                 ],
                 selected: 4,
@@ -464,17 +543,17 @@ mod tests {
         // And the inventory comes back as slots, not as a list: the slot
         // number is the record, and a save that renumbered them on the way
         // through would put a player's things in the wrong hand.
-        let (carried, unknown) = inventories(&back);
+        let (carried, unknown, _) = inventories(&back);
         assert!(unknown.is_empty(), "{unknown:?}");
         let id = parse_id("f3d28cb0-7225-3cb1-baeb-2dadd2be89ae").expect("an id");
         let mine = carried.get(&id).expect("this player carried something");
         assert_eq!(mine.selected, 4);
         assert_eq!(
-            mine.slots[9].map(|s| (s.item.name(), s.count)),
+            mine.slots[9].as_ref().map(|s| (s.item.name(), s.count)),
             Some(("minecraft:cobblestone", 17))
         );
         assert_eq!(
-            mine.slots[45].map(|s| (s.item.name(), s.count)),
+            mine.slots[45].as_ref().map(|s| (s.item.name(), s.count)),
             Some(("minecraft:bucket", 1))
         );
         assert!(mine.slots[10].is_none());
@@ -503,7 +582,7 @@ mod tests {
         assert_eq!(back.version, 1);
         assert_eq!(back.players[0].x, 1.0);
         assert!(back.players[0].inventory.is_empty());
-        let (carried, unknown) = inventories(&back);
+        let (carried, unknown, _) = inventories(&back);
         assert!(carried.is_empty() && unknown.is_empty());
     }
 
@@ -513,6 +592,7 @@ mod tests {
         // changed version needs to know which item their players lost.
         let save = Save {
             version: SAVE_VERSION,
+            components: None,
             blocks: Vec::new(),
             players: vec![SavedPlayer {
                 id: "f3d28cb0-7225-3cb1-baeb-2dadd2be89ae".to_owned(),
@@ -524,17 +604,19 @@ mod tests {
                         slot: 9,
                         item: "minecraft:cobblestone".to_owned(),
                         count: 3,
+                            components: None,
                     },
                     SavedStack {
                         slot: 10,
                         item: "minecraft:unobtainium".to_owned(),
                         count: 1,
+                            components: None,
                     },
                 ],
                 selected: 0,
             }],
         };
-        let (carried, unknown) = inventories(&save);
+        let (carried, unknown, _) = inventories(&save);
         assert_eq!(unknown, vec!["minecraft:unobtainium".to_owned()]);
         let id = parse_id("f3d28cb0-7225-3cb1-baeb-2dadd2be89ae").expect("an id");
         let mine = carried.get(&id).expect("present");
@@ -547,6 +629,7 @@ mod tests {
         let dir = temp_dir("future");
         let save = Save {
             version: SAVE_VERSION + 1,
+            components: None,
             ..Save::default()
         };
         store(&dir, &save).expect("written");
@@ -605,6 +688,7 @@ mod tests {
         let dir = temp_dir("atomic");
         let good = Save {
             version: SAVE_VERSION,
+            components: None,
             blocks: vec![SavedBlock {
                 x: 7,
                 y: 7,

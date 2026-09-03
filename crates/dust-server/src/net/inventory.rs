@@ -87,6 +87,7 @@
 
 use std::sync::OnceLock;
 
+use dust_protocol::components::ComponentPatch;
 use dust_protocol::types::Slot;
 use dust_registry::tags::{self, TagRegistry};
 use dust_registry::Item;
@@ -277,25 +278,67 @@ fn may_place(index: usize, item: Item) -> bool {
     true
 }
 
-/// One stack: an item and how many of it.
+/// One stack: an item, how many of it, and what makes it that one.
 ///
 /// The count is never zero — an empty slot is `None`, not a stack of nothing —
 /// and never above the item's own maximum. Both are invariants of every
 /// constructor and every mutation here, which is what lets the rest of this
 /// module do arithmetic without re-checking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The third field is the stack's data components: its name, its enchantments,
+/// how worn it is, what is inside it. It is one `Option<Arc<[u8]>>` — `None`
+/// for the overwhelming majority of stacks, which allocate nothing — and it is
+/// what [`stacks_with`] compares, because **two stacks merge only if their
+/// components are equal**. Getting that comparison wrong in one direction
+/// duplicates items and in the other destroys them; see
+/// [`dust_protocol::components`] for why it is byte equality and which of the
+/// two directions that can fail in.
+///
+/// [`stacks_with`]: Stack::stacks_with
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stack {
     pub item: Item,
     pub count: u8,
+    pub components: ComponentPatch,
 }
 
 impl Stack {
     /// A stack of `count`, clamped to what the item allows and to at least one.
     #[must_use]
     pub fn new(item: Item, count: u8) -> Self {
+        Self::with_components(item, count, ComponentPatch::EMPTY)
+    }
+
+    /// The same, carrying components.
+    #[must_use]
+    pub fn with_components(item: Item, count: u8, components: ComponentPatch) -> Self {
         Self {
             item,
             count: count.clamp(1, item.max_stack_size()),
+            components,
+        }
+    }
+
+    /// Whether these two stacks are the same thing, and may therefore pour into
+    /// one another.
+    ///
+    /// The item **and** the components. A stack of sixteen arrows and a stack
+    /// of sixteen arrows named "Bob" are two different things in Minecraft and
+    /// two different things here; merging them would take Bob's name off
+    /// sixteen arrows and give it to none, which the player sees as the server
+    /// tidying their inventory by destroying part of it.
+    #[must_use]
+    pub fn stacks_with(&self, other: &Self) -> bool {
+        self.item == other.item && self.components == other.components
+    }
+
+    /// A copy of this stack with a different count, components and all.
+    #[must_use]
+    fn of(&self, count: u8) -> Self {
+        Self {
+            item: self.item,
+            count,
+            components: self.components.clone(),
         }
     }
 
@@ -303,7 +346,7 @@ impl Stack {
     /// as whether the *slot* it is in is full — see [`slot_limit`] — and the
     /// two callers left are the double-click gather, which is about the cursor
     /// and about stacks it will not break open.
-    fn is_full(self) -> bool {
+    fn is_full(&self) -> bool {
         self.count >= self.item.max_stack_size()
     }
 }
@@ -410,7 +453,7 @@ pub struct Inventory {
 impl Default for Inventory {
     fn default() -> Self {
         Self {
-            slots: [None; SLOTS],
+            slots: std::array::from_fn(|_| None),
             cursor: None,
             selected: 0,
             drag: Drag::default(),
@@ -437,16 +480,17 @@ impl Inventory {
         &self.slots
     }
 
-    /// What one slot holds.
+    /// What one slot holds. Borrowed: a stack carries its components and a
+    /// caller that only wants to look at one should not touch their refcount.
     #[must_use]
-    pub fn slot(&self, index: usize) -> Option<Stack> {
-        self.slots.get(index).copied().flatten()
+    pub fn slot(&self, index: usize) -> Option<&Stack> {
+        self.slots.get(index).and_then(Option::as_ref)
     }
 
     /// What is on the cursor.
     #[must_use]
-    pub fn cursor(&self) -> Option<Stack> {
-        self.cursor
+    pub fn cursor(&self) -> Option<&Stack> {
+        self.cursor.as_ref()
     }
 
     /// Which hotbar slot is in hand, `0..9`.
@@ -458,7 +502,9 @@ impl Inventory {
     /// The item in the selected hotbar slot, if there is one.
     #[must_use]
     pub fn held(&self) -> Option<Item> {
-        self.slots[HOTBAR_START + self.selected].map(|stack| stack.item)
+        self.slots[HOTBAR_START + self.selected]
+            .as_ref()
+            .map(|stack| stack.item)
     }
 
     /// The sequence number to stamp on the next sync.
@@ -622,7 +668,7 @@ impl Inventory {
         if slot == OUTSIDE {
             // Clicked the world behind the window with something on the
             // cursor. Left drops it all, right drops one.
-            match (self.cursor, button) {
+            match (self.cursor.clone(), button) {
                 (Some(_), 0) => {
                     self.cursor = None;
                     changed.mark_cursor();
@@ -649,8 +695,9 @@ impl Inventory {
     fn pickup_left(&mut self, index: usize, changed: &mut Changed) {
         let limit = self
             .cursor
+            .as_ref()
             .map_or(u8::MAX, |held| slot_limit(index, held.item));
-        match (self.cursor, self.slots[index]) {
+        match (self.cursor.clone(), self.slots[index].clone()) {
             // Hand empty, slot full: take it all.
             (None, Some(stack)) => {
                 self.cursor = Some(stack);
@@ -665,16 +712,13 @@ impl Inventory {
                 }
                 let moved = held.count.min(limit);
                 held.count -= moved;
-                self.slots[index] = Some(Stack {
-                    item: held.item,
-                    count: moved,
-                });
+                self.slots[index] = Some(held.of(moved));
                 self.cursor = (held.count > 0).then_some(held);
             }
             // Both full, same item: pour the hand into the slot up to what the
             // slot will hold and keep the rest.
             (Some(mut held), Some(mut there))
-                if held.item == there.item
+                if held.stacks_with(&there)
                     && there.count < limit
                     && may_place(index, held.item) =>
             {
@@ -701,15 +745,12 @@ impl Inventory {
     }
 
     fn pickup_right(&mut self, index: usize, changed: &mut Changed) {
-        match (self.cursor, self.slots[index]) {
+        match (self.cursor.clone(), self.slots[index].clone()) {
             // Hand empty: take half, rounded up. Vanilla rounds the *taken*
             // half up, so a right-click on three leaves one behind.
             (None, Some(mut there)) => {
                 let taken = there.count.div_ceil(2);
-                self.cursor = Some(Stack {
-                    item: there.item,
-                    count: taken,
-                });
+                self.cursor = Some(there.of(taken));
                 there.count -= taken;
                 self.slots[index] = (there.count > 0).then_some(there);
             }
@@ -719,14 +760,11 @@ impl Inventory {
                     return;
                 }
                 held.count -= 1;
-                self.slots[index] = Some(Stack {
-                    item: held.item,
-                    count: 1,
-                });
+                self.slots[index] = Some(held.of(1));
                 self.cursor = (held.count > 0).then_some(held);
             }
             (Some(mut held), Some(mut there))
-                if held.item == there.item
+                if held.stacks_with(&there)
                     && there.count < slot_limit(index, held.item)
                     && may_place(index, held.item) =>
             {
@@ -768,7 +806,7 @@ impl Inventory {
             return;
         }
         loop {
-            let Some(mut stack) = self.slots[index] else {
+            let Some(mut stack) = self.slots[index].clone() else {
                 return;
             };
             let destination = self.quick_move_destination(index, stack.item);
@@ -843,7 +881,7 @@ impl Inventory {
         if other == index {
             return;
         }
-        let Some(mut coming) = self.slots[other] else {
+        let Some(mut coming) = self.slots[other].clone() else {
             // Nothing coming in: this is a take, and every slot here may be
             // taken from.
             if self.slots[index].is_some() {
@@ -869,11 +907,8 @@ impl Inventory {
         // deleted to make room.
         let going = self.slots[index].take();
         coming.count -= limit;
+        self.slots[index] = Some(coming.of(limit));
         self.slots[other] = Some(coming);
-        self.slots[index] = Some(Stack {
-            item: coming.item,
-            count: limit,
-        });
         changed.mark(index);
         changed.mark(other);
         if let Some(going) = going {
@@ -893,13 +928,13 @@ impl Inventory {
         if self.cursor.is_some() {
             return;
         }
-        let Some(there) = self.slots[index] else {
+        let Some(there) = self.slots[index].as_ref() else {
             return;
         };
-        self.cursor = Some(Stack {
-            item: there.item,
-            count: there.item.max_stack_size(),
-        });
+        // Vanilla's middle-click is `ItemStack.copy()`, which copies the
+        // components too: middle-clicking a named pickaxe gives a named
+        // pickaxe, not a plain one.
+        self.cursor = Some(there.of(there.item.max_stack_size()));
         changed.mark_cursor();
     }
 
@@ -913,7 +948,7 @@ impl Inventory {
         let Some(index) = self.writable(slot) else {
             return;
         };
-        let Some(mut there) = self.slots[index] else {
+        let Some(mut there) = self.slots[index].clone() else {
             return;
         };
         match button {
@@ -962,15 +997,15 @@ impl Inventory {
                 // the way in makes the others' share larger. Dragging twenty-one
                 // cobblestone across the chest slot and one ordinary slot puts
                 // all twenty-one in the ordinary slot on a real server, not ten.
-                let Some(held) = self.cursor else {
+                let Some(held) = self.cursor.as_ref() else {
                     self.drag.reset();
                     return;
                 };
                 let fits = may_place(index, held.item)
-                    && match self.slots[index] {
+                    && match self.slots[index].as_ref() {
                         None => true,
                         Some(there) => {
-                            there.item == held.item && there.count < slot_limit(index, held.item)
+                            there.stacks_with(held) && there.count < slot_limit(index, held.item)
                         }
                     };
                 if fits {
@@ -990,7 +1025,7 @@ impl Inventory {
     }
 
     fn finish_drag(&mut self, kind: u8, changed: &mut Changed) {
-        let Some(held) = self.cursor else {
+        let Some(held) = self.cursor.clone() else {
             return;
         };
         if self.drag.count == 0 {
@@ -1012,7 +1047,7 @@ impl Inventory {
             if self.drag.slots & (1u64 << index) == 0 {
                 continue;
             }
-            let existing = self.slots[index].map_or(0, |s| s.count);
+            let existing = self.slots[index].as_ref().map_or(0, |s| s.count);
             let want = share.min(slot_limit(index, held.item).saturating_sub(existing));
             if want == 0 {
                 continue;
@@ -1023,20 +1058,17 @@ impl Inventory {
             if take == 0 {
                 break;
             }
-            self.slots[index] = Some(Stack {
-                item: held.item,
-                count: existing + take,
-            });
+            // Every slot in the drag joined it holding either nothing or a
+            // stack this one merges with, so writing the cursor's components
+            // over the slot's writes the same bytes it already had.
+            self.slots[index] = Some(held.of(existing + take));
             changed.mark(index);
             if kind != 2 {
                 left -= take;
             }
         }
         if kind != 2 && left != held.count {
-            self.cursor = (left > 0).then_some(Stack {
-                item: held.item,
-                count: left,
-            });
+            self.cursor = (left > 0).then_some(held.of(left));
             changed.mark_cursor();
         }
     }
@@ -1047,7 +1079,7 @@ impl Inventory {
     /// double-clicking with a half stack tidies the loose ones up instead of
     /// breaking a full stack somewhere else in the inventory.
     fn pickup_all(&mut self, button: i8, changed: &mut Changed) {
-        let Some(mut held) = self.cursor else {
+        let Some(mut held) = self.cursor.clone() else {
             return;
         };
         if held.is_full() {
@@ -1062,10 +1094,10 @@ impl Inventory {
                 if index == CRAFTING_OUTPUT {
                     continue;
                 }
-                let Some(mut there) = self.slots[index] else {
+                let Some(mut there) = self.slots[index].clone() else {
                     continue;
                 };
-                if there.item != held.item {
+                if !there.stacks_with(&held) {
                     continue;
                 }
                 if pass == 0 && there.is_full() {
@@ -1122,11 +1154,11 @@ impl Inventory {
                 if stack.count == 0 {
                     return;
                 }
-                let Some(mut there) = self.slots[index] else {
+                let Some(mut there) = self.slots[index].clone() else {
                     continue;
                 };
                 let limit = slot_limit(index, stack.item);
-                if there.item != stack.item || there.count >= limit {
+                if !there.stacks_with(stack) || there.count >= limit {
                     continue;
                 }
                 let moved = stack.count.min(limit - there.count);
@@ -1144,10 +1176,7 @@ impl Inventory {
                 continue;
             }
             let moved = stack.count.min(slot_limit(index, stack.item));
-            self.slots[index] = Some(Stack {
-                item: stack.item,
-                count: moved,
-            });
+            self.slots[index] = Some(stack.of(moved));
             stack.count -= moved;
             changed.mark(index);
             return;
@@ -1220,23 +1249,65 @@ fn decode(slot: &Slot) -> Decoded {
             if count > item.max_stack_size() {
                 return Decoded::TooMany;
             }
-            Decoded::Stack(Stack { item, count })
+            let components = match components_of(slot) {
+                Some(components) => components,
+                None => return Decoded::Empty,
+            };
+            Decoded::Stack(Stack {
+                item,
+                count,
+                components,
+            })
         }
     }
 }
 
+/// This stack's components, as the wire gave them.
+fn components_of(slot: &Slot) -> Option<ComponentPatch> {
+    match slot {
+        Slot::Empty => Some(ComponentPatch::EMPTY),
+        Slot::Present { components, .. } => Some(components.clone()),
+    }
+}
+
+/// Tell `dust-protocol` how to name a data-component type id.
+///
+/// The layouts of the fifty-seven component types are protocol knowledge and
+/// live in `dust-protocol`; their *numbers* are Minecraft's, they are a
+/// position in `minecraft:data_component_type`, and that registry is extracted
+/// from the operator's own jar. Writing them down a second time in
+/// `dust-protocol` would be a second answer to a question the registry already
+/// answers — decision record 0016 declined the same trade for equipment slots —
+/// so the lookup is installed here instead, where both halves are visible.
+///
+/// Idempotent, and cheap enough to call on every server construction: the
+/// registry handle is resolved once and the lookup is a function pointer.
+pub fn install_component_types() {
+    fn name_of(id: i32) -> Option<&'static str> {
+        static REGISTRY: OnceLock<Option<dust_registry::Registry>> = OnceLock::new();
+        let registry =
+            (*REGISTRY.get_or_init(|| {
+                dust_registry::Registry::from_name("minecraft:data_component_type")
+            }))?;
+        registry.entry_name(u32::try_from(id).ok()?)
+    }
+    dust_protocol::components::install_type_names(name_of);
+}
+
 /// A stack as the wire wants it.
 ///
-/// The removals list is empty because nothing here stores one; see this
-/// module's header.
+/// The components are the bytes that arrived, in their canonical order. A
+/// `memcpy` and nothing else: they are not re-encoded per send, which matters
+/// because this is called once per slot the client is wrong about, on every
+/// click, for every player.
 #[must_use]
-pub fn to_wire(stack: Option<Stack>) -> Slot {
+pub fn to_wire(stack: Option<&Stack>) -> Slot {
     match stack {
         None => Slot::Empty,
         Some(stack) => Slot::Present {
             count: i32::from(stack.count),
             item_id: stack.item.protocol_id() as i32,
-            removed_components: Vec::new(),
+            components: stack.components.clone(),
         },
     }
 }
@@ -1294,14 +1365,14 @@ mod tests {
         Slot::Present {
             count,
             item_id: item.protocol_id() as i32,
-            removed_components: Vec::new(),
+            components: ComponentPatch::EMPTY,
         }
     }
 
     fn with(pairs: &[(usize, Item, u8)]) -> Inventory {
         let mut inventory = Inventory::default();
         for &(index, item, count) in pairs {
-            inventory.slots[index] = Some(Stack { item, count });
+            inventory.slots[index] = Some(Stack::new(item, count));
         }
         inventory
     }
@@ -1321,7 +1392,7 @@ mod tests {
     fn a_fresh_inventory_holds_nothing() {
         let inventory = Inventory::default();
         assert_eq!(inventory.held(), None);
-        assert_eq!(inventory.cursor(), None);
+        assert_eq!(inventory.cursor().cloned(), None);
         assert!(inventory.slots().iter().all(Option::is_none));
     }
 
@@ -1347,9 +1418,9 @@ mod tests {
         // stacks to one, so two is already too many.
         let mut inventory = Inventory::default();
         assert_eq!(inventory.set_creative(36, &wire(bucket(), 2)), Err(36));
-        assert_eq!(inventory.slot(36), None);
+        assert_eq!(inventory.slot(36).cloned(), None);
         assert_eq!(inventory.set_creative(37, &wire(stone(), 65)), Err(37));
-        assert_eq!(inventory.slot(37), None);
+        assert_eq!(inventory.slot(37).cloned(), None);
         // And the ones that are fine stay fine.
         assert_eq!(inventory.set_creative(38, &wire(stone(), 64)), Ok(Some(38)));
         assert_eq!(
@@ -1383,7 +1454,7 @@ mod tests {
                 &Slot::Present {
                     count: 1,
                     item_id: 999_999,
-                    removed_components: Vec::new(),
+                    components: ComponentPatch::EMPTY,
                 }
             ),
             Err(36)
@@ -1407,7 +1478,7 @@ mod tests {
         // Take.
         let changed = inventory.click(ClickMode::Pickup, 9, 0);
         assert_eq!(inventory.cursor().map(|s| s.count), Some(30));
-        assert_eq!(inventory.slot(9), None);
+        assert_eq!(inventory.slot(9).cloned(), None);
         assert!(changed.has(9) && changed.cursor());
 
         // Merge: 30 into a stack of 50 leaves 16 in hand and 64 in the slot.
@@ -1417,13 +1488,13 @@ mod tests {
 
         // Swap: a different item.
         inventory.click(ClickMode::Pickup, 11, 0);
-        assert_eq!(inventory.slot(11), Some(Stack::new(stone(), 16)));
-        assert_eq!(inventory.cursor(), Some(Stack::new(dirt(), 1)));
+        assert_eq!(inventory.slot(11).cloned(), Some(Stack::new(stone(), 16)));
+        assert_eq!(inventory.cursor().cloned(), Some(Stack::new(dirt(), 1)));
 
         // Put down.
         inventory.click(ClickMode::Pickup, 12, 0);
-        assert_eq!(inventory.slot(12), Some(Stack::new(dirt(), 1)));
-        assert_eq!(inventory.cursor(), None);
+        assert_eq!(inventory.slot(12).cloned(), Some(Stack::new(dirt(), 1)));
+        assert_eq!(inventory.cursor().cloned(), None);
     }
 
     #[test]
@@ -1443,27 +1514,27 @@ mod tests {
 
         inventory.click(ClickMode::Pickup, 10, 1);
         assert_eq!(inventory.slot(10).map(|s| s.count), Some(2));
-        assert_eq!(inventory.cursor(), None);
+        assert_eq!(inventory.cursor().cloned(), None);
     }
 
     #[test]
     fn right_click_on_a_single_leaves_the_slot_empty_rather_than_a_stack_of_nothing() {
         let mut inventory = with(&[(9, bucket(), 1)]);
         inventory.click(ClickMode::Pickup, 9, 1);
-        assert_eq!(inventory.slot(9), None);
-        assert_eq!(inventory.cursor(), Some(Stack::new(bucket(), 1)));
+        assert_eq!(inventory.slot(9).cloned(), None);
+        assert_eq!(inventory.cursor().cloned(), Some(Stack::new(bucket(), 1)));
     }
 
     #[test]
     fn shift_click_sends_the_hotbar_to_the_inventory_and_back() {
         let mut inventory = with(&[(36, stone(), 20)]);
         inventory.click(ClickMode::QuickMove, 36, 0);
-        assert_eq!(inventory.slot(36), None);
-        assert_eq!(inventory.slot(9), Some(Stack::new(stone(), 20)));
+        assert_eq!(inventory.slot(36).cloned(), None);
+        assert_eq!(inventory.slot(9).cloned(), Some(Stack::new(stone(), 20)));
 
         inventory.click(ClickMode::QuickMove, 9, 0);
-        assert_eq!(inventory.slot(9), None);
-        assert_eq!(inventory.slot(36), Some(Stack::new(stone(), 20)));
+        assert_eq!(inventory.slot(9).cloned(), None);
+        assert_eq!(inventory.slot(36).cloned(), Some(Stack::new(stone(), 20)));
     }
 
     #[test]
@@ -1477,7 +1548,7 @@ mod tests {
         inventory.click(ClickMode::QuickMove, 36, 0);
         assert_eq!(inventory.slot(9).map(|s| s.count), Some(64));
         assert_eq!(inventory.slot(10).map(|s| s.count), Some(10));
-        assert_eq!(inventory.slot(36), None);
+        assert_eq!(inventory.slot(36).cloned(), None);
     }
 
     #[test]
@@ -1492,32 +1563,32 @@ mod tests {
         inventory.slots[36] = Some(Stack::new(stone(), 5));
         let changed = inventory.click(ClickMode::QuickMove, 36, 0);
         assert!(changed.is_empty());
-        assert_eq!(inventory.slot(36), Some(Stack::new(stone(), 5)));
+        assert_eq!(inventory.slot(36).cloned(), Some(Stack::new(stone(), 5)));
     }
 
     #[test]
     fn a_number_key_swaps_with_that_hotbar_slot_and_f_swaps_with_the_offhand() {
         let mut inventory = with(&[(9, stone(), 4), (38, dirt(), 2)]);
         inventory.click(ClickMode::Swap, 9, 2);
-        assert_eq!(inventory.slot(9), Some(Stack::new(dirt(), 2)));
-        assert_eq!(inventory.slot(38), Some(Stack::new(stone(), 4)));
+        assert_eq!(inventory.slot(9).cloned(), Some(Stack::new(dirt(), 2)));
+        assert_eq!(inventory.slot(38).cloned(), Some(Stack::new(stone(), 4)));
 
         inventory.click(ClickMode::Swap, 9, SWAP_OFFHAND_BUTTON);
-        assert_eq!(inventory.slot(9), None);
-        assert_eq!(inventory.slot(OFFHAND), Some(Stack::new(dirt(), 2)));
+        assert_eq!(inventory.slot(9).cloned(), None);
+        assert_eq!(inventory.slot(OFFHAND).cloned(), Some(Stack::new(dirt(), 2)));
     }
 
     #[test]
     fn middle_click_clones_a_full_stack_of_that_items_own_maximum() {
         let mut inventory = with(&[(9, stone(), 1), (10, bucket(), 1)]);
         inventory.click(ClickMode::Clone, 9, 2);
-        assert_eq!(inventory.cursor(), Some(Stack::new(stone(), 64)));
-        assert_eq!(inventory.slot(9), Some(Stack::new(stone(), 1)), "unchanged");
+        assert_eq!(inventory.cursor().cloned(), Some(Stack::new(stone(), 64)));
+        assert_eq!(inventory.slot(9).cloned(), Some(Stack::new(stone(), 1)), "unchanged");
 
         // And the number is the item's, not 64.
         let mut inventory = with(&[(10, bucket(), 1)]);
         inventory.click(ClickMode::Clone, 10, 2);
-        assert_eq!(inventory.cursor(), Some(Stack::new(bucket(), 1)));
+        assert_eq!(inventory.cursor().cloned(), Some(Stack::new(bucket(), 1)));
     }
 
     #[test]
@@ -1526,7 +1597,7 @@ mod tests {
         inventory.click(ClickMode::Throw, 36, 0);
         assert_eq!(inventory.slot(36).map(|s| s.count), Some(2));
         inventory.click(ClickMode::Throw, 36, 1);
-        assert_eq!(inventory.slot(36), None);
+        assert_eq!(inventory.slot(36).cloned(), None);
     }
 
     #[test]
@@ -1536,7 +1607,7 @@ mod tests {
         inventory.click(ClickMode::Pickup, OUTSIDE, 1);
         assert_eq!(inventory.cursor().map(|s| s.count), Some(3));
         inventory.click(ClickMode::Pickup, OUTSIDE, 0);
-        assert_eq!(inventory.cursor(), None);
+        assert_eq!(inventory.cursor().cloned(), None);
     }
 
     #[test]
@@ -1581,7 +1652,7 @@ mod tests {
         // arrives after it does nothing.
         inventory.click(ClickMode::Pickup, 20, 0);
         inventory.click(ClickMode::QuickCraft, -999, 2);
-        assert_eq!(inventory.slot(10), None, "the drag never landed");
+        assert_eq!(inventory.slot(10).cloned(), None, "the drag never landed");
         assert_eq!(inventory.slot(20).map(|s| s.count), Some(10));
     }
 
@@ -1601,8 +1672,8 @@ mod tests {
         inventory.click(ClickMode::PickupAll, 12, 0);
         // 5 + 7 + 3 = 15, then 49 taken off the full stack to reach 64.
         assert_eq!(inventory.cursor().map(|s| s.count), Some(64));
-        assert_eq!(inventory.slot(10), None);
-        assert_eq!(inventory.slot(11), None);
+        assert_eq!(inventory.slot(10).cloned(), None);
+        assert_eq!(inventory.slot(11).cloned(), None);
         assert_eq!(inventory.slot(9).map(|s| s.count), Some(15));
     }
 
@@ -1612,8 +1683,8 @@ mod tests {
         inventory.click(ClickMode::Pickup, 9, 0);
         assert_eq!(inventory.cursor().map(|s| s.count), Some(4));
         inventory.closed();
-        assert_eq!(inventory.cursor(), None);
-        assert_eq!(inventory.slot(CRAFTING_START), None);
+        assert_eq!(inventory.cursor().cloned(), None);
+        assert_eq!(inventory.slot(CRAFTING_START).cloned(), None);
         // Both landed somewhere in the inventory.
         let total: u32 = inventory
             .slots()
@@ -1633,7 +1704,7 @@ mod tests {
         // And the crafting output, which is a real slot number and still not
         // one a click may take from.
         assert!(inventory.click(ClickMode::Pickup, 0, 0).is_empty());
-        assert_eq!(inventory.slot(9), Some(Stack::new(stone(), 4)));
+        assert_eq!(inventory.slot(9).cloned(), Some(Stack::new(stone(), 4)));
     }
 
     #[test]
@@ -1648,8 +1719,8 @@ mod tests {
     #[test]
     fn a_stack_survives_the_wire_and_back() {
         for (item, count) in [(stone(), 64u8), (bucket(), 1), (dirt(), 17)] {
-            let stack = Stack { item, count };
-            assert_eq!(from_wire(&to_wire(Some(stack))), Some(stack));
+            let stack = Stack::new(item, count);
+            assert_eq!(from_wire(&to_wire(Some(&stack))), Some(stack));
         }
         assert_eq!(to_wire(None), Slot::Empty);
         assert_eq!(from_wire(&Slot::Empty), None);
@@ -1708,8 +1779,8 @@ mod tests {
         inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
         let changed = inventory.click(ClickMode::Pickup, ARMOUR_HEAD as i16, 0);
         assert!(changed.is_empty(), "a refused click changes nothing");
-        assert_eq!(inventory.slot(ARMOUR_HEAD), None);
-        assert_eq!(inventory.cursor(), Some(Stack::new(stone(), 9)));
+        assert_eq!(inventory.slot(ARMOUR_HEAD).cloned(), None);
+        assert_eq!(inventory.cursor().cloned(), Some(Stack::new(stone(), 9)));
 
         // Boots into the helmet slot are refused for the same reason, and the
         // helmet slot takes the helmet.
@@ -1722,20 +1793,20 @@ mod tests {
         inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
         inventory.click(ClickMode::Pickup, (MAIN_START + 1) as i16, 0);
         inventory.click(ClickMode::Pickup, ARMOUR_HEAD as i16, 0);
-        assert_eq!(inventory.slot(ARMOUR_HEAD), Some(Stack::new(helmet(), 1)));
+        assert_eq!(inventory.slot(ARMOUR_HEAD).cloned(), Some(Stack::new(helmet(), 1)));
     }
 
     #[test]
     fn shift_click_puts_armour_on_and_takes_it_off_again() {
         let mut inventory = with(&[(MAIN_START, helmet(), 1)]);
         inventory.click(ClickMode::QuickMove, MAIN_START as i16, 0);
-        assert_eq!(inventory.slot(ARMOUR_HEAD), Some(Stack::new(helmet(), 1)));
-        assert_eq!(inventory.slot(MAIN_START), None);
+        assert_eq!(inventory.slot(ARMOUR_HEAD).cloned(), Some(Stack::new(helmet(), 1)));
+        assert_eq!(inventory.slot(MAIN_START).cloned(), None);
 
         // Off again, and into the inventory rather than back onto the head.
         inventory.click(ClickMode::QuickMove, ARMOUR_HEAD as i16, 0);
-        assert_eq!(inventory.slot(ARMOUR_HEAD), None);
-        assert_eq!(inventory.slot(MAIN_START), Some(Stack::new(helmet(), 1)));
+        assert_eq!(inventory.slot(ARMOUR_HEAD).cloned(), None);
+        assert_eq!(inventory.slot(MAIN_START).cloned(), Some(Stack::new(helmet(), 1)));
     }
 
     #[test]
@@ -1745,9 +1816,9 @@ mod tests {
             (MAIN_START, item("minecraft:golden_helmet"), 1),
         ]);
         inventory.click(ClickMode::QuickMove, MAIN_START as i16, 0);
-        assert_eq!(inventory.slot(ARMOUR_HEAD), Some(Stack::new(helmet(), 1)));
+        assert_eq!(inventory.slot(ARMOUR_HEAD).cloned(), Some(Stack::new(helmet(), 1)));
         assert_eq!(
-            inventory.slot(HOTBAR_START),
+            inventory.slot(HOTBAR_START).cloned(),
             Some(Stack::new(item("minecraft:golden_helmet"), 1))
         );
     }
@@ -1757,22 +1828,22 @@ mod tests {
         let shield = item("minecraft:shield");
         let mut inventory = with(&[(MAIN_START, shield, 1)]);
         inventory.click(ClickMode::QuickMove, MAIN_START as i16, 0);
-        assert_eq!(inventory.slot(OFFHAND), Some(Stack::new(shield, 1)));
+        assert_eq!(inventory.slot(OFFHAND).cloned(), Some(Stack::new(shield, 1)));
 
         let mut inventory = with(&[(MAIN_START, shield, 1), (OFFHAND, stone(), 1)]);
         inventory.click(ClickMode::QuickMove, MAIN_START as i16, 0);
-        assert_eq!(inventory.slot(OFFHAND), Some(Stack::new(stone(), 1)));
-        assert_eq!(inventory.slot(HOTBAR_START), Some(Stack::new(shield, 1)));
+        assert_eq!(inventory.slot(OFFHAND).cloned(), Some(Stack::new(stone(), 1)));
+        assert_eq!(inventory.slot(HOTBAR_START).cloned(), Some(Stack::new(shield, 1)));
     }
 
     #[test]
     fn the_offhand_and_the_crafting_grid_empty_into_the_inventory() {
         let mut inventory = with(&[(OFFHAND, stone(), 9), (CRAFTING_START, stone(), 4)]);
         inventory.click(ClickMode::QuickMove, OFFHAND as i16, 0);
-        assert_eq!(inventory.slot(MAIN_START), Some(Stack::new(stone(), 9)));
+        assert_eq!(inventory.slot(MAIN_START).cloned(), Some(Stack::new(stone(), 9)));
         inventory.click(ClickMode::QuickMove, CRAFTING_START as i16, 0);
-        assert_eq!(inventory.slot(MAIN_START), Some(Stack::new(stone(), 13)));
-        assert_eq!(inventory.slot(CRAFTING_START), None);
+        assert_eq!(inventory.slot(MAIN_START).cloned(), Some(Stack::new(stone(), 13)));
+        assert_eq!(inventory.slot(CRAFTING_START).cloned(), None);
     }
 
     #[test]
@@ -1784,15 +1855,15 @@ mod tests {
         ]);
         let changed = inventory.click(ClickMode::Swap, ARMOUR_HEAD as i16, 0);
         assert!(changed.is_empty(), "a block cannot be swapped onto a head");
-        assert_eq!(inventory.slot(ARMOUR_HEAD), Some(Stack::new(helmet(), 1)));
+        assert_eq!(inventory.slot(ARMOUR_HEAD).cloned(), Some(Stack::new(helmet(), 1)));
 
         inventory.click(ClickMode::Swap, ARMOUR_HEAD as i16, 1);
         assert_eq!(
-            inventory.slot(ARMOUR_HEAD),
+            inventory.slot(ARMOUR_HEAD).cloned(),
             Some(Stack::new(item("minecraft:golden_helmet"), 1))
         );
         assert_eq!(
-            inventory.slot(HOTBAR_START + 1),
+            inventory.slot(HOTBAR_START + 1).cloned(),
             Some(Stack::new(helmet(), 1))
         );
     }
@@ -1805,8 +1876,8 @@ mod tests {
         let mut inventory = with(&[(MAIN_START, head(), 9)]);
         inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
         inventory.click(ClickMode::Pickup, ARMOUR_HEAD as i16, 0);
-        assert_eq!(inventory.slot(ARMOUR_HEAD), Some(Stack::new(head(), 1)));
-        assert_eq!(inventory.cursor(), Some(Stack::new(head(), 8)));
+        assert_eq!(inventory.slot(ARMOUR_HEAD).cloned(), Some(Stack::new(head(), 1)));
+        assert_eq!(inventory.cursor().cloned(), Some(Stack::new(head(), 8)));
 
         // And a shift-click puts one on the head and then keeps going: the
         // second pass finds the head slot occupied, takes the ordinary arm and
@@ -1814,9 +1885,9 @@ mod tests {
         // a single pass leaves them in the slot that was clicked.
         let mut inventory = with(&[(MAIN_START, head(), 9)]);
         inventory.click(ClickMode::QuickMove, MAIN_START as i16, 0);
-        assert_eq!(inventory.slot(ARMOUR_HEAD), Some(Stack::new(head(), 1)));
-        assert_eq!(inventory.slot(MAIN_START), None);
-        assert_eq!(inventory.slot(HOTBAR_START), Some(Stack::new(head(), 8)));
+        assert_eq!(inventory.slot(ARMOUR_HEAD).cloned(), Some(Stack::new(head(), 1)));
+        assert_eq!(inventory.slot(MAIN_START).cloned(), None);
+        assert_eq!(inventory.slot(HOTBAR_START).cloned(), Some(Stack::new(head(), 8)));
     }
 
     #[test]
@@ -1830,12 +1901,12 @@ mod tests {
         inventory.click(ClickMode::QuickCraft, ARMOUR_CHEST as i16, 1);
         inventory.click(ClickMode::QuickCraft, (MAIN_START + 8) as i16, 1);
         inventory.click(ClickMode::QuickCraft, OUTSIDE, 2);
-        assert_eq!(inventory.slot(ARMOUR_CHEST), None);
+        assert_eq!(inventory.slot(ARMOUR_CHEST).cloned(), None);
         assert_eq!(
-            inventory.slot(MAIN_START + 8),
+            inventory.slot(MAIN_START + 8).cloned(),
             Some(Stack::new(stone(), 21))
         );
-        assert_eq!(inventory.cursor(), None);
+        assert_eq!(inventory.cursor().cloned(), None);
     }
 
     #[test]
@@ -1843,7 +1914,7 @@ mod tests {
         let mut inventory = with(&[(MAIN_START, stone(), 9), (OFFHAND, dirt(), 2)]);
         inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
         inventory.click(ClickMode::Pickup, OFFHAND as i16, 0);
-        assert_eq!(inventory.slot(OFFHAND), Some(Stack::new(stone(), 9)));
-        assert_eq!(inventory.cursor(), Some(Stack::new(dirt(), 2)));
+        assert_eq!(inventory.slot(OFFHAND).cloned(), Some(Stack::new(stone(), 9)));
+        assert_eq!(inventory.cursor().cloned(), Some(Stack::new(dirt(), 2)));
     }
 }
