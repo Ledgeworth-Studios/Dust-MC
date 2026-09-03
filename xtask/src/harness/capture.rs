@@ -480,6 +480,7 @@ fn pregenerate(
         expected.len()
     );
 
+    let mut last_save = Instant::now() - SAVE_EVERY;
     loop {
         let pending = pending_chunks(region_dir, expected);
         if pending.is_empty() {
@@ -492,10 +493,32 @@ fn pregenerate(
                 &pending[..pending.len().min(5)]
             ));
         }
+        // **Ask for the save rather than waiting for one.** A forceloaded chunk
+        // is generated in seconds and then stays in memory: vanilla writes it
+        // when it autosaves, which is every 6,000 ticks, and a server this busy
+        // does not tick 6,000 times quickly. The poll's criterion is "on disk",
+        // so the poll is what should be asking. Without this a three-square
+        // capture spent nine minutes a square idle at 3% CPU, and the whole
+        // wait was for an autosave.
+        if last_save.elapsed() >= SAVE_EVERY {
+            last_save = Instant::now();
+            // Best effort on purpose. A save that fails is the next round's
+            // problem, and the deadline above is what decides the run.
+            let _ = rcon_with_retries(Instant::now() + SAVE_EVERY, &mut |client| {
+                client.exec_delimited("save-all").map(|_| ())
+            });
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         std::thread::sleep(Duration::from_secs(2).min(remaining));
     }
 }
+
+/// How often the poll asks the server to write what it has generated.
+///
+/// Ten seconds rather than every round: a `save-all` runs on the server thread
+/// and one every two seconds would compete with the generation it is waiting
+/// for.
+const SAVE_EVERY: Duration = Duration::from_secs(10);
 
 /// The inclusive block box covering every chunk in `expected`.
 ///
@@ -531,7 +554,14 @@ fn pending_chunks(region_dir: &Path, expected: &[(i32, i32)]) -> Vec<(i32, i32)>
     for &(x, z) in expected {
         let key = super::region::region_coords(x, z);
         let contents = files.entry(key).or_insert_with(|| {
-            std::fs::read(super::region::region_file_path(region_dir, key.0, key.1)).ok()
+            // `region_file_path` takes **chunk** coordinates and does the shift
+            // itself. Handing it the region coordinates shifts twice, and a
+            // second shift is silent: every chunk of the square around the
+            // origin is in region 0,0 either way, so this was right for as long
+            // as `--at` did not exist and wrong for every square it added. It
+            // named `r.9.9.mca` as `r.0.0.mca`, read the wrong file's header at
+            // the right slot, and answered about a chunk a thousand chunks away.
+            std::fs::read(region_dir.join(super::region::region_file_name(key.0, key.1))).ok()
         });
         let present = contents
             .as_deref()
@@ -787,6 +817,33 @@ mod tests {
 
         write_world(&world, &expected);
         assert!(pending_chunks(&world, &expected).is_empty());
+    }
+
+    /// The poll has to answer about a square that is not the one on the origin.
+    ///
+    /// Every chunk within four of 0,0 is in `r.0.0.mca`, so a poll that names
+    /// its region file wrongly still finds them. `--at` is what made that
+    /// reachable: chunk 300,300 is in `r.9.9.mca`, and the poll was shifting
+    /// the coordinates a second time and asking `r.0.0.mca` about it. It
+    /// answered about a chunk a thousand chunks away — sometimes present when
+    /// the far square was empty, and here absent when the far square is full,
+    /// which is a capture that never finishes.
+    #[test]
+    fn polling_answers_about_squares_that_are_not_at_the_origin() {
+        let world = scratch_dir("capture-pending-far").join("world/region");
+        // 300,300 is region 9,9; -450,180 is region -15,5; -1100,-1050 is
+        // region -35,-33. Three files that a doubly-shifted name would miss.
+        let far = vec![(300, 300), (-450, 180), (-1100, -1050)];
+        write_world(&world, &far);
+        assert!(
+            pending_chunks(&world, &far).is_empty(),
+            "written chunks a long way out must count as written"
+        );
+        assert_eq!(
+            pending_chunks(&world, &[(301, 300)]),
+            vec![(301, 300)],
+            "and an unwritten neighbour in the same far region must not"
+        );
     }
 
     #[test]
