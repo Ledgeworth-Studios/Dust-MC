@@ -1,0 +1,433 @@
+// Breaks blocks on a running server and writes down what came out.
+//
+// The fourth survey in this directory and the first about *entities*. It reads
+// the item entities off the raw packet stream — `spawn_entity` for the entity
+// and `entity_metadata` for which item it is holding — because that is what a
+// client actually receives, and because `bot.entities` is prismarine's reading
+// of the same bytes plus its own opinions.
+//
+// Usage, against Dust (creative, the bot puts its own block down):
+//   node drops.js 25601 stone,dirt,oak_leaves
+//
+// Usage, as a gate rather than a survey — what a player feels, checked:
+//   node drops.js 25601 --check
+//
+// Usage, against a real vanilla server, which is the measurement:
+//   mkfifo /tmp/mc-console
+//   ( tail -f /tmp/mc-console | java -jar server.jar nogui > /tmp/mc.log 2>&1 & )
+//   DUST_SERVER_CONSOLE=/tmp/mc-console node drops.js 25701 blocks.txt --survival
+//
+// Output is TSV on stdout and belongs in the operator's own scratch directory,
+// never in the repository: what a block drops is Minecraft's data.
+//
+// # A break that yielded nothing and a break that never happened
+//
+// These look identical from outside — both leave air where a block was, and
+// most of the interesting blocks (leaves, grass) legitimately yield nothing.
+// Every earlier survey in this directory was bitten by the same shape from the
+// other end, and the fix is the same: the target cell is **read before and
+// after**, and a run only says NOTHING when the block was there first and is
+// air afterwards. A cell that never held the block is NO SUCH BLOCK; one that
+// still holds it is NOT BROKEN. Three outcomes, not one.
+
+const mineflayer = require('mineflayer')
+const fs = require('fs')
+
+const VERSION = '1.21.1'
+const JOIN_TIMEOUT_MS = 30000
+const SETTLE_MS = 900
+const DIG_TIMEOUT_MS = 20000
+
+// One state, one drop, one count: if breaking this does not yield exactly one
+// cobblestone the run is not measuring what it thinks it is and stops before
+// printing a single answer. Every survey here has one and every one of them
+// has caught something.
+const CONTROL = 'stone'
+const CONTROL_YIELDS = 'minecraft:cobblestone*1'
+
+const wait = ms => new Promise(r => setTimeout(r, ms))
+
+function usage (why) {
+  console.error(why)
+  console.error('usage: [DUST_SERVER_CONSOLE=<fifo>] node drops.js <port> <blocks|file> [--survival] [--tool <item>]')
+  process.exit(2)
+}
+
+const argv = process.argv.slice(2)
+const port = Number(argv[0])
+if (!port) usage('a port is the first argument')
+let survival = false
+let gate = false
+let tool = 'netherite_pickaxe'
+const rest = []
+for (let i = 1; i < argv.length; i++) {
+  if (argv[i] === '--survival') survival = true
+  else if (argv[i] === '--check') gate = true
+  else if (argv[i] === '--tool') tool = argv[++i]
+  else rest.push(argv[i])
+}
+const console_path = process.env.DUST_SERVER_CONSOLE
+if (survival && !console_path) {
+  usage('--survival builds its arena from the server console, so DUST_SERVER_CONSOLE must be set')
+}
+
+let blocks = []
+if (rest.length === 0 && !gate) usage('name the blocks to break, or a file of them')
+if (rest.length === 0) {
+  blocks = []
+} else if (fs.existsSync(rest[0])) {
+  blocks = fs.readFileSync(rest[0], 'utf8').split(/\s+/).filter(Boolean)
+} else {
+  blocks = rest.join(',').split(',').filter(Boolean)
+}
+blocks = blocks.map(name => (name.includes(':') ? name : 'minecraft:' + name))
+if (!gate && !blocks.includes('minecraft:' + CONTROL)) blocks.unshift('minecraft:' + CONTROL)
+
+function say (command) {
+  fs.appendFileSync(console_path, command + '\n')
+}
+
+function spawned (username) {
+  return new Promise((resolve, reject) => {
+    const b = mineflayer.createBot({
+      host: '127.0.0.1', port, username, auth: 'offline', version: VERSION
+    })
+    const timer = setTimeout(
+      () => reject(new Error(`${username} never reached the world in ${JOIN_TIMEOUT_MS / 1000}s`)),
+      JOIN_TIMEOUT_MS
+    )
+    b.on('error', e => { clearTimeout(timer); reject(new Error(`${username}: ${e.message}`)) })
+    b.on('kicked', r => { clearTimeout(timer); reject(new Error(`${username} was kicked: ${JSON.stringify(r)}`)) })
+    b.once('spawn', () => { clearTimeout(timer); resolve(b) })
+  })
+}
+
+// Every item entity the server has told us about, by entity id. Two packets
+// make one answer: the spawn says an item entity exists and the metadata says
+// which item, and a server that sent only the first has dropped something the
+// player cannot see.
+function watchItems (b) {
+  const itemType = b.registry.entitiesByName.item.id
+  const seen = new Map()
+  b._client.on('spawn_entity', p => {
+    if (p.type !== itemType) return
+    seen.set(p.entityId, { id: p.entityId, item: null, count: 0, x: p.x, y: p.y, z: p.z })
+  })
+  b._client.on('entity_metadata', p => {
+    const entry = seen.get(p.entityId)
+    if (!entry) return
+    for (const field of p.metadata || []) {
+      // Index 8 on an item entity is the stack it is holding.
+      if (field.key !== 8) continue
+      const slot = field.value
+      if (!slot || slot.itemId === undefined) continue
+      entry.item = b.registry.items[slot.itemId]
+        ? 'minecraft:' + b.registry.items[slot.itemId].name
+        : 'item#' + slot.itemId
+      entry.count = slot.itemCount
+    }
+  })
+  const collected = []
+  b._client.on('collect', p => collected.push(p))
+  // How many times the server corrected an item's position. The claim this
+  // counts is the one in `net/items.rs`: an item costs a spawn, a settle and
+  // nothing else, because the client runs the same arc the server does. A
+  // server streaming positions would put twenty of these a second here.
+  let teleports = 0
+  const destroyed = []
+  // By packet id rather than by name: prismarine's name for a packet is its
+  // own reading of the protocol, and this counts what the *server* sent about
+  // an entity it knows is an item. Any packet carrying a known item entity's
+  // id and a position is a correction, whatever it is called.
+  b._client.on('packet', (data, meta) => {
+    if (data && seen.has(data.entityId) && data.x !== undefined) teleports += 1
+    if (process.env.DUST_BOT_PACKETS) tally[meta.name] = (tally[meta.name] || 0) + 1
+  })
+  const tally = {}
+  b._client.on('entity_destroy', p => {
+    for (const id of p.entityIds || []) destroyed.push(id)
+  })
+  return {
+    teleports: () => teleports,
+    tally: () => tally,
+    destroyed,
+    all: () => [...seen.values()],
+    since (mark) {
+      return [...seen.values()].filter(entry => entry.id > mark)
+    },
+    mark () {
+      let top = 0
+      for (const id of seen.keys()) top = Math.max(top, id)
+      return top
+    },
+    collected
+  }
+}
+
+function creativeSlot (b, slot, name) {
+  const known = b.registry.itemsByName[name.replace('minecraft:', '')]
+  if (!known) return false
+  b._client.write('set_creative_slot', {
+    slot,
+    item: {
+      itemCount: 1,
+      itemId: known.id,
+      addedComponentCount: 0,
+      removedComponentCount: 0,
+      components: [],
+      removeComponents: []
+    }
+  })
+  return true
+}
+
+const results = []
+function check (name, ok, detail) {
+  results.push({ name, ok })
+  console.log(`${ok ? 'ok  ' : 'FAIL'}  ${name}${detail ? ' — ' + detail : ''}`)
+}
+
+// Walk the player onto a point, one small step at a time.
+//
+// By hand rather than through mineflayer's pathfinder, for the reason every
+// other script here writes its packets by hand: the movement this is exercising
+// is the server's, and a library that decided to teleport instead would be
+// testing itself. Small steps because the server has a speed limit and a
+// player who claims to have crossed the room in one packet is put back.
+async function walkTo (b, x, y, z) {
+  const steps = 24
+  const from = b.entity.position.clone()
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps
+    b._client.write('position', {
+      x: from.x + (x - from.x) * t,
+      y: from.y + (y - from.y) * t,
+      z: from.z + (z - from.z) * t,
+      onGround: true
+    })
+    await wait(50)
+  }
+}
+
+/// What a player feels, asked of a running server.
+async function gateRun () {
+  const b = await spawned('Digger')
+  const items = watchItems(b)
+  await wait(SETTLE_MS)
+  const stood = b.entity.position.floored()
+  const at = stood.offset(4, 0, 0)
+
+  async function put (block) {
+    const target = b.blockAt(at)
+    if (target && target.name !== 'air') {
+      try { await b.dig(target) } catch (e) {}
+      await wait(200)
+    }
+    creativeSlot(b, 36, block)
+    b._client.write('held_item_slot', { slotId: 0 })
+    await wait(150)
+    const under = b.blockAt(at.offset(0, -1, 0))
+    b._client.write('block_place', {
+      hand: 0,
+      location: { x: under.position.x, y: under.position.y, z: under.position.z },
+      direction: 1,
+      cursorX: 0.5,
+      cursorY: 1.0,
+      cursorZ: 0.5,
+      insideBlock: false,
+      sequence: 1
+    })
+    await wait(400)
+    return b.blockAt(at)
+  }
+
+  // The cell is four blocks away, which is inside the reach a player breaks
+  // at and outside the reach they pick up at. That gap is what makes the
+  // pickup check have a negative half: a drop that is collected before
+  // anybody walks to it would pass a check that only ever looked afterwards.
+  //
+  // 1. A block that is broken drops.
+  let placed = await put('minecraft:stone')
+  check('a stone can be put down to break', placed && placed.name === 'stone',
+    placed ? placed.name : 'nothing there')
+  let mark = items.mark()
+  const before = items.collected.length
+  await b.dig(b.blockAt(at))
+  await wait(SETTLE_MS)
+  let fresh = items.since(mark).filter(e => e.item)
+  check('breaking stone drops one cobblestone',
+    fresh.length === 1 && fresh[0].item === 'minecraft:cobblestone' && fresh[0].count === 1,
+    fresh.map(e => `${e.item}*${e.count}`).join(',') || 'nothing')
+  const drop = fresh[0]
+
+  // 2. It came out of the block, not out of the player.
+  const centre = drop
+    ? Math.hypot(drop.x - (at.x + 0.5), drop.z - (at.z + 0.5))
+    : 99
+  check('the item is at the centre of the block that broke',
+    centre < 0.5,
+    drop ? `${centre.toFixed(2)} blocks from the centre, and ` +
+      `${Math.hypot(drop.x - b.entity.position.x, drop.z - b.entity.position.z).toFixed(2)} from the player`
+      : 'no item')
+
+  // 3. It is *not* taken from where the player is standing. The negative half.
+  check('an item out of reach is left where it fell',
+    items.collected.length === before,
+    `${items.collected.length - before} collected without anybody walking to it`)
+
+  // 4. Walking over it collects it, with no key pressed.
+  if (drop) await walkTo(b, drop.x, at.y, drop.z)
+  await wait(SETTLE_MS)
+  const taken = items.collected.slice(before)
+  check('walking over it picks it up',
+    taken.length === 1 && taken[0].collectedEntityId === (drop && drop.id),
+    taken.length ? `entity ${taken[0].collectedEntityId} to ${taken[0].collectorEntityId}` : 'nothing collected')
+  check('and it is in the inventory afterwards',
+    b.inventory.items().some(i => i.name === 'cobblestone'),
+    b.inventory.items().map(i => `${i.name}*${i.count}`).join(',') || 'empty')
+
+  // 5. Two of the same item lying together become one, back out of reach.
+  await walkTo(b, stood.x + 0.5, stood.y, stood.z + 0.5)
+  await wait(SETTLE_MS)
+  mark = items.mark()
+  for (let i = 0; i < 2; i++) {
+    const again = await put('minecraft:stone')
+    if (again && again.name === 'stone') await b.dig(b.blockAt(at))
+    await wait(600)
+  }
+  await wait(2500)
+  fresh = items.since(mark).filter(e => e.item)
+  const gone = fresh.filter(e => items.destroyed.includes(e.id))
+  check('two of the same item lying together become one',
+    fresh.length === 2 && gone.length === 1,
+    `${fresh.length} spawned, ${gone.length} removed`)
+
+  // 6. The wire cost of an item, which is the claim `net/items.rs` makes.
+  // A number that can only be too high: every item that landed sent exactly
+  // one correction, so the count is at least one and at most one per item. A
+  // check written as "at most" alone would pass on a server that sent none,
+  // and a server that sent none is one whose items are in the wrong place.
+  const corrections = items.teleports()
+  check('an item costs a spawn and one correction, not a position stream',
+    corrections >= 1 && corrections <= items.all().length,
+    `${items.all().length} item(s), ${corrections} correction(s)`)
+  if (process.env.DUST_BOT_PACKETS) console.error(JSON.stringify(items.tally()))
+
+  b.quit()
+  const failed = results.filter(r => !r.ok).length
+  console.log(`\n${results.length - failed}/${results.length} checks passed`)
+  process.exit(failed ? 1 : 0)
+}
+
+async function main () {
+  if (gate) return gateRun()
+  const b = await spawned('Digger')
+  const items = watchItems(b)
+  await wait(SETTLE_MS)
+
+  const stood = b.entity.position.floored()
+  // Two blocks away and one down: far enough that the bot is not standing on
+  // the cell it is breaking, near enough to be in reach at any yaw.
+  const at = stood.offset(2, 0, 0)
+
+  if (survival) {
+    say(`gamemode survival Digger`)
+    say(`give Digger ${tool}`)
+    say(`fill ${at.x - 2} ${at.y - 1} ${at.z - 2} ${at.x + 2} ${at.y - 1} ${at.z + 2} minecraft:stone`)
+    await wait(SETTLE_MS)
+  }
+
+  const rows = []
+  for (const block of blocks) {
+    const name = block.replace('minecraft:', '')
+    // Clear the cell first, so what is measured is this run's block and not
+    // whatever the last one left.
+    if (survival) {
+      say(`setblock ${at.x} ${at.y} ${at.z} minecraft:air replace`)
+      await wait(250)
+      say(`setblock ${at.x} ${at.y} ${at.z} ${block} replace`)
+      await wait(400)
+    } else {
+      const target = b.blockAt(at)
+      if (target && target.name !== 'air') {
+        try { await b.dig(target) } catch (e) { /* reported by the read below */ }
+        await wait(250)
+      }
+      if (!creativeSlot(b, 36, block)) {
+        rows.push([block, tool, 'NO SUCH ITEM', '-'])
+        continue
+      }
+      b._client.write('held_item_slot', { slotId: 0 })
+      await wait(200)
+      const under = b.blockAt(at.offset(0, -1, 0))
+      if (under) {
+        b._client.write('block_place', {
+          hand: 0,
+          location: { x: under.position.x, y: under.position.y, z: under.position.z },
+          direction: 1,
+          cursorX: 0.5,
+          cursorY: 1.0,
+          cursorZ: 0.5,
+          insideBlock: false,
+          sequence: 1
+        })
+      }
+      await wait(400)
+    }
+
+    const before = b.blockAt(at)
+    if (!before || before.name === 'air' || (before.name !== name && 'minecraft:' + before.name !== block)) {
+      // The block never got there. Not a fact about drops, and kept apart from
+      // one: this is the row that stops a tool failure being read as a block
+      // that yields nothing.
+      rows.push([block, tool, 'NO SUCH BLOCK', before ? before.name : 'unloaded'])
+      continue
+    }
+
+    const mark = items.mark()
+    let dug = true
+    try {
+      await Promise.race([
+        b.dig(before),
+        wait(DIG_TIMEOUT_MS).then(() => { throw new Error('dig timed out') })
+      ])
+    } catch (e) {
+      dug = false
+    }
+    await wait(SETTLE_MS)
+
+    const after = b.blockAt(at)
+    const gone = after && after.name === 'air'
+    if (!gone) {
+      rows.push([block, tool, dug ? 'NOT BROKEN' : 'REFUSED', after ? after.name : 'unloaded'])
+      continue
+    }
+    const fresh = items.since(mark).filter(entry => entry.item)
+    const spelled = fresh.length
+      ? fresh.map(entry => `${entry.item}*${entry.count}`).sort().join(',')
+      : '-'
+    rows.push([block, tool, fresh.length ? 'BROKE' : 'NOTHING', spelled])
+  }
+
+  const control = rows.find(row => row[0] === 'minecraft:' + CONTROL)
+  if (!control || control[2] !== 'BROKE' || control[3] !== CONTROL_YIELDS) {
+    console.error(
+      `control failed: breaking ${CONTROL} with a ${tool} gave ` +
+      `${control ? control[2] + ' ' + control[3] : 'no row at all'}, ` +
+      `and it has to give ${CONTROL_YIELDS}. Nothing else this run saw is trustworthy.`
+    )
+    b.quit()
+    process.exit(1)
+  }
+
+  console.log('# block\ttool\toutcome\tdrops')
+  for (const row of rows) console.log(row.join('\t'))
+  console.error(`${rows.length} block(s), ${items.collected.length} picked up`)
+  b.quit()
+  process.exit(0)
+}
+
+main().catch(e => {
+  console.error(e.message)
+  process.exit(1)
+})

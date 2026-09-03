@@ -83,5 +83,15 @@ movement port="25565" check="":
 # Outside `verify` for the same reason `bot` is. Run it against both worlds:
 # a flat one and a `world_source` of region files exercise different halves
 # of the world lookup, and the second is the one with a column cache in it.
+# What a player feels about a broken block, asked of a running server.
+#
+#   just drops 25565            the gate: drop, pickup, merge, wire cost
+#   node drops.js <port> stone,dirt,oak_leaves     what came out, as TSV
+#
+# The survey half wants a real vanilla server and `--survival`; see the header
+# of `tools/bot/drops.js`. Not in `verify`, for the same reason `bot` is not.
+drops port="25565":
+    cd tools/bot && node drops.js {{port}} --check
+
 collide port="25565":
     cd tools/bot && node collide.js {{port}}

@@ -89,8 +89,18 @@ const PICKUP_REACH: f64 = 1.4;
 const PICKUP_BELOW: f64 = 0.7;
 const PICKUP_ABOVE: f64 = 2.0;
 
-/// How near two items have to be to become one, in blocks.
-const MERGE_REACH: f64 = 0.5;
+/// How near two items have to be to become one: horizontally, and vertically.
+///
+/// **A block's worth of drops has to merge, and the spread is what decides
+/// how far apart they can start.** An item pops out anywhere within a quarter
+/// of a block of the centre, so two of them can land half a block apart on
+/// each axis — three quarters of a block by the diagonal. A merge reach under
+/// that is a reach that works most of the time, which for a mined-out vein is
+/// a pile that is sometimes one stack and sometimes six. Vanilla asks the same
+/// question as a box inflated by half a block around an item a quarter wide,
+/// which comes to the same number.
+const MERGE_REACH: f64 = 1.0;
+const MERGE_RISE: f64 = 0.5;
 
 /// Blocks per tick per tick. Vanilla's item gravity.
 const GRAVITY: f64 = 0.04;
@@ -465,9 +475,8 @@ fn merged(entities: &[ItemEntity], left: usize, right: usize) -> Option<u8> {
         return None;
     }
     let dx = a.x - b.x;
-    let dy = a.y - b.y;
     let dz = a.z - b.z;
-    if dx * dx + dy * dy + dz * dz > MERGE_REACH * MERGE_REACH {
+    if dx * dx + dz * dz > MERGE_REACH * MERGE_REACH || (a.y - b.y).abs() > MERGE_RISE {
         return None;
     }
     Some(total as u8)
@@ -512,9 +521,16 @@ fn step(entity: &mut ItemEntity, ground: Option<&mut super::collide::Ground<'_>>
             );
             if entity.vy <= 0.0 && ground.first_solid(cell, cell).is_some() {
                 y = f64::from(cell.1 + 1);
-                // Vanilla bounces at half the speed, which is what makes a
-                // stack dropped from a height settle rather than stop dead.
-                entity.vy *= -0.5;
+                // **Zero, not a bounce.** Vanilla's item does multiply its
+                // vertical speed by minus a half on landing, but only after
+                // the collision that stopped it has already set that speed to
+                // zero, so the multiply is on nothing and an item does not
+                // bounce. Written as a bounce here it hopped for three seconds
+                // before it came to rest, which is three seconds of a player
+                // watching cobblestone behave like a rubber ball — and three
+                // seconds in which two drops from one block are never within
+                // merging distance of each other at the same instant.
+                entity.vy = 0.0;
                 on_ground = true;
             }
         }
