@@ -54,11 +54,11 @@ use crate::noise::rng::{Positional, Xoroshiro};
 
 /// The most result blocks a rule may name.
 ///
-/// Three codes are spoken for by the noise stage — air, the default block and
-/// the default fluid — and a material is a `u8` because a chunk's worth is
-/// ninety-six kibibytes of scratch that is reused for every column a server
-/// ever generates.
-pub const MAX_PALETTE: usize = 253;
+/// Four codes are spoken for by the noise stage — air, the default block, the
+/// default fluid and the lava an aquifer writes — and a material is a `u8`
+/// because a chunk's worth is ninety-six kibibytes of scratch that is reused
+/// for every column a server ever generates.
+pub const MAX_PALETTE: usize = 252;
 
 /// The noise a column's surface depth is drawn from.
 const SURFACE_NOISE: &str = "minecraft:surface";
@@ -208,7 +208,7 @@ pub struct Rules {
 impl Rules {
     /// The result blocks, which a caller resolves against its own registry.
     ///
-    /// A material code of `3 + i` is `palette()[i]`.
+    /// A material code of `4 + i` is `palette()[i]`.
     pub fn palette(&self) -> &[BlockSpec] {
         &self.palette
     }
@@ -385,7 +385,11 @@ impl<'a> Painter<'a> {
                     if code == 0 {
                         stone_above = 0;
                         water_height = NO_GROUND;
-                    } else if code == 2 {
+                    } else if code == 2 || code == 3 {
+                        // Any fluid, lava included: vanilla's walk asks
+                        // `!getFluidState().isEmpty()` and not "is it water",
+                        // so a `water` condition over a lava lake reads the
+                        // lava's own surface.
                         if water_height == NO_GROUND {
                             water_height = y + 1;
                         }
@@ -398,7 +402,11 @@ impl<'a> Painter<'a> {
                             stone_floor = i32::MIN / 2;
                             let mut below = y - 1;
                             while below >= min_y - 1 {
-                                if below < min_y || at(below) == 0 || at(below) == 2 {
+                                if below < min_y
+                                    || at(below) == 0
+                                    || at(below) == 2
+                                    || at(below) == 3
+                                {
                                     stone_floor = below + 1;
                                     break;
                                 }
@@ -413,7 +421,7 @@ impl<'a> Painter<'a> {
                         // not fill an ocean.
                         if code == 1 {
                             if let Some(index) = self.apply(self.rules.root, biomes) {
-                                materials[(y - min_y) as usize * 256 + column] = 3 + index;
+                                materials[(y - min_y) as usize * 256 + column] = 4 + index;
                                 // The only write that can move a column's top
                                 // is one that puts air there, and the rules
                                 // that do sit under `hole` in a frozen ocean.
@@ -434,7 +442,7 @@ impl<'a> Painter<'a> {
                         .rev()
                         .find(|&y| {
                             let code = materials[(y - min_y) as usize * 256 + column];
-                            code != 0 && self.rules.air != Some(code.wrapping_sub(3))
+                            code != 0 && self.rules.air != Some(code.wrapping_sub(4))
                         })
                         .unwrap_or(min_y - 1);
                 }
@@ -1169,6 +1177,7 @@ mod tests {
                     "sea_level": 63,
                     "default_block": {{"Name": "minecraft:stone"}},
                     "default_fluid": {{"Name": "minecraft:water"}},
+                    "aquifers_enabled": false,
                     "surface_rule": {rule},
                     "noise_router": {{"temperature": 0.0, "vegetation": 0.0,
                                       "continents": 0.0, "erosion": 0.0,
@@ -1245,6 +1254,7 @@ mod tests {
             Material::Air => "air".to_owned(),
             Material::Solid => "stone".to_owned(),
             Material::Fluid => "water".to_owned(),
+            Material::Lava => "lava".to_owned(),
             Material::Surface(index) => rules.palette()[index as usize].name.clone(),
         }
     }
@@ -1309,6 +1319,7 @@ mod tests {
                     match at(&materials, x, y, z) {
                         Material::Air => air += 1,
                         Material::Fluid => fluid += 1,
+                        Material::Lava => panic!("this dimension has no aquifer to write lava"),
                         Material::Solid => {
                             panic!("a rule that always answers left stone at {x},{y},{z}")
                         }

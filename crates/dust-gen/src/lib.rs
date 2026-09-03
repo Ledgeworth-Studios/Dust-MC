@@ -18,6 +18,7 @@
 //! constant, so it is right on a modded world as well as a vanilla one;
 //! `vanilla_ores` is one caller that happens to supply vanilla's numbers.
 
+pub mod aquifer;
 pub mod biome;
 pub mod generated;
 pub mod noise;

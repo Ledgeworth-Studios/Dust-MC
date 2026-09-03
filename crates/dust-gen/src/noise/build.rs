@@ -120,6 +120,9 @@ pub struct NoiseSettings {
     pub default_block: BlockSpec,
     /// The block a cell below the fluid level gets.
     pub default_fluid: BlockSpec,
+    /// Whether the dimension runs aquifers. The overworld does; the nether and
+    /// the end say `false` and their pockets are simply air.
+    pub aquifers_enabled: bool,
 }
 
 /// A block name and the properties a settings file wrote beside it.
@@ -147,6 +150,36 @@ pub struct Router {
     pub settings: NoiseSettings,
     /// The dimension's surface rules, compiled into the same graph.
     pub surface: Option<crate::surface::Rules>,
+    /// The six routes an aquifer reads, or `None` when the dimension's
+    /// settings say it has none.
+    pub aquifer: Option<AquiferRoutes>,
+    /// The world seed the graph was built for. Kept because a stage that
+    /// derives its own stream from it — the aquifers do, off
+    /// `minecraft:aquifer` — is built from the router and not beside it.
+    pub seed: i64,
+}
+
+/// The routes [`crate::aquifer`] reads, as node indices into the one graph.
+///
+/// Four of them are the aquifer's own noises and two are shared with the
+/// terrain and the biome source — which is the reason they are indices into
+/// the router's graph rather than a graph of their own. `erosion` is under a
+/// `flat_cache` five other functions already fill.
+#[derive(Debug, Clone, Copy)]
+pub struct AquiferRoutes {
+    /// `barrier`: the noise that decides whether the wall between two
+    /// aquifers of different levels is rock or a passage.
+    pub barrier: usize,
+    /// `fluid_level_floodedness`: whether a region's aquifers hold anything.
+    pub floodedness: usize,
+    /// `fluid_level_spread`: where the surface of one that does sits.
+    pub spread: usize,
+    /// `lava`: which deep ones hold lava instead.
+    pub lava: usize,
+    /// `erosion` and `depth`, which together name the deep dark, where the
+    /// aquifers are turned off so the ancient cities are dry.
+    pub erosion: usize,
+    pub depth: usize,
 }
 
 /// Compile a dimension's whole noise router — climate and terrain — for one
@@ -189,6 +222,26 @@ pub fn router(root: &Path, dimension: &str, seed: i64) -> Result<Router, BuildEr
         None => None,
     };
 
+    // Compiled only when the settings say the dimension has aquifers, and
+    // then all six or an error: a settings file that claims aquifers and is
+    // missing a route would otherwise generate a world with half of one.
+    let aquifer = if shape.aquifers_enabled {
+        Some(AquiferRoutes {
+            barrier: builder.compile_route(&table, "barrier", &settings_path)?,
+            floodedness: builder.compile_route(
+                &table,
+                "fluid_level_floodedness",
+                &settings_path,
+            )?,
+            spread: builder.compile_route(&table, "fluid_level_spread", &settings_path)?,
+            lava: builder.compile_route(&table, "lava", &settings_path)?,
+            erosion: builder.compile_route(&table, "erosion", &settings_path)?,
+            depth: builder.compile_route(&table, "depth", &settings_path)?,
+        })
+    } else {
+        None
+    };
+
     let graph = builder.finish(seed)?;
     Ok(Router {
         graph,
@@ -197,6 +250,8 @@ pub fn router(root: &Path, dimension: &str, seed: i64) -> Result<Router, BuildEr
         initial_density,
         settings: shape,
         surface,
+        aquifer,
+        seed,
     })
 }
 
@@ -271,6 +326,13 @@ fn noise_settings(settings: &Value, path: &Path) -> Result<NoiseSettings, BuildE
             .ok_or_else(|| complain("no `sea_level`".to_owned()))?,
         default_block: block("default_block")?,
         default_fluid: block("default_fluid")?,
+        // Absent means absent, not false: a settings file that carries no
+        // `aquifers_enabled` is one this build has not seen, and a default of
+        // `false` would silently drown every cave on it.
+        aquifers_enabled: settings
+            .get("aquifers_enabled")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| complain("no `aquifers_enabled`".to_owned()))?,
     })
 }
 
