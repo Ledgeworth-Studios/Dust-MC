@@ -93,6 +93,21 @@ movement port="25565" check="":
 drops port="25565":
     cd tools/bot && node drops.js {{port}} --check
 
+# How long a block takes to break, asked of a running server.
+#
+#   just break 25601
+#
+# **Needs a server whose `[server] game_mode` is survival.** On a creative
+# server every answer is one tick, correctly, and a check that passed on both
+# would be a check about nothing — the first row asserts against that. Needs a
+# `[data] path` with a `destroy_speed` column too; without it the same five
+# rows go red, which is the negative control decision record 0028 records.
+#
+# Outside `verify` for the same reason `bot` is: it needs a server already
+# running, and this one needs a particular configuration of it.
+break port="25565":
+    cd tools/bot && node drops.js {{port}} --check-times
+
 collide port="25565":
     cd tools/bot && node collide.js {{port}}
 

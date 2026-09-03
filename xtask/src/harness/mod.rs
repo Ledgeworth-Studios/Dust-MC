@@ -56,11 +56,11 @@
 //! Mojang files; when `dust-nbt` lands, both are deleted in favour of it.
 
 pub mod area;
+mod breaking;
 pub mod cache;
 pub mod capture;
 pub mod compare;
 pub mod digest;
-mod breaking;
 mod drops;
 pub mod light;
 mod nbt;

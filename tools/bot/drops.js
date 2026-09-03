@@ -310,14 +310,26 @@ function digPacket (b, at, status, sequence) {
 async function timedDig (b, at, holdTicks, sequence) {
   const started = Date.now()
   digPacket(b, at, 0, sequence)
-  if (holdTicks > 0) await wait(holdTicks * 50)
+  // **What the cell held the moment before the stop**, and it is the field
+  // that keeps a held run from passing vacuously. A server with no hardness at
+  // all breaks on the start; the poll below only begins after the hold, so it
+  // would report the length of the hold and read as a correct answer. This
+  // says whether the block survived to be stopped.
+  let heldThrough = true
+  if (holdTicks > 0) {
+    await wait(holdTicks * 50)
+    const mid = b.blockAt(at)
+    heldThrough = Boolean(mid) && mid.name !== 'air'
+  }
   digPacket(b, at, 2, sequence + 1)
   while (Date.now() - started < 20000) {
     const now = b.blockAt(at)
-    if (now && now.name === 'air') return Date.now() - started
+    if (now && now.name === 'air') {
+      return { ms: Date.now() - started, heldThrough }
+    }
     await wait(25)
   }
-  return null
+  return { ms: null, heldThrough }
 }
 
 /// What a survival player feels when they hold the button down.
@@ -377,7 +389,8 @@ async function timeGateRun () {
   // check that stops the whole file passing vacuously.
   let placed = await put('minecraft:stone')
   await hand('minecraft:wooden_pickaxe')
-  let took = ticksOf(await timedDig(b, at, 0, sequence))
+  let dug = await timedDig(b, at, 0, sequence)
+  let took = ticksOf(dug.ms)
   sequence += 2
   check('stone with a wooden pickaxe takes 23 ticks, not none',
     Boolean(placed) && placed.name === 'stone' && took !== null &&
@@ -389,7 +402,8 @@ async function timeGateRun () {
   // server that had only one of those right would land between them.
   placed = await put('minecraft:stone')
   await hand(null)
-  took = ticksOf(await timedDig(b, at, 0, sequence))
+  dug = await timedDig(b, at, 0, sequence)
+  took = ticksOf(dug.ms)
   sequence += 2
   check('stone bare-handed takes 150 ticks',
     Boolean(placed) && took !== null && took >= 149 && took <= 152,
@@ -399,10 +413,14 @@ async function timeGateRun () {
   // says the tool table is being read and not just the hardness column.
   placed = await put('minecraft:stone')
   await hand('minecraft:netherite_pickaxe')
-  took = ticksOf(await timedDig(b, at, 0, sequence))
+  dug = await timedDig(b, at, 0, sequence)
+  took = ticksOf(dug.ms)
   sequence += 2
-  check('stone with a netherite pickaxe takes 5 ticks',
-    Boolean(placed) && took !== null && took <= 7,
+  // A range and not a ceiling. Five ticks is fast and one tick is instant, and
+  // a check written as "at most seven" cannot tell them apart — which is
+  // exactly the answer a server with no hardness column gives.
+  check('stone with a netherite pickaxe takes 5 ticks and not none',
+    Boolean(placed) && took !== null && took >= 4 && took <= 7,
     `${took === null ? 'never broke' : took + ' tick(s)'}`)
 
   // 4. **The client is believed before the server has finished counting.**
@@ -414,11 +432,13 @@ async function timeGateRun () {
   // only that one arrived.
   placed = await put('minecraft:stone')
   await hand('minecraft:wooden_pickaxe')
-  took = ticksOf(await timedDig(b, at, 16, sequence))
+  dug = await timedDig(b, at, 16, sequence)
+  took = ticksOf(dug.ms)
   sequence += 2
   check('a stop at 70% is believed rather than refused',
-    Boolean(placed) && took !== null && took <= 19,
-    `${took === null ? 'never broke' : took + ' tick(s)'} after a 16-tick hold`)
+    Boolean(placed) && dug.heldThrough && took !== null && took <= 19,
+    `${dug.heldThrough ? 'still there at the stop' : 'gone before the stop'}, ` +
+      `${took === null ? 'never broke' : took + ' tick(s)'} after a 16-tick hold`)
 
   // 5. Letting go abandons the break. Start, cancel, wait out the whole 23
   // ticks and more: the block is still there. Without this the timing could

@@ -161,10 +161,7 @@ pub fn run(options: &Options) -> std::process::ExitCode {
                 Some(hardness) => hardness,
                 None => {
                     unknown += 1;
-                    worklist.push(format!(
-                        "{}: no hardness for state {state}",
-                        timing.block
-                    ));
+                    worklist.push(format!("{}: no hardness for state {state}", timing.block));
                     continue;
                 }
             }
@@ -180,8 +177,7 @@ pub fn run(options: &Options) -> std::process::ExitCode {
             // survey that say 15 and 60 where the drops verdict alone predicts
             // 50 and 200.
             correct: dust_sim::mining::tool_is_correct(
-                requires_tool
-                    .is_some_and(|(table, flag)| table.is_set(flag, state)),
+                requires_tool.is_some_and(|(table, flag)| table.is_set(flag, state)),
                 dust_registry::mining::correct_for_drops(timing.tool, block),
             ),
             on_ground: true,
