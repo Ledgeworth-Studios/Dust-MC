@@ -232,3 +232,11 @@ larger than the one this record removed.** A join builds and sends 289 columns
 at the default view distance, a batch at a time, on the session's own task —
 and unlike a movement check it does it for columns nobody will hold. Residency
 does not touch it. That is the next measurement.
+
+**Answered by [D31](0031-how-a-join-streams-its-chunks.md), 2026-09-03.** The
+stream is the store's third caller and builds nothing itself; the store now
+belongs to a generated world as well as an Anvil one, which is where the cost
+had moved to. D31 also found the defect this record left behind: giving a column
+back scanned the whole resident map, which was affordable for the two callers
+this record had and starved every reader the moment a third arrived that
+released a column fifty times a second.

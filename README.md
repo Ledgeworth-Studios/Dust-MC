@@ -44,6 +44,19 @@ The same work, in the same order, finishing at the same moment — with the
 session answering throughout instead of at the end. A player who joins and walks
 immediately used to have their movement packets sit in the socket for a second.
 
+The columns themselves are built by the world rather than by the session that
+wants them, and a session sends only the ones that are ready — nearest first, a
+prefix with no holes in it, over a window of 24 columns it claims in the shared
+column store and gives back as they go out. That is what keeps a join off its
+own tokio worker and out of everybody else's way. Four bots joining at once,
+while a settled player timed a chat round trip twenty times a second: the
+settled player's worst round trip on a generated world went from 279, 875 and
+500 ms over three runs to 24, 69 and 87 ms, and the four joiners now finish
+within 20 ms of each other rather than staggered across 400, because the store
+builds their columns once between them. Decision record
+[0031](docs/decisions/0031-how-a-join-streams-its-chunks.md) has the ladder
+that says which world each number is about.
+
 A player who changes their render distance mid-game is served the new one, which
 the pacing made cheap enough to bother with: the view forgets or sends the
 difference on its next move, out of the same computation it already does.
@@ -286,16 +299,14 @@ aquifers, carvers or features**, so a generated world has no trees or ore veins,
 its noise caves are flooded where vanilla leaves them dry, and there are no
 icebergs — decision record
 [0032](docs/decisions/0032-what-the-ground-is-made-of.md)
-is what each of those is worth on the same sample, in cells; **nothing keeps a generated
-column**, so a world with no file behind it builds every column a player walks
-toward on the thread that asked, which is what an Anvil column cost before
-record 0025; no
+is what each of those is worth on the same sample, in cells; no
 physics or block updates, so a player is stopped from
-entering a block and never pushed out of one; **no residency for the chunks a
-client is looking at**, so a join still builds and sends 289 columns on the
-session's own task — which is now the largest blocking region-file cost left in
-the server, larger than the one residency removed, and record
-[0025](docs/decisions/0025-who-keeps-a-chunk-column.md) says so at the end;
+entering a block and never pushed out of one; **only one thread builds columns
+for a world**, so a cold join into generated terrain is about 1.7 seconds of
+world arriving around a player who is already walking — the loading screen ends
+at 145 ms and record
+[0031](docs/decisions/0031-how-a-join-streams-its-chunks.md) says what a pool
+would move and why it is declined for now;
 **no water on the movement path**,
 so a player who says they are sprinting and airborne is measured at their feet
 rather than at their full height, because they might be swimming and no client

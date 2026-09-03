@@ -6,14 +6,22 @@
 //! will be a variant here rather than a rewrite of everything that asks for a
 //! column.
 //!
-//! # What an Anvil world costs to serve, and what is cached
+//! # What a world costs to serve, and who keeps what
 //!
 //! Region files are held open — a world is a few dozen of them and reopening
 //! one per column would be a syscall storm — behind a mutex, because they are
-//! read from every session's task and a `RegionFile` seeks as it reads. What is
-//! **not** cached is the parsed column: a chunk is about a megabyte and a view
-//! distance of ten is four hundred of them, so caching them all is a design
-//! decision with a memory budget attached and not something to slip in.
+//! read from every session's task and a `RegionFile` seeks as it reads.
+//!
+//! The parsed columns are kept by a [`ColumnStore`], and **only the ones
+//! somebody is holding**: a player's ring, the columns falling items will read,
+//! and the window a chunk stream is about to send. A column of a real world is
+//! **111 KB** — measured by `benches/movement.rs` with a counting allocator,
+//! against the "about a megabyte" three modules including this one claimed for
+//! the life of the project — so what makes a cache of them a design decision is
+//! how many are held and by whom, not their size. Decision records
+//! [0025](../../../../docs/decisions/0025-who-keeps-a-chunk-column.md) and
+//! [0031](../../../../docs/decisions/0031-how-a-join-streams-its-chunks.md) are
+//! the two that answer it.
 //!
 //! # What *is* cached is 256 integers per column
 //!
@@ -35,11 +43,11 @@
 //! # A missing column is not an error
 //!
 //! A real world is a disc of generated chunks in an infinite plane, and a
-//! player can walk off the edge of it. Vanilla generates what is missing; Dust
-//! has no generator yet, so it falls back to the flat column. That is visible —
-//! terrain stops and a plain runs on — which is the right kind of wrong: an
-//! error would disconnect a player for walking, and a hole would look like a
-//! bug in the chunk packet.
+//! player can walk off the edge of it. Vanilla generates what is missing, and
+//! so does Dust when it could read the world's own seed — see [`Fallback`],
+//! which is where the two answers are chosen between and why the choice is not
+//! a setting. Either way an error would disconnect a player for walking, and a
+//! hole would look like a bug in the chunk packet.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
