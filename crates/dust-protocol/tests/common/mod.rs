@@ -1894,6 +1894,50 @@ fn play_frames(out: &mut Vec<Frame>) {
             value: 200,
         }
     ));
+    // Content carries the whole window plus the cursor: an empty slot, a plain
+    // stack and one with removals, because those are the three shapes `Slot`
+    // has and a frame with only the middle one would not exercise the other
+    // two.
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::ContainerSetContent {
+            window_id: 0,
+            state_id: VarInt(7),
+            slots: vec![
+                Slot::Empty,
+                Slot::Present {
+                    count: 64,
+                    item_id: 1,
+                    removed_components: Vec::new(),
+                },
+                Slot::Present {
+                    count: 1,
+                    item_id: 856,
+                    removed_components: vec![3, 9],
+                },
+            ],
+            carried_item: Slot::Empty,
+        }
+    ));
+    // A negative window id, because it is the field this packet gets wrong if
+    // it is widened: -1 is the cursor.
+    out.push(frame!(
+        cb,
+        Play,
+        Clientbound,
+        cb::ContainerSetSlot {
+            window_id: -1,
+            state_id: VarInt(8),
+            slot: 36,
+            item: Slot::Present {
+                count: 17,
+                item_id: 14,
+                removed_components: Vec::new(),
+            },
+        }
+    ));
     out.push(frame!(
         cb,
         Play,

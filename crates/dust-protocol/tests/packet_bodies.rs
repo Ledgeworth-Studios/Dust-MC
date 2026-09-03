@@ -552,19 +552,6 @@ fn the_unclaimed_worklist_is_exactly_the_blocked_set() {
     // or updates it on purpose — silently growing it is how a worklist stops
     // being one.
     let blocked: &[(State, Direction, &str)] = &[
-        // The Slot wall: an item stack whose added components have no length
-        // cannot be stepped over. See `Slot` for why partial decoding is not
-        // available here.
-        (
-            State::Play,
-            Direction::Clientbound,
-            "minecraft:container_set_content",
-        ),
-        (
-            State::Play,
-            Direction::Clientbound,
-            "minecraft:container_set_slot",
-        ),
         // The chat-signing wall: offline-first means no session keys, and
         // these packets exist to carry them. See `play::chat`.
         (State::Play, Direction::Clientbound, "minecraft:delete_chat"),

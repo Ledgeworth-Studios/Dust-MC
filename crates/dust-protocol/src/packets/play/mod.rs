@@ -2,14 +2,12 @@
 //!
 //! # Where this state stands
 //!
-//! Every packet this version's table lists is defined here except eight, and
-//! those eight are blocked rather than skipped. Each carries one of three
-//! walls, named so nobody has to rediscover which one applies:
+//! Every packet this version's table lists is defined here except six, and
+//! those six are blocked rather than skipped. Each carries one of two walls,
+//! named so nobody has to rediscover which one applies:
 //!
 //! | Packet | Direction | Blocker |
 //! | --- | --- | --- |
-//! | `minecraft:container_set_content` | clientbound | **Slot wall** — its body is an array of item stacks |
-//! | `minecraft:container_set_slot` | clientbound | **Slot wall** — same array shape, one slot |
 //! | `minecraft:delete_chat` | clientbound | **Chat signing** — removes messages by signature digest |
 //! | `minecraft:chat_command` | serverbound | **Chat signing** — unsigned commands still ride the signed-chat envelope |
 //! | `minecraft:chat_command_signed` | serverbound | **Chat signing** — argument signatures and acknowledgements |
@@ -17,11 +15,27 @@
 //! | `minecraft:debug_sample` | clientbound | **Dev-only** — F3 debug samples; the vanilla server gates them on operator status |
 //! | `minecraft:debug_sample_subscription` | serverbound | **Dev-only** — subscribes to the above |
 //!
-//! The Slot wall is [`crate::types::Slot`]'s: a component-bearing stack has no
-//! length to skip past, and inventories are made of nothing else. The signing
-//! wall is [`chat`]'s: Dust is offline-first, and the day online mode arrives,
-//! the layouts there are where verification plugs in. The dev pair is a pair
-//! because neither half means anything alone.
+//! The signing wall is [`chat`]'s: Dust is offline-first, and the day online
+//! mode arrives, the layouts there are where verification plugs in. The dev
+//! pair is a pair because neither half means anything alone.
+//!
+//! # The Slot wall was never a clientbound wall
+//!
+//! `container_set_content` and `container_set_slot` sat on that list until the
+//! inventory needed them, and the reason they came off is worth stating,
+//! because the same mistake is available for every other Slot-carrying packet.
+//! [`crate::types::Slot`] refuses a stack whose *added* components are
+//! present, and it refuses it **on decode**: a component carries no length, so
+//! an unknown one cannot be stepped over. Encoding has no such problem. It
+//! writes a zero for the additions and knows exactly where every byte goes.
+//!
+//! These two are clientbound, so the server only ever encodes them, and the
+//! wall is on the side it never touches. What is still true is that a body
+//! decoded back — by the round-trip tests here, or by anything replaying a
+//! capture — refuses added components exactly as it does everywhere else. That
+//! is the same refusal, not a new one, and it is why these could be claimed
+//! without finishing the component work: what Dust *sends* has no added
+//! components, because Dust does not model any.
 //!
 //! [`crate::packets::unclaimed_for`] returns exactly this list for 1.21.1, and
 //! a test pins it: a packet added here must either leave that list or update
