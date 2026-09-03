@@ -712,3 +712,90 @@ fn a_gzip_payload_with_a_flipped_magic_byte_is_refused_by_scheme() {
         .expect("present");
     assert_eq!(payload.len(), 3_000);
 }
+
+// ---------------------------------------------------------------------------
+// The tail Minecraft leaves, which is the case in this file that is *not*
+// damage. Vanilla writes a chunk's four-byte length, its compression byte and
+// its stream, and then stops: the last chunk of a region file it wrote sits in
+// a sector that was never padded out, so the file ends mid-sector with every
+// byte of the stream present. Measured on ten region files from two worlds the
+// harness generated — in all ten, the bytes after the last chunk's offset were
+// its declared length plus the four-byte prefix, exactly.
+//
+// Dust read those files as damaged and, because `open` refuses a file with any
+// damage in it, threw away all 1,024 chunks of the region and served its flat
+// fallback there instead. Nothing caught it: Dust's own writer pads, and every
+// test in this suite round-trips Dust to Dust.
+// ---------------------------------------------------------------------------
+
+/// Where the last chunk of a file starts, and how many bytes its stream
+/// declares — read out of the file rather than assumed, so this follows the
+/// writer wherever it puts things.
+fn last_stream(bytes: &[u8]) -> (usize, usize) {
+    let mut last = (0u32, 0u32);
+    for slot in 0..1024 {
+        let at = slot * 4;
+        let first =
+            u32::from(bytes[at]) << 16 | u32::from(bytes[at + 1]) << 8 | u32::from(bytes[at + 2]);
+        let count = u32::from(bytes[at + 3]);
+        if first != 0 && first + count > last.0 + last.1 {
+            last = (first, count);
+        }
+    }
+    let at = last.0 as usize * SECTOR_BYTES;
+    let declared =
+        u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize;
+    (at, declared)
+}
+
+#[test]
+fn a_file_that_stops_where_minecraft_stops_writing_keeps_every_chunk() {
+    let mut bytes = sound_region();
+    let (at, declared) = last_stream(&bytes);
+    bytes.truncate(at + 4 + declared);
+    assert_ne!(
+        bytes.len() % SECTOR_BYTES,
+        0,
+        "the point is an unpadded tail"
+    );
+
+    let mut file = RegionFile::open(MemoryStore::from_bytes(bytes), REGION).expect("opens");
+    assert_eq!(file.chunk_count(), 2);
+    assert_eq!(
+        file.read_chunk(chunk(0, 0)).expect("reads"),
+        Some(ChunkPayload::from_bytes(b"the first chunk".repeat(200)))
+    );
+    assert_eq!(
+        file.read_chunk(chunk(5, 7)).expect("reads"),
+        Some(ChunkPayload::from_bytes(incompressible(20_000)))
+    );
+}
+
+#[test]
+fn one_byte_less_than_minecraft_would_have_written_is_still_refused() {
+    // The negative control for the test above, and the reason rounding up is
+    // not the same as trusting the file: a stream cut one byte short is caught
+    // against the bytes that are there, and the count in the message is a byte
+    // count rather than a sector count.
+    let mut bytes = sound_region();
+    let (at, declared) = last_stream(&bytes);
+    bytes.truncate(at + 4 + declared - 1);
+    let target = chunk(5, 7);
+    let err = read_err(bytes, target);
+    names(&err, target);
+    match err {
+        RegionError::StreamPastSectors {
+            declared: said,
+            available,
+            ..
+        } => {
+            assert_eq!(
+                said as usize,
+                declared - 1,
+                "the stream's own length, less its compression byte"
+            );
+            assert_eq!(available as usize, declared - 2, "one byte short of it");
+        }
+        other => panic!("{other}"),
+    }
+}
