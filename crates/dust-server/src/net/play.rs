@@ -73,6 +73,7 @@ pub fn login_packet(
     max_players: u32,
     view_distance: u32,
     dimension_type: u32,
+    mode: Gamemode,
 ) -> Result<play::clientbound::Login, dust_protocol::wire::DecodeError> {
     Ok(play::clientbound::Login {
         entity_id,
@@ -99,7 +100,13 @@ pub fn login_packet(
         // everywhere — and a random number here would make two joins to the
         // same server disagree about nothing.
         hashed_seed: 0,
-        game_mode: GameModeByte(Gamemode::Creative),
+        // **The one byte that decides whether a break is timed.** A creative
+        // client removes a block locally the instant it is clicked and never
+        // sends a stop; a survival client animates a break whose length it
+        // works out itself and waits for the server to agree. The server's
+        // side of that agreement is `dust_sim::mining`, and it is only asked
+        // when this says survival — see decision record 0028.
+        game_mode: GameModeByte(mode),
         // `None`, meaning "no previous mode", which is what a fresh join is.
         // Encoded as -1 rather than as a mode nobody was in.
         previous_game_mode: PreviousGameMode(None),

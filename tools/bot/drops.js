@@ -58,6 +58,15 @@ const ARENA_Y = 200
 const CONTROL = 'stone'
 const CONTROL_YIELDS = 'minecraft:cobblestone*1'
 
+// The same idea for `--times`, where the rows are numbers and not drops.
+// Stone is hardness 1.5, a wooden pickaxe has speed 2 and is correct for its
+// drops, so progress is 2 / 1.5 / 30 per tick and the break is 23 ticks. That
+// number is on every published break-time table and was measured against a
+// real 1.21.1 server before it was written down here.
+const CONTROL_TIME_BLOCK = 'stone'
+const CONTROL_TIME_TOOL = 'minecraft:wooden_pickaxe'
+const CONTROL_TICKS = 23
+
 const wait = ms => new Promise(r => setTimeout(r, ms))
 
 function usage (why) {
@@ -232,23 +241,34 @@ async function walkTo (b, x, y, z) {
 ///
 /// Not `bot.dig`, and the difference is the whole measurement: mineflayer
 /// computes its own break time from its own copy of Minecraft's numbers, waits
-/// that long and then says it is done, so timing it measures prismarine. This
-/// sends `START_DESTROY_BLOCK` once, never sends a stop, and waits for the cell
-/// to become air — because a vanilla server that is never told to stop keeps
-/// counting on its own and destroys the block when *its* progress reaches one.
-/// What comes back is the server's own answer in milliseconds.
+/// that long and then says it is done, so timing it measures prismarine.
+///
+/// # A start with no stop is never broken, and that cost forty minutes
+///
+/// The obvious shape — send `START_DESTROY_BLOCK`, send nothing else, wait for
+/// the cell to go — measures nothing, and 42 consecutive rows timed out at two
+/// minutes each proving it. **A vanilla server counts a break it was never
+/// told to stop but never destroys it.** `ServerPlayerGameMode.tick` has two
+/// branches and only one of them takes a block away: `hasDelayedDestroy`,
+/// which finishes at progress 1.0, and `isDestroyingBlock`, which only sends
+/// the crack overlay. The block a player is holding the button down on is
+/// destroyed by the *stop*, not by the count.
+///
+/// So this sends both, back to back. The stop arrives long before the 70% the
+/// server believes, which is exactly what arms `hasDelayedDestroy` — and the
+/// delayed path then finishes the break on the server's own clock, from the
+/// tick the start arrived on. What comes back is the server's own full break
+/// time in milliseconds, in one round trip and with no guess about how long to
+/// hold.
 ///
 /// A poll rather than a packet listener, at half a tick, because the answer
 /// wanted is "which tick did it go" and any read finer than that is measuring
 /// the poll.
 async function timeBreak (b, at) {
   const started = Date.now()
-  b._client.write('block_dig', {
-    status: 0,
-    location: { x: at.x, y: at.y, z: at.z },
-    face: 1,
-    sequence: 1
-  })
+  const where = { x: at.x, y: at.y, z: at.z }
+  b._client.write('block_dig', { status: 0, location: where, face: 1, sequence: 1 })
+  b._client.write('block_dig', { status: 2, location: where, face: 1, sequence: 2 })
   while (Date.now() - started < TIME_LIMIT_MS) {
     const now = b.blockAt(at)
     if (now && now.name === 'air') return Date.now() - started
@@ -625,6 +645,47 @@ async function main () {
   // where the run held a bare hand at all, the negative control asks that the
   // same block with an empty hand gives nothing — the rule this survey exists
   // to measure, checked in the direction that a broken harness cannot fake.
+  // A timing run's rows are milliseconds and ticks, so the drop controls above
+  // cannot read them. Its own control is the number every published table of
+  // break times agrees on: **stone with a wooden pickaxe is 23 ticks.** A run
+  // that gets that right measured the server; a run that gets it wrong is
+  // measuring its own polling, its own latency, or a haste effect somebody
+  // left on, and every other row in the file is worth nothing.
+  //
+  // Two ticks of slack, which is one poll either side. Not more: the whole
+  // point of the control is that a harness which drifted would be caught, and
+  // a control with room for a five-tick error cannot catch a five-tick error.
+  if (times) {
+    // Both names are compared un-namespaced. The block column is written
+    // namespaced and the tool column is written exactly as `--tool` spelled
+    // it, which is one of the two, and a control that assumed either one
+    // silently fails to find its own row — which is what a control looks like
+    // when it is not a control. Ten minutes of measurement were thrown away
+    // finding that out.
+    const plain = name => String(name).replace('minecraft:', '')
+    const timed = rows.find(row => plain(row[0]) === plain(CONTROL_TIME_BLOCK) &&
+                                   plain(row[1]) === plain(CONTROL_TIME_TOOL))
+    const got = timed ? Number(timed[3]) : NaN
+    if (!Number.isFinite(got) || Math.abs(got - CONTROL_TICKS) > 2) {
+      console.error(
+        `timing control failed: ${CONTROL_TIME_BLOCK} with ${CONTROL_TIME_TOOL} took ` +
+        `${timed ? timed[2] + ' ms (' + timed[3] + ' ticks)' : 'no row at all'}, and it ` +
+        `has to take ${CONTROL_TICKS} ticks. Nothing else this run timed is trustworthy.`
+      )
+      // On stderr and never on stdout. The rows are untrustworthy and must not
+      // reach a scorer, but a run of this costs ten minutes of real time and a
+      // reader looking at why the control failed needs to see what it saw.
+      for (const row of rows) console.error('  ' + row.join('\t'))
+      b.quit()
+      process.exit(1)
+    }
+    console.log('# block\ttool\tms\tticks')
+    for (const row of rows) console.log(row.join('\t'))
+    console.error(`${rows.length} timing(s), control ${got} ticks`)
+    b.quit()
+    process.exit(0)
+  }
+
   const control = rows.find(row => row[0] === 'minecraft:' + CONTROL && row[1] !== BARE)
   if (!control || control[2] !== 'BROKE' || control[3] !== CONTROL_YIELDS) {
     console.error(
@@ -649,13 +710,6 @@ async function main () {
     }
   }
 
-  if (times) {
-    console.log('# block\ttool\tms\tticks')
-    for (const row of rows) console.log(row.join('\t'))
-    console.error(`${rows.length} timing(s)`)
-    b.quit()
-    process.exit(0)
-  }
   console.log('# block\ttool\toutcome\tdrops')
   for (const row of rows) console.log(row.join('\t'))
   console.error(`${rows.length} block(s), ${items.collected.length} picked up`)

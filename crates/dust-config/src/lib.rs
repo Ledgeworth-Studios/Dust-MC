@@ -132,6 +132,12 @@ impl ConfigValue for crate::model::LogLevel {
     }
 }
 
+impl ConfigValue for crate::model::GameMode {
+    fn render_default(&self) -> String {
+        format!("{self}")
+    }
+}
+
 impl<T: ConfigValue> ConfigValue for Option<T> {
     fn render_default(&self) -> String {
         match self {

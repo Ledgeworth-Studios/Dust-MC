@@ -60,6 +60,7 @@ pub mod cache;
 pub mod capture;
 pub mod compare;
 pub mod digest;
+mod breaking;
 mod drops;
 pub mod light;
 mod nbt;
@@ -148,6 +149,17 @@ outside the repository (override with DUST_HARNESS_CACHE).
       not a gate, for the same reason `light` is: exit 0 unless the run itself
       failed. Decision record 0011 is why this exists.
 
+  break --answers <file> [--tables <[data] path>] [--without-hardness] [--verbose]
+      Score how long Dust says a block takes to break against the milliseconds
+      `tools/bot/drops.js --survival --times` measured a real Minecraft server
+      taking. The computed side reads the operator's own hardness column and
+      each item's own `minecraft:tool` component, so neither side restates the
+      other. A row agrees within one tick, which is the poll's own resolution.
+      `--without-hardness` is the negative control: it withholds the column,
+      every block computes as instant, and a scorer that still agrees is not
+      reading what it says it reads. A gate: exit 1 on any disagreement.
+      Decision record 0028 is why this exists.
+
   drops --answers <file> [--tables <[data] path>] [--verbose]
       Score what Dust says a broken block yields against the answers
       `tools/bot/drops.js --survival` asked of a real Minecraft server in
@@ -182,6 +194,7 @@ enum Verb {
     Light(light::Options),
     Placement(placement::Options),
     Drops(drops::Options),
+    Break(breaking::Options),
     Worldgen(worldgen::Options),
 }
 
@@ -218,6 +231,7 @@ pub fn dispatch(args: &[String]) -> Result<ExitCode, String> {
         Verb::Light(options) => Ok(light::run(&options)),
         Verb::Placement(options) => Ok(placement::run(&options)),
         Verb::Drops(options) => Ok(drops::run(&options)),
+        Verb::Break(options) => Ok(breaking::run(&options)),
         Verb::Worldgen(options) => Ok(worldgen::run(&options)),
     }
 }
@@ -237,10 +251,11 @@ fn parse(args: &[String]) -> Result<Verb, String> {
         "light" => light::parse(rest).map(Verb::Light),
         "placement" => placement::parse(rest).map(Verb::Placement),
         "drops" => drops::parse(rest).map(Verb::Drops),
+        "break" => breaking::parse(rest).map(Verb::Break),
         "worldgen" => worldgen::parse(rest).map(Verb::Worldgen),
         other => Err(format!(
             "unknown harness verb `{other}`\n\nThe verbs are: provision, rcon, capture, \
-             compare, rewrite, registries, light, placement, drops, worldgen."
+             compare, rewrite, registries, light, placement, drops, break, worldgen."
         )),
     }
 }

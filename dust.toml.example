@@ -55,6 +55,18 @@ shutdown_timeout_secs = 10
 # Lowest severity logged: error, warn, info, debug or trace.
 log_level = "info"
 
+# Which game mode joining players are put in: survival or creative.
+#
+# Not a cosmetic byte. A creative client takes a block away the instant it is
+# clicked and never asks the server how long that should have taken; a survival
+# client animates a break of a length it works out itself and waits. Set this
+# to survival and the server times every break against the hardness in
+# dust-constants.tsv and the tool in the player's hand — see decision record
+# 0028. Creative is the default because that is the mode this server's content
+# is: there is no crafting, no furnace, no hunger and no health yet, and a
+# survival player's only way to get a block is to mine one.
+game_mode = "creative"
+
 [jvm]
 # Turning this off runs the server with no JVM in the process. Everything
 # except plugins keeps working — that is a guarantee with a test behind it,
