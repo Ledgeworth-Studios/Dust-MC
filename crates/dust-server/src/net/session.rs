@@ -694,6 +694,14 @@ where
             )
             .await?;
         }
+        // And what they are wearing and holding. Same reasoning again, and it
+        // is the failure mode this half of the feature exists for: a player
+        // who logs in would otherwise see everybody bare-headed and
+        // empty-handed until each of them happened to change a slot. One
+        // packet per dressed player, and none at all for an undressed one.
+        if let Some(packet) = play_mod::equipment_on_sight(other) {
+            send_play(conn, packet, version).await?;
+        }
     }
 
     // The loop records the position into the shared map as the player moves,
@@ -911,6 +919,13 @@ where
     )
     .await?;
 
+    // What this player is wearing, to everybody who can already see them.
+    // After the restore and not before it: the roster took this player with
+    // nothing on, because the container is loaded here and the join is up
+    // there, and a player who logged out in full armour would otherwise be
+    // naked to everyone until their first click.
+    ctx.roster.equipped(me.entity_id, inventory.equipment());
+
     // Every item lying in the world from now on. Subscribed *before* the
     // items already there are sent, for the reason the edit channel is: an
     // item that appears in the window between the two is better sent twice
@@ -1004,6 +1019,13 @@ where
                                 send_slot(conn, ctx, &mut inventory, index).await?;
                             }
                         }
+                        // A pickup is a container change like any other, and
+                        // it is one this loop used not to record: an item
+                        // walked over and then a crash put it nowhere. It is
+                        // also the one change that can arm a player without a
+                        // click — a sword collected into the selected hotbar
+                        // slot is a sword everybody else has to see.
+                        record_inventory(ctx, profile_id, me.entity_id, &inventory);
                         // A full inventory puts it straight back on the floor
                         // where the player is standing, so nothing is deleted
                         // and they can see what would not fit.
@@ -1146,6 +1168,14 @@ where
                             ctx.version,
                         )
                         .await?;
+                        // Almost always nothing: a player joins the roster
+                        // before their container is loaded, and the equipment
+                        // that follows arrives as its own change a moment
+                        // later. Sent anyway, because "almost always" is not
+                        // a reason to leave the one case that is not.
+                        if let Some(packet) = play_mod::equipment_on_sight(&player) {
+                            send_play(conn, packet, ctx.version).await?;
+                        }
                     }
                     Ok(RosterChange::Left { entity_id, uuid }) if entity_id != me.entity_id => {
                         // Both halves, again: the entity id takes the body away
@@ -1186,6 +1216,16 @@ where
                             ctx.version,
                         )
                         .await?;
+                    }
+                    // Equipment goes to everybody but its wearer, like a
+                    // swing and for a sharper reason: a player's own armour
+                    // and hand are drawn from the container they already
+                    // have, and vanilla's own tracker does not send an entity
+                    // its own equipment either.
+                    Ok(RosterChange::Equipped { entity_id, slots }) if entity_id != me.entity_id => {
+                        if let Some(packet) = play_mod::set_equipment(entity_id, &slots) {
+                            send_play(conn, packet, ctx.version).await?;
+                        }
                     }
                     Ok(RosterChange::Posture {
                         entity_id,
@@ -1241,6 +1281,9 @@ where
                                 ctx.version,
                             )
                             .await?;
+                            if let Some(packet) = play_mod::equipment_on_sight(&other) {
+                                send_play(conn, packet, ctx.version).await?;
+                            }
                         }
                     }
                 }
@@ -1570,7 +1613,7 @@ where
                     // right-click is a different block because of it.
                     Ok(play::serverbound::Packet::SetCarriedItem(carried)) => {
                         if inventory.select(carried.slot) {
-                            record_inventory(ctx, profile_id, &inventory);
+                            record_inventory(ctx, profile_id, me.entity_id, &inventory);
                         }
                     }
                     // A creative client writing a slot directly, which is the
@@ -1581,7 +1624,7 @@ where
                     Ok(play::serverbound::Packet::SetCreativeModeSlot(set)) => {
                         match inventory.set_creative(set.slot, &set.item) {
                             Ok(Some(index)) => {
-                                record_inventory(ctx, profile_id, &inventory);
+                                record_inventory(ctx, profile_id, me.entity_id, &inventory);
                                 // Not echoed back. The client wrote the slot
                                 // itself and already draws it; a set-slot here
                                 // would be a packet per creative-menu click
@@ -1607,7 +1650,7 @@ where
                             let changed =
                                 inventory.click(ClickMode::from(click.mode), click.slot, click.button);
                             if !changed.is_empty() {
-                                record_inventory(ctx, profile_id, &inventory);
+                                record_inventory(ctx, profile_id, me.entity_id, &inventory);
                             }
                             push_back(conn, ctx, &mut inventory, changed, &click).await?;
                         }
@@ -1617,7 +1660,7 @@ where
                     // inventory rather than nowhere; see `Inventory::closed`.
                     Ok(play::serverbound::Packet::CloseContainer(closed)) => {
                         if closed.window_id == PLAYER_WINDOW && !inventory.closed().is_empty() {
-                            record_inventory(ctx, profile_id, &inventory);
+                            record_inventory(ctx, profile_id, me.entity_id, &inventory);
                             send_container(conn, ctx, &mut inventory).await?;
                         }
                     }
@@ -2145,16 +2188,24 @@ where
     Ok(())
 }
 
-/// Put a player's inventory where a shutdown, and the next session, can find
-/// it.
+/// The container moved: put it where a shutdown and the next session can find
+/// it, and tell everybody what of it shows.
+///
+/// The two travel together on purpose. There are five places a player's
+/// container changes — a pickup, a hotbar key, a creative write, a click and
+/// a close — and a rule spelled at five call sites is a rule that is wrong at
+/// one of them. Both halves are wanted at all five, so both live here and a
+/// caller cannot remember one and forget the other.
 ///
 /// Called when a slot moves rather than on a timer: a click is a few times a
 /// minute where a movement packet is twenty a second, so this can afford to
 /// copy the container while [`record`] cannot afford to copy three floats
-/// twice.
+/// twice. The roster call is a six-slot comparison and sends nothing at all
+/// when nothing visible moved, which is every click in the main inventory.
 fn record_inventory(
     ctx: &SessionContext,
     profile_id: [u8; 16],
+    entity_id: i32,
     inventory: &super::inventory::Inventory,
 ) {
     ctx.inventories
@@ -2167,6 +2218,7 @@ fn record_inventory(
                 selected: inventory.selected(),
             },
         );
+    ctx.roster.equipped(entity_id, inventory.equipment());
 }
 
 /// Put a player's position where a shutdown can find it.

@@ -45,6 +45,9 @@ use dust_protocol::packets::play;
 use dust_protocol::packets::play::chunk::{
     ChunkData, LightArray, Section as WireSection, LIGHT_SECTION_BYTES,
 };
+use dust_protocol::packets::play::containers::{
+    EquipmentEntries, EquipmentEntry, EquipmentSlot,
+};
 use dust_protocol::packets::play::metadata;
 use dust_protocol::packets::play::{GameModeByte, Gamemode, PreviousGameMode, TeleportFlags};
 use dust_protocol::types::{BitSet, Identifier, PrefixedBytes, VarInt};
@@ -580,6 +583,52 @@ pub fn turn_head(entity_id: i32, yaw: f32) -> play::clientbound::RotateHead {
         entity_id: VarInt(entity_id),
         head_yaw: Angle::from_degrees(yaw),
     }
+}
+
+/// What somebody else is wearing and holding.
+///
+/// `slots` is the difference, not the set: the packet charges a byte plus a
+/// slot per entry, so the six-entry set a one-slot change would otherwise send
+/// costs sixteen bytes where the entry alone costs six. One packet however
+/// many slots moved, which is why the caller batches rather than looping.
+///
+/// `None` when there is nothing to say. The encoder refuses an empty entry
+/// list — a bare "no equipment" is a frame the client reads as garbage — so
+/// the emptiness is answered here rather than at four call sites.
+pub fn set_equipment(
+    entity_id: i32,
+    slots: &[super::inventory::EquipmentChange],
+) -> Option<play::clientbound::SetEquipment> {
+    let entries: Vec<EquipmentEntry> = slots
+        .iter()
+        .filter_map(|(wire_slot, stack)| {
+            Some(EquipmentEntry {
+                slot: EquipmentSlot::from_discriminant(i32::from(*wire_slot))?,
+                item: super::inventory::to_wire(stack.as_ref()),
+            })
+        })
+        .collect();
+    (!entries.is_empty()).then(|| play::clientbound::SetEquipment {
+        entity_id: VarInt(entity_id),
+        entries: EquipmentEntries(entries),
+    })
+}
+
+/// The same, for a player who has just come into view: everything they are
+/// wearing that is not empty.
+///
+/// Empty slots are left out because a client that has just been told an entity
+/// exists already has all six empty — the packet is only worth its bytes for
+/// the ones that are not. A player carrying nothing therefore costs nothing.
+pub fn equipment_on_sight(player: &Player) -> Option<play::clientbound::SetEquipment> {
+    let slots: Vec<super::inventory::EquipmentChange> = player
+        .equipment
+        .iter()
+        .enumerate()
+        .filter(|(_, stack)| stack.is_some())
+        .map(|(wire_slot, stack)| (wire_slot as u8, stack.clone()))
+        .collect();
+    set_equipment(player.entity_id, &slots)
 }
 
 /// Take a player's body away.

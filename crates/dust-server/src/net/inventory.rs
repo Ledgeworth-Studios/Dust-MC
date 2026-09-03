@@ -150,6 +150,54 @@ pub const HOTBAR_SLOTS: usize = 9;
 /// The slot number a click outside the window carries.
 pub const OUTSIDE: i16 = -999;
 
+/// How many slots `minecraft:set_equipment` can carry for a player: the main
+/// hand, the offhand, and the four armour pieces.
+///
+/// The protocol has a seventh, `Body`, which is a horse's barding and a wolf's
+/// armour. A player never has one, so a player's equipment array never carries
+/// it and no packet ever names it.
+pub const EQUIPMENT_SLOTS: usize = 6;
+
+/// What everybody except its owner can see of an inventory, indexed by the
+/// slot numbers `minecraft:set_equipment` uses.
+///
+/// Those numbers are the protocol's, not this container's, which is why the
+/// boots come before the helmet and the hand comes before either. Indexing by
+/// the wire's own numbering means the diff below is the packet's payload with
+/// no second table in between.
+pub type Equipment = [Option<Stack>; EQUIPMENT_SLOTS];
+
+/// The wire slot number of the main hand.
+pub const EQUIP_MAIN_HAND: u8 = 0;
+/// The wire slot number of the offhand.
+pub const EQUIP_OFF_HAND: u8 = 1;
+/// The wire slot number of the boots.
+pub const EQUIP_BOOTS: u8 = 2;
+/// The wire slot number of the leggings.
+pub const EQUIP_LEGGINGS: u8 = 3;
+/// The wire slot number of the chestplate.
+pub const EQUIP_CHESTPLATE: u8 = 4;
+/// The wire slot number of the helmet.
+pub const EQUIP_HELMET: u8 = 5;
+
+/// Which container slot each equipment slot reads, in wire order.
+///
+/// A flat six-entry table rather than a `match`, because it is walked whole on
+/// every inventory change and the compiler can unroll six indexed reads.
+const EQUIPMENT_SOURCE: [usize; EQUIPMENT_SLOTS] = [
+    // The main hand is not a fixed slot: it is whichever hotbar slot is
+    // selected, so this entry is a placeholder the reader replaces.
+    usize::MAX,
+    OFFHAND,
+    ARMOUR_FEET,
+    ARMOUR_LEGS,
+    ARMOUR_CHEST,
+    ARMOUR_HEAD,
+];
+
+/// One equipment slot and what is now in it, ready to become a wire entry.
+pub type EquipmentChange = (u8, Option<Stack>);
+
 /// The `button` a swap click uses to mean the offhand rather than a hotbar
 /// slot. Vanilla's `Inventory.SLOT_OFFHAND`, and it is 40 rather than 45
 /// because a swap's button numbers the *hotbar* and offhand is bolted onto the
@@ -511,6 +559,24 @@ impl Inventory {
         self.slots[HOTBAR_START + self.selected]
             .as_ref()
             .map(|stack| stack.item)
+    }
+
+    /// What everybody else can see of this inventory.
+    ///
+    /// Six clones of an `Option<Stack>`, which is an item, a count and a
+    /// refcount bump on the component bytes — cheap enough to take on every
+    /// change to the container and compare, which is what makes this the one
+    /// place that has to know a helmet is worn on the head.
+    #[must_use]
+    pub fn equipment(&self) -> Equipment {
+        std::array::from_fn(|wire_slot| {
+            let index = if wire_slot == EQUIP_MAIN_HAND as usize {
+                HOTBAR_START + self.selected
+            } else {
+                EQUIPMENT_SOURCE[wire_slot]
+            };
+            self.slots[index].clone()
+        })
     }
 
     /// The sequence number to stamp on the next sync.
@@ -2094,6 +2160,67 @@ mod tests {
         assert_eq!(inventory.cursor().map(|s| s.count), Some(64));
         assert_eq!(
             inventory.cursor().map(|s| s.components.clone()),
+            Some(named())
+        );
+    }
+
+    #[test]
+    fn the_equipment_set_reads_the_six_slots_the_wire_numbers() {
+        // Each of the six from a *different* item, because a set built with
+        // one item in every slot agrees with any permutation of the table —
+        // the reason this reads six names and not one.
+        let mut inventory = Inventory::default();
+        let pieces = [
+            (HOTBAR_START, "minecraft:diamond_sword"),
+            (OFFHAND, "minecraft:shield"),
+            (ARMOUR_FEET, "minecraft:diamond_boots"),
+            (ARMOUR_LEGS, "minecraft:diamond_leggings"),
+            (ARMOUR_CHEST, "minecraft:diamond_chestplate"),
+            (ARMOUR_HEAD, "minecraft:diamond_helmet"),
+        ];
+        for (slot, name) in pieces {
+            inventory.slots[slot] = Some(Stack::new(item(name), 1));
+        }
+
+        let worn = inventory.equipment();
+        for (wire_slot, (_, name)) in pieces.into_iter().enumerate() {
+            assert_eq!(
+                worn[wire_slot].as_ref().map(|stack| stack.item),
+                Some(item(name)),
+                "wire slot {wire_slot} should hold {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_main_hand_follows_the_hotbar_slot_the_player_selected() {
+        // The one equipment slot that is not a fixed container index. A player
+        // scrolling from an empty slot to a sword has armed themselves without
+        // touching the container, and everybody else has to see it.
+        let mut inventory = Inventory::default();
+        inventory.slots[HOTBAR_START + 3] = Some(Stack::new(item("minecraft:diamond_sword"), 1));
+
+        assert_eq!(inventory.equipment()[EQUIP_MAIN_HAND as usize], None);
+        assert!(inventory.select(3));
+        assert_eq!(
+            inventory.equipment()[EQUIP_MAIN_HAND as usize]
+                .as_ref()
+                .map(|stack| stack.item),
+            Some(item("minecraft:diamond_sword"))
+        );
+    }
+
+    #[test]
+    fn a_worn_stack_carries_its_components_into_the_equipment_set() {
+        // A named sword everybody else sees as a plain one is #54's defect
+        // reappearing one layer out.
+        install_component_types();
+        let mut inventory = Inventory::default();
+        inventory.slots[HOTBAR_START] = Some(stone_with(named(), 1));
+        assert_eq!(
+            inventory.equipment()[EQUIP_MAIN_HAND as usize]
+                .as_ref()
+                .map(|stack| stack.components.clone()),
             Some(named())
         );
     }
