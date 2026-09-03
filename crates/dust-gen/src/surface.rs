@@ -1135,3 +1135,294 @@ fn block_spec(value: &Value) -> Option<BlockSpec> {
         properties,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::biome::BiomeParameters;
+    use crate::terrain::{Generator, Material};
+
+    /// A pack with the three noises a surface walk reads, a terrain that falls
+    /// away with height, and whatever `surface_rule` the caller wants.
+    fn pack(name: &str, rule: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("dust-gen-surface-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for noise in [
+            "surface",
+            "surface_secondary",
+            "clay_bands_offset",
+            "scratch",
+        ] {
+            write(
+                &root,
+                &format!("minecraft/worldgen/noise/{noise}.json"),
+                r#"{"firstOctave": -6, "amplitudes": [1.0, 1.0, 1.0]}"#,
+            );
+        }
+        write(
+            &root,
+            "minecraft/worldgen/noise_settings/overworld.json",
+            &format!(
+                r#"{{"noise": {{"height": 384, "min_y": -64,
+                                "size_horizontal": 1, "size_vertical": 2}},
+                    "sea_level": 63,
+                    "default_block": {{"Name": "minecraft:stone"}},
+                    "default_fluid": {{"Name": "minecraft:water"}},
+                    "surface_rule": {rule},
+                    "noise_router": {{"temperature": 0.0, "vegetation": 0.0,
+                                      "continents": 0.0, "erosion": 0.0,
+                                      "depth": 0.0, "ridges": 0.0,
+                                      "initial_density_without_jaggedness": {TERRAIN},
+                                      "final_density": {{"type": "minecraft:interpolated",
+                                                         "argument": {TERRAIN}}}}}}}"#
+            ),
+        );
+        root
+    }
+
+    /// Ground that falls away with height and is rough enough that two columns
+    /// differ, which is the same shape the terrain tests use.
+    const TERRAIN: &str = r#"{
+        "type": "minecraft:add",
+        "argument1": {"type": "minecraft:y_clamped_gradient",
+                      "from_y": -64, "to_y": 224,
+                      "from_value": 1.0, "to_value": -1.0},
+        "argument2": {"type": "minecraft:mul", "argument1": 0.8,
+                      "argument2": {"type": "minecraft:noise",
+                                    "noise": "minecraft:scratch",
+                                    "xz_scale": 1.0, "y_scale": 1.0}}
+      }"#;
+
+    fn write(root: &Path, relative: &str, text: &str) {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().expect("has a parent")).expect("mkdir");
+        std::fs::write(path, text).expect("write");
+    }
+
+    /// Grass on the top block of rock, dirt for the three under it, stone
+    /// below — the smallest rule that is a real surface.
+    const STACK: &str = r#"{"type": "minecraft:sequence", "sequence": [
+        {"type": "minecraft:condition",
+         "if_true": {"type": "minecraft:stone_depth", "surface_type": "floor",
+                     "add_surface_depth": false, "offset": 0,
+                     "secondary_depth_range": 0},
+         "then_run": {"type": "minecraft:block",
+                      "result_state": {"Name": "minecraft:grass_block"}}},
+        {"type": "minecraft:condition",
+         "if_true": {"type": "minecraft:stone_depth", "surface_type": "floor",
+                     "add_surface_depth": false, "offset": 3,
+                     "secondary_depth_range": 0},
+         "then_run": {"type": "minecraft:block",
+                      "result_state": {"Name": "minecraft:dirt"}}}]}"#;
+
+    fn parameters() -> BiomeParameters {
+        let axes = "\t-10000\t10000".repeat(6);
+        let table = format!(
+            "# biome_id\tbiome\ttemperature_min\ttemperature_max\thumidity_min\thumidity_max\
+             \tcontinentalness_min\tcontinentalness_max\terosion_min\terosion_max\
+             \tdepth_min\tdepth_max\tweirdness_min\tweirdness_max\toffset\n\
+             0\tminecraft:plains{axes}\t0\n"
+        );
+        BiomeParameters::parse(&table).expect("the scratch table parses")
+    }
+
+    fn painted(root: &Path) -> (Generator, Vec<u8>) {
+        let generator =
+            Generator::new(root, "overworld", 42, parameters()).expect("the pack compiles");
+        let mut columns = generator.columns();
+        let materials = columns.surface(0, 0).to_vec();
+        (generator, materials)
+    }
+
+    fn at(materials: &[u8], x: usize, y: i32, z: usize) -> Material {
+        Material::from_code(materials[(y + 64) as usize * 256 + z * 16 + x])
+    }
+
+    /// The name of what is at a position, resolved through the rules' palette.
+    fn name(rules: &Rules, materials: &[u8], x: usize, y: i32, z: usize) -> String {
+        match at(materials, x, y, z) {
+            Material::Air => "air".to_owned(),
+            Material::Solid => "stone".to_owned(),
+            Material::Fluid => "water".to_owned(),
+            Material::Surface(index) => rules.palette()[index as usize].name.clone(),
+        }
+    }
+
+    /// The top of every rock column is grass, the three under it are dirt, and
+    /// the fifth down is still the default block.
+    ///
+    /// **Watched to fail in both directions.** `offset: 3` is what makes the
+    /// dirt three deep; the same rule with the depths swapped puts grass three
+    /// blocks down, and the fifth assertion is what catches a walk that has
+    /// stopped counting depth at all and paints the whole column.
+    #[test]
+    fn grass_sits_on_dirt_which_sits_on_the_default_block() {
+        let root = pack("stack", STACK);
+        let (generator, materials) = painted(&root);
+        let rules = generator.surface().expect("the pack has rules");
+        let mut checked = 0;
+        for z in 0..16usize {
+            for x in 0..16usize {
+                // The topmost rock, which is where the rules start.
+                let top = (-64..320)
+                    .rev()
+                    .find(|&y| at(&materials, x, y, z) != Material::Air)
+                    .expect("every column has ground");
+                if at(&materials, x, top, z) == Material::Fluid {
+                    continue;
+                }
+                assert_eq!(name(rules, &materials, x, top, z), "minecraft:grass_block");
+                for down in 1..=3 {
+                    assert_eq!(
+                        name(rules, &materials, x, top - down, z),
+                        "minecraft:dirt",
+                        "at {x},{},{z}",
+                        top - down
+                    );
+                }
+                assert_eq!(name(rules, &materials, x, top - 4, z), "stone");
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no column of this chunk had dry ground on it");
+    }
+
+    /// The rules only ever claim the dimension's own block.
+    ///
+    /// Air stays air and the fluid stays fluid, however loudly a rule says
+    /// otherwise: a rule that painted a whole column would fill an ocean.
+    #[test]
+    fn a_rule_that_always_answers_still_leaves_the_air_and_the_fluid_alone() {
+        let root = pack(
+            "greedy",
+            r#"{"type": "minecraft:block", "result_state": {"Name": "minecraft:gravel"}}"#,
+        );
+        let (generator, materials) = painted(&root);
+        let rules = generator.surface().expect("the pack has rules");
+        let mut air = 0;
+        let mut fluid = 0;
+        let mut gravel = 0;
+        for y in -64..320 {
+            for z in 0..16usize {
+                for x in 0..16usize {
+                    match at(&materials, x, y, z) {
+                        Material::Air => air += 1,
+                        Material::Fluid => fluid += 1,
+                        Material::Solid => {
+                            panic!("a rule that always answers left stone at {x},{y},{z}")
+                        }
+                        Material::Surface(index) => {
+                            assert_eq!(rules.palette()[index as usize].name, "minecraft:gravel");
+                            gravel += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            air > 0 && fluid > 0 && gravel > 0,
+            "{air} air, {fluid} fluid, {gravel} gravel"
+        );
+    }
+
+    /// A `y_above` rule is a horizontal line through the world, and the line
+    /// is where the rule says and not one block off.
+    #[test]
+    fn a_y_above_rule_cuts_exactly_where_it_says() {
+        let root = pack(
+            "line",
+            r#"{"type": "minecraft:condition",
+                "if_true": {"type": "minecraft:y_above",
+                            "anchor": {"absolute": 20},
+                            "surface_depth_multiplier": 0,
+                            "add_stone_depth": false},
+                "then_run": {"type": "minecraft:block",
+                             "result_state": {"Name": "minecraft:calcite"}}}"#,
+        );
+        let (generator, materials) = painted(&root);
+        let rules = generator.surface().expect("the pack has rules");
+        for z in 0..16usize {
+            for x in 0..16usize {
+                assert_eq!(name(rules, &materials, x, 20, z), "minecraft:calcite");
+                assert_eq!(name(rules, &materials, x, 19, z), "stone");
+            }
+        }
+    }
+
+    /// A biome name the registry does not have is reported and matches
+    /// nothing, rather than matching everything.
+    #[test]
+    fn an_unbound_biome_name_is_named_and_claims_no_block() {
+        let root = pack(
+            "biome",
+            r#"{"type": "minecraft:condition",
+                "if_true": {"type": "minecraft:biome",
+                            "biome_is": ["minecraft:nowhere"]},
+                "then_run": {"type": "minecraft:block",
+                             "result_state": {"Name": "minecraft:mud"}}}"#,
+        );
+        let mut generator =
+            Generator::new(&root, "overworld", 42, parameters()).expect("the pack compiles");
+        let missing = generator.bind_surface_biomes(|name| {
+            if name == "minecraft:plains" {
+                Some(0)
+            } else {
+                None
+            }
+        });
+        assert_eq!(missing, vec!["minecraft:nowhere".to_owned()]);
+        let mut columns = generator.columns();
+        let materials = columns.surface(0, 0).to_vec();
+        assert!(
+            (-64..320).all(|y| (0..16).all(|c| at(&materials, c, y, 0) != Material::Surface(0))),
+            "an unbound biome name claimed a block"
+        );
+    }
+
+    /// The blur stays inside the cell it started in, and does not agree with
+    /// the plain quart everywhere.
+    ///
+    /// Both halves matter. A blur that wandered further than a cell would put
+    /// a desert's sand in a forest; one that never moved would be the quart
+    /// grid with a hash bolted on, and the coast would run down a straight
+    /// line. This is the check that says which.
+    #[test]
+    fn the_biome_blur_moves_a_boundary_without_leaving_the_neighbourhood() {
+        let seed = crate::noise::rng::obfuscate_seed(1234);
+        let mut moved = 0;
+        let mut looked = 0;
+        for x in -40..40 {
+            for z in -40..40 {
+                let (qx, qy, qz) = crate::biome::blurred_quart(seed, x, 64, z);
+                assert!((qx - (x >> 2)).abs() <= 1, "{qx} is not beside {}", x >> 2);
+                assert!((qz - (z >> 2)).abs() <= 1);
+                assert!((qy - (64 >> 2)).abs() <= 1);
+                if (qx, qy, qz) != (x >> 2, 64 >> 2, z >> 2) {
+                    moved += 1;
+                }
+                looked += 1;
+            }
+        }
+        assert!(
+            moved > looked / 10,
+            "the blur moved {moved} of {looked} positions, which is a quart grid"
+        );
+        // And it is a fact about *this* world. A blur that ignored the zoom
+        // seed would wobble every coast in every world identically, which is
+        // the sort of wrong that still looks like a coast.
+        let other = crate::noise::rng::obfuscate_seed(4321);
+        assert_ne!(other, seed);
+        let differ = (-40..40)
+            .flat_map(|x| (-40..40).map(move |z| (x, z)))
+            .filter(|&(x, z)| {
+                crate::biome::blurred_quart(seed, x, 64, z)
+                    != crate::biome::blurred_quart(other, x, 64, z)
+            })
+            .count();
+        assert!(
+            differ > 0,
+            "two world seeds blurred the same 6,400 positions alike"
+        );
+    }
+}
