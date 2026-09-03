@@ -174,6 +174,23 @@ sixty-one items placed wrongly for a neighbour reason are down to two. Decision
 record [0014](docs/decisions/0014-what-a-block-reads-from-the-cell-next-door.md)
 has the counts and says what it declined.
 
+And a block put down in water comes out **wet**. A fence post in a river
+waterlogs instead of leaving a dry hole in it, a second layer of snow stacks on
+the first up to eight, a slab dropped into its own other half becomes a double
+slab, and a torch or a sign put on the side of a block becomes the wall form of
+it rather than the standing one that falls over. The first three read the cell
+the block is going *into*, which is a third variable neither earlier survey
+could vary — `tools/bot/placement.js --into` is the one that can, and it walls
+its target with stone because an unwalled water source floods the arena within
+two ticks. The fourth is data: an item carries two blocks, a torch and a wall
+torch are related by nothing but the item that holds both, and the wall form
+and its attachment direction are two more columns off the operator's own jar.
+Against Minecraft's own answers the grid's 496 wrong states are down to 62 and
+its 101 wrong items to 21, and 108 placements into a cell that already held
+something agree exactly. Decision record
+[0016](docs/decisions/0016-what-a-placed-block-reads-from-the-cell-it-lands-in.md)
+has the counts and says what it declined.
+
 **Not yet**, and each of these is stated where the code for it would go: no
 physics, block updates, drops or tool checks, so a player is stopped from
 entering a block and never pushed out of one, and **no pose**, so the box a
@@ -187,13 +204,14 @@ needs one more column of `dust-items.tsv`, and 0013 says which; no
 **redstone wire** and no **scaffolding distance**, which are the last two
 neighbour rules of the sixty-one decision record
 [0014](docs/decisions/0014-what-a-block-reads-from-the-cell-next-door.md)
-found, and no **rail bend**; a hundred and one of the eight hundred and
+found, and no **rail bend**; twenty-one of the eight hundred and
 fifty-six items that place anything still go down in a state Minecraft would
 not, which is `cargo xtask harness placement`'s number rather than this
-paragraph's; a block placed
-into water replaces it rather than waterlogging, player-placed leaves decay,
-a sign never becomes a wall sign, and eight layers of snow are replaced where
-Minecraft would refuse; light that
+paragraph's — a **hanging sign on a wall** keeps its standing form, because its
+wall form faces across the wall rather than out of it and the grid was taken at
+one yaw; a crafter's `orientation`, the age of three vines and a note block's
+`instrument`, which is the block below it and needs a column of its own; light
+that
 crosses a chunk boundary — sky light from a neighbour it would have to travel
 *through*, and any light at all from a torch on the far side of one — which is
 an engine gap and not a data one, and is now the *only* thing between a served

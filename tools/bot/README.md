@@ -247,6 +247,28 @@ opinion is not a measurement.
 "does this block's placement read anything at all?" — the question worth asking
 of every placeable item where the full grid is worth asking of a handful.
 
+`--neighbours` varies what is **beside** the target instead of the click, and
+`--into` varies what is **in** it. Those are the three variables a placement
+has and each survey holds the other two still.
+
+```
+DUST_SERVER_CONSOLE=/tmp/mc-console node placement.js 25565 oak_fence,snow,oak_slab --into
+DUST_SERVER_CONSOLE=/tmp/mc-console node placement.js 25565 oak_fence --into all
+```
+
+Two things about `--into` that neither of the others has to deal with:
+
+- **The target is walled on four sides with stone.** An unwalled water source
+  spreads across the arena within two ticks and every sample after it is
+  measured in a puddle. The cell above is left open so a block taller than one
+  is not refused for a reason that is not the question.
+- **A refusal does not leave air.** Everywhere else the target is empty, so a
+  refused placement leaves air and `minecraft:air` is the whole test. Here it
+  leaves whatever was already there, which is a state and reads exactly like a
+  successful placement of it. The test is "is the cell what it was a tick ago",
+  and a slab put into a double slab and a ninth layer of snow are precisely
+  that.
+
 What comes out is scored by `cargo xtask harness placement --answers <file>`,
 which asks Dust the same questions and counts. That verb is the whole point of
 this one: decision record 0011 chose rules in Dust over a table on the
