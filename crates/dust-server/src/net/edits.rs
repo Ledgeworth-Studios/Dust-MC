@@ -354,6 +354,37 @@ impl EditedWorld {
         Edits(self.edits.read().expect("the edit map is never poisoned"))
     }
 
+    /// Claim the columns around `centre` for one player, so that a movement
+    /// check near them reads a column the server already has rather than one
+    /// it has to build.
+    ///
+    /// Refcounts and no file reads: safe on a session's own task. See
+    /// [`super::residency::Residency`] for who owns a column and when it goes.
+    pub fn hold(&self, centre: ChunkPos) {
+        self.generated.hold(centre);
+    }
+
+    /// Give up one player's claim on the columns around `centre`.
+    pub fn release(&self, centre: ChunkPos) {
+        self.generated.release(centre);
+    }
+
+    /// Build the claimed-and-missing columns around `centre`, off the network
+    /// path. Returns how many were built.
+    ///
+    /// **Reads region files.** The caller is a blocking thread, never a
+    /// session task — that is the whole point of it being a separate call from
+    /// [`EditedWorld::hold`].
+    pub fn warm(&self, centre: ChunkPos) -> u32 {
+        self.generated.warm(centre)
+    }
+
+    /// How many columns the server is keeping resident, across all players.
+    #[must_use]
+    pub fn resident_columns(&self) -> usize {
+        self.generated.resident_columns()
+    }
+
     /// How far up and down this world goes.
     pub fn height(&self) -> dust_world::heightmap::WorldHeight {
         self.generated.flat().height()

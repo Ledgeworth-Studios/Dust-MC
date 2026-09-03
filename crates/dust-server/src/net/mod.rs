@@ -50,6 +50,7 @@ pub mod level;
 pub mod listen;
 pub mod play;
 pub mod players;
+pub mod residency;
 pub mod save;
 pub mod session;
 pub mod source;

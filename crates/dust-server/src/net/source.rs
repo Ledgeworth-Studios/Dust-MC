@@ -43,7 +43,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use dust_world::anvil::{self, Ids, Names};
 use dust_world::chunk::Chunk;
@@ -52,6 +52,7 @@ use dust_world::coords::{ChunkPos, RegionPos};
 use dust_world::heightmap::WorldHeight;
 use dust_world::region::{FileStore, RegionFile};
 
+use super::residency::Residency;
 use super::world::FlatWorld;
 
 /// Region files that have been opened, or found not to exist.
@@ -61,20 +62,29 @@ use super::world::FlatWorld;
 /// player walking outward.
 type OpenRegions = HashMap<(i32, i32), Option<RegionFile<FileStore>>>;
 
-/// A column, borrowed when it can be and built when it cannot.
+/// A column, borrowed when it can be, shared when the server is keeping one,
+/// and built when neither.
 ///
-/// The two variants differ in size by about a megabyte, and that is the point
+/// The variants differ in size by about a megabyte, and that is the point
 /// rather than an oversight: the borrowed one is what a flat world hands out
 /// once per column per join without allocating — 289 times at the default view
 /// distance — and boxing it to even the
 /// variants out would put an allocation on exactly the path the borrow exists
 /// to keep free. The value is a temporary — a caller sends the column and drops
 /// it — so the large variant never sits in a collection.
+///
+/// [`Column::Resident`] is the one that is *not* a temporary, and it is an
+/// `Arc` for that reason: it is a handle on a column the whole server is
+/// keeping, and a caller may hold it for as long as it likes without stopping
+/// the residency from retiring its own entry. See [`Residency`].
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Column<'a> {
     /// Every position shares this one. See [`FlatWorld`].
     Shared(&'a Chunk),
+    /// One the server is keeping because a player is near it. See
+    /// [`Residency`].
+    Resident(Arc<Chunk>),
     /// Read from disk for this position.
     Built(Chunk),
 }
@@ -83,6 +93,7 @@ impl Column<'_> {
     pub fn as_chunk(&self) -> &Chunk {
         match self {
             Self::Shared(chunk) => chunk,
+            Self::Resident(chunk) => chunk,
             Self::Built(chunk) => chunk,
         }
     }
@@ -116,7 +127,65 @@ impl Source {
     pub fn column(&self, pos: ChunkPos) -> Column<'_> {
         match self {
             Self::Flat(flat) => Column::Shared(flat.column()),
-            Self::Anvil(world) => Column::Built(world.column(pos)),
+            Self::Anvil(world) => match world.residency.resident(pos) {
+                Some(chunk) => Column::Resident(chunk),
+                // Nobody is keeping this one. Built here, on whatever thread
+                // asked, which is what every caller did before residency
+                // existed: this path can only ever be as slow as it was.
+                None => Column::Built(world.column(pos)),
+            },
+        }
+    }
+
+    /// Claim the columns around `centre` for one player.
+    ///
+    /// Refcounts only — see [`Residency::hold`]. Nothing here reads a file, so
+    /// a session may call it from the task that just judged a movement packet;
+    /// [`Source::warm`] is the half that must not be.
+    ///
+    /// A flat world has nothing to keep: it lends one template column to every
+    /// position, so residency would be a refcount on a borrow.
+    pub fn hold(&self, centre: ChunkPos) {
+        if let Self::Anvil(world) = self {
+            world.residency.hold(centre);
+        }
+    }
+
+    /// Give up one player's claim on the columns around `centre`.
+    pub fn release(&self, centre: ChunkPos) {
+        if let Self::Anvil(world) = self {
+            world.residency.release(centre);
+        }
+    }
+
+    /// Build whatever around `centre` is claimed and not yet there, and return
+    /// how many columns that was.
+    ///
+    /// **This reads region files and must not be called from a session's own
+    /// task.** It is the whole 0.9-ms-a-column cost that D20 measured, moved
+    /// off the network path and nowhere else: the point of residency is that a
+    /// player never waits for it, not that it stopped happening.
+    pub fn warm(&self, centre: ChunkPos) -> u32 {
+        let Self::Anvil(world) = self else { return 0 };
+        let mut built = 0;
+        for pos in world.residency.cold(centre) {
+            // Built with no lock held, then offered. A player who walked away
+            // in the meantime, or another thread that got there first, means
+            // the column is dropped here rather than kept — see
+            // [`Residency::fill`].
+            let chunk = world.column(pos);
+            world.residency.fill(pos, chunk);
+            built += 1;
+        }
+        built
+    }
+
+    /// How many columns the server is keeping. Zero on a flat world.
+    #[must_use]
+    pub fn resident_columns(&self) -> usize {
+        match self {
+            Self::Flat(_) => 0,
+            Self::Anvil(world) => world.residency.len(),
         }
     }
 
@@ -156,6 +225,12 @@ pub struct AnvilWorld {
     /// columns beside it. See the module note for why this is cached when the
     /// chunks are not.
     sky_floors: Mutex<HashMap<(i32, i32), SkyFloor>>,
+    /// The columns the server is keeping because players are near them. The
+    /// module note above says the parsed chunks are not cached, and this is the
+    /// one exception and the reason it is one: these are kept against a stated
+    /// budget of nine columns a player, shared, rather than everything that
+    /// has been asked for. See [`Residency`].
+    residency: Residency,
 }
 
 /// How many columns' sky floors are kept before the cache is emptied.
@@ -180,6 +255,7 @@ impl std::fmt::Debug for AnvilWorld {
                     .map(|open| open.len())
                     .unwrap_or_default(),
             )
+            .field("resident_columns", &self.residency.len())
             .finish_non_exhaustive()
     }
 }
@@ -217,6 +293,7 @@ impl AnvilWorld {
             opacity,
             constants,
             sky_floors: Mutex::new(HashMap::new()),
+            residency: Residency::new(),
         }
     }
 

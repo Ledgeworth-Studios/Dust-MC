@@ -603,6 +603,20 @@ where
     let mut view = View::with_radius(view_distance);
     let centre = view::column_of(start.0, start.2);
 
+    // The columns this player's movement will be checked against, claimed
+    // before anything is sent and given up however this session ends. See
+    // `residency::Residence`.
+    //
+    // Warmed here rather than on a blocking thread, which is the one place
+    // that is right: this is a join, there is no movement packet waiting on
+    // it, and the nine columns it builds are nine of the first twenty-five the
+    // stream below is about to send — so the stream finds them resident and
+    // the warm costs the join nothing it was not already paying.
+    let mut residence = super::residency::Residence::new(ctx.world.clone());
+    if residence.move_to(centre) {
+        ctx.world.warm(centre);
+    }
+
     // The near square first, then the loading screen ends, then the rest.
     //
     // A player used to spend the whole burst looking at a progress bar with the
@@ -697,6 +711,7 @@ where
         &me,
         profile_id,
         start,
+        &mut residence,
     )
     .await;
 
@@ -820,6 +835,7 @@ async fn play_loop<W>(
     me: &super::players::Player,
     profile_id: [u8; 16],
     start: (f64, f64, f64),
+    residence: &mut super::residency::Residence,
 ) -> Result<(), SessionError>
 where
     W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1250,7 +1266,8 @@ where
                                     me.yaw,
                                     me.pitch,
                                 );
-                                moved(conn, ctx, &mut view, position.0, position.2).await?;
+                                moved(conn, ctx, &mut view, residence, position.0, position.2)
+                                    .await?;
                             }
                             dust_guard::Claim::Ignored => {}
                             dust_guard::Claim::Refused(why) => {
@@ -1288,7 +1305,8 @@ where
                                     m.yaw,
                                     m.pitch,
                                 );
-                                moved(conn, ctx, &mut view, position.0, position.2).await?;
+                                moved(conn, ctx, &mut view, residence, position.0, position.2)
+                                    .await?;
                             }
                             dust_guard::Claim::Ignored => {}
                             dust_guard::Claim::Refused(why) => {
@@ -1715,17 +1733,39 @@ async fn moved<W>(
     conn: &mut Conn<W>,
     ctx: &SessionContext,
     view: &mut View,
+    residence: &mut super::residency::Residence,
     x: f64,
     z: f64,
 ) -> Result<(), SessionError>
 where
     W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let centre = view::column_of(x, z);
+    // The claim is taken here, on this task, because it is nine hash lookups
+    // and no file. The *building* goes to a blocking thread and is not waited
+    // for: a movement check that had to wait for a region file would be the
+    // 0.9 ms stall this exists to remove, moved rather than deleted.
+    //
+    // Nothing depends on the warm having finished. A player who somehow
+    // reached a column before it was built finds it missing and builds it
+    // themselves, which is what every column cost before this — the floor is
+    // the old behaviour, not a hole. `dust_guard::SpeedLimit` is what makes
+    // that not happen: sixteen blocks of walking is 1.6 seconds at the fastest
+    // speed this server will believe and the warm is about five milliseconds.
+    if residence.move_to(centre) {
+        let world = ctx.world.clone();
+        // Deliberately not awaited. The handle is dropped, the task runs to
+        // completion on the blocking pool, and this session goes back to
+        // reading packets.
+        drop(tokio::task::spawn_blocking(move || {
+            world.warm(centre);
+        }));
+    }
     // A batch, not the whole difference. A player crossing a chunk boundary at
     // a large view distance wants dozens of columns at once, and sending them
     // all here would put the same stall back that the join just lost — the
     // loop's own ticker takes the rest.
-    stream_up_to(conn, ctx, view, view::column_of(x, z), STREAM_BATCH).await
+    stream_up_to(conn, ctx, view, centre, STREAM_BATCH).await
 }
 
 /// The block state a right-click puts down.
