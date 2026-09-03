@@ -193,7 +193,8 @@ fn start(y: f64) -> (f64, f64, f64) {
 /// client's own packets carry — `tools/bot/movement.js` measured it.
 ///
 /// The distance is deliberately enough to cross chunk boundaries: 2,000 steps
-/// is 432 blocks, twenty-seven of them.
+/// is 432 blocks of walking, which is a chunk boundary crossed every 74 steps
+/// and twenty-seven of them in a row.
 fn walk<F>(movement: &mut Movement, y: f64, mut judge: F) -> u32
 where
     F: FnMut(&mut Movement, (f64, f64, f64)) -> dust_guard::Claim,

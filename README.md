@@ -116,6 +116,24 @@ sprint-jumping, creative flight, a 300-block free fall and a walk through a
 [0012](docs/decisions/0012-how-fast-a-player-may-say-they-moved.md) has the
 table and says what it declined.
 
+And a player cannot walk into a wall. A movement packet is checked against the
+blocks the player would be standing in, not only against how far they claim to
+have come: a player may not move from outside a solid block to inside one, and
+a player already inside one may move anywhere, because every honest way to end
+up inside a block — a block placed onto somebody standing still, a piston, a
+boat — resolves by moving out of it. Which blocks count is Minecraft's own
+`isCollisionShapeFullBlock`, read out of `dust-constants.tsv`, because every
+proxy for it in the table is wrong in the direction that refuses honest play.
+The world is asked as it is at that instant, so a block broken underneath a
+player a tick ago costs them nothing, and an unloaded chunk is not solid, so a
+player outrunning their own chunk loading is believed. `just collide` is the
+third-party check: six cases, and the three refusals go red with the two lines
+that refuse the move taken out. It costs 32 ns a packet on a flat world and 408
+on a world read from region files, which at twenty packets a second is 0.08% of
+one core across a hundred players. Decision record
+[0015](docs/decisions/0015-what-a-movement-check-asks-the-world.md) has the
+ladder and says what it declined.
+
 And a player carries what they were carrying. All forty-six slots of the
 player's own container — the twenty-seven main slots, the nine hotbar, four
 armour, an offhand and the crafting grid — with counts bounded by each item's
@@ -144,10 +162,10 @@ record [0014](docs/decisions/0014-what-a-block-reads-from-the-cell-next-door.md)
 has the counts and says what it declined.
 
 **Not yet**, and each of these is stated where the code for it would go: no
-physics, block updates, drops or tool checks; **no collision**, so movement is
-checked for speed and for being a number and not against the blocks it passed
-through, and a client may still walk into a wall so long as it walks at a
-walking pace; **no item entities**, so a dropped stack is destroyed rather than
+physics, block updates, drops or tool checks, so a player is stopped from
+entering a block and never pushed out of one, and **no pose**, so the box a
+movement check measures is 0.6 high rather than 1.8 and a cheat's head may pass
+through a wall its feet may not; **no item entities**, so a dropped stack is destroyed rather than
 thrown, and nothing can be picked up off the ground; no crafting, so the grid is
 five slots that store and never combine; **no data components on a stack**, so a
 renamed block or an enchanted tool is stored and given back as the plain item,
