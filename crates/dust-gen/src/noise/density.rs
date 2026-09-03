@@ -228,6 +228,12 @@ pub struct Evaluator<'a> {
     stamps: u64,
     /// The current value of each `interpolated` node, one slot each.
     lattice: Vec<f64>,
+    /// The interval each `interpolated` node is confined to over the whole of
+    /// the cell now being filled.
+    lattice_bounds: Vec<(f64, f64)>,
+    bounds_memo: Vec<(f64, f64)>,
+    bounds_stamp: Vec<u64>,
+    bounds_generation: u64,
 }
 
 impl<'a> Evaluator<'a> {
@@ -252,6 +258,10 @@ impl<'a> Evaluator<'a> {
             quart: (i32::MIN, i32::MIN),
             stamps: 0,
             lattice: vec![0.0; graph.interpolated.len()],
+            lattice_bounds: vec![(f64::NEG_INFINITY, f64::INFINITY); graph.interpolated.len()],
+            bounds_memo: vec![(0.0, 0.0); size],
+            bounds_stamp: vec![u64::MAX; size],
+            bounds_generation: 0,
         }
     }
 
@@ -269,6 +279,178 @@ impl<'a> Evaluator<'a> {
     /// Put a slot's value for the block about to be asked for.
     pub fn set_interpolated(&mut self, slot: usize, value: f64) {
         self.lattice[slot] = value;
+    }
+
+    /// Say which cell is being filled, by handing over every interpolated
+    /// node's eight corners.
+    ///
+    /// A trilinear interpolation is a convex combination of its corners, so
+    /// the smallest and the largest of the eight bound the node over the whole
+    /// cell — exactly, with nothing assumed.
+    pub fn enter_cell(&mut self, corners: impl Fn(usize) -> [f64; 8]) {
+        for slot in 0..self.lattice_bounds.len() {
+            let eight = corners(slot);
+            let mut low = eight[0];
+            let mut high = eight[0];
+            for value in &eight[1..] {
+                low = low.min(*value);
+                high = high.max(*value);
+            }
+            self.lattice_bounds[slot] = (low, high);
+        }
+        self.stamps += 1;
+        self.bounds_generation = self.stamps;
+    }
+
+    /// The interval `root` is confined to anywhere in the cell
+    /// [`Self::enter_cell`] named.
+    ///
+    /// **This can only ever be wider than the truth.** Every arm below is the
+    /// interval arithmetic for its node, and every node whose value depends on
+    /// the position inside the cell — a noise, a spline, the old blended noise
+    /// — answers with the widest interval it could ever take anywhere, or with
+    /// an infinite one where that is not known. A caller may therefore act on
+    /// `high <= 0` or `low > 0` and cannot act on anything else.
+    ///
+    /// The walk stops at an `interpolated` node, which is why it is cheap: the
+    /// noise under it is bounded by the eight corners that were sampled
+    /// anyway, and the forty octaves below that are never reached.
+    pub fn cell_bounds(&mut self, root: usize) -> (f64, f64) {
+        if self.bounds_stamp[root] == self.bounds_generation {
+            return self.bounds_memo[root];
+        }
+        let value = self.bounds_uncached(root);
+        self.bounds_stamp[root] = self.bounds_generation;
+        self.bounds_memo[root] = value;
+        value
+    }
+
+    fn bounds_uncached(&mut self, index: usize) -> (f64, f64) {
+        let unknown = (f64::NEG_INFINITY, f64::INFINITY);
+        match self.graph.nodes[index] {
+            Node::Constant(value) => (value, value),
+            Node::Interpolated(slot) => self.lattice_bounds[slot],
+            Node::Passthrough(a) | Node::ColumnCache(a) | Node::FlatCache(a) => self.cell_bounds(a),
+            Node::Abs(a) => {
+                let (low, high) = self.cell_bounds(a);
+                if low >= 0.0 {
+                    (low, high)
+                } else if high <= 0.0 {
+                    (-high, -low)
+                } else {
+                    (0.0, (-low).max(high))
+                }
+            }
+            Node::Add(a, b) => {
+                let (al, ah) = self.cell_bounds(a);
+                let (bl, bh) = self.cell_bounds(b);
+                (al + bl, ah + bh)
+            }
+            Node::Mul(a, b) => {
+                let (al, ah) = self.cell_bounds(a);
+                let (bl, bh) = self.cell_bounds(b);
+                let corners = [al * bl, al * bh, ah * bl, ah * bh];
+                if corners.iter().any(|value| value.is_nan()) {
+                    unknown
+                } else {
+                    corners
+                        .iter()
+                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), v| {
+                            (l.min(*v), h.max(*v))
+                        })
+                }
+            }
+            Node::Min(a, b) => {
+                let (al, ah) = self.cell_bounds(a);
+                let (bl, bh) = self.cell_bounds(b);
+                (al.min(bl), ah.min(bh))
+            }
+            Node::Max(a, b) => {
+                let (al, ah) = self.cell_bounds(a);
+                let (bl, bh) = self.cell_bounds(b);
+                (al.max(bl), ah.max(bh))
+            }
+            Node::BlendAlpha => (1.0, 1.0),
+            Node::BlendOffset => (0.0, 0.0),
+            Node::Clamp { argument, min, max } => {
+                let (low, high) = self.cell_bounds(argument);
+                (low.clamp(min, max), high.clamp(min, max))
+            }
+            Node::Square(a) => {
+                let (low, high) = self.cell_bounds(a);
+                let ends = [low * low, high * high];
+                if low <= 0.0 && high >= 0.0 {
+                    (0.0, ends[0].max(ends[1]))
+                } else {
+                    (ends[0].min(ends[1]), ends[0].max(ends[1]))
+                }
+            }
+            // Cubing and both negative-halving rules are increasing, so the
+            // ends stay the ends.
+            Node::Cube(a) => {
+                let (low, high) = self.cell_bounds(a);
+                (low * low * low, high * high * high)
+            }
+            Node::HalfNegative(a) => {
+                let half = |value: f64| if value > 0.0 { value } else { value * 0.5 };
+                let (low, high) = self.cell_bounds(a);
+                (half(low), half(high))
+            }
+            Node::QuarterNegative(a) => {
+                let quarter = |value: f64| if value > 0.0 { value } else { value * 0.25 };
+                let (low, high) = self.cell_bounds(a);
+                (quarter(low), quarter(high))
+            }
+            Node::Squeeze(a) => {
+                let squeeze = |value: f64| {
+                    let clamped = value.clamp(-1.0, 1.0);
+                    clamped / 2.0 - clamped * clamped * clamped / 24.0
+                };
+                let (low, high) = self.cell_bounds(a);
+                (squeeze(low), squeeze(high))
+            }
+            // Either branch may be taken somewhere in the cell, so the answer
+            // is both of them. The input is not consulted: narrowing on it
+            // would be a claim about where in the cell the branch flips.
+            Node::RangeChoice {
+                in_range,
+                out_of_range,
+                ..
+            } => {
+                let (al, ah) = self.cell_bounds(in_range);
+                let (bl, bh) = self.cell_bounds(out_of_range);
+                (al.min(bl), ah.max(bh))
+            }
+            Node::YClampedGradient {
+                from_value,
+                to_value,
+                ..
+            } => (from_value.min(to_value), from_value.max(to_value)),
+            Node::Noise { noise, .. } => {
+                let max = self.graph.noises[noise].max_value();
+                (-max, max)
+            }
+            Node::ShiftedNoise { noise, .. } => {
+                let max = self.graph.noises[noise].max_value();
+                (-max, max)
+            }
+            Node::ShiftA(noise) | Node::ShiftB(noise) => {
+                let max = self.graph.noises[noise].max_value() * 4.0;
+                (-max, max)
+            }
+            Node::WeirdScaledSampler { noise, rarity, .. } => {
+                let scale = match rarity {
+                    Rarity::Type1 => 2.0,
+                    Rarity::Type2 => 3.0,
+                };
+                (0.0, scale * self.graph.noises[noise].max_value())
+            }
+            // A spline extends linearly past its ends and the old blended
+            // noise's range is not derived here. Both sit under an
+            // `interpolated` in every dimension vanilla ships, so an infinite
+            // interval here costs nothing and claims nothing.
+            Node::Spline(_) | Node::Blended(_) => unknown,
+        }
     }
 
     /// Run `body` as if it were a fresh point, then give the caller's point

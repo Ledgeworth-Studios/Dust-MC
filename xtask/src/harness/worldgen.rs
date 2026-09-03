@@ -85,7 +85,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use dust_gen::biome::{BiomeParameters, BiomeSource, Sampler};
+use dust_gen::biome::BiomeParameters;
+use dust_gen::terrain::{Columns, Generator, Material};
 use dust_server::net::source::RegistryNames;
 use dust_server::net::world::{self, FlatWorld, Palette};
 use dust_world::anvil::{Ids as _, Names as _};
@@ -228,6 +229,15 @@ enum Rung {
     /// six climate values sampled out of the operator's density functions and
     /// matched against their parameter list. Changes no block.
     Biomes,
+    /// Dust's own terrain: `final_density` over the interpolation lattice, the
+    /// dimension's default block where it is positive, its default fluid below
+    /// the sea level the settings name, air elsewhere.
+    ///
+    /// **The last rung a server could run in**, and the first one that is a
+    /// world rather than a plain. Surface rules have not run, so the ground is
+    /// the default block and not grass; that is vanilla's own noise stage and
+    /// decision record 0012 puts the rules after it.
+    Density,
     /// The flat stack again, with each column's grass at the y Minecraft's
     /// `MOTION_BLOCKING` puts it. The terrain's *shape*, and nothing else:
     /// stone is still dirt, an ocean is still filled in solid.
@@ -252,10 +262,11 @@ enum Rung {
 
 impl Rung {
     /// The ladder, in order.
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Flat,
         Self::FlatAtSeaLevel,
         Self::Biomes,
+        Self::Density,
         Self::Heights,
         Self::Carvers,
         Self::BelowTheSurface,
@@ -267,7 +278,8 @@ impl Rung {
             Self::Flat => "the flat world Dust serves today",
             Self::FlatAtSeaLevel => "+ the world's own sea level",
             Self::Biomes => "+ Dust's biome source                    (the multi-noise climate)",
-            Self::Heights => "+ Minecraft's surface height             (the density functions)",
+            Self::Density => "+ Dust's terrain                         (the density functions)",
+            Self::Heights => "+ Minecraft's surface height             (the ceiling above it)",
             Self::Carvers => "+ Minecraft's carvers                    (caves)",
             Self::BelowTheSurface => {
                 "+ Minecraft's blocks at and below it     (surface rules, ores, trees)"
@@ -279,7 +291,10 @@ impl Rung {
     /// Whether this rung reads its answer out of the region file, and is
     /// therefore not a mode any server could run in.
     fn reads_the_region_file(self) -> bool {
-        !matches!(self, Self::Flat | Self::FlatAtSeaLevel | Self::Biomes)
+        !matches!(
+            self,
+            Self::Flat | Self::FlatAtSeaLevel | Self::Biomes | Self::Density
+        )
     }
 }
 
@@ -334,6 +349,15 @@ struct Scores {
     /// What Minecraft has underfoot where Dust has something else. The
     /// worklist a surface-rule engine would be written against.
     surface_wanted: BTreeMap<String, u64>,
+    /// What Minecraft is *standing on* in the columns whose surface **height**
+    /// disagrees.
+    ///
+    /// Not the same list as the one above, and the difference is which stage
+    /// owns the gap. `MOTION_BLOCKING` counts leaves and ice, so a column
+    /// whose ground is exactly right still reads five blocks short when a tree
+    /// is on it — and a terrain generator that has no trees would be blamed
+    /// for the forest. This names it instead.
+    surface_short_on: BTreeMap<String, u64>,
     biome_cells: u64,
     biome_agree: u64,
     minecrafts_biomes: BTreeSet<String>,
@@ -379,6 +403,24 @@ struct Model<'a> {
     names: &'a RegistryNames,
     height: WorldHeight,
     constants: Option<&'a dust_registry::BlockConstants>,
+    /// The dimension's own `default_block` and `default_fluid`, resolved from
+    /// the settings file rather than named here. A pack that generates a
+    /// basalt world generates one.
+    solid: u32,
+    fluid: u32,
+}
+
+/// Resolve a block the noise settings named, properties and all.
+fn spec_state(spec: &dust_gen::noise::build::BlockSpec) -> Result<u32, String> {
+    let block = dust_registry::Block::from_name(&spec.name)
+        .ok_or_else(|| format!("the generated block table has no {}", spec.name))?;
+    let mut state = block.default_state();
+    for (property, value) in &spec.properties {
+        state = state
+            .with(property, value)
+            .ok_or_else(|| format!("{} has no {property}={value}", spec.name))?;
+    }
+    Ok(state.id())
 }
 
 /// Build Dust's biome source for this world, out of the operator's own data.
@@ -389,7 +431,7 @@ struct Model<'a> {
 /// rather than defaulted when either is missing — a rung that quietly copied
 /// Minecraft's biomes instead would report a perfect biome score for a
 /// generator that had not run.
-fn biome_source(version: &str, seed: i64, names: &RegistryNames) -> Result<BiomeSource, String> {
+fn generator(version: &str, seed: i64, names: &RegistryNames) -> Result<Generator, String> {
     let cache = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("xtask lives one level below the workspace root")
@@ -437,7 +479,20 @@ fn biome_source(version: &str, seed: i64, names: &RegistryNames) -> Result<Biome
         table.display(),
         data.display()
     );
-    BiomeSource::new(&data, "overworld", seed, parameters).map_err(|e| e.to_string())
+    let generator =
+        Generator::new(&data, "overworld", seed, parameters).map_err(|e| e.to_string())?;
+    let settings = generator.settings();
+    println!(
+        "terrain: {}x{} cells over y {}..{}, sea level {}, {} and {}",
+        settings.cell_width,
+        settings.cell_height,
+        settings.min_y,
+        settings.min_y + settings.height,
+        settings.sea_level,
+        settings.default_block.name,
+        settings.default_fluid.name
+    );
+    Ok(generator)
 }
 
 fn measure(options: &Options) -> Result<(), String> {
@@ -522,24 +577,27 @@ fn measure(options: &Options) -> Result<(), String> {
         surfaces.push(surface_of(chunk));
     }
 
-    let source = biome_source(&options.version, options.seed, &names)?;
+    let source = generator(&options.version, options.seed, &names)?;
     let model = Model {
         flat: &flat,
         blocks: &blocks,
         names: &names,
         height,
         constants: constants.as_ref().map(|(_, table)| table),
+        solid: spec_state(&source.settings().default_block)?,
+        fluid: spec_state(&source.settings().default_fluid)?,
     };
 
     let mut ladder = Vec::new();
     for rung in Rung::ALL {
         let mut scores = Scores::default();
-        // One sampler per rung rather than per chunk: the `flat_cache` nodes
-        // hold a column's continentalness across its 96 biome cells, and a
-        // sampler rebuilt per chunk would still be correct and would throw
-        // that away at every boundary. It is scratch space, not state — the
-        // graph and every noise table are shared and immutable.
-        let mut sampler = source.sampler();
+        // One set of scratch per rung rather than per chunk: the `flat_cache`
+        // nodes hold a column's continentalness across its 96 biome cells, the
+        // material buffer is 96 KiB, and rebuilding either per chunk would
+        // still be correct and would throw both away at every boundary. It is
+        // scratch space, not state — the graph and every noise table are
+        // shared and immutable.
+        let mut sampler = source.columns();
         for (chunk, surface) in vanilla.iter().zip(&surfaces) {
             let started = Instant::now();
             let built = build(rung, chunk, surface, &model, &mut sampler);
@@ -576,7 +634,7 @@ fn build(
     vanilla: &Chunk,
     surface: &[Option<i32>; 256],
     model: &Model,
-    biomes: &mut Sampler,
+    generator: &mut Columns,
 ) -> Chunk {
     let Model {
         flat,
@@ -584,6 +642,8 @@ fn build(
         names,
         height,
         constants,
+        solid,
+        fluid,
     } = *model;
     // Rung zero is the server's own column, cloned rather than rebuilt: that
     // clone is also what `Source::column` hands out for a position a real
@@ -621,46 +681,73 @@ fn build(
     );
 
     let top = height.min_y() + height.height() as i32;
-    for z in 0..16u32 {
-        for x in 0..16u32 {
-            let column = (x + z * 16) as usize;
-            // Where this model puts the grass. The flat rungs put it at sea
-            // level everywhere; the rest take it from Minecraft, and a column
-            // Minecraft left empty gets no ground at all rather than a guess.
-            let ground = match rung {
-                Rung::Flat => unreachable!("returned above"),
-                Rung::FlatAtSeaLevel | Rung::Biomes => Some(SEA_LEVEL),
-                _ => surface[column],
-            };
-            for y in height.min_y()..top {
-                let state = if y == height.min_y() {
-                    blocks.palette.bedrock
-                } else {
-                    match rung {
-                        Rung::Flat => unreachable!("returned above"),
-                        Rung::FlatAtSeaLevel | Rung::Biomes | Rung::Heights => {
-                            stack(y, ground, blocks)
+    if rung == Rung::Density {
+        // The world's own floor is bedrock on every rung of this ladder,
+        // including the control, because vanilla's is: the bedrock gradient is
+        // true at and below the bottom without a die being rolled. What is
+        // above it here is the noise stage and nothing else.
+        let materials = generator.terrain(vanilla.pos().x, vanilla.pos().z);
+        for z in 0..16u32 {
+            for x in 0..16u32 {
+                for y in height.min_y()..top {
+                    let state = if y == height.min_y() {
+                        blocks.palette.bedrock
+                    } else {
+                        let at = (y - height.min_y()) as usize * 256 + (z * 16 + x) as usize;
+                        match Material::from_code(materials[at]) {
+                            Material::Air => air,
+                            Material::Solid => solid,
+                            Material::Fluid => fluid,
                         }
-                        Rung::Carvers => {
-                            let v = vanilla.get_block(x, y, z);
-                            if ground.is_some_and(|g| y <= g) && blocks.is_air(v) {
-                                v
-                            } else {
+                    };
+                    if state != air {
+                        chunk.set_block(x, y, z, state);
+                    }
+                }
+            }
+        }
+    } else {
+        for z in 0..16u32 {
+            for x in 0..16u32 {
+                let column = (x + z * 16) as usize;
+                // Where this model puts the grass. The flat rungs put it at sea
+                // level everywhere; the rest take it from Minecraft, and a column
+                // Minecraft left empty gets no ground at all rather than a guess.
+                let ground = match rung {
+                    Rung::Flat | Rung::Density => unreachable!("handled above"),
+                    Rung::FlatAtSeaLevel | Rung::Biomes => Some(SEA_LEVEL),
+                    _ => surface[column],
+                };
+                for y in height.min_y()..top {
+                    let state = if y == height.min_y() {
+                        blocks.palette.bedrock
+                    } else {
+                        match rung {
+                            Rung::Flat | Rung::Density => unreachable!("handled above"),
+                            Rung::FlatAtSeaLevel | Rung::Biomes | Rung::Heights => {
                                 stack(y, ground, blocks)
                             }
-                        }
-                        Rung::BelowTheSurface => {
-                            if ground.is_some_and(|g| y <= g) {
-                                vanilla.get_block(x, y, z)
-                            } else {
-                                air
+                            Rung::Carvers => {
+                                let v = vanilla.get_block(x, y, z);
+                                if ground.is_some_and(|g| y <= g) && blocks.is_air(v) {
+                                    v
+                                } else {
+                                    stack(y, ground, blocks)
+                                }
                             }
+                            Rung::BelowTheSurface => {
+                                if ground.is_some_and(|g| y <= g) {
+                                    vanilla.get_block(x, y, z)
+                                } else {
+                                    air
+                                }
+                            }
+                            Rung::Everything => vanilla.get_block(x, y, z),
                         }
-                        Rung::Everything => vanilla.get_block(x, y, z),
+                    };
+                    if state != air {
+                        chunk.set_block(x, y, z, state);
                     }
-                };
-                if state != air {
-                    chunk.set_block(x, y, z, state);
                 }
             }
         }
@@ -677,7 +764,7 @@ fn build(
                 }
             }
         }
-    } else if rung == Rung::Biomes {
+    } else if matches!(rung, Rung::Biomes | Rung::Density) {
         // Quart coordinates: the cell index, which is the block position
         // shifted down by two. The x and z of the chunk are added first,
         // because a climate is a fact about where in the world the column is
@@ -694,7 +781,7 @@ fn build(
                 let quart_x = base_x + (x as i32 >> 2);
                 let quart_z = base_z + (z as i32 >> 2);
                 for y in (height.min_y()..top).step_by(4) {
-                    if let Some(biome) = biomes.biome(quart_x, y >> 2, quart_z) {
+                    if let Some(biome) = generator.biomes().biome(quart_x, y >> 2, quart_z) {
                         chunk.set_biome(x, y, z, biome);
                     }
                 }
@@ -756,6 +843,10 @@ fn score(
                 scores.surface_agree += 1;
             } else if let (Some(want), Some(got)) = (want, got) {
                 *scores.surface_off_by.entry(got - want).or_default() += 1;
+                *scores
+                    .surface_short_on
+                    .entry(block_name(vanilla.get_block(x, want, z)))
+                    .or_default() += 1;
             }
             // Asked at Minecraft's y and not at Dust's. A column whose ground
             // is thirty blocks too low can still be grass on top of dirt, and
@@ -872,6 +963,10 @@ fn report(rung: Rung, scores: &Scores) {
             .map(|(delta, count)| format!("{delta:+} x {count}"))
             .collect();
         println!("      off by (Dust minus Minecraft): {}", shown.join(", "));
+        histogram(
+            "      and Minecraft's own surface there was:",
+            &scores.surface_short_on,
+        );
     }
     println!(
         "  surface block   {:>10} of {:>10} column(s)  ({:.3}%)",
@@ -1148,7 +1243,11 @@ mod tests {
         );
         write(
             "minecraft/worldgen/noise_settings/overworld.json",
-            r#"{"noise_router": {
+            r#"{"noise": {"height": 384, "min_y": -64, "size_horizontal": 1, "size_vertical": 2},
+               "sea_level": 63,
+               "default_block": {"Name": "minecraft:stone"},
+               "default_fluid": {"Name": "minecraft:water", "Properties": {"level": "0"}},
+               "noise_router": {
                  "temperature": {
                    "type": "minecraft:y_clamped_gradient",
                    "from_y": -64, "to_y": 320, "from_value": -1.0, "to_value": 1.0
@@ -1165,7 +1264,14 @@ mod tests {
                  "continents": 0.0,
                  "erosion": 0.0,
                  "depth": 0.0,
-                 "ridges": 0.0
+                 "ridges": 0.0,
+                 "final_density": {
+                   "type": "minecraft:interpolated",
+                   "argument": {
+                     "type": "minecraft:y_clamped_gradient",
+                     "from_y": -64, "to_y": 144, "from_value": 1.0, "to_value": -1.0
+                   }
+                 }
                }}"#,
         );
     }
@@ -1183,13 +1289,17 @@ mod tests {
         )
     }
 
-    fn scratch_source(root: &Path, cold: u32, warm: u32) -> BiomeSource {
+    fn scratch_source(root: &Path, cold: u32, warm: u32) -> Generator {
         scratch_pack(root);
         let parameters =
             BiomeParameters::parse(&scratch_table(cold, warm)).expect("the table parses");
         assert_eq!(parameters.len(), 2);
-        BiomeSource::new(root, "overworld", 1234, parameters).expect("the pack compiles")
+        Generator::new(root, "overworld", 1234, parameters).expect("the pack compiles")
     }
+
+    /// The y the scratch pack's density crosses zero at: solid below, and
+    /// water from there to the sea level.
+    const SCRATCH_GROUND: i32 = 40;
 
     fn model<'a>(
         flat: &'a FlatWorld,
@@ -1203,6 +1313,14 @@ mod tests {
             names,
             height,
             constants: None,
+            solid: dust_registry::Block::from_name("minecraft:stone")
+                .expect("stone")
+                .default_state()
+                .id(),
+            fluid: dust_registry::Block::from_name("minecraft:water")
+                .expect("water")
+                .default_state()
+                .id(),
         }
     }
 
@@ -1227,7 +1345,7 @@ mod tests {
             &vanilla,
             &surface,
             &model(&flat, &blocks, &names, height),
-            &mut source.sampler(),
+            &mut source.columns(),
         );
         let mut scores = Scores::default();
         score(
@@ -1271,7 +1389,7 @@ mod tests {
             &vanilla,
             &surface,
             &model(&flat, &blocks, &names, height),
-            &mut source.sampler(),
+            &mut source.columns(),
         );
         // Take the top block of one column away. The surface drops, the block
         // underfoot changes and one cell of the world differs.
@@ -1317,7 +1435,7 @@ mod tests {
                 &vanilla,
                 &surface,
                 &model(&flat, &blocks, &names, height),
-                &mut source.sampler(),
+                &mut source.columns(),
             );
             let mut scores = Scores::default();
             score(
@@ -1357,7 +1475,7 @@ mod tests {
             &vanilla,
             &surface,
             &model(&flat, &blocks, &names, height),
-            &mut source.sampler(),
+            &mut source.columns(),
         );
         assert_eq!(&built, flat.column());
     }
@@ -1386,7 +1504,7 @@ mod tests {
             &vanilla,
             &surface,
             &model(&flat, &blocks, &names, height),
-            &mut source.sampler(),
+            &mut source.columns(),
         );
 
         // Below the crossing and above it, on the cell either side of it.
@@ -1440,14 +1558,14 @@ mod tests {
              {dry}\tminecraft:savanna{axes}\t-10000\t0{axes}{axes}{axes}{axes}\t0\n\
              {wet}\tminecraft:jungle{axes}\t0\t10000{axes}{axes}{axes}{axes}\t0\n"
         );
-        let source = BiomeSource::new(
+        let source = Generator::new(
             &scratch,
             "overworld",
             1234,
             BiomeParameters::parse(&table).expect("the table parses"),
         )
         .expect("the pack compiles");
-        let mut sampler = source.sampler();
+        let mut sampler = source.columns();
 
         let here = ChunkPos::new(0, 0);
         let far = ChunkPos::new(1000, -1000);
@@ -1488,14 +1606,18 @@ mod tests {
 
     #[test]
     fn the_ladder_changes_one_thing_per_rung_and_ends_at_the_control() {
-        assert_eq!(Rung::ALL.len(), 7);
+        assert_eq!(Rung::ALL.len(), 8);
         assert_eq!(Rung::ALL[0], Rung::Flat);
-        assert_eq!(*Rung::ALL.last().expect("seven"), Rung::Everything);
+        assert_eq!(*Rung::ALL.last().expect("eight"), Rung::Everything);
         assert!(!Rung::Flat.reads_the_region_file());
         assert!(!Rung::FlatAtSeaLevel.reads_the_region_file());
         assert!(
             !Rung::Biomes.reads_the_region_file(),
             "the biome rung answers for itself now, so it is a mode a server could run in"
+        );
+        assert!(
+            !Rung::Density.reads_the_region_file(),
+            "the terrain rung answers for itself too, and is the last rung that does"
         );
         assert!(Rung::Heights.reads_the_region_file());
     }
