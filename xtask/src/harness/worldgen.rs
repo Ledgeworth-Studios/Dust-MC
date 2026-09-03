@@ -338,6 +338,13 @@ struct Scores {
     biome_agree: u64,
     minecrafts_biomes: BTreeSet<String>,
     dusts_biomes: BTreeSet<String>,
+    /// `Minecraft's biome -> Dust's` for every cell they disagree on.
+    ///
+    /// Both sides and not just the wanted one, because a biome source is wrong
+    /// in *pairs*: "435,459 cells short" says nothing a reader can act on, and
+    /// "swamp where Minecraft has mangrove_swamp, 149 cells" names one region
+    /// of the parameter list and one boundary to go and look at.
+    biome_confusions: BTreeMap<String, u64>,
     /// Cells Minecraft left open strictly below its own surface.
     carved: u64,
     /// ... of which Dust also leaves open.
@@ -802,6 +809,13 @@ fn score(
                 scores.biome_cells += 1;
                 if wanted == built {
                     scores.biome_agree += 1;
+                } else {
+                    let pair = format!(
+                        "{} where Minecraft has {}",
+                        biome_name(names, built),
+                        biome_name(names, wanted)
+                    );
+                    *scores.biome_confusions.entry(pair).or_default() += 1;
                 }
                 if let Some(name) = names.biome_name(wanted) {
                     scores.minecrafts_biomes.insert(name.to_owned());
@@ -812,6 +826,17 @@ fn score(
             }
         }
     }
+}
+
+/// A biome's name, or its number when the registry does not know it.
+///
+/// Never a bare number silently: an id with no name is a table and a registry
+/// that have come apart, which is the thing `BiomeParameters::rebind` exists to
+/// say out loud.
+fn biome_name(names: &RegistryNames, id: u32) -> String {
+    names
+        .biome_name(id)
+        .map_or_else(|| format!("biome #{id}"), str::to_owned)
 }
 
 fn block_name(state: u32) -> String {
@@ -863,6 +888,10 @@ fn report(rung: Rung, scores: &Scores) {
         percent(scores.biome_agree, scores.biome_cells),
         scores.minecrafts_biomes.len(),
         scores.dusts_biomes.len()
+    );
+    histogram(
+        "      Dust has, where they disagree:",
+        &scores.biome_confusions,
     );
     println!(
         "  caves           {:>10} of {:>10} carved cell(s) open ({:.3}%); {} cell(s) Dust opened \
