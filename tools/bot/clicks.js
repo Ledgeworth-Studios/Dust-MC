@@ -46,6 +46,9 @@ const SPAWN_SETTLE_MS = 3000
 const CLICK_SETTLE_MS = 400
 
 const OUTSIDE = -999
+// The two slots `--predict` uses, named because the numbers are vanilla's.
+const HELMET = 5
+const MAIN = 9
 const SWAP_OFFHAND_BUTTON = 40
 const SLOTS = 46
 
@@ -133,15 +136,15 @@ function creativeSlot (b, slot, itemName, count) {
   b._client.write('set_creative_slot', { slot, item })
 }
 
-function windowClick (b, slot, mouseButton, mode) {
+function windowClick (b, slot, mouseButton, mode, changedSlots = [], cursorItem = { itemCount: 0 }) {
   b._client.write('window_click', {
     windowId: 0,
     stateId: 0,
     slot,
     mouseButton,
     mode,
-    changedSlots: [],
-    cursorItem: { itemCount: 0 }
+    changedSlots,
+    cursorItem
   })
 }
 
@@ -408,6 +411,69 @@ async function record (port, out) {
   console.log(`${steps.length - 1} clicks recorded to ${out}`)
 }
 
+// The one thing the recording above cannot reach.
+//
+// Every click it sends claims "nothing changed", so a click the server refuses
+// is a click where both ends already agree and no packet needs to be sent. A
+// real client does not claim that. It *predicts*: it draws the cobblestone in
+// the helmet slot on the frame the player clicked, tells the server that is
+// what it did, and waits to be contradicted. A server that refuses the click
+// and says nothing leaves that prediction standing — the player sees a block on
+// their head until they relog, and the differential above reports 101/101 the
+// whole time, because a recording of two servers that both send nothing is two
+// recordings that agree.
+//
+// So this sends the prediction and requires the contradiction. Run it against a
+// real server first: what it asserts is what a real server does, not what looks
+// correct.
+//
+//   node clicks.js <port> --predict
+async function predict (port) {
+  const bot = await spawned(port, 'Predictor')
+  const state = tracker(bot)
+  await wait(SPAWN_SETTLE_MS)
+
+  const stone = 'cobblestone'
+  for (let slot = 1; slot < SLOTS; slot++) creativeSlot(bot, slot, null, 0)
+  creativeSlot(bot, MAIN, stone, 9)
+  await wait(SPAWN_SETTLE_MS)
+
+  // Onto the cursor, honestly. This click is predicted correctly, so a server
+  // may answer it with nothing at all.
+  state.cursor = null
+  windowClick(bot, MAIN, 0, PICKUP)
+  await wait(CLICK_SETTLE_MS)
+
+  // And now the lie a real client tells: "I put the cobblestone on my head and
+  // my hand is empty." The server refused the click, so both halves are wrong.
+  const cobble = {
+    itemCount: 9,
+    itemId: bot.registry.itemsByName[stone].id,
+    addedComponentCount: 0,
+    removedComponentCount: 0,
+    components: [],
+    removeComponents: []
+  }
+  state.slots[HELMET] = { name: stone, count: 9 }
+  state.cursor = null
+  windowClick(bot, HELMET, 0, PICKUP, [{ location: HELMET, number: HELMET, item: cobble }], { itemCount: 0 })
+  await wait(CLICK_SETTLE_MS)
+
+  const checks = [
+    ['the helmet slot is put back to empty', state.slots[HELMET] === null],
+    ['the cursor is put back to the cobblestone', state.cursor && state.cursor.count === 9],
+    ['the inventory slot it came from is still empty', state.slots[MAIN] === null]
+  ]
+  try { bot.quit() } catch (e) { /* already gone */ }
+  let failed = 0
+  for (const [what, ok] of checks) {
+    if (!ok) failed++
+    console.log(`  ${ok ? 'ok  ' : 'FAIL'}  ${what}`)
+  }
+  console.log(`\n${checks.length - failed}/${checks.length} checks passed`)
+  process.exit(failed === 0 ? 0 : 1)
+}
+
 // Counts, not a rate. A percentage would not say which click.
 function compare (aPath, bPath) {
   const fs = require('fs')
@@ -442,6 +508,11 @@ function compare (aPath, bPath) {
 const args = process.argv.slice(2)
 if (args[0] === '--compare') {
   compare(args[1], args[2])
+} else if (args.includes('--predict')) {
+  predict(Number(args[0])).catch(e => {
+    console.log(`FAIL  ${e.message}`)
+    process.exit(1)
+  })
 } else {
   const port = Number(args[0] || 25565)
   const outAt = args.indexOf('--out')
