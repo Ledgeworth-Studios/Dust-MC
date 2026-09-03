@@ -71,6 +71,7 @@ mod region;
 pub mod registries;
 mod rewrite;
 mod wire;
+pub mod worldgen;
 
 use std::process::ExitCode;
 
@@ -141,6 +142,17 @@ outside the repository (override with DUST_HARNESS_CACHE).
       them, and a worklist of what each one places instead. A measurement and
       not a gate, for the same reason `light` is: exit 0 unless the run itself
       failed. Decision record 0011 is why this exists.
+
+  worldgen --version <v> [--seed <n>] [--radius <r>] [--at <x>,<z>]
+      Read a world Minecraft generated, build the same chunks with Dust's own
+      generator, and count how far apart they are: surface height, surface
+      block, biome, caves and every block state, as a ladder of seven models
+      over the same chunks in one run. Each rung hands Dust one more of
+      Minecraft's own answers, and the last hands over all of them and has to
+      be exact. Costs are scored beside the accuracy -- columns per second and
+      bytes held -- because this code runs for every chunk a player walks
+      toward. A measurement and not a gate: exit 0 unless the run failed.
+      Decision record 0012 is what it was built to write.
 ";
 
 /// Which verb was selected, with its parsed options.
@@ -154,6 +166,7 @@ enum Verb {
     Registries(registries::Options),
     Light(light::Options),
     Placement(placement::Options),
+    Worldgen(worldgen::Options),
 }
 
 /// Parse and run one harness verb.
@@ -188,6 +201,7 @@ pub fn dispatch(args: &[String]) -> Result<ExitCode, String> {
         Verb::Registries(options) => Ok(registries::run(&options)),
         Verb::Light(options) => Ok(light::run(&options)),
         Verb::Placement(options) => Ok(placement::run(&options)),
+        Verb::Worldgen(options) => Ok(worldgen::run(&options)),
     }
 }
 
@@ -205,9 +219,10 @@ fn parse(args: &[String]) -> Result<Verb, String> {
         "registries" => registries::parse(rest).map(Verb::Registries),
         "light" => light::parse(rest).map(Verb::Light),
         "placement" => placement::parse(rest).map(Verb::Placement),
+        "worldgen" => worldgen::parse(rest).map(Verb::Worldgen),
         other => Err(format!(
             "unknown harness verb `{other}`\n\nThe verbs are: provision, rcon, capture, \
-             compare, rewrite, registries, light."
+             compare, rewrite, registries, light, placement, worldgen."
         )),
     }
 }

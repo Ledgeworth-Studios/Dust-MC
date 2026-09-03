@@ -803,12 +803,46 @@ mod tests {
             );
             return;
         };
-        let subset: Vec<(i32, i32)> = listed.into_iter().take(25).collect();
-        let set = digest::scan(&region_dir, &subset, seed)
-            .expect("a real vanilla world must scan cleanly");
+        // **What a region file lists is not what was captured.** Generating a
+        // `full` chunk needs its neighbours as far as `structure_starts`, and
+        // vanilla writes those into the same file, so every capture leaves a
+        // ring of unfinished chunks around the square it was asked for. Taking
+        // the first twenty-five *listed* was a coin flip on whichever radius
+        // somebody last ran — green at radius 2 and red at radius 4, on a
+        // world neither run had anything wrong with.
+        //
+        // So both halves are asserted instead: the finished chunks scan, and a
+        // chunk from the ring is *refused*. The second half is the one the
+        // original spelling was reaching for and could not state.
+        let mut full: Vec<(i32, i32)> = Vec::new();
+        let mut ring: Vec<(i32, i32)> = Vec::new();
+        for pos in listed.into_iter().take(400) {
+            if digest::scan(&region_dir, &[pos], seed).is_ok() {
+                full.push(pos);
+            } else {
+                ring.push(pos);
+            }
+            if full.len() >= 25 && !ring.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            !full.is_empty(),
+            "a captured world has finished chunks in it"
+        );
+        let set =
+            digest::scan(&region_dir, &full, seed).expect("a real vanilla world must scan cleanly");
         assert!(!set.chunks.is_empty());
         for chunk in &set.chunks {
             assert_eq!(chunk.status, "full", "a saved chunk must be complete");
+        }
+        if let Some(&edge) = ring.first() {
+            let err = digest::scan(&region_dir, &[edge], seed)
+                .expect_err("a chunk vanilla never finished must be refused, not fingerprinted");
+            assert!(
+                err.contains("the pregeneration did not finish"),
+                "the refusal must say what is wrong with it: {err}"
+            );
         }
         println!(
             "smoke: fingerprinted {} real chunk(s) from {}",
