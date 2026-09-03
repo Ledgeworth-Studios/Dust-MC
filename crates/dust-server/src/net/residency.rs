@@ -170,10 +170,28 @@ struct Resident {
     holders: u32,
 }
 
+/// The columns the server is keeping, and how many of them nobody holds.
+///
+/// The count is carried rather than derived, and that is not a micro-optimism:
+/// deriving it is a scan of the whole map, and [`Residency::release_columns`]
+/// went from a caller that ran when a player crossed a chunk boundary to one
+/// that runs fifty times a second per session the moment the chunk stream
+/// started giving columns back. Counting it cost a session's settled
+/// neighbours **41 ms of worst-case chat round trip against 758** on a world
+/// read from region files, where a column is cheap enough that four joins
+/// release two thousand of them a second.
+#[derive(Default)]
+struct Kept {
+    columns: HashMap<(i32, i32), Resident>,
+    /// How many entries in `columns` have `holders == 0`. Maintained by every
+    /// path that moves a holder count across zero, and by nothing else.
+    retired: usize,
+}
+
 /// The columns the server is keeping.
 #[derive(Default)]
 pub struct Residency {
-    columns: RwLock<HashMap<(i32, i32), Resident>>,
+    columns: RwLock<Kept>,
 }
 
 impl std::fmt::Debug for Residency {
@@ -181,16 +199,13 @@ impl std::fmt::Debug for Residency {
     /// them nobody is standing near, which are the two numbers the policy is
     /// about.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let columns = self
+        let kept = self
             .columns
             .read()
             .expect("the residency is never poisoned");
         f.debug_struct("Residency")
-            .field("columns", &columns.len())
-            .field(
-                "retired",
-                &columns.values().filter(|c| c.holders == 0).count(),
-            )
+            .field("columns", &kept.columns.len())
+            .field("retired", &kept.retired)
             .finish()
     }
 }
@@ -218,6 +233,7 @@ impl Residency {
         self.columns
             .read()
             .expect("the residency is never poisoned")
+            .columns
             .get(&(pos.x, pos.z))?
             .chunk
             .clone()
@@ -230,16 +246,49 @@ impl Residency {
     /// packet. [`Residency::cold`] and [`Residency::fill`] are the half that
     /// costs something, and they belong on another thread.
     pub fn hold(&self, centre: ChunkPos) {
-        let mut columns = self
+        let mut kept = self
             .columns
             .write()
             .expect("the residency is never poisoned");
         for key in ring(centre) {
-            let entry = columns.entry(key).or_insert(Resident {
-                chunk: None,
-                holders: 0,
-            });
-            entry.holders += 1;
+            Self::take(&mut kept, key);
+        }
+    }
+
+    /// One holder more on `key`, and the retired count kept honest.
+    ///
+    /// A column that was not in the map at all was never retired, so it is not
+    /// un-retired here. Writing this as "if it has no holders, one fewer
+    /// retired" underflows the count on the first column any claim ever takes.
+    fn take(kept: &mut Kept, key: (i32, i32)) {
+        let Kept { columns, retired } = kept;
+        match columns.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().holders == 0 {
+                    *retired -= 1;
+                }
+                entry.get_mut().holders += 1;
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(Resident {
+                    chunk: None,
+                    holders: 1,
+                });
+            }
+        }
+    }
+
+    /// One holder fewer on `key`, and the retired count kept honest. A column
+    /// this is called for that is not there is not an error: a claim may
+    /// outlive a wholesale retirement.
+    fn give_back(kept: &mut Kept, key: (i32, i32)) {
+        if let Some(entry) = kept.columns.get_mut(&key) {
+            if entry.holders > 0 {
+                entry.holders -= 1;
+                if entry.holders == 0 {
+                    kept.retired += 1;
+                }
+            }
         }
     }
 
@@ -249,23 +298,29 @@ impl Residency {
     /// zero — retired, not dropped — until there are more than [`RETIRED_CAP`]
     /// such columns, at which point all of them go at once.
     pub fn release(&self, centre: ChunkPos) {
-        let mut columns = self
+        let mut kept = self
             .columns
             .write()
             .expect("the residency is never poisoned");
         for key in ring(centre) {
-            if let Some(entry) = columns.get_mut(&key) {
-                entry.holders = entry.holders.saturating_sub(1);
-            }
+            Self::give_back(&mut kept, key);
         }
-        Self::retire(&mut columns);
+        Self::retire(&mut kept);
     }
 
     /// Drop every column nobody holds, but only once there are more of them
     /// than the cap. See [`RETIRED_CAP`].
-    fn retire(columns: &mut HashMap<(i32, i32), Resident>) {
-        if columns.values().filter(|c| c.holders == 0).count() > RETIRED_CAP {
-            columns.retain(|_, c| c.holders > 0);
+    ///
+    /// **The test is a comparison, not a scan.** This is called on every
+    /// release, and the chunk stream releases a column for every column it
+    /// sends — so counting the retired ones here put a walk of the whole map
+    /// inside the write lock fifty times a second per player. The `retain`
+    /// below is still a walk, and it still happens: once every sixty-four
+    /// retirements rather than on every one of them.
+    fn retire(kept: &mut Kept) {
+        if kept.retired > RETIRED_CAP {
+            kept.columns.retain(|_, c| c.holders > 0);
+            kept.retired = 0;
         }
     }
 
@@ -280,32 +335,49 @@ impl Residency {
     /// the point: two players and a pile of cobblestone standing on one column
     /// keep one copy of it between them.
     pub fn hold_columns(&self, columns: &[ChunkPos]) {
-        let mut held = self
+        let mut kept = self
             .columns
             .write()
             .expect("the residency is never poisoned");
         for pos in columns {
-            held.entry((pos.x, pos.z))
-                .or_insert(Resident {
-                    chunk: None,
-                    holders: 0,
-                })
-                .holders += 1;
+            Self::take(&mut kept, (pos.x, pos.z));
         }
     }
 
     /// Give up a claim taken by [`Residency::hold_columns`].
     pub fn release_columns(&self, columns: &[ChunkPos]) {
-        let mut held = self
+        let mut kept = self
             .columns
             .write()
             .expect("the residency is never poisoned");
         for pos in columns {
-            if let Some(entry) = held.get_mut(&(pos.x, pos.z)) {
-                entry.holders = entry.holders.saturating_sub(1);
-            }
+            Self::give_back(&mut kept, (pos.x, pos.z));
         }
-        Self::retire(&mut held);
+        Self::retire(&mut kept);
+    }
+
+    /// Take `added` and give up `dropped`, under **one** write lock.
+    ///
+    /// The chunk stream's window slides every twenty milliseconds per session
+    /// and both halves happen together; two calls is two acquisitions of a
+    /// lock that a movement check on every other session is waiting to read.
+    /// Additions go first, so a column in both sets never falls to zero
+    /// holders in between and is never retired and rebuilt.
+    pub fn exchange(&self, added: &[ChunkPos], dropped: &[ChunkPos]) {
+        if added.is_empty() && dropped.is_empty() {
+            return;
+        }
+        let mut kept = self
+            .columns
+            .write()
+            .expect("the residency is never poisoned");
+        for pos in added {
+            Self::take(&mut kept, (pos.x, pos.z));
+        }
+        for pos in dropped {
+            Self::give_back(&mut kept, (pos.x, pos.z));
+        }
+        Self::retire(&mut kept);
     }
 
     /// The columns in the ring around `centre` that are held and not yet built.
@@ -325,13 +397,17 @@ impl Residency {
     /// The same question about a named set of columns.
     #[must_use]
     pub fn cold_columns(&self, columns: &[ChunkPos]) -> Vec<ChunkPos> {
-        let held = self
+        let kept = self
             .columns
             .read()
             .expect("the residency is never poisoned");
         columns
             .iter()
-            .filter(|pos| held.get(&(pos.x, pos.z)).is_some_and(|c| c.chunk.is_none()))
+            .filter(|pos| {
+                kept.columns
+                    .get(&(pos.x, pos.z))
+                    .is_some_and(|c| c.chunk.is_none())
+            })
             .copied()
             .collect()
     }
@@ -344,11 +420,11 @@ impl Residency {
     /// second one to arrive finds a chunk already there and its own copy is
     /// dropped on the spot. Duplicated work, never duplicated memory.
     pub fn fill(&self, pos: ChunkPos, chunk: Chunk) -> bool {
-        let mut columns = self
+        let mut kept = self
             .columns
             .write()
             .expect("the residency is never poisoned");
-        match columns.get_mut(&(pos.x, pos.z)) {
+        match kept.columns.get_mut(&(pos.x, pos.z)) {
             Some(entry) if entry.chunk.is_none() => {
                 entry.chunk = Some(Arc::new(chunk));
                 true
@@ -363,6 +439,7 @@ impl Residency {
         self.columns
             .read()
             .expect("the residency is never poisoned")
+            .columns
             .len()
     }
 
@@ -517,8 +594,7 @@ impl ColumnClaim {
             .filter(|pos| !wanted.contains(pos))
             .copied()
             .collect();
-        residency.hold_columns(&added);
-        residency.release_columns(&dropped);
+        residency.exchange(&added, &dropped);
         self.held.clear();
         self.held.extend_from_slice(wanted);
         if !added.is_empty() {
@@ -606,8 +682,8 @@ mod tests {
         // (1,0) is in both rings, so the first player leaving does not retire
         // it — and the second player's movement check still reads it.
         assert!(residency.resident(at(1, 0)).is_some());
-        let columns = residency.columns.read().expect("not poisoned");
-        assert_eq!(columns[&(1, 0)].holders, 1);
+        let kept = residency.columns.read().expect("not poisoned");
+        assert_eq!(kept.columns[&(1, 0)].holders, 1);
     }
 
     /// The order [`Residence::move_to`] takes its two steps in, checked by the
@@ -649,11 +725,11 @@ mod tests {
             let mut player = Residence::new(Some(Arc::clone(&residency)));
             player.move_to(at(0, 0));
             let held = residency.columns.read().expect("not poisoned");
-            assert_eq!(held.values().filter(|c| c.holders > 0).count(), 9);
+            assert_eq!(held.columns.values().filter(|c| c.holders > 0).count(), 9);
         }
         let held = residency.columns.read().expect("not poisoned");
         assert_eq!(
-            held.values().filter(|c| c.holders > 0).count(),
+            held.columns.values().filter(|c| c.holders > 0).count(),
             0,
             "nine columns outlived the session that claimed them"
         );
@@ -671,15 +747,44 @@ mod tests {
             // is not loses it.
             claim.set(&mut vec![at(1, 0), at(2, 0)]);
             let held = residency.columns.read().expect("not poisoned");
-            assert_eq!(held[&(0, 0)].holders, 0);
-            assert_eq!(held[&(1, 0)].holders, 1, "a column wanted twice running");
-            assert_eq!(held[&(2, 0)].holders, 1);
+            assert_eq!(held.columns[&(0, 0)].holders, 0);
+            assert_eq!(
+                held.columns[&(1, 0)].holders,
+                1,
+                "a column wanted twice running"
+            );
+            assert_eq!(held.columns[&(2, 0)].holders, 1);
         }
         let held = residency.columns.read().expect("not poisoned");
         assert!(
-            held.values().all(|c| c.holders == 0),
+            held.columns.values().all(|c| c.holders == 0),
             "the items despawned and their columns stayed claimed"
         );
+    }
+
+    /// The retired count is a second answer to a question the map already
+    /// answers, and a second answer that drifts is worse than a scan.
+    #[test]
+    fn the_retired_count_agrees_with_the_map_through_every_path() {
+        let residency = Residency::new();
+        let agree = |what: &str| {
+            let kept = residency.columns.read().expect("not poisoned");
+            let scanned = kept.columns.values().filter(|c| c.holders == 0).count();
+            assert_eq!(kept.retired, scanned, "{what}");
+        };
+        residency.hold(at(0, 0));
+        agree("after a ring was taken");
+        residency.hold_columns(&[at(5, 5), at(5, 6)]);
+        agree("after named columns were taken");
+        residency.exchange(&[at(5, 7)], &[at(5, 5)]);
+        agree("after an exchange");
+        residency.release(at(0, 0));
+        agree("after the ring went back");
+        residency.release_columns(&[at(5, 6), at(5, 7)]);
+        agree("after the named columns went back");
+        // And a column that was never held: `give_back` must not count one.
+        residency.release_columns(&[at(90, 90)]);
+        agree("after a column nobody ever held was released");
     }
 
     #[test]
