@@ -26,9 +26,10 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::density::{Graph, Node, Spline, SplinePoint, SplineValue};
+use super::blended::{BlendedNoise, BlendedShape};
+use super::density::{Graph, Node, Rarity, Spline, SplinePoint, SplineValue};
 use super::perlin::{NoiseParameters, NormalNoise};
-use super::rng::Xoroshiro;
+use super::rng::{Positional, Xoroshiro};
 
 /// What went wrong, with the file and the place inside it.
 #[derive(Debug)]
@@ -71,6 +72,11 @@ impl std::fmt::Display for BuildError {
 
 impl std::error::Error for BuildError {}
 
+/// The name vanilla hashes the old blended noise's stream from. It names no
+/// file: there is no `worldgen/noise/terrain.json`, and the amplitudes come
+/// from the node's own five numbers instead.
+const TERRAIN_NOISE: &str = "minecraft:terrain";
+
 /// The six climate functions, in the order a climate point holds them.
 pub const CLIMATE_ROUTES: [&str; 6] = [
     "temperature",
@@ -88,38 +94,161 @@ pub struct ClimateGraph {
     pub roots: [usize; 6],
 }
 
+/// The shape of a dimension's noise, as its settings file states it.
+///
+/// Not one of these numbers is written here. `cell_width` and `cell_height`
+/// are the interpolation lattice a column's terrain is lerped across, and a
+/// pack that halves either one generates a different world at a different
+/// price; that is the operator's call to make and not this file's.
+#[derive(Debug, Clone)]
+pub struct NoiseSettings {
+    pub min_y: i32,
+    pub height: i32,
+    pub cell_width: i32,
+    pub cell_height: i32,
+    pub sea_level: i32,
+    /// The block a solid cell gets, as `(name, properties)`.
+    pub default_block: BlockSpec,
+    /// The block a cell below the fluid level gets.
+    pub default_fluid: BlockSpec,
+}
+
+/// A block name and the properties a settings file wrote beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockSpec {
+    pub name: String,
+    pub properties: Vec<(String, String)>,
+}
+
+/// A dimension's noise router: the climate half, the density half, and the
+/// settings both are read under.
+#[derive(Debug, Clone)]
+pub struct Router {
+    pub graph: Graph,
+    /// The six climate roots, in [`CLIMATE_ROUTES`] order.
+    pub climate: [usize; 6],
+    /// `final_density`: positive is the default block, and everything else is
+    /// air or fluid.
+    pub final_density: usize,
+    pub settings: NoiseSettings,
+}
+
+/// Compile a dimension's whole noise router — climate and terrain — for one
+/// seed.
+///
+/// One graph and not two. `shift_x` is under five of the six climate functions
+/// *and* under the offset spline the terrain's height comes from; compiled
+/// apart they would be two noises with two permutation tables, sampled twice
+/// per point.
+pub fn router(root: &Path, dimension: &str, seed: i64) -> Result<Router, BuildError> {
+    let mut builder = Builder::new(root);
+    let settings_path = builder.path("noise_settings", dimension);
+    let settings = read_json(&settings_path)?;
+    let table = router_object(&settings, &settings_path)?;
+
+    let mut climate = [0usize; 6];
+    for (slot, name) in climate.iter_mut().zip(CLIMATE_ROUTES) {
+        *slot = builder.compile_route(&table, name, &settings_path)?;
+    }
+    let final_density = builder.compile_route(&table, "final_density", &settings_path)?;
+    let shape = noise_settings(&settings, &settings_path)?;
+    let graph = builder.finish(seed)?;
+    Ok(Router {
+        graph,
+        climate,
+        final_density,
+        settings: shape,
+    })
+}
+
+fn router_object(
+    settings: &Value,
+    path: &Path,
+) -> Result<serde_json::Map<String, Value>, BuildError> {
+    Ok(settings
+        .get("noise_router")
+        .and_then(Value::as_object)
+        .ok_or_else(|| BuildError::Malformed {
+            path: path.to_path_buf(),
+            detail: "no noise_router object".to_owned(),
+        })?
+        .clone())
+}
+
+fn noise_settings(settings: &Value, path: &Path) -> Result<NoiseSettings, BuildError> {
+    let complain = |detail: String| BuildError::Malformed {
+        path: path.to_path_buf(),
+        detail,
+    };
+    let noise = settings
+        .get("noise")
+        .and_then(Value::as_object)
+        .ok_or_else(|| complain("no `noise` object".to_owned()))?;
+    let field = |name: &str| -> Result<i32, BuildError> {
+        noise
+            .get(name)
+            .and_then(Value::as_i64)
+            .map(|value| value as i32)
+            .ok_or_else(|| complain(format!("noise has no `{name}`")))
+    };
+    let block = |name: &str| -> Result<BlockSpec, BuildError> {
+        let entry = settings
+            .get(name)
+            .and_then(Value::as_object)
+            .ok_or_else(|| complain(format!("no `{name}` object")))?;
+        let id = entry
+            .get("Name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| complain(format!("`{name}` has no `Name`")))?;
+        let mut properties: Vec<(String, String)> = entry
+            .get("Properties")
+            .and_then(Value::as_object)
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(key, value)| {
+                        value.as_str().map(|value| (key.clone(), value.to_owned()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        properties.sort();
+        Ok(BlockSpec {
+            name: namespaced(id),
+            properties,
+        })
+    };
+    Ok(NoiseSettings {
+        min_y: field("min_y")?,
+        height: field("height")?,
+        // Quart positions, times four. A `size_horizontal` of 1 is a cell four
+        // blocks wide, which is why a chunk is four cells across and not
+        // sixteen.
+        cell_width: field("size_horizontal")? * 4,
+        cell_height: field("size_vertical")? * 4,
+        sea_level: settings
+            .get("sea_level")
+            .and_then(Value::as_i64)
+            .map(|value| value as i32)
+            .ok_or_else(|| complain("no `sea_level`".to_owned()))?,
+        default_block: block("default_block")?,
+        default_fluid: block("default_fluid")?,
+    })
+}
+
 /// Compile the climate half of a dimension's noise router for one world seed.
 pub fn climate_graph(root: &Path, dimension: &str, seed: i64) -> Result<ClimateGraph, BuildError> {
     let mut builder = Builder::new(root);
     let settings_path = builder.path("noise_settings", dimension);
     let settings = read_json(&settings_path)?;
-    let router = settings
-        .get("noise_router")
-        .and_then(Value::as_object)
-        .ok_or_else(|| BuildError::Malformed {
-            path: settings_path.clone(),
-            detail: "no noise_router object".to_owned(),
-        })?
-        .clone();
+    let table = router_object(&settings, &settings_path)?;
 
     let mut roots = [0usize; 6];
     for (slot, name) in roots.iter_mut().zip(CLIMATE_ROUTES) {
-        let entry = router.get(name).ok_or_else(|| BuildError::Malformed {
-            path: settings_path.clone(),
-            detail: format!("the noise router has no `{name}`"),
-        })?;
-        *slot = builder.compile(entry, &settings_path)?;
+        *slot = builder.compile_route(&table, name, &settings_path)?;
     }
 
-    let noises = builder.build_noises(seed)?;
-    Ok(ClimateGraph {
-        graph: Graph {
-            nodes: builder.nodes,
-            splines: builder.splines,
-            noises,
-        },
-        roots,
-    })
+    let graph = builder.finish(seed)?;
+    Ok(ClimateGraph { graph, roots })
 }
 
 struct Builder {
@@ -134,6 +263,12 @@ struct Builder {
     /// Noise names in the order they were first reached, with their shapes.
     noise_names: Vec<String>,
     noise_index: HashMap<String, usize>,
+    /// One entry per distinct `old_blended_noise` shape. Two nodes with the
+    /// same shape are the same noise: the stream is drawn from the same hash
+    /// of the same name, so building it twice would build it identically.
+    blended: Vec<BlendedShape>,
+    /// The argument of each `interpolated` node, indexed by its slot.
+    interpolated: Vec<usize>,
 }
 
 impl Builder {
@@ -146,7 +281,50 @@ impl Builder {
             in_progress: Vec::new(),
             noise_names: Vec::new(),
             noise_index: HashMap::new(),
+            blended: Vec::new(),
+            interpolated: Vec::new(),
         }
+    }
+
+    /// Compile one entry of a noise router by name.
+    fn compile_route(
+        &mut self,
+        table: &serde_json::Map<String, Value>,
+        name: &str,
+        origin: &Path,
+    ) -> Result<usize, BuildError> {
+        let entry = table.get(name).ok_or_else(|| BuildError::Malformed {
+            path: origin.to_path_buf(),
+            detail: format!("the noise router has no `{name}`"),
+        })?;
+        self.compile(&entry.clone(), origin)
+    }
+
+    /// Seed everything the graph named and hand the graph over.
+    fn finish(self, seed: i64) -> Result<Graph, BuildError> {
+        // One factory for the whole world, forked from the seed exactly once,
+        // and every noise drawn from it by name.
+        let mut base = Xoroshiro::from_seed(seed);
+        let factory = base.fork_positional();
+        let noises = self.build_noises(&factory)?;
+        let blended = self
+            .blended
+            .iter()
+            .map(|shape| {
+                // Vanilla hands the old blended noise the stream hashed from
+                // `minecraft:terrain` — the one name in the router that names
+                // no file.
+                let mut stream = factory.from_hash_of(TERRAIN_NOISE);
+                BlendedNoise::new(&mut stream, *shape)
+            })
+            .collect();
+        Ok(Graph {
+            nodes: self.nodes,
+            splines: self.splines,
+            noises,
+            blended,
+            interpolated: self.interpolated,
+        })
     }
 
     /// `<root>/minecraft/worldgen/<registry>/<path>.json`, from a namespaced
@@ -185,13 +363,10 @@ impl Builder {
         index
     }
 
-    fn build_noises(&self, seed: i64) -> Result<Vec<NormalNoise>, BuildError> {
-        // One factory for the whole world, forked from the seed exactly once.
-        // Every noise is then drawn by *name*, which is why building five of
-        // vanilla's noises and not the other fifty-five still gives the five
-        // Minecraft would have given.
-        let mut base = Xoroshiro::from_seed(seed);
-        let factory = base.fork_positional();
+    /// Every noise is drawn by *name*, which is why building five of vanilla's
+    /// noises and not the other fifty-five still gives the five Minecraft
+    /// would have given.
+    fn build_noises(&self, factory: &Positional) -> Result<Vec<NormalNoise>, BuildError> {
         let mut built = Vec::with_capacity(self.noise_names.len());
         for name in &self.noise_names {
             let path = self.path("noise", name);
@@ -243,13 +418,91 @@ impl Builder {
             }
             "minecraft:blend_alpha" => Node::BlendAlpha,
             "minecraft:blend_offset" => Node::BlendOffset,
-            "minecraft:cache_once" | "minecraft:interpolated" | "minecraft:blend_density" => {
+            // `blend_density` is old-chunk blending, which a world with no
+            // old chunks in it leaves alone.
+            "minecraft:cache_once" | "minecraft:blend_density" => {
                 let argument = self.child(object, "argument", origin)?;
                 Node::Passthrough(argument)
             }
-            "minecraft:flat_cache" | "minecraft:cache_2d" => {
+            "minecraft:cache_2d" => {
                 let argument = self.child(object, "argument", origin)?;
                 Node::ColumnCache(argument)
+            }
+            "minecraft:flat_cache" => {
+                let argument = self.child(object, "argument", origin)?;
+                Node::FlatCache(argument)
+            }
+            "minecraft:interpolated" => {
+                let argument = self.child(object, "argument", origin)?;
+                self.interpolated.push(argument);
+                Node::Interpolated(self.interpolated.len() - 1)
+            }
+            "minecraft:square" => Node::Square(self.child(object, "argument", origin)?),
+            "minecraft:cube" => Node::Cube(self.child(object, "argument", origin)?),
+            "minecraft:half_negative" => {
+                Node::HalfNegative(self.child(object, "argument", origin)?)
+            }
+            "minecraft:quarter_negative" => {
+                Node::QuarterNegative(self.child(object, "argument", origin)?)
+            }
+            "minecraft:squeeze" => Node::Squeeze(self.child(object, "argument", origin)?),
+            "minecraft:clamp" => Node::Clamp {
+                argument: self.child(object, "input", origin)?,
+                min: number(object, "min", origin)?,
+                max: number(object, "max", origin)?,
+            },
+            "minecraft:range_choice" => Node::RangeChoice {
+                input: self.child(object, "input", origin)?,
+                min_inclusive: number(object, "min_inclusive", origin)?,
+                max_exclusive: number(object, "max_exclusive", origin)?,
+                in_range: self.child(object, "when_in_range", origin)?,
+                out_of_range: self.child(object, "when_out_of_range", origin)?,
+            },
+            "minecraft:weird_scaled_sampler" => {
+                let name = self.noise_name(object, origin)?;
+                let noise = self.noise(&name);
+                let mapper = object
+                    .get("rarity_value_mapper")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| BuildError::Malformed {
+                        path: origin.to_path_buf(),
+                        detail: "missing `rarity_value_mapper`".to_owned(),
+                    })?;
+                let rarity = match mapper {
+                    "type_1" => Rarity::Type1,
+                    "type_2" => Rarity::Type2,
+                    // Refused rather than defaulted. The two mappers differ by
+                    // a factor of one and a half at the same input, which is
+                    // the difference between a cave and solid rock.
+                    other => {
+                        return Err(BuildError::UnknownType {
+                            name: origin.display().to_string(),
+                            kind: format!("rarity_value_mapper `{other}`"),
+                        })
+                    }
+                };
+                Node::WeirdScaledSampler {
+                    input: self.child(object, "input", origin)?,
+                    noise,
+                    rarity,
+                }
+            }
+            "minecraft:old_blended_noise" => {
+                let shape = BlendedShape {
+                    xz_scale: number(object, "xz_scale", origin)?,
+                    y_scale: number(object, "y_scale", origin)?,
+                    xz_factor: number(object, "xz_factor", origin)?,
+                    y_factor: number(object, "y_factor", origin)?,
+                    smear_scale_multiplier: number(object, "smear_scale_multiplier", origin)?,
+                };
+                let index = match self.blended.iter().position(|held| *held == shape) {
+                    Some(index) => index,
+                    None => {
+                        self.blended.push(shape);
+                        self.blended.len() - 1
+                    }
+                };
+                Node::Blended(index)
             }
             "minecraft:shift_a" | "minecraft:shift_b" => {
                 let name = object

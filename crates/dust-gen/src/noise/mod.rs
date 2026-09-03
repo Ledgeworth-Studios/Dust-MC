@@ -10,6 +10,7 @@
 //! Minecraft the operator already has — the same rule decision records 0006,
 //! 0007 and 0008 set for block constants and item mappings.
 
+pub mod blended;
 pub mod build;
 pub mod density;
 pub mod perlin;
