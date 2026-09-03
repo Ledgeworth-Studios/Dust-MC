@@ -292,6 +292,12 @@ fn oriented(block: Block, click: Click) -> BlockState {
     if let Some(state) = as_turned(block, state, click) {
         return state;
     }
+    if let Some(state) = as_hung(block, state, click) {
+        return state;
+    }
+    if let Some(state) = as_multiface(block, state, click) {
+        return state;
+    }
     state
 }
 
@@ -389,6 +395,60 @@ fn as_doubled(block: Block, click: Click) -> Option<BlockState> {
         Some(dry) => dry,
         None => doubled,
     })
+}
+
+/// A lantern: it hangs when the ceiling was the face that was clicked.
+///
+/// A `hanging` bool and nothing else that orients it, which is the two
+/// lanterns and nothing else in the game.
+fn as_hung(block: Block, state: BlockState, click: Click) -> Option<BlockState> {
+    let values = values_of(block, "hanging")?;
+    if !same_set(values, BOOL) {
+        return None;
+    }
+    state.with(
+        "hanging",
+        if click.face == Face::Down {
+            "true"
+        } else {
+            "false"
+        },
+    )
+}
+
+/// Glow lichen, sculk vein and vine: they stick to the face they were put on.
+///
+/// Six bools and a `waterlogged` is a multiface block; five bools with no
+/// `down` and no `waterlogged` is a vine. **The `waterlogged` is what keeps
+/// the mushroom blocks out**, which also have six bools and whose every side
+/// is `true` by default — a rule that set one side and cleared the rest would
+/// turn a mushroom block inside out, and the grid says it is right today.
+///
+/// The side that is set is the one *opposite* the clicked face: clicking the
+/// top of a block puts the lichen above it, hanging from its own `down`.
+fn as_multiface(block: Block, state: BlockState, click: Click) -> Option<BlockState> {
+    let mut sides = 0;
+    let mut wet = false;
+    let mut has_down = false;
+    for property in block.properties() {
+        match property.name {
+            "north" | "south" | "west" | "east" | "up" if same_set(property.values, BOOL) => {
+                sides += 1;
+            }
+            "down" if same_set(property.values, BOOL) => {
+                sides += 1;
+                has_down = true;
+            }
+            "waterlogged" => wet = true,
+            _ => return None,
+        }
+    }
+    let multiface = sides == 6 && wet;
+    let vine = sides == 5 && !has_down && !wet;
+    if !multiface && !vine {
+        return None;
+    }
+    state.with(click.face.opposite().direction(), "true")
 }
 
 /// A sign, a banner or a head standing on the ground: sixteen ways round.
@@ -592,6 +652,10 @@ fn as_horizontal(block: Block, state: BlockState, click: Click) -> Option<BlockS
         look
     } else if ANVILS.contains(&block.name()) {
         clockwise(look)
+    } else if AS_LOOKED.contains(&block.name()) {
+        look
+    } else if ON_THE_WALL.contains(&block.name()) {
+        click.face.direction()
     } else if trapdoor && !matches!(click.face, Face::Up | Face::Down) {
         click.face.direction()
     } else {
@@ -682,6 +746,32 @@ const ANVILS: [&str; 3] = [
     "minecraft:chipped_anvil",
     "minecraft:damaged_anvil",
 ];
+
+/// Four-way blocks that face **the way the player is looking**, like a stair.
+///
+/// Named because nothing separates them from a furnace. A campfire has `lit`
+/// and so does a furnace; a decorated pot has `facing` and `waterlogged` and
+/// so does a chest. The property table cannot say which of the two answers a
+/// block gives, and the grid can: at yaw 180 all four of these come out facing
+/// north and a furnace comes out facing south.
+const AS_LOOKED: [&str; 4] = [
+    "minecraft:campfire",
+    "minecraft:soul_campfire",
+    "minecraft:decorated_pot",
+    "minecraft:calibrated_sculk_sensor",
+];
+
+/// Four-way blocks that face **out of the wall they were put on**.
+///
+/// A ladder and a tripwire hook hang on the block behind them, so their facing
+/// is the clicked face and not the player at all — which is a lever's rule
+/// without a lever's `face` property to say so. Two names, because a ladder's
+/// shape is `facing` and `waterlogged`, which is a decorated pot's shape and a
+/// chest's.
+///
+/// **Getting this wrong turns a ladder inside out**: it hangs off the wrong
+/// side of the cell, against nothing, and a player cannot climb it.
+const ON_THE_WALL: [&str; 2] = ["minecraft:ladder", "minecraft:tripwire_hook"];
 
 /// Six-way blocks that point **away** from where the player is looking.
 ///
@@ -1835,6 +1925,93 @@ mod tests {
                 "rotation"
             ),
             "12"
+        );
+    }
+
+    #[test]
+    fn a_campfire_faces_the_way_the_player_looks_and_a_furnace_faces_back() {
+        // The same pair the whole measurement was taken to settle, one shape
+        // further on: a campfire has `lit` and so does a furnace, and at yaw
+        // 180 they come out facing opposite ways.
+        for name in [
+            "minecraft:campfire",
+            "minecraft:soul_campfire",
+            "minecraft:decorated_pot",
+            "minecraft:calibrated_sculk_sensor",
+        ] {
+            assert_eq!(
+                value(&state(name, Face::Up, 180.0, 0.25), "facing"),
+                "north",
+                "{name}"
+            );
+        }
+        assert_eq!(
+            value(&state("minecraft:furnace", Face::Up, 180.0, 0.25), "facing"),
+            "south"
+        );
+    }
+
+    #[test]
+    fn a_ladder_faces_out_of_the_wall_it_hangs_on() {
+        // Not the player at all. Getting this wrong hangs the ladder off the
+        // wrong side of its own cell, against nothing, and it cannot be
+        // climbed.
+        for name in ["minecraft:ladder", "minecraft:tripwire_hook"] {
+            assert_eq!(
+                value(&state(name, Face::North, 180.0, 0.25), "facing"),
+                "north",
+                "{name}"
+            );
+            assert_eq!(
+                value(&state(name, Face::East, 0.0, 0.25), "facing"),
+                "east",
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lantern_hangs_from_a_ceiling_and_stands_on_a_floor() {
+        assert_eq!(
+            value(
+                &state("minecraft:lantern", Face::Down, 0.0, 0.25),
+                "hanging"
+            ),
+            "true"
+        );
+        assert_eq!(
+            value(
+                &state("minecraft:soul_lantern", Face::Up, 0.0, 0.25),
+                "hanging"
+            ),
+            "false"
+        );
+    }
+
+    #[test]
+    fn lichen_sticks_to_the_face_it_was_put_on_and_a_mushroom_block_does_not() {
+        // Six bools and a `waterlogged` is a multiface block. Six bools and no
+        // `waterlogged` is a mushroom block, whose every side is `true` by
+        // default — and a rule that set one and cleared the rest would turn it
+        // inside out. That clause is the whole reason `waterlogged` is in the
+        // shape test.
+        for name in ["minecraft:glow_lichen", "minecraft:sculk_vein"] {
+            assert_eq!(
+                value(&state(name, Face::Up, 0.0, 0.25), "down"),
+                "true",
+                "{name}"
+            );
+            assert_eq!(
+                value(&state(name, Face::North, 0.0, 0.25), "south"),
+                "true",
+                "{name}"
+            );
+        }
+        let mushroom = block("minecraft:brown_mushroom_block");
+        assert_eq!(
+            state_for(mushroom, click(Face::Up, 0.0, 0.25)),
+            mushroom.default_state(),
+            "every side stays as it was"
         );
     }
 
