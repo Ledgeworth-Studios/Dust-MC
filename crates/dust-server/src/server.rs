@@ -734,6 +734,7 @@ impl Server {
         let view_distance = config.server.view_distance;
         let reach = dust_guard::Reach::new(config.server.interaction_range);
         let speed = dust_guard::SpeedLimit::new(config.server.movement_speed_limit);
+        let collision = config.server.movement_collision;
         let data_path = config.data.path.clone();
 
         let fail = |message: String| -> ServerError {
@@ -830,7 +831,7 @@ impl Server {
                 "dust::data",
                 format!(
                     "block constants: Minecraft's own answers for {} block states, \
-                     {} of them emitting, {} heightmap predicate(s), {}, and {}",
+                     {} of them emitting, {} heightmap predicate(s), {}, {}, and {}",
                     table.len(),
                     table.emitting(),
                     table.flags().count(),
@@ -856,6 +857,17 @@ impl Server {
                         "no place sounds, so a placed block is silent; re-run \
                          `cargo xtask extract --only constants` for those"
                             .to_owned()
+                    },
+                    // The same shape again, and for the same reason: a table
+                    // without this column says nothing is solid, and a server
+                    // that printed "0 states are solid" would be reporting
+                    // Minecraft rather than the operator's own file.
+                    match crate::net::collide::solid_states(table) {
+                        Some(solid) => format!("{solid} a player cannot walk into"),
+                        None => "no full_collision column, so nothing stops a \
+                                 player walking through a wall; re-run \
+                                 `cargo xtask extract --only constants` for it"
+                            .to_owned(),
                     }
                 ),
             ),
@@ -868,8 +880,9 @@ impl Server {
                 format!(
                     "no {} under [data] path, so a served world's sky light treats \
                      every block but air as a wall, its sky floor sits above the \
-                     grass, and a placed block makes no sound: the light is \
-                     measured at 0.6% of cells inland and 3.5% over ocean",
+                     grass, a placed block makes no sound, and nothing stops a \
+                     player walking through a wall: the light is measured at \
+                     0.6% of cells inland and 3.5% over ocean",
                     crate::registries::constants::FILE
                 ),
             ),
@@ -1090,6 +1103,7 @@ impl Server {
             view_distance,
             reach,
             speed,
+            collision,
             overworld_dimension_type: overworld,
             blocks: crate::net::PlaceableBlocks {
                 air: palette.air,

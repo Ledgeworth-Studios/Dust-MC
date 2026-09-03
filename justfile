@@ -75,3 +75,13 @@ soak port="25565" minutes="10":
 # is argued about with numbers rather than opinions.
 movement port="25565" check="":
     cd tools/bot && node movement.js {{port}} {{ if check == "check" { "--check" } else { "" } }}
+
+# Whether a player who claims to be standing inside a block is put back —
+# and, as the control that makes the answer mean anything, whether a move of
+# the same length that ends in open air is left alone.
+#
+# Outside `verify` for the same reason `bot` is. Run it against both worlds:
+# a flat one and a `world_source` of region files exercise different halves
+# of the world lookup, and the second is the one with a column cache in it.
+collide port="25565":
+    cd tools/bot && node collide.js {{port}}

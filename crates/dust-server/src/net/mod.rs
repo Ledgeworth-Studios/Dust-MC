@@ -40,6 +40,7 @@ pub(crate) use dust_protocol::wire::Writer;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 pub mod chat;
+pub mod collide;
 pub mod configure;
 pub mod edits;
 pub mod favicon;

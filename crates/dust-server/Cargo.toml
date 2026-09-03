@@ -67,3 +67,7 @@ dust-world.workspace = true
 # cross the compression threshold, so a test that could only read uncompressed
 # frames could not read the packets that matter.
 flate2.workspace = true
+
+[[bench]]
+name = "movement"
+harness = false

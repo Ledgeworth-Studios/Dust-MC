@@ -115,6 +115,12 @@ pub struct SessionContext {
     /// movement packets actually contain, and decision record 0012 says what it
     /// found and what the number is set to because of it.
     pub speed: dust_guard::SpeedLimit,
+
+    /// Whether a player may walk into a block. `[server] movement_collision`.
+    /// The check also needs a block table that says which states are solid, so
+    /// this being true is necessary and not sufficient — see
+    /// [`super::collide::Ground::of`].
+    pub collision: bool,
     /// The furthest this server will stream, in columns.
     ///
     /// A ceiling and not the answer: a client asks for a distance of its own
@@ -809,6 +815,14 @@ where
     // packet said. Until this existed they were the same thing, and the README
     // said so in its "Not yet" list.
     let mut movement = dust_guard::Movement::new(ctx.speed, start);
+    // The world this player's movement is checked against, and the four
+    // columns it keeps. `None` where the block table cannot say what is solid,
+    // which is a server running without the operator's extracted constants or
+    // with a table extracted before the `full_collision` column existed.
+    let mut ground = ctx
+        .collision
+        .then(|| super::collide::Ground::of(&ctx.world, ctx.constants.as_deref()))
+        .flatten();
     // When the last movement packet was judged. A movement budget has to be
     // per *tick* and not per packet, or a connection that stalls and then
     // delivers fourteen queued packets at once refuses thirteen of them.
@@ -1111,7 +1125,7 @@ where
                     // the spot has not changed which columns they can see.
                     Ok(play::serverbound::Packet::MovePlayerPos(m)) => {
                         let ticks = ticks_since(&mut last_move);
-                        match movement.claimed((m.x, m.y, m.z), ticks) {
+                        match judge(&mut movement, (m.x, m.y, m.z), ticks, &mut ground) {
                             dust_guard::Claim::Accepted => {
                                 position = movement.at();
                                 record(ctx, profile_id, position);
@@ -1147,7 +1161,7 @@ where
                         // would leave the two out of step for no gain.
                         rotation = (m.yaw, m.pitch);
                         let ticks = ticks_since(&mut last_move);
-                        match movement.claimed((m.x, m.y, m.z), ticks) {
+                        match judge(&mut movement, (m.x, m.y, m.z), ticks, &mut ground) {
                             dust_guard::Claim::Accepted => {
                                 position = movement.at();
                                 record(ctx, profile_id, position);
@@ -1401,6 +1415,24 @@ where
     }
 }
 
+/// Judge a claimed position against the world, or against nothing.
+///
+/// The two arms are the same call to the same generic method and differ only in
+/// what they hand it, which is the point: a server with no answer for what is
+/// solid runs the identical rule against [`dust_guard::Open`], where nothing
+/// is, rather than running a different rule or a branch inside the hot one.
+fn judge(
+    movement: &mut dust_guard::Movement,
+    to: (f64, f64, f64),
+    ticks: u32,
+    ground: &mut Option<super::collide::Ground<'_>>,
+) -> dust_guard::Claim {
+    match ground {
+        Some(ground) => movement.claimed(to, ticks, ground),
+        None => movement.claimed(to, ticks, &mut dust_guard::Open),
+    }
+}
+
 /// Ticks since the last movement packet was judged, and reset the clock.
 ///
 /// Wall time rather than a tick counter, because a session has no tick counter
@@ -1447,6 +1479,10 @@ where
     let reason = match why {
         dust_guard::Refusal::NotFinite => "a coordinate that is not a number".to_owned(),
         dust_guard::Refusal::OutOfWorld => "a position outside every world".to_owned(),
+        dust_guard::Refusal::IntoSolid { block } => format!(
+            "a step into the solid block at {}, {}, {}",
+            block.0, block.1, block.2
+        ),
         dust_guard::Refusal::TooFast {
             moved_squared,
             allowed_squared,
