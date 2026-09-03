@@ -48,7 +48,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use super::configure::{configure, Configured};
 use super::edits::{Edit, Player, SharedWorld};
 use super::finish;
-use super::inventory::{ClickMode, Inventory};
+use super::inventory::{ClickMode, Inventory, Window};
 use super::play as play_mod;
 use super::status::StatusPolicy;
 use super::view::{self, View};
@@ -937,11 +937,17 @@ where
         .unwrap_or_default()
         .crafting_with(Arc::clone(&ctx.recipes));
 
+    // Which container the client has open. A join has only its own, and every
+    // right-click on a crafting table replaces it until the client says it
+    // closed one.
+    let mut screen = Screen::player();
+    let mut next_window = FIRST_CONTAINER_WINDOW;
+
     // And told to the client, all forty-six slots at once. This is the one
     // place the whole container goes out: a join has nothing to compare
     // against, so there is nothing to send a difference of. Every change after
     // this one is a single slot.
-    send_container(conn, ctx, &mut inventory).await?;
+    send_container(conn, ctx, &mut inventory, screen).await?;
     send_play(
         conn,
         play::clientbound::SetCarriedItem {
@@ -1084,10 +1090,8 @@ where
                     for (item, count) in collected.drain(..) {
                         let (changed, left) = inventory
                             .collect(super::inventory::Stack::new(item, count));
-                        for index in 0..super::inventory::SLOTS {
-                            if changed.has(index) {
-                                send_slot(conn, ctx, &mut inventory, index).await?;
-                            }
+                        for index in changed.iter() {
+                            send_slot(conn, ctx, &mut inventory, screen, index).await?;
                         }
                         // A pickup is a container change like any other, and
                         // it is one this loop used not to record: an item
@@ -1741,7 +1745,68 @@ where
                         // would refuse a legitimate click at the edge of range
                         // and allow one aimed back towards the player from just
                         // outside it.
-                        let holding = held_place(ctx.item_blocks.as_deref(), inventory.held());
+                        // A crafting table opens rather than being built on.
+                        //
+                        // Vanilla's order, and it is the order a player feels:
+                        // `useItemOn` asks the *block* first, and only a
+                        // player holding secondary use — crouching — skips
+                        // that and places what is in their hand. So a player
+                        // walking up to a table with a stack of dirt opens it,
+                        // and a player who means to put the dirt on top
+                        // crouches. Getting this backwards would make the
+                        // table unusable for anyone carrying blocks, which is
+                        // everyone.
+                        let opens = !posture.sneaking
+                            && crafting_table()
+                                .is_some_and(|table| {
+                                    cell(&ctx.world, use_on.hit.location).block() == table
+                                })
+                            && within_reach(ctx, position, movement.pose(), use_on.hit.location);
+                        if opens {
+                            if let Some(menu) = crafting_menu() {
+                                // A window the player had open is closed
+                                // first, which returns whatever was in its
+                                // grid: two open tables would be one player
+                                // with two grids and one set of ten slots
+                                // behind them.
+                                if screen.id != PLAYER_WINDOW {
+                                    inventory.closed(screen.window);
+                                }
+                                next_window = if next_window >= LAST_CONTAINER_WINDOW {
+                                    FIRST_CONTAINER_WINDOW
+                                } else {
+                                    next_window + 1
+                                };
+                                screen = Screen {
+                                    id: next_window,
+                                    window: Window::Table,
+                                };
+                                send_play(
+                                    conn,
+                                    play::clientbound::OpenScreen {
+                                        window_id: screen.id,
+                                        menu_kind: VarInt(menu as i32),
+                                        // The client's own word for it, in
+                                        // the player's own language. A
+                                        // fallback is carried for a client
+                                        // whose resource pack has no such
+                                        // key, which is what vanilla sends.
+                                        title: dust_protocol::text::Component::translate(
+                                            "container.crafting",
+                                            Some("Crafting".to_owned()),
+                                        ),
+                                    },
+                                    ctx.version,
+                                )
+                                .await?;
+                                // The screen arrives empty otherwise: an
+                                // `open_screen` says which layout, never what
+                                // is in it.
+                                send_container(conn, ctx, &mut inventory, screen).await?;
+                            }
+                        }
+                        let holding = held_place(ctx.item_blocks.as_deref(), inventory.held())
+                            .filter(|_| !opens);
                         let target = placement(
                             &ctx.world,
                             ctx.constants.as_deref(),
@@ -1796,7 +1861,7 @@ where
                                 // a slot the client did not touch.
                                 for index in changed.iter() {
                                     if index != usize::try_from(set.slot).unwrap_or(usize::MAX) {
-                                        send_slot(conn, ctx, &mut inventory, index).await?;
+                                        send_slot(conn, ctx, &mut inventory, screen, index).await?;
                                     }
                                 }
                             }
@@ -1806,7 +1871,7 @@ where
                             // client believes it put something there, so it has
                             // to be told what is actually in that slot.
                             Err(index) => {
-                                send_slot(conn, ctx, &mut inventory, index).await?;
+                                send_slot(conn, ctx, &mut inventory, screen, index).await?;
                             }
                         }
                     }
@@ -1815,7 +1880,12 @@ where
                     // container, and only the slots the client is now wrong
                     // about are sent back.
                     Ok(play::serverbound::Packet::ClickContainer(click)) => {
-                        if click.window_id == PLAYER_WINDOW {
+                        // A click naming a window that is not the open one is
+                        // a click on a container this player has already left.
+                        // Replaying it against whatever *is* open would put
+                        // items in slots the player never aimed at, and the
+                        // numbering would not even mean the same thing.
+                        if click.window_id == screen.id {
                             // Which window the client thought it was clicking
                             // on, read *before* the click moves anything. A
                             // `state_id` that is not the current one means the
@@ -1824,8 +1894,12 @@ where
                             // be differences against a picture it no longer
                             // holds.
                             let stale = click.state_id.0 != inventory.state_id();
-                            let changed =
-                                inventory.click(ClickMode::from(click.mode), click.slot, click.button);
+                            let changed = inventory.click(
+                                screen.window,
+                                ClickMode::from(click.mode),
+                                click.slot,
+                                click.button,
+                            );
                             if !changed.is_empty() {
                                 record_inventory(ctx, profile_id, me.entity_id, &inventory);
                             }
@@ -1849,9 +1923,10 @@ where
                                 // something happens to move it — which is a
                                 // player looking at an inventory that is not
                                 // theirs, for as long as they leave it alone.
-                                send_container(conn, ctx, &mut inventory).await?;
+                                send_container(conn, ctx, &mut inventory, screen).await?;
                             } else {
-                                push_back(conn, ctx, &mut inventory, changed, &click).await?;
+                                push_back(conn, ctx, &mut inventory, screen, changed, &click)
+                                    .await?;
                             }
                         }
                     }
@@ -1859,9 +1934,22 @@ where
                     // the cursor and in the crafting grid goes back into the
                     // inventory rather than nowhere; see `Inventory::closed`.
                     Ok(play::serverbound::Packet::CloseContainer(closed)) => {
-                        if closed.window_id == PLAYER_WINDOW && !inventory.closed().is_empty() {
-                            record_inventory(ctx, profile_id, me.entity_id, &inventory);
-                            send_container(conn, ctx, &mut inventory).await?;
+                        if closed.window_id == screen.id {
+                            let moved = inventory.closed(screen.window);
+                            let was = screen;
+                            // Whatever it was, the player is looking at their
+                            // own inventory again.
+                            screen = Screen::player();
+                            if !moved.is_empty() {
+                                record_inventory(ctx, profile_id, me.entity_id, &inventory);
+                            }
+                            // A table's contents come back into slots the
+                            // table's own numbering could not name, so the
+                            // player's window is restated whenever one closes
+                            // — not only when something moved.
+                            if !moved.is_empty() || was.id != PLAYER_WINDOW {
+                                send_container(conn, ctx, &mut inventory, screen).await?;
+                            }
                         }
                     }
                     Ok(_) => {}
@@ -2227,6 +2315,51 @@ fn offset(location: dust_protocol::types::Position, face: u8) -> dust_protocol::
 /// opened, and is ignored rather than replayed against the player's own.
 const PLAYER_WINDOW: u8 = 0;
 
+/// The first id a container this server opens is given.
+///
+/// One, and it rises per open. Vanilla does the same, and the reason it is not
+/// a constant is the reason the client checks it at all: a click that arrives
+/// after the player closed a window and opened another must be recognisable as
+/// belonging to the window that is gone.
+const FIRST_CONTAINER_WINDOW: u8 = 1;
+/// One past the last container id, after which they start again. Vanilla wraps
+/// at a hundred; the id is a `u8` on the wire and zero is the player's own.
+const LAST_CONTAINER_WINDOW: u8 = 100;
+
+/// Which container the client has open, and the id it was told.
+///
+/// Not a container: [`Inventory`] holds every slot either window can reach, and
+/// this is the *numbering* in front of it. See `inventory::Window`.
+#[derive(Debug, Clone, Copy)]
+struct Screen {
+    id: u8,
+    window: Window,
+}
+
+impl Screen {
+    /// The player's own inventory, which is open whenever nothing else is.
+    const fn player() -> Self {
+        Self {
+            id: PLAYER_WINDOW,
+            window: Window::Player,
+        }
+    }
+}
+
+/// The block a right-click opens a crafting table for.
+fn crafting_table() -> Option<dust_registry::Block> {
+    dust_registry::Block::from_name("minecraft:crafting_table")
+}
+
+/// The `minecraft:menu` id of the 3x3 crafting screen.
+///
+/// Read out of the generated registry rather than written here: the number is
+/// a protocol id and the wire depends on it, which is exactly the class
+/// decision record 0007 says is generated Rust.
+fn crafting_menu() -> Option<u32> {
+    dust_registry::Registry::from_name("minecraft:menu")?.entry_id("minecraft:crafting")
+}
+
 /// The window id a slot correction carries.
 ///
 /// **Zero, and it was -2 until a second client said otherwise.** The protocol
@@ -2253,20 +2386,29 @@ async fn send_container<W>(
     conn: &mut Conn<W>,
     ctx: &SessionContext,
     inventory: &mut super::inventory::Inventory,
+    screen: Screen,
 ) -> Result<(), SessionError>
 where
     W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let state_id = inventory.next_state_id();
-    let slots = inventory
-        .slots()
-        .iter()
-        .map(|stack| super::inventory::to_wire(stack.as_ref()))
+    // In the *window's* numbering, which is not the container's for anything
+    // but the player's own: a crafting table calls its result 0 and the
+    // player's hotbar 37, and the slot behind each of those is somewhere else
+    // entirely.
+    let slots = (0..screen.window.slot_count())
+        .map(|slot| {
+            let stack = screen
+                .window
+                .storage(slot)
+                .and_then(|index| inventory.slot(index));
+            super::inventory::to_wire(stack)
+        })
         .collect();
     send_play(
         conn,
         play::clientbound::ContainerSetContent {
-            window_id: PLAYER_WINDOW,
+            window_id: screen.id,
             state_id: VarInt(state_id),
             slots,
             carried_item: super::inventory::to_wire(inventory.cursor()),
@@ -2284,19 +2426,30 @@ async fn send_slot<W>(
     conn: &mut Conn<W>,
     ctx: &SessionContext,
     inventory: &mut super::inventory::Inventory,
+    screen: Screen,
     index: usize,
 ) -> Result<(), SessionError>
 where
     W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // A slot the open window cannot see is not sent. With a crafting table
+    // open the armour and the offhand are behind the screen, and a correction
+    // naming slot 5 of a table's numbering would put a helmet in the grid.
+    let Some(wire) = screen.window.wire(index) else {
+        return Ok(());
+    };
     let state_id = inventory.next_state_id();
     let item = super::inventory::to_wire(inventory.slot(index));
     send_play(
         conn,
         play::clientbound::ContainerSetSlot {
-            window_id: CORRECTION_WINDOW,
+            window_id: if screen.id == PLAYER_WINDOW {
+                CORRECTION_WINDOW
+            } else {
+                screen.id as i8
+            },
             state_id: VarInt(state_id),
-            slot: index as i16,
+            slot: wire as i16,
             item,
         },
         ctx.version,
@@ -2353,33 +2506,44 @@ async fn push_back<W>(
     conn: &mut Conn<W>,
     ctx: &SessionContext,
     inventory: &mut super::inventory::Inventory,
+    screen: Screen,
     changed: super::inventory::Changed,
     click: &play::serverbound::ClickContainer,
 ) -> Result<(), SessionError>
 where
     W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    for index in changed.iter() {
-        let claimed = click
+    // The client's claims are in the window's numbering and the server's
+    // changes are in the container's, so one of the two has to be translated
+    // and it is the claims: there are at most a handful of them and fifty-six
+    // of the other.
+    let claimed = |index: usize| {
+        let wire = screen.window.wire(index)?;
+        click
             .changed_slots
             .iter()
-            .find(|slot| usize::try_from(slot.number) == Ok(index));
-        let agrees = claimed.is_some_and(|slot| {
+            .find(|slot| usize::try_from(slot.number) == Ok(wire))
+    };
+    for index in changed.iter() {
+        let agrees = claimed(index).is_some_and(|slot| {
             super::inventory::from_wire(&slot.item).as_ref() == inventory.slot(index)
         });
         if !agrees {
-            send_slot(conn, ctx, inventory, index).await?;
+            send_slot(conn, ctx, inventory, screen, index).await?;
         }
     }
     for slot in &click.changed_slots {
-        let Ok(index) = usize::try_from(slot.number) else {
+        let Ok(wire) = usize::try_from(slot.number) else {
             continue;
         };
-        if index >= super::inventory::SLOTS || changed.has(index) {
+        let Some(index) = screen.window.storage(wire) else {
+            continue;
+        };
+        if changed.has(index) {
             continue;
         }
         if super::inventory::from_wire(&slot.item).as_ref() != inventory.slot(index) {
-            send_slot(conn, ctx, inventory, index).await?;
+            send_slot(conn, ctx, inventory, screen, index).await?;
         }
     }
     if super::inventory::from_wire(&click.cursor_item).as_ref() != inventory.cursor() {
@@ -2414,7 +2578,7 @@ fn record_inventory(
         .insert(
             profile_id,
             super::save::Carried {
-                slots: inventory.slots().clone(),
+                slots: inventory.saved(),
                 selected: inventory.selected(),
             },
         );
