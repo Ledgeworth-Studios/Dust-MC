@@ -94,7 +94,9 @@ fn main() {
         ) {
             Ok(Some((world, _))) => ladder(
                 "generated",
-                &EditedWorld::new(Source::Generated(Box::new(world))),
+                &EditedWorld::new(Source::Generated(Box::new(
+                    dust_server::net::source::GeneratedColumns::new(world),
+                ))),
                 &order,
             ),
             Ok(None) => println!("generated: no dust-biomes.tsv under DUST_BENCH_DATA"),
