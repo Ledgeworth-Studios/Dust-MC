@@ -64,6 +64,11 @@ struct Answer {
     /// which varied the click and never the surroundings — see
     /// [`neighbourhood`] for what that is read as.
     before: String,
+    /// What the cell the placement landed in held **before** it, read back off
+    /// the wire a tick ahead of the click. Empty for a survey that never put
+    /// anything there, which is every run before `--into` existed and is read
+    /// as air.
+    into: String,
     /// Which of those six the placement *changed*, in the same spelling. This
     /// is the second half of a neighbour rule and the half a survey of placed
     /// states alone cannot see: a fence has to connect when the block beside it
@@ -472,13 +477,22 @@ fn dust_state_id(
         // Reported rather than silently assumed: `measure` says which it used.
         None => Block::from_name(item.name())?,
     };
+    // The **second** block, for the fifty-three items that have one. Absent
+    // from a table written before the columns, and asking `has_walls` rather
+    // than reading `None` off `on_wall` is the difference between "this item
+    // has no wall form" and "this file cannot say".
+    let wall = items
+        .as_ref()
+        .filter(|table| table.has_walls())
+        .and_then(|table| table.on_wall(item));
     let click = Click {
         face: Face::from_protocol(answer.face)?,
         cursor_y: answer.cursor_y.parse().ok()?,
         yaw: answer.yaw,
         pitch: answer.pitch,
+        into: into(answer),
     };
-    let placed = dust_sim::placement::state_for(block, click);
+    let placed = dust_sim::placement::state_for_item(block, wall, click);
     let Some(solid) = solid else {
         return Some(placed);
     };
@@ -498,6 +512,24 @@ fn dust_state_id(
 /// where the fifty-five fences, walls and panes in the grid's own wrong list
 /// come from: they are wrong about the *support*, and a scorer that read those
 /// rows as "nothing was beside it" would call them all correct.
+/// What the cell the placement landed in held before it landed.
+///
+/// **Air for a row with no column, and that is a claim rather than a
+/// convenience.** Both surveys written before this one clear the volume and
+/// put back one stone support, so the cell the placement goes into really is
+/// empty in every one of their rows — a reader that guessed anything else
+/// would be scoring 10,400 rows against a cell that was never there.
+///
+/// A state this build cannot parse reads as air too, for the reason the
+/// neighbourhood reader gives: it is a version skew, and the run already
+/// counts those.
+fn into(answer: &Answer) -> BlockState {
+    if answer.into.is_empty() || answer.into == "-" {
+        return air();
+    }
+    parse_state(&answer.into).unwrap_or_else(air)
+}
+
 fn neighbourhood(answer: &Answer) -> Around {
     let mut around = Around::empty();
     if answer.before.is_empty() || answer.before == "-" {
@@ -645,11 +677,21 @@ fn load_items(given: Option<&Path>) -> Result<Option<ItemBlocks>, String> {
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("could not read {}: {e}", path.display()))?;
     let table = ItemBlocks::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    println!(
-        "items: {} placements from {}",
-        table.placing(),
-        path.display()
-    );
+    if table.has_walls() {
+        println!(
+            "items: {} placements and {} wall forms from {}",
+            table.placing(),
+            table.on_walls(),
+            path.display()
+        );
+    } else {
+        println!(
+            "items: {} placements from {}, which is a table written before the wall columns — \
+             so a sign, a torch and a banner go down standing on every face",
+            table.placing(),
+            path.display()
+        );
+    }
     Ok(Some(table))
 }
 
@@ -732,6 +774,7 @@ fn parse_answers(text: &str) -> Result<Vec<Answer>, String> {
         out.push(Answer {
             before: fields.get(7).copied().unwrap_or_default().to_owned(),
             after: fields.get(8).copied().unwrap_or_default().to_owned(),
+            into: fields.get(9).copied().unwrap_or_default().to_owned(),
             item: fields[0].to_owned(),
             face: fields[1]
                 .parse::<u8>()
@@ -873,6 +916,7 @@ minecraft:allium\t1\t0\t0\t0.25\tminecraft:air\tstood
                     result: Outcome::Refused,
                     before: String::new(),
                     after: String::new(),
+                    into: String::new(),
                 },
                 &None,
                 None,

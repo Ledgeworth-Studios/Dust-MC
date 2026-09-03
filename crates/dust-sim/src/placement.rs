@@ -53,7 +53,7 @@
 
 use dust_registry::constants::Flag;
 use dust_registry::tags::TagRegistry;
-use dust_registry::{Block, BlockConstants, BlockState};
+use dust_registry::{Block, BlockConstants, BlockState, WallForm};
 
 /// Which face of a block was clicked.
 ///
@@ -155,6 +155,19 @@ pub struct Click {
     pub yaw: f32,
     /// The player's pitch in the protocol's degrees: -90 is straight up.
     pub pitch: f32,
+    /// What is already in the cell the block is going into.
+    ///
+    /// The one part of a right-click that is not a number off the wire, and
+    /// three rules read it: a block goes down **waterlogged** in water, a
+    /// second layer of snow **stacks** on the first, and a slab put into its
+    /// own other half becomes a **double** slab. All three are the same
+    /// question — *what is there already* — and Minecraft asks it of
+    /// `BlockPlaceContext.getClickedPos()`, which is this cell and not the one
+    /// the click named.
+    ///
+    /// `minecraft:air` for a caller with nothing to look up with, which is
+    /// what every cell a placement lands in used to be assumed to hold.
+    pub into: BlockState,
 }
 
 /// The state `block` takes for this click.
@@ -166,6 +179,85 @@ pub struct Click {
 /// yesterday, and the score says how many are left.
 #[must_use]
 pub fn state_for(block: Block, click: Click) -> BlockState {
+    // Two rules answer with the state that is *already there* rather than with
+    // a fresh one, so they come first and they return outright: a second snow
+    // layer is the first one with a bigger number, and a slab put into its own
+    // other half is that slab turned double. Neither has an orientation to
+    // compute, and running the click rules over them would compute one.
+    if let Some(state) = as_stacked(block, click) {
+        return state;
+    }
+    if let Some(state) = as_doubled(block, click) {
+        return state;
+    }
+    // Water is the last word and not the first: it applies to whatever the
+    // click rules settled on, and every one of them would otherwise carry a
+    // `waterlogged` clause of its own.
+    watered(oriented(block, click), click)
+}
+
+/// The state an item with **two** blocks puts down.
+///
+/// A sign, a torch, a banner and a head each have a standing form and a wall
+/// form, and which one goes down is decided by the face that was clicked. The
+/// item carries both blocks — `StandingAndWallBlockItem` in Java, two more
+/// columns of `dust-items.tsv` here — because nothing else relates them: a
+/// torch and a wall torch share no property and no name a rule could derive.
+///
+/// **The attachment direction is data and not an assumption.** A sign stands
+/// on the ground and attaches `down`, so clicking the *top* of a block puts a
+/// standing sign above it. A **hanging** sign attaches `up`, so the same click
+/// puts nothing at all and clicking the *underside* is what hangs one.
+///
+/// Three of the six faces are settled here and the other three are not, which
+/// is what the survey could say:
+///
+/// * the face **opposite** the attachment puts down the standing form;
+/// * the four **horizontal** faces put down the wall form, facing out of the
+///   wall — measured, and it is the clicked face rather than the player's look;
+/// * the attachment's own face puts down neither and vanilla refuses. This
+///   keeps the standing form there, which is what it did before and is right
+///   for a skull, whose standing form needs nothing to hold it up.
+///
+/// **A hanging sign keeps its old answer on a wall**, deliberately. Its wall
+/// form faces *across* the wall rather than out of it — a north face gives
+/// `west` and an east face gives `south`, which is not a function of the
+/// clicked face — and the grid was taken at one yaw, so it cannot say which of
+/// the two perpendicular directions wins. A wall block facing the wrong way is
+/// wrong in a way a player sees; the standing form is wrong in the way it
+/// already was.
+#[must_use]
+pub fn state_for_item(standing: Block, wall: Option<WallForm>, click: Click) -> BlockState {
+    let Some(form) = wall else {
+        return state_for(standing, click);
+    };
+    let Some(attaches) = Face::from_direction(form.attaches) else {
+        return state_for(standing, click);
+    };
+    if click.face == attaches.opposite() || form.attaches != "down" {
+        return state_for(standing, click);
+    }
+    let Some(facing) = on_wall(form.block, click) else {
+        return state_for(standing, click);
+    };
+    watered(facing, click)
+}
+
+/// The wall form's own state: it faces out of the wall it is on.
+///
+/// `None` for a block with no horizontal `facing`, which no wall form in this
+/// version is — asked rather than assumed, because the answer decides whether
+/// the wall form is used at all.
+fn on_wall(block: Block, click: Click) -> Option<BlockState> {
+    let values = values_of(block, "facing")?;
+    if !same_set(values, HORIZONTAL) {
+        return None;
+    }
+    block.default_state().with("facing", click.face.direction())
+}
+
+/// The state the click's four numbers alone imply.
+fn oriented(block: Block, click: Click) -> BlockState {
     let state = block.default_state();
     if let Some(state) = as_pillar(block, state, click) {
         return state;
@@ -194,7 +286,313 @@ pub fn state_for(block: Block, click: Click) -> BlockState {
     if let Some(state) = as_rail(block, state, click) {
         return state;
     }
+    if let Some(state) = as_leaves(block, state) {
+        return state;
+    }
+    if let Some(state) = as_turned(block, state, click) {
+        return state;
+    }
+    if let Some(state) = as_hung(block, state, click) {
+        return state;
+    }
+    if let Some(state) = as_multiface(block, state, click) {
+        return state;
+    }
     state
+}
+
+/// A block put down in water goes down **wet**.
+///
+/// Minecraft asks the cell's own `getFluidState` and sets `waterlogged` from
+/// it, so this runs on every block that has the property and answers `false`
+/// for the ones that are not in water — which is not the no-op it sounds like.
+/// A conduit, a sea pickle and all twenty coral fans have `waterlogged=true`
+/// in their **default** state, so a server that never touched the property put
+/// every one of them down flooded on dry land: 122 of the 496 rows the grid
+/// survey called wrong were exactly that, and none of them involved water at
+/// all.
+///
+/// The clause left out is the one Minecraft spells `isSourceOfType`: pointed
+/// dripstone waterlogs on a source and not on flowing water, where everything
+/// else waterlogs on either. Flowing water is not a cell a placement usually
+/// lands in — it is one block wide and gone the next tick — and the survey
+/// this rule was read off could not sustain one to measure it.
+fn watered(state: BlockState, click: Click) -> BlockState {
+    if state.property("waterlogged").is_none() {
+        return state;
+    }
+    let wet = if holds_water(click.into) {
+        "true"
+    } else {
+        "false"
+    };
+    state.with("waterlogged", wet).unwrap_or(state)
+}
+
+/// Whether a cell holding this state holds **water**.
+///
+/// Minecraft's `BlockState.getFluidState`, which is not the same question as
+/// "is this block water": seagrass and a bubble column are blocks that stand
+/// *in* water and report it, so a fence put into seagrass comes out
+/// waterlogged and one put into a lily pad does not.
+///
+/// **This is the list the measurement produced and not a list somebody
+/// remembered.** `tools/bot/placement.js --into all` put an oak fence into
+/// every one of the 1,060 blocks this build knows; 89 of them accepted it and
+/// exactly four of those made it wet. Kelp and a kelp plant hold water too and
+/// are deliberately *not* here: nothing can be placed into either, so no
+/// measurement reaches them and a line here would be one nothing checks.
+/// Decision record 0016 has the run.
+fn holds_water(state: BlockState) -> bool {
+    matches!(
+        state.block().name(),
+        "minecraft:water"
+            | "minecraft:bubble_column"
+            | "minecraft:seagrass"
+            | "minecraft:tall_seagrass"
+    )
+}
+
+/// Snow on snow: one more layer, up to eight.
+///
+/// The one rule in this file whose answer is the state that was *already
+/// there*. Minecraft returns the existing block with `layers` raised by one
+/// rather than a fresh block, which matters for nothing today and would matter
+/// the moment snow carried a second property.
+///
+/// Keyed on a `layers` property running one to eight, which is snow and
+/// nothing else. Whether the placement is allowed to land there at all is
+/// [`replaces`]'s question, not this one — eight layers refuse a ninth.
+fn as_stacked(block: Block, click: Click) -> Option<BlockState> {
+    if click.into.block() != block {
+        return None;
+    }
+    let values = values_of(block, "layers")?;
+    if !same_set(values, LAYERS) {
+        return None;
+    }
+    let deep: u8 = click.into.property("layers")?.parse().ok()?;
+    click.into.with("layers", LAYERS[deep.min(7) as usize])
+}
+
+/// The eight depths of snow, in order, so an index is a depth.
+const LAYERS: &[&str] = &["1", "2", "3", "4", "5", "6", "7", "8"];
+
+/// A slab into its own other half: a double slab.
+///
+/// `type=double` and `waterlogged=false` together, because Minecraft says both
+/// in the same line: a double slab fills the cell, so there is nowhere left
+/// for the water to be, and a slab doubled in the sea leaves no water behind.
+fn as_doubled(block: Block, click: Click) -> Option<BlockState> {
+    if click.into.block() != block {
+        return None;
+    }
+    let values = values_of(block, "type")?;
+    if !same_set(values, &["top", "bottom", "double"]) {
+        return None;
+    }
+    if click.into.property("type") == Some("double") {
+        return None;
+    }
+    let doubled = click.into.with("type", "double")?;
+    Some(match doubled.with("waterlogged", "false") {
+        Some(dry) => dry,
+        None => doubled,
+    })
+}
+
+/// A lantern: it hangs when the ceiling was the face that was clicked.
+///
+/// A `hanging` bool and nothing else that orients it, which is the two
+/// lanterns and nothing else in the game.
+fn as_hung(block: Block, state: BlockState, click: Click) -> Option<BlockState> {
+    let values = values_of(block, "hanging")?;
+    if !same_set(values, BOOL) {
+        return None;
+    }
+    state.with(
+        "hanging",
+        if click.face == Face::Down {
+            "true"
+        } else {
+            "false"
+        },
+    )
+}
+
+/// Glow lichen, sculk vein and vine: they stick to the face they were put on.
+///
+/// Six bools and a `waterlogged` is a multiface block; five bools with no
+/// `down` and no `waterlogged` is a vine. **The `waterlogged` is what keeps
+/// the mushroom blocks out**, which also have six bools and whose every side
+/// is `true` by default — a rule that set one side and cleared the rest would
+/// turn a mushroom block inside out, and the grid says it is right today.
+///
+/// The side that is set is the one *opposite* the clicked face: clicking the
+/// top of a block puts the lichen above it, hanging from its own `down`.
+fn as_multiface(block: Block, state: BlockState, click: Click) -> Option<BlockState> {
+    let mut sides = 0;
+    let mut wet = false;
+    let mut has_down = false;
+    for property in block.properties() {
+        match property.name {
+            "north" | "south" | "west" | "east" | "up" if same_set(property.values, BOOL) => {
+                sides += 1;
+            }
+            "down" if same_set(property.values, BOOL) => {
+                sides += 1;
+                has_down = true;
+            }
+            "waterlogged" => wet = true,
+            _ => return None,
+        }
+    }
+    let multiface = sides == 6 && wet;
+    let vine = sides == 5 && !has_down && !wet;
+    if !multiface && !vine {
+        return None;
+    }
+    state.with(click.face.opposite().direction(), "true")
+}
+
+/// A sign, a banner or a head standing on the ground: sixteen ways round.
+///
+/// One property and **two** rules, which is the thing worth writing down. A
+/// sign and a banner face *the player*, so their segment is taken of the yaw
+/// turned half round; a head faces *the same way as the player*, so its
+/// segment is taken of the yaw itself. Both were read off the grid: at yaw 180
+/// a sign is `rotation=0` and a skull is `rotation=8`, and no single rule gives
+/// both.
+///
+/// Which of the two a block gets is `powered` — a head has it and a sign does
+/// not — and that is a shape rather than a list of seven skulls.
+///
+/// The arithmetic is Minecraft's `RotationSegment.convertToSegment`: sixteen
+/// segments of 22.5 degrees, rounded to the nearest and wrapped. Written with
+/// `rem_euclid` for the same reason `looking` is: a yaw off the wire may be
+/// negative, and a mask on a negative number is not the segment.
+fn as_turned(block: Block, state: BlockState, click: Click) -> Option<BlockState> {
+    let values = values_of(block, "rotation")?;
+    if values.len() != 16 {
+        return None;
+    }
+    let facing_away = values_of(block, "powered").is_some();
+    let degrees = if facing_away {
+        click.yaw
+    } else {
+        click.yaw + 180.0
+    };
+    let segment = (f64::from(degrees) * 16.0 / 360.0 + 0.5)
+        .floor()
+        .rem_euclid(16.0);
+    state.with("rotation", values[segment as usize])
+}
+
+/// Leaves a **player** put down do not decay.
+///
+/// The only rule here that reads neither the click nor the cell: a leaf block
+/// is `persistent` because a person placed it, and that is the whole of it.
+/// Minecraft then recomputes `distance` from the logs nearby, which in an
+/// arena with no logs is the 7 the default already carries — so the distance
+/// clause is not written here and the survey cannot say whether it should be.
+///
+/// Keyed on `distance` and `persistent` together, which is leaves and nothing
+/// else: scaffolding has a `distance` and no `persistent`.
+///
+/// Seventy-nine of the 496 rows the grid survey called wrong were the ten leaf
+/// blocks, and every one of them was this.
+fn as_leaves(block: Block, state: BlockState) -> Option<BlockState> {
+    values_of(block, "distance")?;
+    let values = values_of(block, "persistent")?;
+    if !same_set(values, BOOL) {
+        return None;
+    }
+    state.with("persistent", "true")
+}
+
+/// Whether a right-click **on** this cell puts the block *into* it.
+///
+/// `plain` is the constants table's own `canBeReplaced()`, which is a property
+/// of the state and knows nothing about what the player is carrying. Minecraft
+/// asks a version that does, and two blocks answer differently for it:
+///
+/// * **snow** stacks under its own item, so long as the top face was the one
+///   clicked and there are fewer than eight layers. Otherwise a single layer
+///   is replaceable by anything and a deeper drift is replaceable by nothing —
+///   which is why a ninth layer is refused rather than flattening the first
+///   eight.
+/// * a **slab** takes its own other half. Clicked from above a bottom slab
+///   doubles and a top slab does not, and on a side face it is the cursor that
+///   decides — the same half rule the click already uses, asked of the block
+///   that is there rather than of the one going down.
+///
+/// Everything else falls to `plain`, so a table without the column and a
+/// server without these two blocks behave exactly as they did.
+#[must_use]
+pub fn replaces_clicked(block: Block, there: BlockState, plain: bool, click: Click) -> bool {
+    if let Some(deep) = snow_depth(block, there) {
+        if deep < 8 {
+            return click.face == Face::Up;
+        }
+        return false;
+    }
+    if let Some(kind) = slab_half(block, there) {
+        return match kind {
+            "bottom" => click.face == Face::Up || (high(click) && click.face.axis() != "y"),
+            "top" => click.face == Face::Down || (!high(click) && click.face.axis() != "y"),
+            _ => false,
+        };
+    }
+    plain
+}
+
+/// Whether a placement that has already gone past the clicked cell may land
+/// here.
+///
+/// The same two blocks and the easier half of the question: nothing about the
+/// click decides it, because the player did not aim at this cell — they aimed
+/// at the one in front of it. Snow stacks and a slab doubles whichever way the
+/// click came in.
+#[must_use]
+pub fn replaces_beside(block: Block, there: BlockState, plain: bool) -> bool {
+    if let Some(deep) = snow_depth(block, there) {
+        return deep < 8;
+    }
+    if let Some(kind) = slab_half(block, there) {
+        return kind != "double";
+    }
+    plain
+}
+
+/// How deep the snow in this cell is, when it is the same snow the player is
+/// holding.
+fn snow_depth(block: Block, there: BlockState) -> Option<u8> {
+    if there.block() != block {
+        return None;
+    }
+    let values = values_of(block, "layers")?;
+    if !same_set(values, LAYERS) {
+        return None;
+    }
+    there.property("layers")?.parse().ok()
+}
+
+/// Which half of a slab is in this cell, when it is the same slab the player
+/// is holding.
+fn slab_half(block: Block, there: BlockState) -> Option<&'static str> {
+    if there.block() != block {
+        return None;
+    }
+    let values = values_of(block, "type")?;
+    if !same_set(values, &["top", "bottom", "double"]) {
+        return None;
+    }
+    there.property("type")
+}
+
+/// Whether the cursor was in the upper half of the face it landed on.
+fn high(click: Click) -> bool {
+    click.cursor_y > 0.5
 }
 
 /// A lever, a button or a grindstone: a `face` of floor, wall or ceiling.
@@ -258,7 +656,9 @@ fn as_horizontal(block: Block, state: BlockState, click: Click) -> Option<BlockS
         look
     } else if ANVILS.contains(&block.name()) {
         clockwise(look)
-    } else if trapdoor && !matches!(click.face, Face::Up | Face::Down) {
+    } else if AS_LOOKED.contains(&block.name()) {
+        look
+    } else if on_a_wall(block, trapdoor) && !matches!(click.face, Face::Up | Face::Down) {
         click.face.direction()
     } else {
         opposite(look)
@@ -348,6 +748,42 @@ const ANVILS: [&str; 3] = [
     "minecraft:chipped_anvil",
     "minecraft:damaged_anvil",
 ];
+
+/// Four-way blocks that face **the way the player is looking**, like a stair.
+///
+/// Named because nothing separates them from a furnace. A campfire has `lit`
+/// and so does a furnace; a decorated pot has `facing` and `waterlogged` and
+/// so does a chest. The property table cannot say which of the two answers a
+/// block gives, and the grid can: at yaw 180 all four of these come out facing
+/// north and a furnace comes out facing south.
+const AS_LOOKED: [&str; 4] = [
+    "minecraft:campfire",
+    "minecraft:soul_campfire",
+    "minecraft:decorated_pot",
+    "minecraft:calibrated_sculk_sensor",
+];
+
+/// Whether this block takes its facing from the wall it was put against.
+///
+/// A trapdoor by shape — a `half` with no `shape`, which a stair fails and a
+/// furnace fails — and a ladder and a tripwire hook by name, because their
+/// shape is `facing` and `waterlogged`, which is a decorated pot's and a
+/// chest's. Two ways in to one answer, and one place where that answer is.
+fn on_a_wall(block: Block, trapdoor: bool) -> bool {
+    trapdoor || ON_THE_WALL.contains(&block.name())
+}
+
+/// Four-way blocks that face **out of the wall they were put on**.
+///
+/// A ladder and a tripwire hook hang on the block behind them, so their facing
+/// is the clicked face and not the player at all — which is a lever's rule
+/// without a lever's `face` property to say so. Two names, because a ladder's
+/// shape is `facing` and `waterlogged`, which is a decorated pot's shape and a
+/// chest's.
+///
+/// **Getting this wrong turns a ladder inside out**: it hangs off the wrong
+/// side of the cell, against nothing, and a player cannot climb it.
+const ON_THE_WALL: [&str; 2] = ["minecraft:ladder", "minecraft:tripwire_hook"];
 
 /// Six-way blocks that point **away** from where the player is looking.
 ///
@@ -529,7 +965,7 @@ fn half(click: Click) -> &'static str {
     match click.face {
         Face::Down => "top",
         Face::Up => "bottom",
-        _ if click.cursor_y >= 0.5 => "top",
+        _ if high(click) => "top",
         _ => "bottom",
     }
 }
@@ -1034,7 +1470,36 @@ mod tests {
             cursor_y,
             yaw,
             pitch: 0.0,
+            into: air(),
         }
+    }
+
+    /// A placement into an empty cell, which is what every situation the grid
+    /// survey measured was.
+    fn air() -> BlockState {
+        AIR.default_state()
+    }
+
+    /// A placement into a cell that already holds something.
+    fn into(face: Face, cursor_y: f32, there: BlockState) -> Click {
+        Click {
+            face,
+            cursor_y,
+            yaw: 0.0,
+            pitch: 0.0,
+            into: there,
+        }
+    }
+
+    /// A state from `minecraft:name[a=b]`, for saying what is already there.
+    fn there(name: &str, properties: &[(&str, &str)]) -> BlockState {
+        let mut state = block(name).default_state();
+        for (property, value) in properties {
+            state = state
+                .with(property, value)
+                .expect("this build's block has that property");
+        }
+        state
     }
 
     fn state(name: &str, face: Face, yaw: f32, cursor_y: f32) -> Vec<(&'static str, &'static str)> {
@@ -1184,11 +1649,404 @@ mod tests {
     }
 
     #[test]
+    fn a_block_put_down_in_water_comes_out_wet() {
+        // The one a player hits constantly: every dock, every fence post in a
+        // river. Both directions, because the wrong one is the one that was
+        // already happening.
+        let water = there("minecraft:water", &[]);
+        assert_eq!(
+            value(
+                &state_for(block("minecraft:oak_fence"), into(Face::Up, 0.25, water)).properties(),
+                "waterlogged"
+            ),
+            "true"
+        );
+        assert_eq!(
+            value(
+                &state_for(block("minecraft:oak_fence"), click(Face::Up, 0.0, 0.25)).properties(),
+                "waterlogged"
+            ),
+            "false"
+        );
+    }
+
+    #[test]
+    fn a_conduit_on_dry_land_is_not_waterlogged() {
+        // The 122 rows of the grid survey that were wrong with no water in
+        // sight. A conduit, a sea pickle and every coral fan carry
+        // `waterlogged=true` in their *default* state, so a server that never
+        // touched the property flooded them on land.
+        for name in [
+            "minecraft:conduit",
+            "minecraft:sea_pickle",
+            "minecraft:tube_coral_fan",
+        ] {
+            assert_eq!(
+                value(
+                    &state_for(block(name), click(Face::Up, 0.0, 0.25)).properties(),
+                    "waterlogged"
+                ),
+                "false",
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn seagrass_is_water_and_a_lily_pad_is_not() {
+        // `getFluidState`, not "is this block water". Seagrass stands in it
+        // and reports it; a lily pad floats on it and does not, because the
+        // cell a lily pad is in holds air. All four names came out of a run
+        // that put a fence into every block in the game.
+        for name in [
+            "minecraft:water",
+            "minecraft:seagrass",
+            "minecraft:tall_seagrass",
+            "minecraft:bubble_column",
+        ] {
+            assert!(holds_water(there(name, &[])), "{name}");
+        }
+        assert!(!holds_water(there("minecraft:lily_pad", &[])));
+        // Lava is the twin that must not waterlog anything, and it is a cell a
+        // placement really does land in — 89 blocks accepted the fence and
+        // lava was one of them.
+        assert!(!holds_water(there("minecraft:lava", &[])));
+    }
+
+    #[test]
+    fn snow_stacks_to_eight_and_the_ninth_is_refused() {
+        let snow = block("minecraft:snow");
+        for (deep, then) in [("1", "2"), ("4", "5"), ("7", "8")] {
+            let click = into(Face::Up, 0.25, there("minecraft:snow", &[("layers", deep)]));
+            assert_eq!(
+                value(&state_for(snow, click).properties(), "layers"),
+                then,
+                "{deep}"
+            );
+            assert!(replaces_beside(
+                snow,
+                there("minecraft:snow", &[("layers", deep)]),
+                false
+            ));
+        }
+        // Eight is where it stops, and it stops by refusing rather than by
+        // flattening the drift back to one.
+        assert!(!replaces_beside(
+            snow,
+            there("minecraft:snow", &[("layers", "8")]),
+            false
+        ));
+        assert!(!replaces_clicked(
+            snow,
+            there("minecraft:snow", &[("layers", "8")]),
+            false,
+            click(Face::Up, 0.0, 0.25)
+        ));
+        // And a drift is only stacked from *above*. Clicking its side puts the
+        // snow beside it.
+        assert!(!replaces_clicked(
+            snow,
+            there("minecraft:snow", &[("layers", "3")]),
+            false,
+            click(Face::North, 0.0, 0.25)
+        ));
+    }
+
+    #[test]
+    fn a_slab_into_its_own_other_half_is_a_double_slab() {
+        let slab = block("minecraft:oak_slab");
+        let bottom = there("minecraft:oak_slab", &[("type", "bottom")]);
+        let state = state_for(slab, into(Face::Up, 0.25, bottom));
+        assert_eq!(value(&state.properties(), "type"), "double");
+        // A double slab fills the cell, so there is nowhere left for water to
+        // be — Minecraft says both in the same line and so does this.
+        assert_eq!(value(&state.properties(), "waterlogged"), "false");
+        // A slab into a slab of the *other* kind is not a double anything.
+        let spruce = there("minecraft:spruce_slab", &[("type", "bottom")]);
+        assert_eq!(
+            value(
+                &state_for(slab, into(Face::Up, 0.25, spruce)).properties(),
+                "type"
+            ),
+            "bottom"
+        );
+        // Clicked from above, a bottom slab doubles and a top slab does not:
+        // the second one has the player aiming at the cell above it.
+        assert!(replaces_clicked(
+            slab,
+            bottom,
+            false,
+            click(Face::Up, 0.0, 0.25)
+        ));
+        let top = there("minecraft:oak_slab", &[("type", "top")]);
+        assert!(!replaces_clicked(
+            slab,
+            top,
+            false,
+            click(Face::Up, 0.0, 0.25)
+        ));
+        assert!(replaces_clicked(
+            slab,
+            top,
+            false,
+            click(Face::Down, 0.0, 0.25)
+        ));
+        // On a side face the cursor decides, which is the click rule's own
+        // half asked of the block that is already there.
+        assert!(replaces_clicked(
+            slab,
+            bottom,
+            false,
+            click(Face::North, 0.0, 0.75)
+        ));
+        assert!(!replaces_clicked(
+            slab,
+            bottom,
+            false,
+            click(Face::North, 0.0, 0.25)
+        ));
+    }
+
+    #[test]
+    fn a_block_that_reads_no_rule_replaces_what_the_table_says_and_nothing_more() {
+        // The fallback, both ways round, so that adding two blocks with an
+        // opinion did not give one to everything else.
+        let stone = block("minecraft:stone");
+        let grass = there("minecraft:short_grass", &[]);
+        assert!(replaces_beside(stone, grass, true));
+        assert!(!replaces_beside(stone, grass, false));
+        assert!(replaces_clicked(
+            stone,
+            grass,
+            true,
+            click(Face::Up, 0.0, 0.25)
+        ));
+        assert!(!replaces_clicked(
+            stone,
+            grass,
+            false,
+            click(Face::Up, 0.0, 0.25)
+        ));
+    }
+
+    #[test]
+    fn leaves_a_player_put_down_do_not_decay() {
+        for name in ["minecraft:oak_leaves", "minecraft:cherry_leaves"] {
+            assert_eq!(
+                value(
+                    &state_for(block(name), click(Face::Up, 0.0, 0.25)).properties(),
+                    "persistent"
+                ),
+                "true",
+                "{name}"
+            );
+        }
+        // Scaffolding has a `distance` too and no `persistent`, which is the
+        // shape this rule is keyed to refuse.
+        assert!(as_leaves(
+            block("minecraft:scaffolding"),
+            block("minecraft:scaffolding").default_state()
+        )
+        .is_none());
+    }
+
+    /// The wall form an item carries, as the item table hands it over.
+    fn wall(name: &str, attaches: &'static str) -> WallForm {
+        WallForm {
+            block: block(name),
+            attaches,
+        }
+    }
+
+    #[test]
+    fn a_torch_on_a_wall_is_a_wall_torch_and_on_the_ground_is_a_torch() {
+        let torch = block("minecraft:torch");
+        let form = Some(wall("minecraft:wall_torch", "down"));
+        // The top of a block: it stands on it.
+        let up = state_for_item(torch, form, click(Face::Up, 0.0, 0.25));
+        assert_eq!(up.block().name(), "minecraft:torch");
+        // A side: it goes on the wall, facing out of it. Measured — the
+        // clicked face and not the player's look, which at yaw 0 would have
+        // given south for every one of these.
+        for (face, facing) in [
+            (Face::North, "north"),
+            (Face::South, "south"),
+            (Face::East, "east"),
+            (Face::West, "west"),
+        ] {
+            let on = state_for_item(torch, form, click(face, 0.0, 0.25));
+            assert_eq!(on.block().name(), "minecraft:wall_torch", "{facing}");
+            assert_eq!(value(&on.properties(), "facing"), facing);
+        }
+    }
+
+    #[test]
+    fn an_item_with_no_wall_form_is_untouched_by_the_rule() {
+        // The 872 items that have one block, and the case a table written
+        // before the columns puts *every* item in.
+        let stone = block("minecraft:stone");
+        for face in [Face::Up, Face::North, Face::Down] {
+            assert_eq!(
+                state_for_item(stone, None, click(face, 0.0, 0.25)),
+                state_for(stone, click(face, 0.0, 0.25))
+            );
+        }
+        let sign = block("minecraft:oak_sign");
+        assert_eq!(
+            state_for_item(sign, None, click(Face::North, 0.0, 0.25)).block(),
+            sign,
+            "no table, no wall sign — the answer it always gave"
+        );
+    }
+
+    #[test]
+    fn a_hanging_sign_attaches_upward_and_keeps_its_old_answer_on_a_wall() {
+        // The attachment direction is why the columns carry it. The face that
+        // stands a sign up hangs nothing, and the face that hangs one is the
+        // one a sign refuses.
+        let hanging = block("minecraft:oak_hanging_sign");
+        let form = Some(wall("minecraft:oak_wall_hanging_sign", "up"));
+        assert_eq!(
+            state_for_item(hanging, form, click(Face::Down, 0.0, 0.25)).block(),
+            hanging
+        );
+        // And on a wall it is left alone, because the wall form faces *across*
+        // the wall rather than out of it and the grid was taken at one yaw.
+        assert_eq!(
+            state_for_item(hanging, form, click(Face::North, 0.0, 0.25)).block(),
+            hanging
+        );
+    }
+
+    #[test]
+    fn a_sign_faces_the_player_and_a_skull_faces_the_way_they_look() {
+        // One property, two rules, and no single one gives both: at yaw 180 a
+        // sign is segment 0 and a skull is segment 8.
+        let checks = [
+            ("minecraft:oak_sign", 180.0, "0"),
+            ("minecraft:oak_sign", 90.0, "12"),
+            ("minecraft:black_banner", 90.0, "12"),
+            ("minecraft:skeleton_skull", 180.0, "8"),
+            ("minecraft:skeleton_skull", 90.0, "4"),
+        ];
+        for (name, yaw, segment) in checks {
+            assert_eq!(
+                value(
+                    &state_for(block(name), click(Face::Up, yaw, 0.25)).properties(),
+                    "rotation"
+                ),
+                segment,
+                "{name} at {yaw}"
+            );
+        }
+        // A yaw that has gone round more than once still lands in the sixteen.
+        assert_eq!(
+            value(
+                &state_for(block("minecraft:oak_sign"), click(Face::Up, -270.0, 0.25)).properties(),
+                "rotation"
+            ),
+            "12"
+        );
+    }
+
+    #[test]
+    fn a_campfire_faces_the_way_the_player_looks_and_a_furnace_faces_back() {
+        // The same pair the whole measurement was taken to settle, one shape
+        // further on: a campfire has `lit` and so does a furnace, and at yaw
+        // 180 they come out facing opposite ways.
+        for name in [
+            "minecraft:campfire",
+            "minecraft:soul_campfire",
+            "minecraft:decorated_pot",
+            "minecraft:calibrated_sculk_sensor",
+        ] {
+            assert_eq!(
+                value(&state(name, Face::Up, 180.0, 0.25), "facing"),
+                "north",
+                "{name}"
+            );
+        }
+        assert_eq!(
+            value(&state("minecraft:furnace", Face::Up, 180.0, 0.25), "facing"),
+            "south"
+        );
+    }
+
+    #[test]
+    fn a_ladder_faces_out_of_the_wall_it_hangs_on() {
+        // Not the player at all. Getting this wrong hangs the ladder off the
+        // wrong side of its own cell, against nothing, and it cannot be
+        // climbed.
+        for name in ["minecraft:ladder", "minecraft:tripwire_hook"] {
+            assert_eq!(
+                value(&state(name, Face::North, 180.0, 0.25), "facing"),
+                "north",
+                "{name}"
+            );
+            assert_eq!(
+                value(&state(name, Face::East, 0.0, 0.25), "facing"),
+                "east",
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lantern_hangs_from_a_ceiling_and_stands_on_a_floor() {
+        assert_eq!(
+            value(
+                &state("minecraft:lantern", Face::Down, 0.0, 0.25),
+                "hanging"
+            ),
+            "true"
+        );
+        assert_eq!(
+            value(
+                &state("minecraft:soul_lantern", Face::Up, 0.0, 0.25),
+                "hanging"
+            ),
+            "false"
+        );
+    }
+
+    #[test]
+    fn lichen_sticks_to_the_face_it_was_put_on_and_a_mushroom_block_does_not() {
+        // Six bools and a `waterlogged` is a multiface block. Six bools and no
+        // `waterlogged` is a mushroom block, whose every side is `true` by
+        // default — and a rule that set one and cleared the rest would turn it
+        // inside out. That clause is the whole reason `waterlogged` is in the
+        // shape test.
+        for name in ["minecraft:glow_lichen", "minecraft:sculk_vein"] {
+            assert_eq!(
+                value(&state(name, Face::Up, 0.0, 0.25), "down"),
+                "true",
+                "{name}"
+            );
+            assert_eq!(
+                value(&state(name, Face::North, 0.0, 0.25), "south"),
+                "true",
+                "{name}"
+            );
+        }
+        let mushroom = block("minecraft:brown_mushroom_block");
+        assert_eq!(
+            state_for(mushroom, click(Face::Up, 0.0, 0.25)),
+            mushroom.default_state(),
+            "every side stays as it was"
+        );
+    }
+
+    #[test]
     fn a_shape_no_rule_recognises_keeps_the_default_state() {
         // The fallback that makes a rule an improvement rather than a trade.
-        // Leaves and stone have nothing here to key on and go down exactly as
+        // Stone and glass have nothing here to key on and go down exactly as
         // they did before this file existed.
-        for name in ["minecraft:stone", "minecraft:oak_leaves", "minecraft:glass"] {
+        //
+        // **Leaves used to be in this list and have earned their way out**, in
+        // the direction this test exists to watch: a rule was written for them
+        // and the shape it keys on is now recognised. A block leaving this
+        // list is a rule arriving; a block joining it would be a rule lost.
+        for name in ["minecraft:stone", "minecraft:glass", "minecraft:bedrock"] {
             let block = block(name);
             assert_eq!(
                 state_for(block, click(Face::North, 90.0, 0.75)),
@@ -1326,6 +2184,7 @@ mod tests {
             cursor_y: 0.25,
             yaw: 0.0,
             pitch: 90.0,
+            into: air(),
         };
         assert_eq!(
             value(

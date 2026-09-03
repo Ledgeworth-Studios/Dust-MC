@@ -48,6 +48,26 @@ use crate::{Block, Item};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemBlocks {
     places: Box<[Option<Block>]>,
+    /// The block each item puts down **on a wall**, for the fifty-three items
+    /// that have a second form. `None` throughout for a table written before
+    /// the columns.
+    walls: Option<Box<[Option<WallForm>]>>,
+}
+
+/// An item's wall form: the block, and which way its *standing* form attaches.
+///
+/// The direction is `StandingAndWallBlockItem.attachmentDirection`, and it is
+/// here rather than assumed because it is not the same for every item that has
+/// a wall form. A sign stands on the ground, attaches **down**, and goes on a
+/// wall when a side is clicked. A **hanging** sign attaches **up** — it hangs
+/// from what is above it — so the face that gives a sign its standing form
+/// gives a hanging sign nothing at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WallForm {
+    /// The block for the wall form.
+    pub block: Block,
+    /// Which way the standing form attaches: `down` or `up`.
+    pub attaches: &'static str,
 }
 
 impl ItemBlocks {
@@ -55,6 +75,33 @@ impl ItemBlocks {
     #[must_use]
     pub fn places(&self, item: Item) -> Option<Block> {
         *self.places.get(item.protocol_id() as usize)?
+    }
+
+    /// The block `item` puts down on a **wall**, and how its standing form
+    /// attaches — `None` for the items that have only one form.
+    ///
+    /// A table written before the columns answers `None` for everything, which
+    /// is the same answer it gave when there was no question. Ask
+    /// [`ItemBlocks::has_walls`] to tell that apart from an item that really
+    /// has no wall form; a caller choosing between two blocks needs to know
+    /// whether the table *knows*, not what it says when it does not.
+    #[must_use]
+    pub fn on_wall(&self, item: Item) -> Option<WallForm> {
+        *self.walls.as_ref()?.get(item.protocol_id() as usize)?
+    }
+
+    /// Whether this table carries the wall columns at all.
+    #[must_use]
+    pub fn has_walls(&self) -> bool {
+        self.walls.is_some()
+    }
+
+    /// How many items have a wall form. 53 on 1.21.1.
+    #[must_use]
+    pub fn on_walls(&self) -> usize {
+        self.walls
+            .as_ref()
+            .map_or(0, |walls| walls.iter().filter(|w| w.is_some()).count())
     }
 
     /// How many items this table describes.
@@ -95,6 +142,7 @@ impl ItemBlocks {
         let expected = Item::all().count();
         let header = Header::read(text)?;
         let mut places: Vec<Option<Option<Block>>> = vec![None; expected];
+        let mut walls: Vec<Option<WallForm>> = vec![None; expected];
 
         for (index, line) in text.lines().enumerate() {
             let line = line.trim_end_matches('\r');
@@ -154,6 +202,33 @@ impl ItemBlocks {
                     })?),
                 };
 
+            if let Some((on_wall, attaches)) = header.wall {
+                if fields[on_wall] != NOTHING {
+                    let block = Block::from_name(fields[on_wall]).ok_or_else(|| {
+                        PlacementError::UnknownBlock {
+                            line: at,
+                            name: fields[on_wall].to_owned(),
+                        }
+                    })?;
+                    // `up` and `down` are the only two Minecraft constructs
+                    // these items with, and a third would be a rule this build
+                    // has never been asked about — refused rather than guessed.
+                    let attaches = match fields[attaches] {
+                        "down" => "down",
+                        "up" => "up",
+                        other => {
+                            return Err(PlacementError::Malformed {
+                                line: at,
+                                detail: format!(
+                                    "attaches is {other:?}, and a wall form attaches up or down"
+                                ),
+                            })
+                        }
+                    };
+                    walls[id as usize] = Some(WallForm { block, attaches });
+                }
+            }
+
             let slot = &mut places[id as usize];
             if slot.is_some() {
                 return Err(PlacementError::DuplicateItem { line: at, id });
@@ -170,6 +245,7 @@ impl ItemBlocks {
                 .into_iter()
                 .map(|p| p.expect("every slot was just counted as present"))
                 .collect(),
+            walls: header.wall.map(|_| walls.into_boxed_slice()),
         })
     }
 }
@@ -187,6 +263,11 @@ struct Header {
     item_id: usize,
     item: usize,
     places: usize,
+    /// Where `on_wall` and `attaches` are, when the table has them. **Both or
+    /// neither**: a wall block with no attachment direction is a block this
+    /// build cannot decide when to use, and reading one without the other
+    /// would be a table that half answers.
+    wall: Option<(usize, usize)>,
 }
 
 impl Header {
@@ -210,11 +291,13 @@ impl Header {
                     column: wanted,
                 })
         };
+        let optional = |wanted: &str| names.iter().position(|name| *name == wanted);
         Ok(Self {
             width: names.len(),
             item_id: required("item_id")?,
             item: required("item")?,
             places: required("places")?,
+            wall: optional("on_wall").zip(optional("attaches")),
         })
     }
 }

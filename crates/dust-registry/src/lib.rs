@@ -61,7 +61,7 @@ pub use generated::blocks::{DATA_VERSION, STATE_COUNT, STATE_SAMPLES};
 pub use generated::items::COMPONENT_SAMPLES;
 pub use generated::registries::{ENTRY_COUNT, ENTRY_SAMPLES};
 pub use items::{ComponentValue, Components, Rarity};
-pub use placement::{ItemBlocks, PlacementError};
+pub use placement::{ItemBlocks, PlacementError, WallForm};
 pub use registry::{Registry, RegistryDef};
 
 /// One property of a block, and the values it may take, in id order.

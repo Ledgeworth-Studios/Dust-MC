@@ -11,6 +11,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.function.Predicate;
 
 /**
@@ -241,8 +242,17 @@ public final class BlockOracle {
      * block and not the *state* — a stair knows which way it faces from where
      * the player stood, and that is a different problem in a different place.
      *
-     * Two columns and both are names: the item's, and the block's. A number
-     * would be a position in whichever Minecraft this ran against.
+     * Four columns and three of them are names: the item's, the block's, and
+     * the block's **wall** form where it has one. A number would be a position
+     * in whichever Minecraft this ran against.
+     *
+     * The wall form is `StandingAndWallBlockItem.wallBlock`, a second field on
+     * a subclass of `BlockItem`, and it is the one thing a rule cannot get at:
+     * a torch and a wall torch, a sign and a wall sign, are related only by the
+     * item that holds both. Fifty-three items have one. `attaches` beside it is
+     * that class's `attachmentDirection` — `down` for a sign, which stands on
+     * the ground, and `up` for a hanging sign, which does not — because the
+     * same clicked face gives those two different answers.
      */
     private static int writeItems(Names names, Path out) throws Exception {
         Object items = names.field("builtin_registries.class", "builtin_registries.item").get(null);
@@ -251,10 +261,14 @@ public final class BlockOracle {
         Method getKey = names.method("registry.class", "registry.get_key", Object.class);
         Class<?> blockItem = names.type("blockitem.class");
         Field held = names.field("blockitem.class", "blockitem.block");
+        Class<?> standingAndWall = names.type("standingandwall.class");
+        Field wallBlock = names.field("standingandwall.class", "standingandwall.wall_block");
+        Field attachment = names.field("standingandwall.class", "standingandwall.attachment");
 
         int written = 0;
+        int walls = 0;
         try (BufferedWriter writer = Files.newBufferedWriter(out)) {
-            writer.write("# item_id\titem\tplaces\n");
+            writer.write("# item_id\titem\tplaces\ton_wall\tattaches\n");
             for (Object item : (Iterable<?>) items) {
                 int id = (int) getId.invoke(items, item);
                 Object name = getKey.invoke(items, item);
@@ -262,13 +276,22 @@ public final class BlockOracle {
                 // diff and in an editor, and a row whose last column vanished
                 // would read as one that was never written.
                 String places = "-";
+                String onWall = "-";
+                String attaches = "-";
                 if (blockItem.isInstance(item)) {
                     places = getKey.invoke(blocks, held.get(item)).toString();
                 }
-                writer.write(id + "\t" + name + "\t" + places + "\n");
+                if (standingAndWall.isInstance(item)) {
+                    onWall = getKey.invoke(blocks, wallBlock.get(item)).toString();
+                    attaches = String.valueOf(attachment.get(item)).toLowerCase(Locale.ROOT);
+                    walls++;
+                }
+                writer.write(
+                    id + "\t" + name + "\t" + places + "\t" + onWall + "\t" + attaches + "\n");
                 written++;
             }
         }
+        System.out.println("wall_items=" + walls);
         return written;
     }
 

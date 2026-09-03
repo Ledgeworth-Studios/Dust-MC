@@ -18,6 +18,7 @@
 //
 // Usage: node placement.js <port> [items.txt|item,item,...] [--survey] > answers.tsv
 //        node placement.js <port> [items] --neighbours [--against all|blocks.txt]
+//        node placement.js <port> [items] --into [all|blocks.txt|block,block,...]
 //
 // `--survey` trades the full 144-situation grid for eight chosen to answer only
 // "does this block's placement depend on anything at all?", which is the
@@ -37,6 +38,23 @@
 // putting that block to the north of the target. `--against all` is every block
 // this build knows, which is how "does a fence connect to X" is answered for
 // every X at once rather than guessed at from a rule.
+//
+// `--into` asks the third question, which neither of the others can reach: what
+// was **already in the cell** the block goes into. The grid clears that cell and
+// the neighbour scenes clear it too, so every row either of them has ever
+// written was a placement into air — and three of Minecraft's rules read that
+// cell. A block put into water comes out waterlogged, a second layer of snow
+// stacks on the first, and a slab into its own other half becomes a double slab.
+// The target is walled on four sides with stone so that a fluid put there stays
+// there: an unwalled source spreads across the arena within a tick or two and
+// the next sample is measured in a puddle.
+//
+// Its rows carry one more column than `--neighbours` — `into`, the state that
+// really was in the target when the placement went out — and like `before` it is
+// read back off the wire rather than copied from the `/setblock` that asked for
+// it. That matters more here than anywhere else: flowing water put in a sealed
+// pocket is gone by the next tick, and a row claiming the placement landed in
+// it would be a row about a cell that held air.
 //
 // Notes to whoever runs it next:
 //
@@ -174,6 +192,34 @@ const DEFAULT_ITEMS = [
   'hopper'            // facing off the face, but never up
 ]
 
+// What to put in the target cell, for `--into` with no list of its own.
+//
+// One per rule the cell is read by, plus the controls that say the rule is
+// keyed on the right thing. `air` is the baseline and is what every other
+// survey's target cell holds; `lava` is water's twin and must *not* waterlog
+// anything; seagrass and a bubble column are blocks that stand *in* water and
+// report it, which is the clause a rule written as "is this block water" gets
+// wrong.
+//
+// The snow depths are 1, 7 and 8 rather than all eight: one is where stacking
+// starts, seven is the last that stacks, and eight is where it stops.
+const DEFAULT_INTO = [
+  'air',
+  'water',
+  'lava',
+  'seagrass',
+  'kelp_plant',
+  'bubble_column',
+  'short_grass',
+  'snow[layers=1]',
+  'snow[layers=7]',
+  'snow[layers=8]',
+  'oak_slab[type=bottom]',
+  'oak_slab[type=top]',
+  'oak_slab[type=double]',
+  'spruce_slab[type=bottom]'
+]
+
 const wait = ms => new Promise(r => setTimeout(r, ms))
 
 /// A rotation as a whole number of degrees.
@@ -304,12 +350,15 @@ function main () {
   const neighbours = process.argv.includes('--neighbours')
   const againstAt = process.argv.indexOf('--against')
   const againstArgument = againstAt === -1 ? null : process.argv[againstAt + 1]
+  const intoAt = process.argv.indexOf('--into')
+  const intoArgument = intoAt === -1 ? null : process.argv[intoAt + 1]
   const names = argument => fs.existsSync(argument)
     ? fs.readFileSync(argument, 'utf8').split(/\s+/).filter(Boolean)
     : argument.split(',')
+  const taken = [againstAt + 1, intoAt + 1]
   const argument = process.argv
     .slice(3)
-    .find((a, i) => !a.startsWith('--') && process.argv[i + 2] !== '--against')
+    .find((a, i) => !a.startsWith('--') && !taken.includes(i + 3))
   let items = DEFAULT_ITEMS
   if (argument) items = names(argument)
   if (againstArgument && !neighbours) {
@@ -623,6 +672,167 @@ function main () {
           )
         }
       }
+    }
+
+    // -----------------------------------------------------------------------
+    // The `into` survey.
+    //
+    // The third variable, and the one neither of the others can vary: what was
+    // already in the cell the block goes into. Both of them clear it, so every
+    // row either has ever written is a placement into air — and Minecraft has
+    // three rules that read it.
+    //
+    // The click is held still, at the support's top face, so the placement
+    // always lands in the cell above the support and that cell is the one this
+    // fills. **It is walled on four sides with stone**, which is not tidiness:
+    // an unwalled water source spreads across the arena inside two ticks and
+    // every sample after it is measured in a puddle. The cell above is left
+    // open so that a block taller than one is not refused for the wrong reason.
+    //
+    // A refusal here does not look like a refusal anywhere else. In the other
+    // surveys the target is air and a refused placement leaves air; here it
+    // leaves **whatever was already there**, which is a state and reads like a
+    // successful placement of it. So the test is not "is it air", it is "is it
+    // what was there a tick ago" — and a slab put into a double slab, or a
+    // ninth layer of snow, is exactly that.
+    async function intoSurvey (blocks) {
+      const target = { x: support.x, y: support.y + 1, z: support.z }
+      const around = {
+        down: support,
+        up: { x: target.x, y: target.y + 1, z: target.z },
+        north: { x: target.x, y: target.y, z: target.z - 1 },
+        south: { x: target.x, y: target.y, z: target.z + 1 },
+        west: { x: target.x - 1, y: target.y, z: target.z },
+        east: { x: target.x + 1, y: target.y, z: target.z }
+      }
+      const sides = [[-1, 0], [1, 0], [0, -1], [0, 1]]
+      await bot.look(0, 0, true)
+      await wait(300)
+
+      let sequence = 1
+      const seen = []
+      process.stdout.write(
+        '# item\tface\tyaw\tpitch\tcursor_y\tresult\tsurvived\tbefore\tafter\tinto\n'
+      )
+      for (const item of [CONTROL, ...items.filter(i => i !== CONTROL)]) {
+        const entry = registry.itemsByName[item]
+        if (!entry) {
+          process.stdout.write(`${item}\t-\t-\t-\t-\tNO SUCH ITEM\t-\t-\t-\t-\n`)
+          continue
+        }
+        bot._client.write('set_creative_slot', {
+          slot: 36,
+          item: {
+            itemCount: 1,
+            itemId: entry.id,
+            addedComponentCount: 0,
+            removedComponentCount: 0,
+            components: [],
+            removeComponents: []
+          }
+        })
+        bot._client.write('held_item_slot', { slotId: 0 })
+        await wait(120)
+
+        for (const block of blocks) {
+          for (const cell of Object.values(around)) changes.delete(at(cell))
+          changes.delete(at(target))
+          say(`fill ${support.x - 2} ${support.y - 2} ${support.z - 2} ` +
+              `${support.x + 2} ${support.y + 3} ${support.z + 2} air`)
+          for (const [dx, dz] of sides) {
+            say(`setblock ${support.x + dx} ${support.y} ${support.z + dz} stone`)
+            say(`setblock ${target.x + dx} ${target.y} ${target.z + dz} stone`)
+          }
+          say(`setblock ${target.x} ${target.y} ${target.z} ${block}`)
+          // The support last, so that seeing it turn to stone means the pocket
+          // and what is in it have landed too.
+          say(`setblock ${support.x} ${support.y} ${support.z} stone`)
+          if (!await settles(support, 'stone', registry)) {
+            process.stdout.write(
+              `minecraft:${item}\t1\t${round(sent.yaw)}\t${round(sent.pitch)}\t` +
+              `0.25\tARENA DID NOT SETTLE\t-\t-\t-\t-\n`
+            )
+            continue
+          }
+          // A tick for the world to react before anything is written down, for
+          // the reason the neighbour survey gives: a block that cannot hold
+          // itself up falls between the barrier and the click, and flowing
+          // water in a sealed pocket is gone by the next tick. What is
+          // recorded is what was there when the placement went out.
+          await wait(100)
+          const before = read(around, registry)
+          const held = changes.get(at(target))
+          const inside = held && held.length
+            ? describe(held[held.length - 1], registry)
+            : 'minecraft:air'
+          changes.delete(at(target))
+
+          bot._client.write('block_place', {
+            hand: 0,
+            location: support,
+            direction: 1,
+            cursorX: 0.5,
+            cursorY: 0.25,
+            cursorZ: 0.5,
+            insideBlock: false,
+            sequence: sequence++
+          })
+          await wait(200)
+          const got = changes.get(at(target))
+          const first = got ? describe(got[0], registry) : null
+          // Unchanged is the refusal, and `minecraft:air` is only one spelling
+          // of unchanged — the one every other survey happens to see because
+          // its target is always empty.
+          const result = first === null || first === inside || first === 'minecraft:air'
+            ? 'REFUSED\t-'
+            : first + (got.length > 1 && got[got.length - 1] !== got[0] ? '\tbroke' : '\tstood')
+          const after = read(around, registry)
+          const moved = Object.keys(after)
+            .filter(direction => after[direction] !== before[direction])
+            .map(direction => `${direction}=${after[direction]}`)
+          if (item === CONTROL) seen.push(`${inside} -> ${result}`)
+          process.stdout.write(
+            `minecraft:${item}\t1\t${round(sent.yaw)}\t${round(sent.pitch)}\t` +
+            `0.25\t${result}\t${spell(before) || '-'}\t${moved.join(';') || '-'}\t${inside}\n`
+          )
+        }
+
+        if (item === CONTROL) {
+          // Stone has one state, so no cell it is placed into may change what
+          // it comes out as. This one has a second job the others do not: it
+          // says the *pocket* is being built, because a scene whose block never
+          // landed would show up as a control that agreed with itself over a
+          // run of empty cells. The stderr line prints how many distinct cells
+          // it was placed into for exactly that reason.
+          const states = new Set(
+            seen.map(s => s.split(' -> ')[1].split('\t')[0]).filter(r => r !== 'REFUSED')
+          )
+          const cells = new Set(seen.map(s => s.split(' -> ')[0]))
+          if (states.size !== 1 || !states.has(`minecraft:${CONTROL}`)) {
+            process.stderr.write(
+              `the control disagreed with itself, so nothing below it is worth reading.\n` +
+              `${CONTROL} has one state and this run saw ${states.size}:\n  ` +
+              seen.join('\n  ') + '\n'
+            )
+            process.exit(1)
+          }
+          process.stderr.write(
+            `control: ${CONTROL} agrees with itself over ${seen.length} cells, ` +
+            `${cells.size} of them distinct\n`
+          )
+        }
+      }
+    }
+
+    if (intoAt !== -1) {
+      const spec = intoArgument && !intoArgument.startsWith('--') ? intoArgument : null
+      const blocks = spec === null
+        ? DEFAULT_INTO
+        : spec === 'all'
+          ? Object.keys(registry.blocksByName).sort()
+          : names(spec)
+      await intoSurvey(blocks)
+      process.exit(0)
     }
 
     if (neighbours) {
