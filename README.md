@@ -50,10 +50,11 @@ prefix with no holes in it, over a window of 24 columns it claims in the shared
 column store and gives back as they go out. That is what keeps a join off its
 own tokio worker and out of everybody else's way. Four bots joining at once,
 while a settled player timed a chat round trip twenty times a second: the
-settled player's worst round trip on a generated world went from 279, 875 and
-500 ms over three runs to 24, 69 and 87 ms, and the four joiners now finish
-within 20 ms of each other rather than staggered across 400, because the store
-builds their columns once between them. Decision record
+settled player's worst round trip on a generated world went from 469, 298 and
+697 ms over three runs to 20, 71 and 20 ms, and the four joiners were sent 273
+to 279 of their 289 columns in the same three seconds where they used to get 181
+to 253 — finishing within 20 ms of each other rather than staggered across 400,
+because the store builds their columns once between them. Decision record
 [0031](docs/decisions/0031-how-a-join-streams-its-chunks.md) has the ladder
 that says which world each number is about.
 
@@ -302,9 +303,10 @@ icebergs — decision record
 is what each of those is worth on the same sample, in cells; no
 physics or block updates, so a player is stopped from
 entering a block and never pushed out of one; **only one thread builds columns
-for a world**, so a cold join into generated terrain is about 1.7 seconds of
-world arriving around a player who is already walking — the loading screen ends
-at 145 ms and record
+for a world**, so a cold join into generated terrain is about 3.3 seconds of
+world arriving around a player who is already walking, and four people joining a
+saved world at once contend where they used not to — the loading screen ends
+at 242 ms and record
 [0031](docs/decisions/0031-how-a-join-streams-its-chunks.md) says what a pool
 would move and why it is declined for now;
 **no water on the movement path**,

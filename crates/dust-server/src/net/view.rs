@@ -201,6 +201,20 @@ impl View {
         self.loaded.len()
     }
 
+    /// Whether this client already holds everything a view centred on `centre`
+    /// reaches.
+    ///
+    /// A comparison and a count, which is the point: the chunk stream's own
+    /// tick fires fifty times a second for the life of every session, and for
+    /// almost all of that life there is nothing to send. Asking `move_to` costs
+    /// a set of every column in range built and differenced to answer "none";
+    /// asking this costs two integers.
+    #[must_use]
+    pub fn complete(&self, centre: ChunkPos) -> bool {
+        let span = (2 * self.radius + 1) as usize;
+        self.centre == Some(centre) && self.loaded.len() == span * span
+    }
+
     /// Whether the client holds this column.
     pub fn holds(&self, pos: ChunkPos) -> bool {
         self.loaded.contains(&(pos.x, pos.z))
@@ -282,6 +296,19 @@ mod tests {
         let ahead = view.peek(centre, 25);
         view.move_to_limited(centre, Some(4));
         assert_eq!(view.peek(centre, 21), ahead[4..], "in the same order");
+    }
+
+    #[test]
+    fn a_view_is_complete_only_where_it_stands_and_only_when_it_is_full() {
+        let mut view = View::with_radius(2);
+        let centre = ChunkPos::new(0, 0);
+        assert!(!view.complete(centre), "before it has ever moved");
+        view.move_to_limited(centre, Some(4));
+        assert!(!view.complete(centre), "a partial pass is not a full view");
+        view.move_to(centre);
+        assert!(view.complete(centre));
+        // Somewhere else, the same twenty-five columns are the wrong ones.
+        assert!(!view.complete(ChunkPos::new(1, 0)));
     }
 
     #[test]

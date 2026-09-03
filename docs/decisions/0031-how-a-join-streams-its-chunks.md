@@ -4,11 +4,16 @@
 the same order as before, and **the session's own task no longer builds any of
 them**. On a generated world — which is what a server with no `world_source`
 serves since [D26](0026-the-terrain-dust-serves-and-what-it-does-at-the-seam.md)
-— that removed **2,293.9 ms of blocking work from a tokio worker**, and the
+— that removed **2,450 ms of blocking work from a tokio worker**, and the
 players already standing in the world felt it: with four bots joining at once, a
-settled player's chat round trip went from a worst case of **279, 875 and 500 ms
-over three runs to 24, 69 and 87 ms**, and from two thirds of its pings never
+settled player's chat round trip went from a worst case of **469, 298 and 697 ms
+over three runs to 20, 71 and 20 ms**, and from a third of its pings never
 coming back inside the window to all of them.
+
+It is **not uniformly better**: on a world read from region files, where a
+column was never expensive enough to be worth moving, four simultaneous joins
+now have a fatter tail. The last section says what that is and what is known
+about it.
 
 [D25](0025-who-keeps-a-chunk-column.md) named this as the next measurement in
 its own last section. It is the third caller of the store D25 built, and
@@ -21,20 +26,25 @@ by `benches/join.rs`, which runs a ladder over the same 289 columns on each —
 each row the one above it plus a single named change, because a total cannot say
 which input owns which part of it:
 
-| | build only | build and encode | encode only, resident |
+| | build only, cold | build and encode, warm | encode only, resident |
 | --- | --- | --- | --- |
-| **flat** | 0.0 ms | 5.5 ms | (keeps nothing) |
-| **generated** | 2,293.9 ms cold | 1,300.5 ms warm | **16.0 ms** |
-| **region files** | 104.0 ms cold | 76.6 ms warm | **5.8 ms** |
+| **flat** | 0.0 ms | 8.0 ms | (keeps nothing) |
+| **generated** | 2,450.0 ms | 1,658.7 ms | **14.0 ms** |
+| **region files** | 452.5 ms | 249.5 ms | **14.9 ms** |
 
 Two things fall out of the ladder and neither is visible in a single figure.
 
-**Encoding a column is 19 us and building one is 3.8 ms generated, 0.24 ms out
-of a region file.** The build is 99.5% of the stream on a generated world and
-92% of it on a region one. So moving the *build* off the session task is the
-whole of the change worth making, and moving the encode is not worth making:
-5.8 ms spread over 289 columns is not something a player can feel, and a scheme
+**Encoding a column is about 50 us and building one is 8.5 ms generated, 1.6 ms
+out of a region file.** The build is 99.4% of the stream on a generated world
+and 96.7% of it on a region one. So moving the *build* off the session task is
+the whole of the change worth making, and moving the encode is not worth making:
+15 ms spread over 289 columns is not something a player can feel, and a scheme
 that also moved it would have to move the socket with it.
+
+The region row is one saved world's columns — the one `tools/bot` runs against —
+and a different save reads differently: the same ladder over a sparser world
+answered 104.0 ms where this one answers 452.5. That is why the row is stated
+with the world it is about rather than as "a region column".
 
 **The world that needed D25's residency sixteen times more than the other was
 the only one without it.** `Source::Generated` had no store at all; every
@@ -53,11 +63,19 @@ A session runs on a tokio worker and the item loop runs on the engine's own
 a noise function.
 
 **One thread per store, not a pool.** What that thread serves is the ring ahead
-of a walking player — nine columns, 34 ms of generated terrain against the
+of a walking player — nine columns, 76 ms of generated terrain against the
 1,600 ms [D17](0017-how-fast-a-player-may-say-they-moved.md)'s speed limit gives
-a player to cross the column they are standing in. A margin of 47 to one does
+a player to cross the column they are standing in. A margin of 21 to one does
 not need a second thread, and the one caller that wants 289 columns at once does
-not come through here.
+not come through here. The last section reopens this.
+
+**A builder offers eight columns at a time, not one.** The residency's write
+lock is what every movement check on every other session is waiting to read, and
+a builder that takes it per column takes it about a thousand times a second on a
+region-file world. The columns are still built with nothing held; only the
+handover is batched. The cost is that the first column of a batch waits for the
+eighth, which on a generated world is 46 ms against a streaming tick that was
+never going to keep up with the builder anyway.
 
 **The join's first twenty-five are built with `tokio::task::spawn_blocking`.**
 This is the one place in this server where that door is the right one, and the
@@ -101,6 +119,11 @@ world measures — the batch of eight plus sixteen of runway, each released as i
 goes out. D25 declined a claim the size of the view for this exact reason: 289
 columns is 32 MB a player, and a stream does not need to hold what it has
 already sent.
+
+A session whose view is full is charged nothing at all: `View::complete` answers
+in two integers, where the old tick built the set of every column in range and
+differenced it to say "none" — fifty times a second, for the life of every
+session.
 
 The total work is unchanged. The same columns are built once, in the same order,
 and finish at about the same moment. What changed is which thread pays and who
@@ -148,22 +171,23 @@ Worst round trip, and how many of the ~150 pings completed:
 
 |  | before | after |
 | --- | --- | --- |
-| **region files** | 170 / 276 / 403 ms (107, 93, 40 samples) | 109 / 221 / 125 ms (113, 105, 114) |
-| **generated** | 279 / 875 / 500 ms (77, 59, 54 samples) | 24 / 69 / 87 ms (151, 135, 149) |
+| **generated, four joining** | 469 / 298 / 697 ms (67, 93, 56 samples) | **20 / 71 / 20 ms** (155, 153, 153) |
+| **region files, one joining** | 65 / 54 / 35 ms (140, 140, 142) | **9 / 11 / 11 ms** (144, 144, 143) |
+| **region files, four joining** | 48–403 ms over 19 runs, median 146 | 11–828 ms over 19 runs, median 131 |
 
-Four joiners, time until the last of their 289 columns arrived: on a generated
-world **2,017–2,400 ms before and 1,663–1,684 ms after**, and tightly clustered
-where they used to be spread. On a region world the two are the same within the
-noise, **720–1,273 ms before and 713–981 ms after** — a region column is cheap
-enough that there was never much to move, which is the point of measuring both.
+**How much of the world arrived in those three seconds** is the other half of
+the generated row: the four joiners were sent **181, 253 and 189 of their 289
+columns before, and 273, 279 and 275 after** — and they used to finish
+staggered across 400 ms of each other and now finish within 20, because the
+store builds their columns once between them instead of four times.
 
 ## What was declined
 
 **A pool of warming threads.** It would make a cold generated join finish in
 about a quarter of the time. It also takes cores the tick loop wants, and the
 number that matters — when the loading screen ends — is already 25 columns and
-not 289. Priority 2, once priority 1 is satisfied. If it is ever wanted, the
-caller to give threads to is `spawn_blocking` at the join, not the store.
+not 289. Declined on priority 2 with priority 1 satisfied, and the last section
+says what would reopen it.
 
 **Moving the encode off the session task too.** 5.8 ms across 289 columns, and
 it would put the socket write behind another hop.
@@ -184,14 +208,28 @@ wrote**, five runs each on both builds.
 
 ## What is still wrong
 
-**A cold generated join is still 1.7 seconds of world arriving**, and about
-1.6 of that is one thread evaluating noise. The loading screen ends at 145 ms
-and the player can walk, so this is terrain filling in around somebody who is
-already playing rather than a wait — but it is the number a thread pool would
-move, and it is the reason the pool is declined rather than rejected.
+**Four simultaneous joins on a region-file world have a fatter tail than they
+did.** Nineteen interleaved runs either side: the median worst round trip is
+unchanged at 131 ms against 146, and the maximum went from 403 ms to 828. It is
+**not** the join path — with *one* joiner the same measurement is 9–11 ms after
+against 35–65 before, five times better and never worse. It is four callers
+meeting at one store: one warming thread, one region-file mutex and one
+residency write lock, where before the four built their own columns on four
+tokio workers and contended only on the file.
 
-**The join warms twenty-five columns and the play loop then streams the other
-264 at eight per twenty milliseconds.** On a generated world the store cannot
-keep up with that cadence, so the stream is paced by the builder and the batch
-size is not doing anything. That is not wrong, but it means `STREAM_BATCH` is
-now a bound on the region case only.
+That is the case a small pool would answer, and it is the reason the pool above
+is declined rather than rejected: it is not wanted for the generated world,
+where the loading screen already ends at 242 ms, but it is the shape of the one
+regression this record ships. **What must be measured before building it is
+whether the tail is the thread or the lock**, because a pool makes the second
+worse.
+
+**A cold generated join is still about 3.3 seconds of world arriving** at the
+terrain [D32](0032-what-the-ground-is-made-of.md) now generates, and almost all
+of it is one thread evaluating noise. The loading screen ends at 242 ms and the
+player can walk, so this is terrain filling in around somebody who is already
+playing rather than a wait.
+
+**`STREAM_BATCH` is now a bound on the region case only.** On a generated world
+the store cannot build eight columns in twenty milliseconds, so the stream is
+paced by the builder and the batch size does nothing.

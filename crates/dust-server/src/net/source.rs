@@ -170,6 +170,18 @@ impl Columns for GeneratedWorld {
 /// one does not need a second thread, and a join — the one caller that wants
 /// 289 columns at once — does not come through here at all. See
 /// `net::session::stream_inner`.
+/// How many columns a builder offers to the residency at once.
+///
+/// Eight, which is `net::session::STREAM_BATCH`: the stream takes columns in
+/// eights, so a builder that offers them in eights hands over exactly what the
+/// next pass can use. The point of the batch is the write lock — offering one
+/// column at a time takes it about a thousand times a second on a region-file
+/// world, and it is the lock a movement check on every other session is waiting
+/// to read. The cost is that the first column of a batch waits for the eighth,
+/// which on a generated world is 46 ms against a 20 ms streaming tick that was
+/// never going to keep up with the builder anyway.
+const FILL_BATCH: usize = 8;
+
 pub struct ColumnStore {
     residency: Arc<Residency>,
     /// Columns somebody has claimed and nobody has built yet. `None` where the
@@ -193,10 +205,17 @@ impl ColumnStore {
                     // a lock across a build: `cold` takes a snapshot, the
                     // column is built with nothing held, and `fill` takes the
                     // write lock for one insert.
+                    let mut built = Vec::with_capacity(FILL_BATCH);
                     while let Ok(columns) = requests.recv() {
                         for pos in residency.cold_columns(&columns) {
-                            residency.fill(pos, core.column(pos));
+                            built.push((pos, core.column(pos)));
+                            if built.len() == FILL_BATCH {
+                                residency.fill_many(std::mem::take(&mut built));
+                                built.reserve(FILL_BATCH);
+                            }
                         }
+                        residency.fill_many(std::mem::take(&mut built));
+                        built.reserve(FILL_BATCH);
                     }
                 }
             })
@@ -431,16 +450,16 @@ impl Source {
             Self::Anvil(world) => (&world.store, world.core.as_ref()),
         };
         let mut built = 0;
-        for pos in store.residency.cold_columns(columns) {
-            // Built with no lock held, then offered. A player who walked away
-            // in the meantime, or another thread that got there first, means
-            // the column is dropped here rather than kept — see
-            // [`Residency::fill`].
-            let chunk = core.column(pos);
-            store.residency.fill(pos, chunk);
-            built += 1;
+        let cold = store.residency.cold_columns(columns);
+        // Built with no lock held, then offered in batches. A player who walked
+        // away in the meantime, or another thread that got there first, means
+        // the column is dropped rather than kept — see [`Residency::fill_many`].
+        for run in cold.chunks(FILL_BATCH) {
+            let batch: Vec<_> = run.iter().map(|pos| (*pos, core.column(*pos))).collect();
+            built += batch.len();
+            store.residency.fill_many(batch);
         }
-        built
+        u32::try_from(built).unwrap_or(u32::MAX)
     }
 
     /// The server's resident set, for a caller that keeps a claim on it —

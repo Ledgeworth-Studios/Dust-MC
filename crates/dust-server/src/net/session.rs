@@ -882,6 +882,13 @@ async fn stream_inner<W>(
 where
     W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // Nothing to send and nothing to forget, which is what all but a few
+    // thousand of a session's streaming ticks say. Answered with two integers
+    // rather than by building the set of every column in range and differencing
+    // it, twice, fifty times a second for the life of the session.
+    if view.complete(centre) {
+        return Ok(());
+    }
     // The window: what this pass may send, and the runway behind it. Peeked
     // rather than taken, because `View`'s record is a statement about what the
     // client holds and a column that has only been *asked for* is not held by

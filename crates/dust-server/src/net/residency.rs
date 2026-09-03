@@ -433,6 +433,35 @@ impl Residency {
         }
     }
 
+    /// Put a run of built columns in under **one** write lock.
+    ///
+    /// Same rule as [`Residency::fill`] for each of them; returns how many were
+    /// kept. This exists because the write lock is the one every movement check
+    /// on every other session is waiting to read, and a builder that takes it
+    /// once per column takes it about a thousand times a second on a world read
+    /// from region files — where a column is cheap enough that four joins can
+    /// ask for two thousand of them. The columns are built with nothing held
+    /// and offered together.
+    pub fn fill_many(&self, built: Vec<(ChunkPos, Chunk)>) -> usize {
+        if built.is_empty() {
+            return 0;
+        }
+        let mut kept = self
+            .columns
+            .write()
+            .expect("the residency is never poisoned");
+        let mut filled = 0;
+        for (pos, chunk) in built {
+            if let Some(entry) = kept.columns.get_mut(&(pos.x, pos.z)) {
+                if entry.chunk.is_none() {
+                    entry.chunk = Some(Arc::new(chunk));
+                    filled += 1;
+                }
+            }
+        }
+        filled
+    }
+
     /// How many columns the server is keeping, held and retired together.
     #[must_use]
     pub fn len(&self) -> usize {
