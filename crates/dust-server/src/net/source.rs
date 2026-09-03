@@ -58,7 +58,7 @@ use dust_world::chunk::Chunk;
 use dust_world::column_light::{Skirt, SkyFloor};
 use dust_world::coords::{ChunkPos, RegionPos};
 use dust_world::heightmap::WorldHeight;
-use dust_world::region::{FileStore, RegionFile};
+use dust_world::region::{FileStore, RawChunk, RegionFile};
 
 use super::generated::GeneratedWorld;
 use super::residency::Residency;
@@ -784,7 +784,31 @@ impl AnvilCore {
         }
     }
 
+    /// One column out of the file.
+    ///
+    /// **Only the seek holds the region mutex.** Decompressing the stream,
+    /// parsing the NBT and assembling the chunk are pure work on bytes this
+    /// thread now owns, and they used to happen with the map locked — which
+    /// made about 60% of a column serial and put a hard ceiling of 1.5x on
+    /// however many threads were reading the world. `benches/contention.rs`
+    /// is the ladder that says so, and decision record 0038 is why it matters.
     fn read(&self, pos: ChunkPos) -> Option<Chunk> {
+        let raw = self.stored(pos)?;
+        let bytes = raw.compression.decompress(&raw.data).ok()?;
+        let named = dust_nbt::read::from_bytes(&bytes).ok()?;
+        let dust_nbt::Tag::Compound(root) = &named.tag else {
+            return None;
+        };
+        anvil::chunk(root, self.height, &self.names).ok()
+    }
+
+    /// A column's bytes exactly as the file holds them, compressed.
+    ///
+    /// This is the whole of what needs the region mutex: a `RegionFile` seeks
+    /// as it reads, so two threads sharing one cannot be inside it at once.
+    /// What comes back is owned, so nothing the caller does with it needs the
+    /// lock.
+    fn stored(&self, pos: ChunkPos) -> Option<RawChunk> {
         let region = RegionPos::new(pos.x >> 5, pos.z >> 5);
         let mut open = self
             .regions
@@ -796,13 +820,7 @@ impl AnvilCore {
             // every column.
             RegionFile::open_in(&self.directory, region).ok()
         });
-        let file = slot.as_mut()?;
-        let payload = file.read_chunk(pos).ok()??;
-        let named = dust_nbt::read::from_bytes(payload.as_bytes()).ok()?;
-        let dust_nbt::Tag::Compound(root) = &named.tag else {
-            return None;
-        };
-        anvil::chunk(root, self.height, &self.names).ok()
+        slot.as_mut()?.read_chunk_raw(pos).ok()?
     }
 }
 

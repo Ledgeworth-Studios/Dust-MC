@@ -224,6 +224,18 @@ regression this record ships. **What must be measured before building it is
 whether the tail is the thread or the lock**, because a pool makes the second
 worse.
 
+**Answered by [D38](0038-how-wide-the-region-lock-is.md), 2026-09-03.** It was
+the lock, and the lock was six times wider than it needed to be: sixty per cent
+of a region column was spent holding the region mutex, which capped four
+threads at 1.49x however many of them there were. Narrowing it to the seek
+alone brings the settled player's worst chat round trip on a region-file world
+to a median of 194 ms over twelve interleaved runs, against 390 before — and
+against **251 ms on a flat world, which has no columns to build, no lock and no
+warming thread**. Most of what this section called a regression is a floor that
+four simultaneous joins impose on any world at all, and the pool is declined a
+second time because the count of stalls did not change when the build got 2.2x
+faster; only their length did.
+
 **A cold generated join is still about 3.3 seconds of world arriving** at the
 terrain [D32](0032-what-the-ground-is-made-of.md) now generates, and almost all
 of it is one thread evaluating noise. The loading screen ends at 242 ms and the

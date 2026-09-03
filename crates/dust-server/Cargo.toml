@@ -80,3 +80,7 @@ harness = false
 [[bench]]
 name = "join"
 harness = false
+
+[[bench]]
+name = "contention"
+harness = false
