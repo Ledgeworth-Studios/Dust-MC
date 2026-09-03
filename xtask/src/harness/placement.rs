@@ -183,11 +183,10 @@ struct Score {
     neighbours_disagreed: u64,
     /// The same, for what the placement did to the cells around it.
     neighbour_disagreements: BTreeMap<String, Example>,
-    /// Neighbours the placement *destroyed* rather than reshaped. A support
-    /// rule and not a shape rule, counted apart so that it cannot quietly
-    /// become one — the same separation the measuring tool makes with its
-    /// `survived` column.
-    neighbours_broke: u64,
+    /// Sides that were in the scene a tick before the click and gone a tick
+    /// after it, so the click read air where the survey wrote a block. See
+    /// [`emptied`].
+    emptied: u64,
 }
 
 impl Score {
@@ -204,6 +203,7 @@ impl Score {
             Outcome::Placed(state) => state,
         };
 
+        self.emptied += emptied(answer);
         self.add_neighbours(answer, items, solid);
         let Some(theirs) = dust_state(answer, items, solid) else {
             self.unresolved += 1;
@@ -218,12 +218,15 @@ impl Score {
         }
         *seen = true;
         self.disagreed += 1;
-        let entry = self.disagreements.entry(answer.item.clone()).or_insert_with(|| Example {
-            dust: theirs.clone(),
-            vanilla: expected.clone(),
-            around: answer.before.clone(),
-            count: 0,
-        });
+        let entry = self
+            .disagreements
+            .entry(answer.item.clone())
+            .or_insert_with(|| Example {
+                dust: theirs.clone(),
+                vanilla: expected.clone(),
+                around: answer.before.clone(),
+                count: 0,
+            });
         entry.count += 1;
         // The example kept is the first one. Which situation it was is in the
         // answers file; what is wanted here is the *shape* of the difference,
@@ -239,7 +242,12 @@ impl Score {
     /// stands each neighbour alone in a cleared volume with a stone floor, so
     /// its other three sides and the cell above it really are air, and a rule
     /// that read them would be reading air.
-    fn add_neighbours(&mut self, answer: &Answer, items: &Option<ItemBlocks>, solid: Option<Solid>) {
+    fn add_neighbours(
+        &mut self,
+        answer: &Answer,
+        items: &Option<ItemBlocks>,
+        solid: Option<Solid>,
+    ) {
         if answer.after.is_empty() || answer.after == "-" {
             return;
         }
@@ -268,14 +276,6 @@ impl Score {
                 Around::empty().with(side.opposite(), placed),
                 solid,
             );
-            if expected == "minecraft:air" {
-                // The neighbour did not change shape, it fell over: a button
-                // or a sapling with nothing to hold it. A support rule and not
-                // a shape rule, and counting it here would report this rule as
-                // wrong about a question nothing asked it.
-                self.neighbours_broke += 1;
-                continue;
-            }
             let rendered = render(ours);
             if rendered == expected {
                 self.neighbours_agreed += 1;
@@ -345,10 +345,7 @@ impl Score {
         let touched = self.neighbours_agreed + self.neighbours_disagreed;
         if touched > 0 {
             println!();
-            println!(
-                "  {:>7}  neighbours the placement changed",
-                touched
-            );
+            println!("  {:>7}  neighbours the placement changed", touched);
             println!(
                 "  {:>7}  of them Dust would change the same way ({})",
                 self.neighbours_agreed,
@@ -360,16 +357,26 @@ impl Score {
                 percent(self.neighbours_disagreed, touched)
             );
         }
-        if self.neighbours_broke > 0 {
+        if self.emptied > 0 {
             println!(
-                "  {:>7}  fell over rather than changed shape, which is a support rule",
-                self.neighbours_broke
+                "  {:>7}  neighbour(s) fell over as the click landed, and are read as the \
+                 air they left",
+                self.emptied
             );
         }
 
-        if self.disagreements.is_empty() {
-            return;
+        // Each list is guarded on its own. An early return on the first one
+        // hid the second entirely the day the first went empty, which is the
+        // day the second is the only thing left worth reading.
+        if !self.disagreements.is_empty() {
+            self.report_placed(verbose);
         }
+        if !self.neighbour_disagreements.is_empty() {
+            self.report_neighbours(verbose);
+        }
+    }
+
+    fn report_placed(&self, verbose: bool) {
         println!();
         println!("what is still wrong, one line per item:");
         let mut rows: Vec<(&String, &Example)> = self.disagreements.iter().collect();
@@ -388,15 +395,18 @@ impl Score {
                 rows.len() - shown
             );
         }
+    }
 
-        if self.neighbour_disagreements.is_empty() {
-            return;
-        }
+    fn report_neighbours(&self, verbose: bool) {
         println!();
         println!("what a placement still does not do to what is beside it:");
         let mut rows: Vec<(&String, &Example)> = self.neighbour_disagreements.iter().collect();
         rows.sort_by_key(|(item, example)| (std::cmp::Reverse(example.count), (*item).clone()));
-        let shown = if verbose { rows.len() } else { rows.len().min(10) };
+        let shown = if verbose {
+            rows.len()
+        } else {
+            rows.len().min(10)
+        };
         for (item, example) in rows.iter().take(shown) {
             print_example(item, example);
         }
@@ -469,7 +479,9 @@ fn dust_state_id(
         pitch: answer.pitch,
     };
     let placed = dust_sim::placement::state_for(block, click);
-    let Some(solid) = solid else { return Some(placed) };
+    let Some(solid) = solid else {
+        return Some(placed);
+    };
     Some(dust_sim::placement::shaped(
         placed,
         neighbourhood(answer),
@@ -500,7 +512,39 @@ fn neighbourhood(answer: &Answer) -> Around {
             around = around.with(side, state);
         }
     }
+    // **A cell the placement emptied was not there for the click to read.**
+    // `before` is measured a tick ahead of the click and `after` a tick behind
+    // it, so a block that falls in between is in the first column and not in
+    // the second: a ladder in the arena hangs on the cell the block is about to
+    // go into, and drops the moment it is asked to hold itself up. Minecraft's
+    // own answer for that row is a fence with no arm, and a scorer that read
+    // the ladder out of `before` would call that a wrong connection rule — one
+    // row in 799 of a fence-against-every-block run, and it looked exactly like
+    // one.
+    for (side, state) in neighbours(&answer.after) {
+        if fell(&state) {
+            around = around.with(side, air());
+        }
+    }
     around
+}
+
+/// How many sides of this row the placement emptied.
+///
+/// Counted and printed rather than quietly folded into the agreement, because
+/// a row whose neighbourhood fell over during the click is a row measured
+/// against a scene that was not fully there — and a survey where that number
+/// grew would be one to go and look at rather than to read the percentage of.
+fn emptied(answer: &Answer) -> u64 {
+    let before: Vec<Face> = neighbours(&answer.before)
+        .into_iter()
+        .filter(|(_, state)| !fell(state))
+        .map(|(side, _)| side)
+        .collect();
+    neighbours(&answer.after)
+        .into_iter()
+        .filter(|(side, state)| fell(state) && before.contains(side))
+        .count() as u64
 }
 
 /// The `north=minecraft:stone;up=…` spelling, read back.
@@ -514,9 +558,7 @@ fn neighbours(field: &str) -> Vec<(Face, String)> {
     field
         .split(';')
         .filter_map(|pair| pair.split_once('='))
-        .filter_map(|(side, state)| {
-            Face::from_direction(side).map(|side| (side, state.to_owned()))
-        })
+        .filter_map(|(side, state)| Face::from_direction(side).map(|side| (side, state.to_owned())))
         .collect()
 }
 
@@ -538,6 +580,24 @@ fn parse_state(text: &str) -> Option<BlockState> {
         state = state.with(name, value)?;
     }
     Some(state)
+}
+
+/// Whether a cell the placement changed was **emptied** rather than reshaped.
+///
+/// Air is the obvious spelling and it is not the only one. A block that was
+/// waterlogged leaves its water behind when it falls, so a coral fan beside a
+/// fence reads back as `minecraft:water[level=0]`; fourteen of the twenty rows
+/// a fence-against-every-block run first reported as wrong shapes were that,
+/// and every one of them was the support rule rather than this one.
+fn fell(state: &str) -> bool {
+    matches!(
+        state.split('[').next().unwrap_or(state),
+        "minecraft:air"
+            | "minecraft:cave_air"
+            | "minecraft:void_air"
+            | "minecraft:water"
+            | "minecraft:lava"
+    )
 }
 
 /// Air, for telling "this cell was shaped" from "this cell was written into".
@@ -609,7 +669,11 @@ fn load_constants(given: Option<&Path>) -> Result<Option<BlockConstants>, String
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("could not read {}: {e}", path.display()))?;
     let table = BlockConstants::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    println!("constants: {} block states from {}", table.len(), path.display());
+    println!(
+        "constants: {} block states from {}",
+        table.len(),
+        path.display()
+    );
     Ok(Some(table))
 }
 

@@ -191,6 +191,9 @@ pub fn state_for(block: Block, click: Click) -> BlockState {
     if let Some(state) = as_hopper(block, state, click) {
         return state;
     }
+    if let Some(state) = as_rail(block, state, click) {
+        return state;
+    }
     state
 }
 
@@ -484,6 +487,39 @@ fn as_stairs(block: Block, state: BlockState, click: Click) -> Option<BlockState
 /// means nothing here.
 const HORIZONTAL: &[&str] = &["north", "south", "west", "east"];
 
+/// A rail, which lies along the axis the player is walking.
+///
+/// The click rule and not the neighbour one: a rail goes down `east_west` when
+/// the player is looking east or west and `north_south` otherwise, and only
+/// *then* does it bend towards the rails beside it. The survey caught this
+/// because it is in the grid at all — one situation of the eight, the one at
+/// yaw 90 — and it had been counted among the neighbour rules on the strength
+/// of the property's name.
+///
+/// Keyed on the shape's values rather than on four block names, so it covers
+/// the plain rail with its ten shapes and the three powered kinds with their
+/// six. Nothing else in the game has a property naming an ascending direction.
+///
+/// **What this does not do is bend.** A rail beside another rail turns towards
+/// it, rises to one a block higher, and rewrites that rail in turn — a rule
+/// that reaches further than one ring, and the one thing decision record 0014
+/// measured and left. A rail here lies along the player's axis and stays there.
+fn as_rail(block: Block, state: BlockState, click: Click) -> Option<BlockState> {
+    let shapes = values_of(block, "shape")?;
+    if !shapes.contains(&"ascending_east") || !shapes.contains(&"north_south") {
+        return None;
+    }
+    let along = looking(click.yaw);
+    state.with(
+        "shape",
+        if along == "east" || along == "west" {
+            "east_west"
+        } else {
+            "north_south"
+        },
+    )
+}
+
 /// Which half of a block a click lands in.
 ///
 /// The face decides it outright when the face is horizontal — clicking the
@@ -524,13 +560,12 @@ fn same_set(a: &[&str], b: &[&str]) -> bool {
     a.len() == b.len() && b.iter().all(|value| a.contains(value))
 }
 
-
 // ---------------------------------------------------------------------------
 // What is beside a block, and what that makes of it.
 //
 // Everything above this line reads the click. Nothing above it can answer why a
 // fence has an arm on one side and not the other, because that is not in the
-// click at all — it is in the cell next door. Decision record 0012 is the
+// click at all — it is in the cell next door. Decision record 0014 is the
 // account of what was measured and what was decided; the short version is that
 // this is **one rule applied twice**, at placement and again whenever a
 // neighbour changes, because a fence that connected only in the direction it
@@ -617,8 +652,7 @@ impl<'a> Solid<'a> {
     /// Whether `state` has a full square face on its `side`.
     #[must_use]
     pub fn sturdy(self, state: BlockState, side: Face) -> bool {
-        self.constants
-            .is_set(self.faces[side as usize], state.id())
+        self.constants.is_set(self.faces[side as usize], state.id())
     }
 }
 
@@ -721,10 +755,20 @@ fn as_cross(state: BlockState, around: Around, solid: Solid) -> Option<BlockStat
 /// is worth saying because the property sits on the connection and reads like
 /// it belongs to it.
 ///
-/// **The post goes up unless the wall is a straight run**, and a straight run
-/// with something on top of it raises the post again. A wall alone has a post;
-/// a wall in the middle of a straight fence-line does not, which is what makes
-/// a long wall look like a wall and not like a row of pillars.
+/// **The post goes up unless the wall runs through**, and "runs through" is a
+/// line in *either* axis and not an exclusive one. A wall alone has a post; a
+/// wall in the middle of a north-south line does not, and a wall connected on
+/// all four sides does not either — which is the clause the phrase "a straight
+/// run" gets wrong, and it was measured rather than reasoned. A long wall
+/// having no post is what makes it look like a wall and not a row of pillars,
+/// and a crossroads is the place a spare post is most visible.
+///
+/// A block on top of a line through does **not** raise the post back up: the
+/// connections it makes `tall` reach the top of the wall already, so there is
+/// nothing for a post to add. What does raise it is a wall above with its own
+/// post, and the odd list in `#minecraft:wall_post_override` — a torch, a
+/// button, a sign, a lantern: small things a player puts on top of a wall that
+/// need a post under them to stand on.
 fn as_wall(state: BlockState, around: Around, solid: Solid) -> Option<BlockState> {
     if !is_wall(state.block()) {
         return None;
@@ -749,14 +793,14 @@ fn as_wall(state: BlockState, around: Around, solid: Solid) -> Option<BlockState
         };
         next = next.with(side.direction(), height)?;
     }
-    // `Face::HORIZONTAL` is north, south, west, east, so the two straight runs
-    // are the two pairs. Written out rather than indexed by direction because
-    // the whole question is "is it exactly one of these two arrangements".
+    // `Face::HORIZONTAL` is north, south, west, east, so a line through is one
+    // of the two pairs. Written out rather than indexed by direction because
+    // the whole question is which pair, and there are only two of them.
     let [north, south, west, east] = joined;
-    let straight = (north && south && !west && !east) || (west && east && !north && !south);
-    let post = !straight
-        || tall
-        || in_tag(above.block(), "minecraft:walls") && above.property("up") == Some("true");
+    let through = (north && south) || (west && east);
+    let post = in_tag(above.block(), "minecraft:walls") && above.property("up") == Some("true")
+        || !through
+        || (!tall && in_tag(above.block(), "minecraft:wall_post_override"));
     next.with("up", if post { "true" } else { "false" })
 }
 
@@ -895,7 +939,10 @@ fn in_tag(block: Block, tag: &str) -> bool {
         if def.contains(name) {
             return true;
         }
-        depth > 0 && def.references().any(|inner| walk(&inner[1..], name, depth - 1))
+        depth > 0
+            && def
+                .references()
+                .any(|inner| walk(&inner[1..], name, depth - 1))
     }
     walk(tag, block.name(), 4)
 }
@@ -1069,6 +1116,30 @@ mod tests {
         ] {
             let placed = state("minecraft:oak_stairs", Face::Up, yaw, 0.25);
             assert_eq!(value(&placed, "facing"), facing, "yaw {yaw}");
+        }
+    }
+
+    #[test]
+    fn a_rail_lies_along_the_axis_the_player_is_walking() {
+        // Four items, and it is a *click* rule rather than the neighbour rule
+        // the property's name suggests. Both axes are asserted because a rule
+        // that answered `north_south` to everything would pass one of them and
+        // `north_south` is the default state.
+        for (yaw, shape) in [
+            (0.0, "north_south"),
+            (90.0, "east_west"),
+            (180.0, "north_south"),
+            (-90.0, "east_west"),
+        ] {
+            for name in [
+                "minecraft:rail",
+                "minecraft:powered_rail",
+                "minecraft:detector_rail",
+                "minecraft:activator_rail",
+            ] {
+                let placed = state(name, Face::Up, yaw, 0.25);
+                assert_eq!(value(&placed, "shape"), shape, "{name} at yaw {yaw}");
+            }
         }
     }
 
@@ -1306,7 +1377,6 @@ mod tests {
         );
     }
 
-
     // ---------------------------------------------------------------------
     // What is beside a block.
     //
@@ -1519,44 +1589,79 @@ mod tests {
         );
         // The property is on the connection and the reason is above the wall,
         // which is the one thing about a wall that cannot be guessed.
-        assert_eq!(covered.property("north"), Some("tall"), "{}", spell(covered));
+        assert_eq!(
+            covered.property("north"),
+            Some("tall"),
+            "{}",
+            spell(covered)
+        );
     }
 
     #[test]
-    fn a_wall_drops_its_post_only_in_a_straight_run() {
+    fn a_wall_keeps_its_post_until_it_runs_through() {
+        // Every case here is a row of the neighbour survey, and two of them are
+        // rows that were red first: a line through with a block on top of it
+        // keeps no post, and a wall connected on all four sides keeps none
+        // either. "A straight run" was the phrase the rule was first written
+        // from and it is wrong about both.
         let table = sturdy(&["minecraft:stone"]);
+        let stone = default("minecraft:stone");
         let alone = with_neighbours("minecraft:cobblestone_wall", &[], &table);
         assert_eq!(alone.property("up"), Some("true"), "{}", spell(alone));
-        let straight = with_neighbours(
-            "minecraft:cobblestone_wall",
-            &[
-                (Face::North, default("minecraft:stone")),
-                (Face::South, default("minecraft:stone")),
-            ],
-            &table,
-        );
-        assert_eq!(straight.property("up"), Some("false"), "{}", spell(straight));
         let corner = with_neighbours(
             "minecraft:cobblestone_wall",
-            &[
-                (Face::North, default("minecraft:stone")),
-                (Face::East, default("minecraft:stone")),
-            ],
+            &[(Face::North, stone), (Face::East, stone)],
             &table,
         );
         assert_eq!(corner.property("up"), Some("true"), "{}", spell(corner));
-        // A straight run with something on top of it is a post again, which is
-        // why the run is not the whole test.
+        let through = with_neighbours(
+            "minecraft:cobblestone_wall",
+            &[(Face::North, stone), (Face::South, stone)],
+            &table,
+        );
+        assert_eq!(through.property("up"), Some("false"), "{}", spell(through));
+        // A block on top makes the connections `tall`, which already reach the
+        // top of the wall — so the post is not needed and Minecraft does not
+        // put one there.
         let loaded = with_neighbours(
             "minecraft:cobblestone_wall",
             &[
-                (Face::North, default("minecraft:stone")),
-                (Face::South, default("minecraft:stone")),
-                (Face::Up, default("minecraft:stone")),
+                (Face::North, stone),
+                (Face::South, stone),
+                (Face::Up, stone),
             ],
             &table,
         );
-        assert_eq!(loaded.property("up"), Some("true"), "{}", spell(loaded));
+        assert_eq!(loaded.property("up"), Some("false"), "{}", spell(loaded));
+        // A crossroads runs through in both axes, so it has no post either.
+        let crossroads = with_neighbours(
+            "minecraft:cobblestone_wall",
+            &[
+                (Face::North, stone),
+                (Face::South, stone),
+                (Face::West, stone),
+                (Face::East, stone),
+            ],
+            &table,
+        );
+        assert_eq!(
+            crossroads.property("up"),
+            Some("false"),
+            "{}",
+            spell(crossroads)
+        );
+        // And the small things a player stands on top of a wall, which are the
+        // reason the tag exists: a torch over a line through gets its post back.
+        let torch = with_neighbours(
+            "minecraft:cobblestone_wall",
+            &[
+                (Face::North, stone),
+                (Face::South, stone),
+                (Face::Up, default("minecraft:torch")),
+            ],
+            &table,
+        );
+        assert_eq!(torch.property("up"), Some("true"), "{}", spell(torch));
     }
 
     #[test]
@@ -1615,13 +1720,23 @@ mod tests {
             Around::empty().with(Face::North, other_half),
             solid,
         );
-        assert_eq!(straight.property("shape"), Some("straight"), "{}", spell(straight));
+        assert_eq!(
+            straight.property("shape"),
+            Some("straight"),
+            "{}",
+            spell(straight)
+        );
         let corner = shaped(
             default("minecraft:oak_stairs"),
             Around::empty().with(Face::North, across),
             solid,
         );
-        assert_eq!(corner.property("shape"), Some("outer_right"), "{}", spell(corner));
+        assert_eq!(
+            corner.property("shape"),
+            Some("outer_right"),
+            "{}",
+            spell(corner)
+        );
     }
 
     #[test]

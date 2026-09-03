@@ -129,6 +129,20 @@ with a third-party client: set slots, leave, come back, look. Decision record
 [0013](docs/decisions/0013-where-a-players-inventory-lives.md) says what the
 record does and does not promise.
 
+And a fence connects to what it touches, whichever way the wall was built. A
+fence, a wall, a glass pane and a stair take their shape from the six cells
+around them — when they are placed, and again whenever anything beside them is
+placed or broken, because a fence that only connected in the direction it was
+built would look worse than one that never connected. What a block asks of its
+neighbour is whether that neighbour has a full square face on the side they
+share, which is six columns off the operator's own jar and not one: the back of
+a bottom stair is a full square and its front is not. Measured against a
+vanilla server over 5,120 situations the old grid could not ask, an oak fence
+now agrees with Minecraft about all 1,060 blocks it can stand beside, and the
+sixty-one items placed wrongly for a neighbour reason are down to two. Decision
+record [0014](docs/decisions/0014-what-a-block-reads-from-the-cell-next-door.md)
+has the counts and says what it declined.
+
 **Not yet**, and each of these is stated where the code for it would go: no
 physics, block updates, drops or tool checks; **no collision**, so movement is
 checked for speed and for being a number and not against the blocks it passed
@@ -138,10 +152,14 @@ thrown, and nothing can be picked up off the ground; no crafting, so the grid is
 five slots that store and never combine; **no data components on a stack**, so a
 renamed block or an enchanted tool is stored and given back as the plain item,
 and shift-clicking a helmet moves it rather than wearing it — that last one
-needs one more column of `dust-items.tsv`, and 0013 says which; **no neighbour rules**, so a fence does not connect to what it touches,
-a rail does not bend and a stair does not become a corner — sixty-one of the
-hundred and sixty blocks Dust still places wrongly are that, and the number is
-`cargo xtask harness placement`'s rather than this paragraph's; a block placed
+needs one more column of `dust-items.tsv`, and 0013 says which; no
+**redstone wire** and no **scaffolding distance**, which are the last two
+neighbour rules of the sixty-one decision record
+[0014](docs/decisions/0014-what-a-block-reads-from-the-cell-next-door.md)
+found, and no **rail bend**; a hundred and one of the eight hundred and
+fifty-six items that place anything still go down in a state Minecraft would
+not, which is `cargo xtask harness placement`'s number rather than this
+paragraph's; a block placed
 into water replaces it rather than waterlogging, player-placed leaves decay,
 a sign never becomes a wall sign, and eight layers of snow are replaced where
 Minecraft would refuse; light that

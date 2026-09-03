@@ -220,7 +220,9 @@ impl EditedWorld {
     /// be announced twice for one click, and a player would watch the fence
     /// appear bare and then connect.
     fn shaped_at(&self, position: Position, state: u32) -> u32 {
-        let Some(solid) = self.solid() else { return state };
+        let Some(solid) = self.solid() else {
+            return state;
+        };
         let Some(placed) = dust_registry::BlockState::from_id(state) else {
             return state;
         };
@@ -632,7 +634,11 @@ mod tests {
         let west = Position { x: 4, y: 70, z: 4 };
         let east = Position { x: 5, y: 70, z: 4 };
         world.place_block(west, state_of("minecraft:oak_fence"), 1);
-        assert_eq!(property_at(&world, west, "east"), "false", "nothing there yet");
+        assert_eq!(
+            property_at(&world, west, "east"),
+            "false",
+            "nothing there yet"
+        );
         world.place_block(east, state_of("minecraft:oak_fence"), 1);
         assert_eq!(property_at(&world, west, "east"), "true", "the older fence");
         assert_eq!(property_at(&world, east, "west"), "true", "the newer fence");

@@ -285,15 +285,63 @@ a random age. Every one of them reads none of the four numbers, so the first
 question calls them fixed — and every one of them is a block Dust currently gets
 wrong. Decision record 0011 has the counts.
 
-### What it does not measure
+### Varying the surroundings instead of the click
 
-The arena is one stone block in a cleared volume, so nothing here varies a
-block's **surroundings**. A stair's `shape` comes from the stairs beside it, a
-chest becomes half of a double chest next to another, a fence connects to what
-it touches, and redstone wire reads all four neighbours. A block this tool calls
-context-free is one whose *placement* reads nothing — it may still owe a
-neighbour rule, which is a different problem worth measuring separately rather
-than folding in and losing.
+```
+DUST_SERVER_CONSOLE=/tmp/mc-console node placement.js 25565 items.txt --neighbours
+DUST_SERVER_CONSOLE=/tmp/mc-console node placement.js 25565 oak_fence --neighbours --against all
+```
+
+The grid above is one stone block in a cleared volume, so it cannot see a rule
+that reads the cell **next door** — and sixty-one of the hundred and sixty items
+it reported wrong were exactly that. `--neighbours` holds the click still and
+varies the surroundings: nothing at all, a full block, a full block that does
+not occlude, a block with no full side, something above, the straight run that
+decides a wall's post, then the block's own kind on one side, two sides and all
+four, and where it has a four-valued `facing`, five more with the neighbour
+turned across it and one of those in the other half. Eleven scenes, or sixteen
+for the blocks that face.
+
+`--against all` replaces the scenes with one per block the build knows, put to
+the north of the target. That is how "does a fence connect to X" is answered for
+every X at once rather than argued about; a run is 1,060 rows and takes about
+seven minutes.
+
+Two columns come back that the grid's rows do not have, and **both are read off
+the wire rather than copied from the commands that built the scene**. `before`
+is what the six cells around the target actually held: a `/setblock` naming a
+property the block does not have is refused and leaves air, and a scene written
+down as what was *asked for* would score a rule against a neighbourhood that was
+never there. `after` is which of those six the placement changed, which is the
+half of a neighbour rule a survey of placed states alone cannot see — a fence
+has to connect when the block beside it arrives later, not only when it was
+there first.
+
+Three things cost time here and every one of them looked like a wrong rule:
+
+* **A neighbour with nothing to stand on falls the tick after it is set.** The
+  floor was one block wide, so a rail set beside the target emptied itself
+  before the click. The fill now lays stone under all four side cells.
+* **A barrier that is not last is not a barrier.** The grid loop sets the
+  support first because nothing follows it; here the scene does, so the support
+  goes down last.
+* **`before` has to be true at the moment of the click.** A ladder goes wherever
+  `/setblock` puts it and falls on the next tick. One row in 799 read the ladder
+  in `before` and air in `after`; the wait before the read is why there are not
+  more, and the scorer reads a side that `after` says was emptied as the air the
+  click actually saw.
+
+The control is the same one and asks the same question of a different variable:
+`minecraft:stone` has one state, so no arrangement of neighbours may change it.
+It agreed with itself over 1,060 neighbourhoods.
+
+### What neither survey measures
+
+Neither varies the **fluid** already in the cell, so the twenty-two blocks that
+default to `waterlogged=true` are still unmeasured, and so is every stair, slab,
+fence and sign that would waterlog. Nothing here goes more than one cell out
+either, so a rail's rise to a rail a block higher and a scaffolding's distance
+to the ground are both out of reach of these scenes.
 
 ## The long one
 
