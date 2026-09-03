@@ -10,18 +10,18 @@
 //!
 //! # What a player gets, and what they do not
 //!
-//! `dust_gen::terrain` is vanilla's **noise stage** and nothing past it: the
-//! dimension's default block where `final_density` is positive, its default
-//! fluid below the sea level its settings name, air above. So the ground is
-//! stone rather than grass and there are no trees, no ores, no carved caves
-//! and no villages. Mountains, valleys, overhangs, coastlines, oceans and
-//! sea floors are all there and all in the right place, and the biome a cell
-//! holds is the biome Minecraft would have put there.
+//! `dust_gen::terrain` is vanilla's **noise stage** and `dust_gen::surface` is
+//! the dimension's own surface rules painted over it. So a player lands on
+//! grass over dirt, sand on a beach, gravel on a shore and deepslate below,
+//! and the mountains, valleys, overhangs, coastlines, oceans and sea floors
+//! are all where Minecraft puts them, with the biome Minecraft would have put
+//! there. Decision record 0032 is what that is worth: 682 of the 1,089 columns
+//! around seed 0's spawn are grass, and every one of them was stone before it.
 //!
-//! Surface rules are the next stage and they are the reason this is stone.
-//! Inventing a rule for the top block — grass above the sea, sand beside it —
-//! would be right most of the time and wrong in a way no test here could name,
-//! and it would poison the measurement that is supposed to replace it.
+//! What is still missing is aquifers, carvers and features — no trees, no ore
+//! veins, no caves, no villages, and every pocket below the sea level holds
+//! water where vanilla would leave two thirds of it dry. Record 0032 prices
+//! each of those in cells on the same sample.
 //!
 //! # Why the light needs the four columns around it
 //!
@@ -86,6 +86,10 @@ pub struct GeneratedWorld {
     /// The dimension's own two blocks, resolved once at boot.
     solid: u32,
     fluid: u32,
+    /// The surface rules' own result blocks, resolved once at boot rather than
+    /// per block. A generated column asks this table about ninety thousand
+    /// times; a name lookup there would be the whole cost of the stage.
+    surface: Vec<u32>,
     /// What a cell gets when the biome source has no answer for it, which is
     /// the same biome the flat world serves.
     default_biome: u32,
@@ -105,6 +109,14 @@ impl GeneratedWorld {
         let settings = generator.settings();
         let solid = state_of(&settings.default_block)?;
         let fluid = state_of(&settings.default_fluid)?;
+        let surface = match generator.surface() {
+            Some(rules) => rules
+                .palette()
+                .iter()
+                .map(state_of)
+                .collect::<Result<Vec<u32>, MissingBlock>>()?,
+            None => Vec::new(),
+        };
         Ok(Self {
             emission: super::world::emission_of(constants.as_deref()),
             height: flat.height(),
@@ -115,6 +127,7 @@ impl GeneratedWorld {
             constants,
             solid,
             fluid,
+            surface,
             default_biome,
             biome_registry_size,
             floors: Mutex::new(HashMap::new()),
@@ -153,10 +166,16 @@ impl GeneratedWorld {
         chunk
     }
 
-    /// Blocks, and biomes only when the caller is going to serve them.
+    /// Blocks, and the surface and biomes only when the caller is going to
+    /// serve them.
     ///
     /// A neighbour is generated for one thing — where its sky reaches — and
-    /// its biomes are 2.4 ms of climate nobody would read.
+    /// its biomes are 2.4 ms of climate nobody would read. **The surface rules
+    /// are skipped with them, and for a reason rather than to save the time**:
+    /// a rule replaces the block at a y, it does not move it, so a column's
+    /// sky floor is the same before and after. The exception is the handful of
+    /// rules that write air into a hole in a frozen ocean floor, which is one
+    /// block of sky reach on a world of them.
     fn build(&self, pos: ChunkPos, with_biomes: bool) -> Chunk {
         let mut chunk = Chunk::uniform(
             pos,
@@ -170,7 +189,11 @@ impl GeneratedWorld {
         let min_y = self.height.min_y();
         let top = min_y + self.height.height() as i32;
         {
-            let materials = columns.terrain(pos.x, pos.z);
+            let materials = if with_biomes {
+                columns.surface(pos.x, pos.z)
+            } else {
+                columns.terrain(pos.x, pos.z)
+            };
             for y in min_y..top {
                 let row = (y - min_y) as usize * 256;
                 for z in 0..16u32 {
@@ -186,6 +209,7 @@ impl GeneratedWorld {
                                 Material::Air => self.palette.air,
                                 Material::Solid => self.solid,
                                 Material::Fluid => self.fluid,
+                                Material::Surface(index) => self.surface[index as usize],
                             }
                         };
                         if state != self.palette.air {
@@ -299,7 +323,7 @@ pub fn beside(
     let regions = parameters.len();
     let biomes = parameters.distinct_biomes();
 
-    let generator = dust_gen::terrain::Generator::new(data_path, "overworld", seed, parameters)
+    let mut generator = dust_gen::terrain::Generator::new(data_path, "overworld", seed, parameters)
         .map_err(|e| {
             format!(
                 "{} has {} beside it but no overworld to generate: {e}",
@@ -307,6 +331,12 @@ pub fn beside(
                 dust_gen::biome::FILE
             )
         })?;
+    // The rules name biomes; this registry numbers them. A name it does not
+    // have is reported and left unbound rather than matched against
+    // everything, because a `biome_is` that matched everything would put a
+    // beach across a continent.
+    let unbound = generator.bind_surface_biomes(|name| names.biome(name));
+    let surface_blocks = generator.surface().map_or(0, |rules| rules.palette().len());
     let settings = generator.settings().clone();
     let world = GeneratedWorld::new(
         generator,
@@ -326,6 +356,8 @@ pub fn beside(
             sea_level: settings.sea_level,
             default_block: settings.default_block.name,
             default_fluid: settings.default_fluid.name,
+            surface_blocks,
+            unbound,
         },
     )))
 }
@@ -340,27 +372,39 @@ pub struct Report {
     pub sea_level: i32,
     pub default_block: String,
     pub default_fluid: String,
+    /// How many distinct blocks the dimension's surface rules can write. Zero
+    /// means the settings carried no rules and the ground is bare stone.
+    pub surface_blocks: usize,
+    /// Biomes the rules ask about that this registry does not have.
+    pub unbound: Vec<String>,
 }
 
 impl Report {
     pub fn summary(&self, seed: i64) -> String {
-        format!(
+        let surface = if self.surface_blocks == 0 {
+            "no surface rules, so the ground is the default block".to_owned()
+        } else {
+            format!("surface rules over {} block(s)", self.surface_blocks)
+        };
+        let mut line = format!(
             "generating from seed {seed}: {} climate region(s) over {} biome(s), \
-             {} above sea level {}, no surface rules yet so the ground is the \
-             default block{}",
-            self.regions,
-            self.biomes,
-            self.default_fluid,
-            self.sea_level,
-            if self.moved.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    " — and {} biome(s) have moved since the table was written: {}",
-                    self.moved.len(),
-                    self.moved.join(", ")
-                )
-            }
-        )
+             {} above sea level {}, {surface}",
+            self.regions, self.biomes, self.default_fluid, self.sea_level,
+        );
+        if !self.moved.is_empty() {
+            line.push_str(&format!(
+                " — and {} biome(s) have moved since the table was written: {}",
+                self.moved.len(),
+                self.moved.join(", ")
+            ));
+        }
+        if !self.unbound.is_empty() {
+            line.push_str(&format!(
+                " — and the surface rules name {} biome(s) this registry does not have: {}",
+                self.unbound.len(),
+                self.unbound.join(", ")
+            ));
+        }
+        line
     }
 }

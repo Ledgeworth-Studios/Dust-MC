@@ -238,6 +238,14 @@ enum Rung {
     /// the default block and not grass; that is vanilla's own noise stage and
     /// decision record 0012 puts the rules after it.
     Density,
+    /// Dust's terrain with the dimension's own surface rules painted over it:
+    /// grass on dirt, sand on a beach, gravel on a shore, snow and ice where
+    /// it is cold, and the deepslate the rules put under the stone.
+    ///
+    /// **The last rung a server could run in.** Everything below it reads the
+    /// region file. Aquifers have still not run, so every pocket below the sea
+    /// level holds water where vanilla would leave most of it dry.
+    Surface,
     /// The flat stack again, with each column's grass at the y Minecraft's
     /// `MOTION_BLOCKING` puts it. The terrain's *shape*, and nothing else:
     /// stone is still dirt, an ocean is still filled in solid.
@@ -262,11 +270,12 @@ enum Rung {
 
 impl Rung {
     /// The ladder, in order.
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Flat,
         Self::FlatAtSeaLevel,
         Self::Biomes,
         Self::Density,
+        Self::Surface,
         Self::Heights,
         Self::Carvers,
         Self::BelowTheSurface,
@@ -279,6 +288,7 @@ impl Rung {
             Self::FlatAtSeaLevel => "+ the world's own sea level",
             Self::Biomes => "+ Dust's biome source                    (the multi-noise climate)",
             Self::Density => "+ Dust's terrain                         (the density functions)",
+            Self::Surface => "+ Dust's surface rules                   (the block underfoot)",
             Self::Heights => "+ Minecraft's surface height             (the ceiling above it)",
             Self::Carvers => "+ Minecraft's carvers                    (caves)",
             Self::BelowTheSurface => {
@@ -293,7 +303,7 @@ impl Rung {
     fn reads_the_region_file(self) -> bool {
         !matches!(
             self,
-            Self::Flat | Self::FlatAtSeaLevel | Self::Biomes | Self::Density
+            Self::Flat | Self::FlatAtSeaLevel | Self::Biomes | Self::Density | Self::Surface
         )
     }
 }
@@ -378,6 +388,9 @@ struct Scores {
     /// produce one, so a run with any is a run with something unexplained in
     /// it.
     opened_wrongly: u64,
+    /// Cells below Minecraft's surface that Minecraft left open and Dust
+    /// filled with the dimension's fluid — what an aquifer would be worth.
+    flooded: u64,
     cells: u64,
     block_agree: u64,
     /// What Minecraft has where Dust is wrong, most common first.
@@ -408,6 +421,8 @@ struct Model<'a> {
     /// basalt world generates one.
     solid: u32,
     fluid: u32,
+    /// The surface rules' result blocks, resolved once.
+    surface: &'a [u32],
 }
 
 /// Resolve a block the noise settings named, properties and all.
@@ -479,8 +494,28 @@ fn generator(version: &str, seed: i64, names: &RegistryNames) -> Result<Generato
         table.display(),
         data.display()
     );
-    let generator =
+    let mut generator =
         Generator::new(&data, "overworld", seed, parameters).map_err(|e| e.to_string())?;
+    let unbound = generator.bind_surface_biomes(|name| names.biome(name));
+    match generator.surface() {
+        Some(rules) => println!(
+            "surface rules: {} result block(s) over {} biome name(s) from {}",
+            rules.palette().len(),
+            rules.biome_names().len(),
+            data.join("minecraft/worldgen/noise_settings/overworld.json")
+                .display()
+        ),
+        None => {
+            println!("surface rules: none in this dimension's settings, so the ground is stone")
+        }
+    }
+    if !unbound.is_empty() {
+        println!(
+            "  {} biome name(s) the rules ask about are not in this registry: {}",
+            unbound.len(),
+            unbound.join(", ")
+        );
+    }
     let settings = generator.settings();
     println!(
         "terrain: {}x{} cells over y {}..{}, sea level {}, {} and {}",
@@ -578,6 +613,14 @@ fn measure(options: &Options) -> Result<(), String> {
     }
 
     let source = generator(&options.version, options.seed, &names)?;
+    let surface_states = match source.surface() {
+        Some(rules) => rules
+            .palette()
+            .iter()
+            .map(spec_state)
+            .collect::<Result<Vec<u32>, String>>()?,
+        None => Vec::new(),
+    };
     let model = Model {
         flat: &flat,
         blocks: &blocks,
@@ -586,6 +629,7 @@ fn measure(options: &Options) -> Result<(), String> {
         constants: constants.as_ref().map(|(_, table)| table),
         solid: spec_state(&source.settings().default_block)?,
         fluid: spec_state(&source.settings().default_fluid)?,
+        surface: &surface_states,
     };
 
     let mut ladder = Vec::new();
@@ -603,9 +647,38 @@ fn measure(options: &Options) -> Result<(), String> {
             let built = build(rung, chunk, surface, &model, &mut sampler);
             scores.built += started.elapsed();
             weigh(&built, &mut scores);
-            score(&built, chunk, surface, &blocks, &names, height, &mut scores);
+            score(
+                &built,
+                chunk,
+                surface,
+                &blocks,
+                &names,
+                height,
+                model.fluid,
+                &mut scores,
+            );
         }
         report(rung, &scores);
+        if rung == Rung::Surface {
+            // Counted, not assumed. `minecraft:temperature` answers `false`
+            // without looking and the badlands bands are the one table in the
+            // rules that is not in the pack, so both are worth a number: a gap
+            // nobody's world reaches is not a gap, and one that every column
+            // reaches is the next piece of work.
+            println!(
+                "      {} of those {} missing cave cell(s) are pockets Dust flooded with {}, \
+                 which is what an aquifer would be worth",
+                scores.flooded,
+                scores.carved - scores.carved_open,
+                source.settings().default_fluid.name
+            );
+            let (temperature, bandlands) = sampler.declined();
+            println!(
+                "      the rules asked `minecraft:temperature` {temperature} time(s), which this \
+                 generator answers `false` without looking, and a badlands band decided \
+                 {bandlands} block(s)"
+            );
+        }
         ladder.push((rung, scores));
     }
     summary(&ladder);
@@ -644,6 +717,7 @@ fn build(
         constants,
         solid,
         fluid,
+        surface: surface_blocks,
     } = *model;
     // Rung zero is the server's own column, cloned rather than rebuilt: that
     // clone is also what `Source::column` hands out for a position a real
@@ -681,12 +755,16 @@ fn build(
     );
 
     let top = height.min_y() + height.height() as i32;
-    if rung == Rung::Density {
+    if rung == Rung::Density || rung == Rung::Surface {
         // The world's own floor is bedrock on every rung of this ladder,
         // including the control, because vanilla's is: the bedrock gradient is
         // true at and below the bottom without a die being rolled. What is
         // above it here is the noise stage and nothing else.
-        let materials = generator.terrain(vanilla.pos().x, vanilla.pos().z);
+        let materials = if rung == Rung::Surface {
+            generator.surface(vanilla.pos().x, vanilla.pos().z)
+        } else {
+            generator.terrain(vanilla.pos().x, vanilla.pos().z)
+        };
         for z in 0..16u32 {
             for x in 0..16u32 {
                 for y in height.min_y()..top {
@@ -698,6 +776,7 @@ fn build(
                             Material::Air => air,
                             Material::Solid => solid,
                             Material::Fluid => fluid,
+                            Material::Surface(index) => surface_blocks[index as usize],
                         }
                     };
                     if state != air {
@@ -714,7 +793,7 @@ fn build(
                 // level everywhere; the rest take it from Minecraft, and a column
                 // Minecraft left empty gets no ground at all rather than a guess.
                 let ground = match rung {
-                    Rung::Flat | Rung::Density => unreachable!("handled above"),
+                    Rung::Flat | Rung::Density | Rung::Surface => unreachable!("handled above"),
                     Rung::FlatAtSeaLevel | Rung::Biomes => Some(SEA_LEVEL),
                     _ => surface[column],
                 };
@@ -723,7 +802,9 @@ fn build(
                         blocks.palette.bedrock
                     } else {
                         match rung {
-                            Rung::Flat | Rung::Density => unreachable!("handled above"),
+                            Rung::Flat | Rung::Density | Rung::Surface => {
+                                unreachable!("handled above")
+                            }
                             Rung::FlatAtSeaLevel | Rung::Biomes | Rung::Heights => {
                                 stack(y, ground, blocks)
                             }
@@ -764,7 +845,7 @@ fn build(
                 }
             }
         }
-    } else if matches!(rung, Rung::Biomes | Rung::Density) {
+    } else if matches!(rung, Rung::Biomes | Rung::Density | Rung::Surface) {
         // Quart coordinates: the cell index, which is the block position
         // shifted down by two. The x and z of the chunk are added first,
         // because a climate is a fact about where in the world the column is
@@ -822,6 +903,7 @@ fn weigh(chunk: &Chunk, scores: &mut Scores) {
 }
 
 /// Score one built chunk against the one Minecraft wrote.
+#[allow(clippy::too_many_arguments)]
 fn score(
     dust: &Chunk,
     vanilla: &Chunk,
@@ -829,6 +911,7 @@ fn score(
     blocks: &Blocks,
     names: &RegistryNames,
     height: WorldHeight,
+    model_fluid: u32,
     scores: &mut Scores,
 ) {
     let dust_surface = surface_of(dust);
@@ -884,7 +967,20 @@ fn score(
                         scores.carved += 1;
                         scores.carved_open += 1;
                     }
-                    (true, false) => scores.carved += 1,
+                    (true, false) => {
+                        scores.carved += 1;
+                        // ... and of those, the ones Dust filled with the
+                        // dimension's own fluid rather than its rock. That is
+                        // the aquifer's share of the cave score: vanilla runs
+                        // its noise caves through an aquifer that leaves most
+                        // of them dry, and a generator without one floods
+                        // every pocket below the sea level. Kept apart because
+                        // it is a *different* stage from carving and a single
+                        // "caves missing" count cannot say which owns it.
+                        if built == model_fluid {
+                            scores.flooded += 1;
+                        }
+                    }
                     (false, true) => scores.opened_wrongly += 1,
                     (false, false) => {}
                 }
@@ -1313,6 +1409,10 @@ mod tests {
             names,
             height,
             constants: None,
+            // The scratch pack carries no `surface_rule`, so nothing here can
+            // reach this table. An empty one panics rather than painting the
+            // wrong block, which is the right way round.
+            surface: &[],
             solid: dust_registry::Block::from_name("minecraft:stone")
                 .expect("stone")
                 .default_state()
@@ -1348,6 +1448,10 @@ mod tests {
             &mut source.columns(),
         );
         let mut scores = Scores::default();
+        let water = dust_registry::Block::from_name("minecraft:water")
+            .expect("water")
+            .default_state()
+            .id();
         score(
             &built,
             &vanilla,
@@ -1355,6 +1459,7 @@ mod tests {
             &blocks,
             &names,
             height,
+            water,
             &mut scores,
         );
         assert_eq!(scores.block_agree, scores.cells, "blocks");
@@ -1398,6 +1503,10 @@ mod tests {
         built.recompute_heightmaps(world::heightmap_predicate(blocks.palette.air, None));
 
         let mut scores = Scores::default();
+        let water = dust_registry::Block::from_name("minecraft:water")
+            .expect("water")
+            .default_state()
+            .id();
         score(
             &built,
             &vanilla,
@@ -1405,6 +1514,7 @@ mod tests {
             &blocks,
             &names,
             height,
+            water,
             &mut scores,
         );
         assert_eq!(scores.block_agree, scores.cells - 1, "exactly one cell");
@@ -1445,6 +1555,10 @@ mod tests {
                 &blocks,
                 &names,
                 height,
+                dust_registry::Block::from_name("minecraft:water")
+                    .expect("water")
+                    .default_state()
+                    .id(),
                 &mut scores,
             );
             assert_eq!(scores.carved, 16, "4x4 cells of cave_air");
@@ -1672,9 +1786,9 @@ mod tests {
 
     #[test]
     fn the_ladder_changes_one_thing_per_rung_and_ends_at_the_control() {
-        assert_eq!(Rung::ALL.len(), 8);
+        assert_eq!(Rung::ALL.len(), 9);
         assert_eq!(Rung::ALL[0], Rung::Flat);
-        assert_eq!(*Rung::ALL.last().expect("eight"), Rung::Everything);
+        assert_eq!(*Rung::ALL.last().expect("nine"), Rung::Everything);
         assert!(!Rung::Flat.reads_the_region_file());
         assert!(!Rung::FlatAtSeaLevel.reads_the_region_file());
         assert!(
@@ -1683,7 +1797,12 @@ mod tests {
         );
         assert!(
             !Rung::Density.reads_the_region_file(),
-            "the terrain rung answers for itself too, and is the last rung that does"
+            "the terrain rung answers for itself too"
+        );
+        assert!(
+            !Rung::Surface.reads_the_region_file(),
+            "the surface rung reads the operator's own data pack and is the last rung \
+             a server could run in"
         );
         assert!(Rung::Heights.reads_the_region_file());
     }

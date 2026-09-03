@@ -90,16 +90,21 @@ generates the world its seed says is there: `dust-gen` samples the six climate
 values Minecraft picks a biome from and evaluates its `final_density` over
 Minecraft's own interpolation lattice, so the mountains, valleys, coastlines and
 sea floors are where vanilla puts them and the biome of a cell is the biome
-vanilla gives it. **Not** the surface rules, aquifers, carvers or features that
-come after, so the ground is stone and there are no trees. How far that is from
-the world Minecraft generates for the same seed is measured rather than
-estimated — `cargo xtask harness worldgen` scores it in five parts. Decision
-record
+vanilla gives it — then paints the dimension's own **surface rules** over the
+result, so a player lands on grass over dirt, sand on a beach, gravel on a shore
+and deepslate below, and not on stone. **Not** the aquifers, carvers or features
+that come after, so there are no trees and every pocket below sea level holds
+water where vanilla would leave it dry. How far that is from the world Minecraft
+generates for the same seed is measured rather than estimated — `cargo xtask
+harness worldgen` scores it in five parts. Decision record
 [0012](docs/decisions/0012-what-worldgen-is-worth-measured-first.md) is what
 each stage of vanilla's pipeline is worth and the order to build them in,
-[0021](docs/decisions/0021-which-biome-a-cell-gets.md) is the biome source, and
+[0021](docs/decisions/0021-which-biome-a-cell-gets.md) is the biome source,
 [0026](docs/decisions/0026-the-terrain-dust-serves-and-what-it-does-at-the-seam.md)
-is the terrain and what a served world does at the edge of a world file. A world
+is the terrain and what a served world does at the edge of a world file, and
+[0032](docs/decisions/0032-what-the-ground-is-made-of.md) is the block underfoot
+— and the finding that two thirds of what reads as a missing carver is a missing
+aquifer. A world
 is a disc in an infinite plane and a player can walk off the edge of it: with
 that world's own seed, read from the `level.dat` beside it, the far side is the
 terrain it would have had; without one, the superflat runs on as it always did,
@@ -277,11 +282,11 @@ what it costs at 1, 10 and 100 players — which is *more* memory, for a reason
 that is about the player and not about the megabytes.
 
 **Not yet**, and each of these is stated where the code for it would go: **no
-surface rules, aquifers, carvers or features**, so a generated world's ground is
-stone rather than grass, it has no trees or ore veins, and every pocket below
-sea level holds water where vanilla would leave it dry — decision record
-[0026](docs/decisions/0026-the-terrain-dust-serves-and-what-it-does-at-the-seam.md)
-is what each of those is worth on the same sample; **nothing keeps a generated
+aquifers, carvers or features**, so a generated world has no trees or ore veins,
+its noise caves are flooded where vanilla leaves them dry, and there are no
+icebergs — decision record
+[0032](docs/decisions/0032-what-the-ground-is-made-of.md)
+is what each of those is worth on the same sample, in cells; **nothing keeps a generated
 column**, so a world with no file behind it builds every column a player walks
 toward on the thread that asked, which is what an Anvil column cost before
 record 0025; no
