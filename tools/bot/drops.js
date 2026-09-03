@@ -45,7 +45,7 @@ const fs = require('fs')
 const VERSION = '1.21.1'
 const JOIN_TIMEOUT_MS = 30000
 const SETTLE_MS = 900
-const DIG_TIMEOUT_MS = 20000
+const DIG_TIMEOUT_MS = 45000
 
 /// Where a survival arena is built. High enough to be above any terrain the
 /// world generated and below the build limit by a margin.
@@ -71,10 +71,12 @@ const port = Number(argv[0])
 if (!port) usage('a port is the first argument')
 let survival = false
 let gate = false
+let times = false
 let tools = ['netherite_pickaxe']
 const rest = []
 for (let i = 1; i < argv.length; i++) {
   if (argv[i] === '--survival') survival = true
+  else if (argv[i] === '--times') times = true
   else if (argv[i] === '--check') gate = true
   else if (argv[i] === '--tool') tools = argv[++i].split(',').filter(Boolean)
   else rest.push(argv[i])
@@ -226,6 +228,38 @@ async function walkTo (b, x, y, z) {
   }
 }
 
+/// How long the **server** takes to break a block that is already there.
+///
+/// Not `bot.dig`, and the difference is the whole measurement: mineflayer
+/// computes its own break time from its own copy of Minecraft's numbers, waits
+/// that long and then says it is done, so timing it measures prismarine. This
+/// sends `START_DESTROY_BLOCK` once, never sends a stop, and waits for the cell
+/// to become air — because a vanilla server that is never told to stop keeps
+/// counting on its own and destroys the block when *its* progress reaches one.
+/// What comes back is the server's own answer in milliseconds.
+///
+/// A poll rather than a packet listener, at half a tick, because the answer
+/// wanted is "which tick did it go" and any read finer than that is measuring
+/// the poll.
+async function timeBreak (b, at) {
+  const started = Date.now()
+  b._client.write('block_dig', {
+    status: 0,
+    location: { x: at.x, y: at.y, z: at.z },
+    face: 1,
+    sequence: 1
+  })
+  while (Date.now() - started < TIME_LIMIT_MS) {
+    const now = b.blockAt(at)
+    if (now && now.name === 'air') return Date.now() - started
+    await wait(25)
+  }
+  return null
+}
+
+/// How long a timing run waits before calling a break impossible.
+const TIME_LIMIT_MS = 120000
+
 /// What a player feels, asked of a running server.
 async function gateRun () {
   const b = await spawned('Digger')
@@ -258,6 +292,16 @@ async function gateRun () {
     return b.blockAt(at)
   }
 
+  // What is in the hand when the block is broken. Hotbar slot 7 holds a tool
+  // and slot 8 is left empty, so neither of them is the slot `put` fills with
+  // the block being placed — a gate that reused one slot for both would be
+  // holding a stone while it tried to prove what a pickaxe does.
+  async function hand (tool) {
+    if (tool) creativeSlot(b, 43, tool)
+    b._client.write('held_item_slot', { slotId: tool ? 7 : 8 })
+    await wait(200)
+  }
+
   // The cell is four blocks away, which is inside the reach a player breaks
   // at and outside the reach they pick up at. That gap is what makes the
   // pickup check have a negative half: a drop that is collected before
@@ -265,6 +309,7 @@ async function gateRun () {
   //
   // 1. A block that is broken drops.
   let placed = await put('minecraft:stone')
+  await hand('minecraft:netherite_pickaxe')
   check('a stone can be put down to break', placed && placed.name === 'stone',
     placed ? placed.name : 'nothing there')
   let mark = items.mark()
@@ -309,6 +354,11 @@ async function gateRun () {
   mark = items.mark()
   for (let i = 0; i < 2; i++) {
     const again = await put('minecraft:stone')
+    // `put` selects the slot the block came out of, so the tool has to go
+    // back before the break — a stone broken while holding a stone is a
+    // break with the wrong tool, and now that the wrong tool means something
+    // it yields nothing and this check measures a rule it is not about.
+    await hand('minecraft:netherite_pickaxe')
     if (again && again.name === 'stone') await b.dig(b.blockAt(at))
     await wait(600)
   }
@@ -329,6 +379,59 @@ async function gateRun () {
     corrections >= 1 && corrections <= items.all().length,
     `${items.all().length} item(s), ${corrections} correction(s)`)
   if (process.env.DUST_BOT_PACKETS) console.error(JSON.stringify(items.tally()))
+
+  // 7. The same block with an empty hand, which is the rule a player feels
+  // first in a survival world: stone breaks and yields nothing. **Both halves
+  // are asserted** — a server that refused the break would also produce no
+  // item, and the two are entirely different things to stand in front of.
+  const bare = await put('minecraft:stone')
+  await hand(null)
+  mark = items.mark()
+  await b.dig(b.blockAt(at))
+  await wait(SETTLE_MS)
+  const nothing = items.since(mark).filter(e => e.item)
+  const after = b.blockAt(at)
+  check('a bare hand breaks stone and gets nothing for it',
+    Boolean(bare) && bare.name === 'stone' && after && after.name === 'air' &&
+      nothing.length === 0,
+    `${after ? after.name : 'unloaded'} afterwards, ` +
+      (nothing.map(e => `${e.item}*${e.count}`).join(',') || 'nothing dropped'))
+  await hand('minecraft:netherite_pickaxe')
+
+  // 8. A wall block yields the block its loot table is named after. Sixty
+  // blocks drop nothing without `dust-blocks.tsv`, and this is one of them:
+  // `oak_wall_sign` draws from `blocks/oak_sign.json`, which no rule about
+  // names arrives at. The sign is placed against the *side* of a stone, so
+  // the server's own placement decides it is the wall form.
+  const anchor = await put('minecraft:stone')
+  const signAt = at.offset(-1, 0, 0)
+  creativeSlot(b, 36, 'minecraft:oak_sign')
+  b._client.write('held_item_slot', { slotId: 0 })
+  await wait(200)
+  b._client.write('block_place', {
+    hand: 0,
+    location: { x: at.x, y: at.y, z: at.z },
+    direction: 4,
+    cursorX: 0.0,
+    cursorY: 0.5,
+    cursorZ: 0.5,
+    insideBlock: false,
+    sequence: 2
+  })
+  await wait(500)
+  const sign = b.blockAt(signAt)
+  check('an oak sign put on the side of a block is a wall sign',
+    Boolean(anchor) && anchor.name === 'stone' && sign && sign.name === 'oak_wall_sign',
+    sign ? sign.name : 'nothing there')
+  await hand('minecraft:netherite_pickaxe')
+  mark = items.mark()
+  if (sign && sign.name === 'oak_wall_sign') await b.dig(sign)
+  await wait(SETTLE_MS)
+  const fromWall = items.since(mark).filter(e => e.item)
+  check('breaking it yields the sign its loot table is named after',
+    fromWall.length === 1 && fromWall[0].item === 'minecraft:oak_sign',
+    fromWall.map(e => `${e.item}*${e.count}`).join(',') || 'nothing')
+
 
   b.quit()
   const failed = results.filter(r => !r.ok).length
@@ -373,7 +476,10 @@ async function main () {
     // measurement's clothes. Haste changes how long a break takes and nothing
     // about what comes out of it, so this survey can have as much of it as the
     // game will give.
-    say(`effect give Digger minecraft:haste 99999 255 true`)
+    // No haste at all in a timing run: haste is the largest single term in
+    // Minecraft's own break-time formula and a run that has it is measuring
+    // the effect rather than the block.
+    if (!times) say(`effect give Digger minecraft:haste 99999 255 true`)
     say(`effect give Digger minecraft:saturation 99999 5 true`)
     // A floor to stand the blocks on, and air above it so nothing falls in.
     say(`fill ${stood.x - 8} ${ARENA_Y} ${stood.z - 8} ${stood.x + 8} ${ARENA_Y + 4} ${stood.z + 8} minecraft:air`)
@@ -467,6 +573,12 @@ async function main () {
       continue
     }
 
+    if (times) {
+      const took = await timeBreak(b, at)
+      rows.push([block, tool, took === null ? 'TIMED OUT' : String(took),
+        took === null ? '-' : String(Math.round(took / 50))])
+      continue
+    }
     const mark = items.mark()
     let dug = true
     try {
@@ -524,6 +636,13 @@ async function main () {
     }
   }
 
+  if (times) {
+    console.log('# block\ttool\tms\tticks')
+    for (const row of rows) console.log(row.join('\t'))
+    console.error(`${rows.length} timing(s)`)
+    b.quit()
+    process.exit(0)
+  }
   console.log('# block\ttool\toutcome\tdrops')
   for (const row of rows) console.log(row.join('\t'))
   console.error(`${rows.length} block(s), ${items.collected.length} picked up`)
