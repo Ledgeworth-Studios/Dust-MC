@@ -31,7 +31,7 @@
 //! than data, and the same route that recovered the surface system's own
 //! constants. **Nothing Mojang's is committed**: what is here is this file's
 //! own arithmetic, and every *number* the world is generated from still
-//! arrives at run time from the pack. Decision record 0034 records what was
+//! arrives at run time from the pack. Decision record 0035 records what was
 //! read and what it cost.
 //!
 //! # The shape of the algorithm
@@ -343,18 +343,16 @@ impl Flow<'_> {
         let third = self.status_of_centre(at[2]);
         let similarity_13 = similarity(best[0], best[2]);
         if similarity_13 > 0.0 {
-            let pressure = similarity_12
-                * similarity_13
-                * self.pressure(x, y, z, &mut barrier, first, third);
+            let pressure =
+                similarity_12 * similarity_13 * self.pressure(x, y, z, &mut barrier, first, third);
             if density + pressure > 0.0 {
                 return Substance::Rock;
             }
         }
         let similarity_23 = similarity(best[1], best[2]);
         if similarity_23 > 0.0 {
-            let pressure = similarity_12
-                * similarity_23
-                * self.pressure(x, y, z, &mut barrier, second, third);
+            let pressure =
+                similarity_12 * similarity_23 * self.pressure(x, y, z, &mut barrier, second, third);
             if density + pressure > 0.0 {
                 return Substance::Rock;
             }
@@ -416,10 +414,8 @@ impl Flow<'_> {
             // the answer, so it is not sampled.
             0.0
         } else {
-            *barrier.get_or_insert_with(|| {
-                self.evaluator
-                    .compute(self.aquifer.routes.barrier, x, y, z)
-            })
+            *barrier
+                .get_or_insert_with(|| self.evaluator.compute(self.aquifer.routes.barrier, x, y, z))
         };
         2.0 * (noise + pressure)
     }
@@ -473,12 +469,7 @@ impl Flow<'_> {
     ///
     /// The `y` range must sit at or above the height the global picker starts
     /// answering lava at, so that "the global one" is a single status.
-    pub fn box_is_global(
-        &mut self,
-        x: (i32, i32),
-        y: (i32, i32),
-        z: (i32, i32),
-    ) -> bool {
+    pub fn box_is_global(&mut self, x: (i32, i32), y: (i32, i32), z: (i32, i32)) -> bool {
         let global = self.aquifer.global(y.1);
         if y.0 < self.aquifer.lava_below || self.aquifer.global(y.0) != global {
             return false;
@@ -486,11 +477,7 @@ impl Flow<'_> {
         // The same window `substance` searches, widened to the whole box: the
         // grid cell of the lowest corner through one past the grid cell of the
         // highest.
-        let low = [
-            grid_x(x.0 - 5),
-            grid_y(y.0 + 1) - 1,
-            grid_z(z.0 - 5),
-        ];
+        let low = [grid_x(x.0 - 5), grid_y(y.0 + 1) - 1, grid_z(z.0 - 5)];
         let high = [
             grid_x(x.1 - 5) + 1,
             grid_y(y.1 + 1) + 1,
@@ -769,7 +756,9 @@ mod tests {
     fn quantising_the_spread_flattens_a_lake() {
         // floor(v / 3) * 3, so eleven consecutive noise values land on four
         // levels and not eleven.
-        let levels: Vec<i32> = (-5..6).map(|v| (f64::from(v) / 3.0).floor() as i32 * 3).collect();
+        let levels: Vec<i32> = (-5..6)
+            .map(|v| (f64::from(v) / 3.0).floor() as i32 * 3)
+            .collect();
         assert_eq!(levels, vec![-6, -6, -3, -3, -3, 0, 0, 0, 3, 3, 3]);
     }
 }

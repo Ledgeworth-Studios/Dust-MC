@@ -228,7 +228,11 @@ pub fn router(root: &Path, dimension: &str, seed: i64) -> Result<Router, BuildEr
     let aquifer = if shape.aquifers_enabled {
         Some(AquiferRoutes {
             barrier: builder.compile_route(&table, "barrier", &settings_path)?,
-            floodedness: builder.compile_route(&table, "fluid_level_floodedness", &settings_path)?,
+            floodedness: builder.compile_route(
+                &table,
+                "fluid_level_floodedness",
+                &settings_path,
+            )?,
             spread: builder.compile_route(&table, "fluid_level_spread", &settings_path)?,
             lava: builder.compile_route(&table, "lava", &settings_path)?,
             erosion: builder.compile_route(&table, "erosion", &settings_path)?,

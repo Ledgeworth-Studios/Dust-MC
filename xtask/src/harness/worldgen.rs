@@ -298,7 +298,9 @@ impl Rung {
             Self::Biomes => "+ Dust's biome source                    (the multi-noise climate)",
             Self::Density => "+ Dust's terrain                         (the density functions)",
             Self::Surface => "+ Dust's surface rules                   (the block underfoot)",
-            Self::Aquifers => "+ Dust's aquifers                        (whether a cave drowns you)",
+            Self::Aquifers => {
+                "+ Dust's aquifers                        (whether a cave drowns you)"
+            }
             Self::Heights => "+ Minecraft's surface height             (the ceiling above it)",
             Self::Carvers => "+ Minecraft's carvers                    (caves)",
             Self::BelowTheSurface => {
@@ -1826,9 +1828,9 @@ mod tests {
 
     #[test]
     fn the_ladder_changes_one_thing_per_rung_and_ends_at_the_control() {
-        assert_eq!(Rung::ALL.len(), 9);
+        assert_eq!(Rung::ALL.len(), 10);
         assert_eq!(Rung::ALL[0], Rung::Flat);
-        assert_eq!(*Rung::ALL.last().expect("nine"), Rung::Everything);
+        assert_eq!(*Rung::ALL.last().expect("ten"), Rung::Everything);
         assert!(!Rung::Flat.reads_the_region_file());
         assert!(!Rung::FlatAtSeaLevel.reads_the_region_file());
         assert!(
@@ -1841,8 +1843,12 @@ mod tests {
         );
         assert!(
             !Rung::Surface.reads_the_region_file(),
-            "the surface rung reads the operator's own data pack and is the last rung \
-             a server could run in"
+            "the surface rung reads the operator's own data pack"
+        );
+        assert!(
+            !Rung::Aquifers.reads_the_region_file(),
+            "the aquifer rung is the operator's own pack and this crate's own \
+             arithmetic, and is the last rung a server could run in"
         );
         assert!(Rung::Heights.reads_the_region_file());
     }

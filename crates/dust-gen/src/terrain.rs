@@ -776,6 +776,14 @@ mod tests {
                      "xz_scale": 1.0, "y_scale": {y_scale}}}"#
             )
         };
+        let barrier = noise("aq_barrier", 0.5);
+        let flood = noise("aq_flood", 0.67);
+        let spread = noise("aq_spread", 0.7142857142857143);
+        let lava = noise("aq_lava", 1.0);
+        let cave = format!(
+            r#"{{"type": "minecraft:mul", "argument1": 3.5, "argument2": {}}}"#,
+            noise("aq_cave", 1.0)
+        );
         write(
             root,
             "minecraft/worldgen/noise_settings/overworld.json",
@@ -798,15 +806,7 @@ mod tests {
                                                          "argument": {{
                                         "type": "minecraft:add",
                                         "argument1": {UNJAGGED},
-                                        "argument2": {cave}}}}}}}}}"#,
-                cave = format!(
-                    r#"{{"type": "minecraft:mul", "argument1": 3.5, "argument2": {}}}"#,
-                    noise("aq_cave", 1.0)
-                ),
-                barrier = noise("aq_barrier", 0.5),
-                flood = noise("aq_flood", 0.67),
-                spread = noise("aq_spread", 0.7142857142857143),
-                lava = noise("aq_lava", 1.0),
+                                        "argument2": {cave}}}}}}}}}"#
             ),
         );
     }
