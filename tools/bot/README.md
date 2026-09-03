@@ -13,6 +13,31 @@ wrote it. Since then it has found a missing `set_health` (and the fact that
 *where* that packet sits in the join burst is load-bearing), and it is what a
 `player_command` decoder one VarInt short was caught failing.
 
+## The movement recorder
+
+`movement.js` is the same idea pointed at a different question. Rather than
+checking what the server said, it records what the *client* sent: it hooks
+mineflayer's own packet writer and counts the displacement in every position
+packet, while the bot walks, sprints, sprint-jumps, flies, falls three hundred
+blocks and walks through a simulated 700 ms network stall.
+
+```
+node movement.js 25581           # print the distribution
+node movement.js 25581 --check   # and assert the server corrects a liar
+```
+
+It exists because `[server] movement_speed_limit` is a number somebody has to
+choose, and a number chosen without this one is a number that rubber-bands
+players on bad connections. Decision record 0012 is its output. The `--check`
+run does both halves: a bot that claims to be 707 blocks away has to be put
+back, and a bot that takes an ordinary 0.3-block step has to be left alone.
+
+**The stall row is the one worth reading.** A connection that stops for 700 ms
+and then delivers everything it queued produces exactly the same displacements
+as an unstalled walk — the packets bunch, the steps do not. A validator that
+charges a movement budget by the clock refuses an honest client for arriving
+early, and this is where that would show up.
+
 ## Running it
 
 ```

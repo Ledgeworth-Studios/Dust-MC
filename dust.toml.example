@@ -30,6 +30,18 @@ view_distance = 10
 # and the server refuses to start rather than let you find that out in game.
 interaction_range = 6.0
 
+# How far a player may move in one tick, in blocks, before the server stops
+# believing them and teleports them back where they were. Measured against a
+# real client rather than guessed: over 1,217 movement packets covering
+# walking, sprinting, sprint-jumping, creative flight, a 300-block free fall
+# and a walk through a 700 ms network stall, the largest single tick was 3.58
+# blocks, and a long enough fall converges on 3.92. Ten is what vanilla allows
+# a player who is not flying an elytra, and the room over honest play is the
+# point: knockback, elytra and riptide are all faster than walking. Raise it
+# for a server with movement mods; `inf` turns the check off. Below 4 the
+# server refuses to start, because below 4 it would correct people for falling.
+movement_speed_limit = 10.0
+
 # After a stall (a slow disk, a paused laptop) the tick loop repays at most
 # this many ticks per pass and skips past anything longer. Twenty is one
 # second of game time: shorter stalls catch up smoothly, longer ones are

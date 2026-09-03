@@ -1075,8 +1075,14 @@ fn a_broken_block_and_a_walked_to_position_both_survive_a_restart() {
     let (x, y, z) = within_reach_of_spawn(3, -60, 5);
     let packed = ((x & 0x3ff_ffff) << 38) | ((z & 0x3ff_ffff) << 12) | (y & 0xfff);
     // Far enough to be a different column, so the position is not
-    // accidentally right by being the spawn one.
-    let walked_to = 40.5f64;
+    // accidentally right by being the spawn one — and reached in two steps of
+    // eight blocks rather than one of sixteen, because sixteen blocks in one
+    // packet is not something a client can do and `dust_guard::Movement` now
+    // says so. The two steps go out back to back with nothing between them,
+    // which is also the bunched-up-after-a-stall case: if the movement budget
+    // were charged by the clock rather than floored at a tick, the second of
+    // these would be refused for arriving too soon after the first.
+    let walked_to = 16.5f64;
 
     {
         let running = start_in(&world_dir, "");
@@ -1093,18 +1099,20 @@ fn a_broken_block_and_a_walked_to_position_both_survive_a_restart() {
             .wait_for(&mut stream, 5)
             .expect("the dig is acknowledged");
 
-        let mut walk = Vec::new();
-        walk.extend_from_slice(&walked_to.to_be_bytes());
-        walk.extend_from_slice(&(-59.0f64).to_be_bytes());
-        walk.extend_from_slice(&0.5f64.to_be_bytes());
-        walk.push(1);
-        send_compressed_frame(&mut stream, 26, &walk);
+        for step in [8.5f64, walked_to] {
+            let mut walk = Vec::new();
+            walk.extend_from_slice(&step.to_be_bytes());
+            walk.extend_from_slice(&(-59.0f64).to_be_bytes());
+            walk.extend_from_slice(&0.5f64.to_be_bytes());
+            walk.push(1);
+            send_compressed_frame(&mut stream, 26, &walk);
+        }
         // Wait for the packet the move *causes*, not for the socket to go
         // quiet. Silence proves only that nothing has arrived yet, and on a
         // slow runner "yet" includes "before the server got to it" — this
-        // failed in CI and passed here for exactly that reason. Walking from
-        // x = 0.5 to x = 40.5 crosses into another column, so a recentre is
-        // the server saying it processed the move.
+        // failed in CI and passed here for exactly that reason. Only the
+        // *second* step crosses a column boundary, so a recentre is the server
+        // saying it processed both.
         client
             .wait_for(&mut stream, 84)
             .expect("the move is processed");
@@ -1205,11 +1213,14 @@ fn two_players_see_each_other_arrive_move_and_leave() {
         "the tab-list row came with the body, not instead of it"
     );
 
-    // The second walks; the first is told where to.
+    // The second walks; the first is told where to. Seven blocks and a bit,
+    // which is a distance a client can cover — sixty-four, which this used to
+    // be, is one `dust_guard::Movement` refuses, and the packet the first
+    // player would then be told about is the correction rather than the walk.
     let mut walk = Vec::new();
-    walk.extend_from_slice(&64.5f64.to_be_bytes());
+    walk.extend_from_slice(&6.5f64.to_be_bytes());
     walk.extend_from_slice(&(-59.0f64).to_be_bytes());
-    walk.extend_from_slice(&8.5f64.to_be_bytes());
+    walk.extend_from_slice(&4.5f64.to_be_bytes());
     walk.push(1);
     send_compressed_frame(&mut second_stream, 26, &walk);
 
@@ -1218,7 +1229,7 @@ fn two_players_see_each_other_arrive_move_and_leave() {
         .expect("the first player is told the second moved");
     let (_, rest) = read_var_int_from(&teleport);
     let x = f64::from_be_bytes(rest[0..8].try_into().expect("eight bytes"));
-    assert_eq!(x, 64.5, "to where they actually went");
+    assert_eq!(x, 6.5, "to where they actually went");
 
     // The second leaves; the first is told to forget them, both halves.
     drop(second_stream);
@@ -2166,6 +2177,78 @@ fn a_render_distance_lowered_mid_game_forgets_what_fell_outside_it() {
         joined.drain_until(&mut stream, |j| j.forgets - forgotten_before >= 72),
         "eighty-one columns down to nine is seventy-two forgotten; saw {}",
         joined.forgets - forgotten_before
+    );
+
+    drop(stream);
+    running.finish();
+}
+
+/// The other half of the reach check: a client that says it is somewhere it
+/// could not have walked to is put back, over a real socket.
+///
+/// The correction is a `player_position` and not a log line, which is the whole
+/// point — a client honours one by moving. What makes this a test of the
+/// *validator* rather than of the packet is where it puts the player: back to
+/// the honest step sent immediately before the impossible one. That single
+/// coordinate says the first move was believed and the second was not, and it
+/// says it without ever waiting for silence, which in this file proves nothing.
+#[test]
+fn a_player_who_claims_to_be_across_the_map_is_put_back() {
+    let running = start("");
+    let addr = running.addr;
+    let mut stream = connect(addr);
+    let mut client = join_as(&mut stream, addr, "Runner");
+    let (spawn_x, spawn_y, spawn_z) = client.spawned_at.expect("a position on join");
+
+    let step = |stream: &mut TcpStream, x: f64| {
+        let mut walk = Vec::new();
+        walk.extend_from_slice(&x.to_be_bytes());
+        walk.extend_from_slice(&spawn_y.to_be_bytes());
+        walk.extend_from_slice(&spawn_z.to_be_bytes());
+        walk.push(1);
+        send_compressed_frame(stream, 26, &walk);
+    };
+
+    // Eight blocks in one packet: more than a walking player covers in a tick
+    // and less than a falling one, so it is inside the limit and has to be
+    // believed. Then five hundred more, which nothing can do.
+    let honest = spawn_x + 8.0;
+    step(&mut stream, honest);
+    step(&mut stream, honest + 500.0);
+
+    let correction = client
+        .wait_for(&mut stream, 64)
+        .expect("the server puts a player back who says they crossed the map");
+    let x = f64::from_be_bytes(correction[0..8].try_into().expect("eight bytes"));
+    assert_eq!(
+        x, honest,
+        "put back to the last position it believed, not to spawn and not to the claim"
+    );
+
+    // Yaw and pitch are marked relative and sent as zero, so the correction
+    // moves the player and does not spin them: a corrected player is already
+    // having their day interrupted.
+    let flags = correction[32];
+    assert_eq!(
+        flags & 0x18,
+        0x18,
+        "the rotation is left alone: {flags:#04x}"
+    );
+    let (teleport_id, _) = read_var_int_from(&correction[33..]);
+    assert_ne!(teleport_id, 1, "a correction takes an id of its own");
+
+    // And the session starts believing this player again once they answer.
+    // Two steps of eight blocks rather than one of sixteen, for the reason the
+    // restart test gives; the second crosses a column and the recentre is the
+    // server saying so.
+    let mut confirm = Vec::new();
+    write_var_int(teleport_id, &mut confirm);
+    send_compressed_frame(&mut stream, 0x00, &confirm);
+    step(&mut stream, 8.5);
+    step(&mut stream, 16.5);
+    assert!(
+        client.wait_for(&mut stream, 84).is_some(),
+        "a corrected player can still walk"
     );
 
     drop(stream);

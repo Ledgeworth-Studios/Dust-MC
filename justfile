@@ -65,3 +65,13 @@ bot port="25565":
 # minutes is not a pull-request gate.
 soak port="25565" minutes="10":
     cd tools/bot && node soak.js {{port}} {{minutes}}
+
+# What a real client's movement packets actually contain, as counts — and,
+# with `check`, whether the server corrects one that lies.
+#
+# Outside `verify` for the same reason `bot` is: it needs a server already
+# running and an npm install. It is what decision record 0012's table came
+# from, and re-running it is how a change to `[server] movement_speed_limit`
+# is argued about with numbers rather than opinions.
+movement port="25565" check="":
+    cd tools/bot && node movement.js {{port}} {{ if check == "check" { "--check" } else { "" } }}

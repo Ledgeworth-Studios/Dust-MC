@@ -82,6 +82,19 @@ pub struct ServerConfig {
     #[config(restart)]
     pub interaction_range: f64,
 
+    /// The furthest, in blocks, a player may move in one tick before the server
+    /// stops believing them and teleports them back. Measured with a real
+    /// client: over 1,217 movement packets covering walking, sprinting,
+    /// sprint-jumping, creative flight, a 300-block free fall and a walk through
+    /// a 700 ms network stall, the largest single tick was 3.58 blocks, and free
+    /// fall's own asymptote is 3.92. Ten is what vanilla's server allows a
+    /// player who is not flying an elytra, and the headroom over honest play is
+    /// deliberate: knockback, elytra and riptide all move a player faster than
+    /// walking. Raise it for a server with movement mods; `inf` turns the check
+    /// off. Below 4 it starts correcting players in an ordinary fall.
+    #[config(restart)]
+    pub movement_speed_limit: f64,
+
     /// The lowest severity the server logs: one of `error`, `warn`, `info`,
     /// `debug`, `trace`. Everything less severe than the chosen level is
     /// suppressed.
@@ -137,6 +150,25 @@ impl Default for ServerConfig {
             // room over, and what it costs is that a cheat reaching 5.9 blocks
             // is not caught — which is not the cheat this exists to stop.
             interaction_range: 6.0,
+            // Ten blocks a tick, which is 200 a second and is vanilla's own
+            // number for a player who is not flying an elytra.
+            //
+            // What an honest client actually produces was measured rather than
+            // assumed — `tools/bot/movement.js`, 1,217 packets — and the whole
+            // distribution sits under 3.6, with everything that is not a free
+            // fall under 1.0. So the default is 2.8 times the fastest honest
+            // thing on this server today, and that margin is the setting's
+            // real content: elytra, riptide, knockback and TNT boosts all move
+            // a player faster than walking and none of them exist here yet. A
+            // limit tuned to what Dust can do this month is a limit that starts
+            // rubber-banding players the month after.
+            //
+            // What it costs is that a steady 9-blocks-a-tick speed hack is not
+            // caught. That is the same hole vanilla has, for the same reason,
+            // and it is not the cheat this exists to stop: the one the README
+            // names is a client that claims to be somewhere it could not have
+            // walked to.
+            movement_speed_limit: 10.0,
             log_level: LogLevel::default(),
             world_source: String::new(),
             favicon: String::new(),
@@ -180,6 +212,20 @@ impl ServerConfig {
             findings.push(Finding::error(
                 format!("{path}.interaction_range"),
                 "must be a number of at least 5; below that the server starts                  refusing blocks a player can legitimately reach, and at 1.62                  or less they cannot break the ground under their own feet",
+            ));
+        }
+        // The floor is free fall. A player who steps off a cliff reaches 3.92
+        // blocks a tick and stays there, so a limit under that corrects
+        // somebody for falling — which is the exact failure this setting is
+        // most able to cause and least able to be forgiven for. Four is the
+        // first whole number above it. `inf` is deliberately allowed, and is
+        // how an operator turns the check off.
+        if self.movement_speed_limit.is_nan() || self.movement_speed_limit < 4.0 {
+            findings.push(Finding::error(
+                format!("{path}.movement_speed_limit"),
+                "must be a number of at least 4, or inf to turn the check off; \
+                 a falling player moves 3.92 blocks a tick, so anything less \
+                 teleports players back for falling",
             ));
         }
         // A ceiling rather than a taste. 32 is vanilla's own maximum and 65x65
