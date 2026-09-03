@@ -40,6 +40,8 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::broadcast;
 
+use super::inventory::{Equipment, EquipmentChange, EQUIPMENT_SLOTS};
+
 /// How many roster changes a slow session may fall behind before it is told.
 ///
 /// Smaller than the block-edit backlog because joins and leaves are rare and a
@@ -65,6 +67,15 @@ pub struct Player {
     pub sneaking: bool,
     /// Running. Same reasoning as [`Player::sneaking`].
     pub sprinting: bool,
+    /// What this player is wearing and holding, in the wire's own slot order.
+    ///
+    /// State, and on the roster for the reason [`Player::sneaking`] is: a
+    /// player who logs in has to be told what everybody is already wearing,
+    /// and the only thing that knows is here. A session that kept its own
+    /// player's equipment and broadcast only changes would leave every
+    /// joining player looking at a world of bare heads until each of its
+    /// inhabitants happened to change a slot.
+    pub equipment: Equipment,
 }
 
 /// Something that happened to the roster.
@@ -119,6 +130,20 @@ pub enum RosterChange {
         entity_id: i32,
         text: dust_protocol::text::Component,
     },
+    /// A player's visible gear changed: only the slots that actually differ,
+    /// and never an empty list.
+    ///
+    /// Carries the difference rather than the whole set because
+    /// `minecraft:set_equipment` charges per entry — a set of six with one
+    /// helmet in it is a seventeen-byte body where the one changed slot is
+    /// seven — and
+    /// because everybody who can receive this has already been told the rest.
+    /// One event for however many slots moved at once, so a player swapping a
+    /// full set of armour costs each viewer one packet and not four.
+    Equipped {
+        entity_id: i32,
+        slots: Vec<EquipmentChange>,
+    },
 }
 
 /// Everyone currently connected.
@@ -164,6 +189,7 @@ impl Roster {
             sneaking: false,
             sprinting: false,
             pitch: 0.0,
+            equipment: std::array::from_fn(|_| None),
         };
 
         let mut players = self.players.lock().expect("the roster is never poisoned");
@@ -260,6 +286,40 @@ impl Roster {
                 sprinting,
             });
         }
+    }
+
+    /// Record what a player is now wearing and holding, and tell everybody
+    /// what changed.
+    ///
+    /// Takes the whole set and works out the difference here, rather than
+    /// asking each caller to. There are five places a container can change and
+    /// a rule spelled at five call sites is a rule that is wrong at one of
+    /// them; and the roster is the only thing that knows what was last said,
+    /// so it is the only thing that can answer "did this change anything".
+    /// Nothing is sent when nothing moved, which is most calls — every click
+    /// in the main inventory is one.
+    pub fn equipped(&self, entity_id: i32, now: Equipment) {
+        let changed = {
+            let mut players = self.players.lock().expect("the roster is never poisoned");
+            let Some(player) = players.get_mut(&entity_id) else {
+                return;
+            };
+            let mut changed: Vec<EquipmentChange> = Vec::new();
+            for (slot, stack) in now.iter().enumerate().take(EQUIPMENT_SLOTS) {
+                if &player.equipment[slot] != stack {
+                    changed.push((slot as u8, stack.clone()));
+                }
+            }
+            if changed.is_empty() {
+                return;
+            }
+            player.equipment = now;
+            changed
+        };
+        let _ = self.changes.send(RosterChange::Equipped {
+            entity_id,
+            slots: changed,
+        });
     }
 
     /// Put a line in everybody's chat log.
@@ -439,6 +499,108 @@ mod tests {
             }
         }
         assert_eq!(heard, 1);
+    }
+
+    /// A set with `count` distinct things in it, at the wire slots named.
+    fn wearing(slots: &[u8]) -> Equipment {
+        let item =
+            dust_registry::Item::from_name("minecraft:stone").expect("stone is in every registry");
+        std::array::from_fn(|index| {
+            slots
+                .contains(&(index as u8))
+                .then(|| super::super::inventory::Stack::new(item, 1))
+        })
+    }
+
+    fn equipment_changes(listener: &mut broadcast::Receiver<RosterChange>) -> Vec<Vec<u8>> {
+        let mut seen = Vec::new();
+        while let Ok(change) = listener.try_recv() {
+            if let RosterChange::Equipped { slots, .. } = change {
+                seen.push(slots.iter().map(|(slot, _)| *slot).collect());
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn four_pieces_at_once_are_one_event_and_not_four() {
+        // The reason the roster takes the whole set rather than a slot: a
+        // player who puts on a full suit of armour in one shift-click storm
+        // should cost each viewer one packet.
+        let roster = Roster::default();
+        let wearer = roster.join(uuid(1), "Wearer".to_owned(), (0.0, 0.0, 0.0));
+        let mut watcher = roster.join(uuid(2), "Watcher".to_owned(), (0.0, 0.0, 0.0));
+
+        roster.equipped(wearer.player.entity_id, wearing(&[2, 3, 4, 5]));
+
+        assert_eq!(
+            equipment_changes(&mut watcher.listener),
+            vec![vec![2, 3, 4, 5]]
+        );
+    }
+
+    #[test]
+    fn only_the_slot_that_moved_is_sent_the_second_time() {
+        // Everybody who can hear this has already been told the rest, and the
+        // packet charges per entry.
+        let roster = Roster::default();
+        let wearer = roster.join(uuid(1), "Wearer".to_owned(), (0.0, 0.0, 0.0));
+        let mut watcher = roster.join(uuid(2), "Watcher".to_owned(), (0.0, 0.0, 0.0));
+
+        roster.equipped(wearer.player.entity_id, wearing(&[2, 3, 4, 5]));
+        let _ = equipment_changes(&mut watcher.listener);
+        roster.equipped(wearer.player.entity_id, wearing(&[0, 2, 3, 4, 5]));
+
+        assert_eq!(equipment_changes(&mut watcher.listener), vec![vec![0]]);
+    }
+
+    #[test]
+    fn a_container_change_that_moved_nothing_visible_sends_nothing() {
+        // Most clicks. Shuffling the main inventory changes no equipment slot,
+        // and a packet per click to every player in the world for a stack of
+        // cobblestone moving from row two to row three is the cost this
+        // comparison exists to refuse.
+        let roster = Roster::default();
+        let wearer = roster.join(uuid(1), "Wearer".to_owned(), (0.0, 0.0, 0.0));
+        let mut watcher = roster.join(uuid(2), "Watcher".to_owned(), (0.0, 0.0, 0.0));
+
+        roster.equipped(wearer.player.entity_id, wearing(&[5]));
+        let _ = equipment_changes(&mut watcher.listener);
+        roster.equipped(wearer.player.entity_id, wearing(&[5]));
+
+        assert!(equipment_changes(&mut watcher.listener).is_empty());
+    }
+
+    #[test]
+    fn a_player_who_joins_later_is_told_what_everybody_is_already_wearing() {
+        // The failure this whole feature is about: without the roster holding
+        // the set, a joining player sees a world of bare heads until each of
+        // its inhabitants happens to change a slot.
+        let roster = Roster::default();
+        let wearer = roster.join(uuid(1), "Wearer".to_owned(), (0.0, 0.0, 0.0));
+        roster.equipped(wearer.player.entity_id, wearing(&[0, 5]));
+
+        let later = roster.join(uuid(2), "Later".to_owned(), (0.0, 0.0, 0.0));
+
+        let seen = later
+            .existing
+            .iter()
+            .find(|player| player.entity_id == wearer.player.entity_id)
+            .expect("the wearer is already here");
+        assert!(seen.equipment[0].is_some(), "and holding something");
+        assert!(seen.equipment[5].is_some(), "and wearing a helmet");
+        assert!(seen.equipment[1].is_none(), "and nothing in the offhand");
+    }
+
+    #[test]
+    fn equipping_a_player_who_already_left_is_ignored_rather_than_a_panic() {
+        // The same race as a movement: the container write and the disconnect
+        // arrive together and the disconnect can win.
+        let roster = Roster::default();
+        let gone = roster.join(uuid(1), "Gone".to_owned(), (0.0, 0.0, 0.0));
+        roster.leave(gone.player.entity_id);
+        roster.equipped(gone.player.entity_id, wearing(&[5]));
+        assert_eq!(roster.count(), 0);
     }
 
     #[test]

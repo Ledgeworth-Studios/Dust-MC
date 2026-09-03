@@ -45,6 +45,7 @@ use dust_protocol::packets::play;
 use dust_protocol::packets::play::chunk::{
     ChunkData, LightArray, Section as WireSection, LIGHT_SECTION_BYTES,
 };
+use dust_protocol::packets::play::containers::{EquipmentEntries, EquipmentEntry, EquipmentSlot};
 use dust_protocol::packets::play::metadata;
 use dust_protocol::packets::play::{GameModeByte, Gamemode, PreviousGameMode, TeleportFlags};
 use dust_protocol::types::{BitSet, Identifier, PrefixedBytes, VarInt};
@@ -582,6 +583,54 @@ pub fn turn_head(entity_id: i32, yaw: f32) -> play::clientbound::RotateHead {
     }
 }
 
+/// What somebody else is wearing and holding.
+///
+/// `slots` is the difference, not the set: the packet charges a byte plus a
+/// slot per entry, so the six-entry set a one-slot change would otherwise send
+/// is a seventeen-byte body where the entry alone is seven. One packet however
+/// many slots moved, which is why the caller batches rather than looping.
+///
+/// `None` when there is nothing to say. The encoder refuses an empty entry
+/// list — a bare "no equipment" is a frame the client reads as garbage — so
+/// the emptiness is answered here rather than at four call sites.
+pub fn set_equipment(
+    entity_id: i32,
+    slots: &[super::inventory::EquipmentChange],
+) -> Option<play::clientbound::SetEquipment> {
+    let entries: Vec<EquipmentEntry> = slots
+        .iter()
+        .filter_map(|(wire_slot, stack)| {
+            Some(EquipmentEntry {
+                slot: EquipmentSlot::from_discriminant(i32::from(*wire_slot))?,
+                item: super::inventory::to_wire(stack.as_ref()),
+            })
+        })
+        .collect();
+    (!entries.is_empty()).then_some(play::clientbound::SetEquipment {
+        entity_id: VarInt(entity_id),
+        entries: EquipmentEntries(entries),
+    })
+}
+
+/// The same, for a player who has just come into view: everything they are
+/// wearing that is not empty.
+///
+/// Empty slots are left out because a client that has just been told an entity
+/// exists already has all six empty — the packet is only worth its bytes for
+/// the ones that are not. A player in full diamond costs a viewer a
+/// thirty-seven-byte body on sight, and a player carrying nothing costs
+/// nothing at all.
+pub fn equipment_on_sight(player: &Player) -> Option<play::clientbound::SetEquipment> {
+    let slots: Vec<super::inventory::EquipmentChange> = player
+        .equipment
+        .iter()
+        .enumerate()
+        .filter(|(_, stack)| stack.is_some())
+        .map(|(wire_slot, stack)| (wire_slot as u8, stack.clone()))
+        .collect();
+    set_equipment(player.entity_id, &slots)
+}
+
 /// Take a player's body away.
 pub fn despawn(entity_id: i32) -> play::clientbound::RemoveEntities {
     play::clientbound::RemoveEntities {
@@ -698,6 +747,7 @@ pub fn frozen_at_noon() -> play::clientbound::SetTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::inventory::EQUIP_HELMET;
     use dust_protocol::types::Position;
 
     /// A constants table where every state places `minecraft:block.stone.place`
@@ -718,6 +768,96 @@ mod tests {
             ));
         }
         dust_registry::BlockConstants::parse(&text).expect("a complete table")
+    }
+
+    /// The bytes one clientbound packet costs on the wire, body only.
+    ///
+    /// The framing above it is a length VarInt and the packet id, which are
+    /// the same however many entries the body carries, so the body is where
+    /// the comparison between "the difference" and "the whole set" lives.
+    fn body_bytes<P: Into<dust_protocol::packets::play::clientbound::Packet>>(packet: P) -> usize {
+        let packet = packet.into();
+        let mut out = dust_protocol::wire::Writer::new();
+        packet
+            .encode_body(
+                &mut out,
+                dust_protocol::ProtocolVersion::from_name("1.21.1").expect("the target version"),
+            )
+            .expect("a set-equipment body always encodes");
+        out.into_bytes().len()
+    }
+
+    fn worn(name: &str) -> Option<super::super::inventory::Stack> {
+        Some(super::super::inventory::Stack::new(
+            dust_registry::Item::from_name(name).expect("this build has that item"),
+            1,
+        ))
+    }
+
+    #[test]
+    fn the_difference_is_the_cheaper_wire_form_and_here_is_by_how_much() {
+        // The question decision record 0029 had to answer with a number and
+        // not an opinion: does the protocol make the whole set cheaper than
+        // the slots that moved? It does not, and this is the measurement.
+        // Entries are self-delimiting and there is no bitmask to fill in, so
+        // an entry nobody needs is an entry nobody pays for only if it is not
+        // sent.
+        let helmet = (EQUIP_HELMET, worn("minecraft:diamond_helmet"));
+        let one = body_bytes(set_equipment(100, std::slice::from_ref(&helmet)).expect("one entry"));
+
+        let whole_set: Vec<_> = (0..6u8)
+            .map(|slot| {
+                if slot == EQUIP_HELMET {
+                    helmet.clone()
+                } else {
+                    (slot, None)
+                }
+            })
+            .collect();
+        let all = body_bytes(set_equipment(100, &whole_set).expect("six entries"));
+
+        assert_eq!((one, all), (7, 17), "one changed slot, then all six");
+        assert!(
+            one < all,
+            "the difference is the cheaper form, so the roster sends the difference"
+        );
+    }
+
+    #[test]
+    fn a_player_in_full_armour_costs_forty_bytes_to_somebody_who_has_just_arrived() {
+        // The other half of the same record: what a viewer pays per dressed
+        // player on sight. Everything worn, nothing empty, one packet.
+        let player = Player {
+            entity_id: 100,
+            uuid: [0; 16],
+            name: "Wearer".to_owned(),
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            yaw: 0.0,
+            pitch: 0.0,
+            sneaking: false,
+            sprinting: false,
+            equipment: [
+                worn("minecraft:diamond_sword"),
+                worn("minecraft:shield"),
+                worn("minecraft:diamond_boots"),
+                worn("minecraft:diamond_leggings"),
+                worn("minecraft:diamond_chestplate"),
+                worn("minecraft:diamond_helmet"),
+            ],
+        };
+        assert_eq!(
+            body_bytes(equipment_on_sight(&player).expect("six things worn")),
+            37
+        );
+        // And nothing at all for somebody carrying nothing, which is the
+        // reason the empty slots are left out rather than sent as empty.
+        let bare = Player {
+            equipment: std::array::from_fn(|_| None),
+            ..player
+        };
+        assert!(equipment_on_sight(&bare).is_none());
     }
 
     #[test]

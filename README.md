@@ -165,8 +165,23 @@ fails the build if a version adds a wearable. `tools/bot/clicks.js` replays a
 hundred clicks against Dust and against a real 1.21.1 server and diffs the two
 recordings: **101 of 101 snapshots agree**, up from 60 of 83 when the armour
 clicks were first asked. Decision record
-[0016](docs/decisions/0016-which-slot-an-item-is-worn-in.md) has the table and
-what a helmet still does not do.
+[0016](docs/decisions/0016-which-slot-an-item-is-worn-in.md) has the table.
+
+**And everybody else can see it.** A helmet on a player's head, a shield in
+their offhand and the sword in their hand are sent to every other player who
+can see them, and the whole set is sent unprompted to anybody who has just come
+into view — so a player who logs in finds the world dressed rather than finding
+it naked until each of its inhabitants happens to change a slot. Only the slots
+that actually moved go out, because the packet's entries are self-delimiting
+and the difference costs 7 bytes where the same change spelled as all six slots
+costs 17, and a container change that moved nothing visible costs nothing at
+all. `tools/bot/equipment.js` runs three bots — one who dresses, one who
+watches, and one who arrives after everything has already happened — against
+Dust and against a real 1.21.1 server and diffs the two recordings: **14 of 15
+snapshots agree**, and the fifteenth is Minecraft coalescing per tick where
+Dust broadcasts per change, named in the script and declined in decision record
+[0029](docs/decisions/0029-what-other-players-see-you-wearing.md), which also
+says what this costs with ten players in view of each other and with a hundred.
 
 And a fence connects to what it touches, whichever way the wall was built. A
 fence, a wall, a glass pane and a stair take their shape from the six cells
@@ -247,9 +262,8 @@ saved, so a restart clears the floor; no crafting, so the grid is
 five slots that store and never combine; a stack now carries its data
 components, but **nothing in the world reads them**, so every silk-touch and
 fortune branch of every loot table takes its unenchanted side and a broken chest
-drops a chest without its contents; **an armour slot's contents do nothing**, so
-a helmet on a player's head is invisible to everybody else and protects from
-nothing; no
+drops a chest without its contents; **armour protects from nothing**, since there is no
+damage to protect from yet; no
 **redstone wire** and no **scaffolding distance**, which are the last two
 neighbour rules of the sixty-one decision record
 [0014](docs/decisions/0014-what-a-block-reads-from-the-cell-next-door.md)
