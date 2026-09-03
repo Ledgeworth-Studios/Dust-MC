@@ -87,6 +87,12 @@ const BAND_LIGHT_GRAY: &str = "minecraft:light_gray_terracotta";
 /// How many bands a badlands column repeats through.
 const BANDS: usize = 192;
 
+/// The one block name this file has to recognise rather than merely write.
+///
+/// A rule that puts air at the top of a column lowers where its sky reaches,
+/// and `steep` reads that. Everything else the rules name is opaque to them.
+const AIR: &str = "minecraft:air";
+
 /// One rule of the tree.
 #[derive(Debug, Clone)]
 enum Rule {
@@ -193,6 +199,10 @@ pub struct Rules {
     factory: Positional,
     /// Palette indices, 192 of them, and the badlands column is this repeated.
     bands: Vec<u8>,
+    /// Which palette entry is air, if any. Resolved once because it is asked
+    /// about every block a rule claims and a name comparison there would be
+    /// the cost of the stage.
+    air: Option<u8>,
 }
 
 impl Rules {
@@ -256,7 +266,19 @@ pub struct Painter<'a> {
     stone_above: i32,
     stone_below: i32,
     water_height: i32,
-    biome: u32,
+    /// The biome at this block, fetched the first time a rule asks for one.
+    ///
+    /// **Lazily, and that is the whole cost of the stage.** A biome is a
+    /// climate search and the walk visits every solid block of every column;
+    /// looking one up per block cost eighteen times the rest of the generator
+    /// put together. Most blocks never reach a `biome` condition at all — the
+    /// rules refuse everything below the preliminary surface two conditions in
+    /// — so the ones that do are a thin shell and not a column.
+    biome: Option<u32>,
+    /// The last quart cell looked up, because consecutive blocks of one column
+    /// mostly land in it.
+    memo: Option<((i32, i32, i32), u32)>,
+    zoom_seed: i64,
     declined: u64,
     bandlands: u64,
 }
@@ -289,7 +311,9 @@ impl<'a> Painter<'a> {
             stone_above: 0,
             stone_below: 0,
             water_height: NO_GROUND,
-            biome: u32::MAX,
+            biome: None,
+            memo: None,
+            zoom_seed: 0,
             declined: 0,
             bandlands: 0,
         }
@@ -322,9 +346,22 @@ impl<'a> Painter<'a> {
         let top = min_y + self.settings.height;
         let base_x = chunk_x * 16;
         let base_z = chunk_z * 16;
+        self.zoom_seed = zoom_seed;
+        self.memo = None;
 
+        // The highest row of the chunk that holds anything at all, found by
+        // reading whole rows rather than 256 columns of sky. Above a mountain
+        // that is two hundred and fifty rows nobody has to look at twice, and
+        // the answer is the same.
+        let ceiling = (min_y..top)
+            .rev()
+            .find(|&y| {
+                let row = (y - min_y) as usize * 256;
+                materials[row..row + 256].iter().any(|&code| code != 0)
+            })
+            .unwrap_or(min_y - 1);
         for column in 0..256usize {
-            self.heights[column] = (min_y..top)
+            self.heights[column] = (min_y..=ceiling)
                 .rev()
                 .find(|&y| materials[(y - min_y) as usize * 256 + column] != 0)
                 .unwrap_or(min_y - 1);
@@ -340,6 +377,7 @@ impl<'a> Painter<'a> {
                 let mut stone_above = 0;
                 let mut water_height = NO_GROUND;
                 let mut stone_floor = i32::MAX;
+                let mut lowered = false;
                 let mut y = self.heights[column] + 1;
                 while y >= min_y {
                     let at = |y: i32| materials[(y - min_y) as usize * 256 + column];
@@ -368,32 +406,38 @@ impl<'a> Painter<'a> {
                             }
                         }
                         stone_above += 1;
-                        self.start_block(
-                            y,
-                            stone_above,
-                            y - stone_floor + 1,
-                            water_height,
-                            biomes,
-                            zoom_seed,
-                        );
+                        self.start_block(y, stone_above, y - stone_floor + 1, water_height);
                         // Only the dimension's own block is the rules' to
                         // claim. A cell the noise stage made fluid or air is
                         // not offered to them, which is why a surface rule can
                         // not fill an ocean.
                         if code == 1 {
-                            if let Some(index) = self.apply(self.rules.root) {
+                            if let Some(index) = self.apply(self.rules.root, biomes) {
                                 materials[(y - min_y) as usize * 256 + column] = 3 + index;
+                                // The only write that can move a column's top
+                                // is one that puts air there, and the rules
+                                // that do sit under `hole` in a frozen ocean.
+                                // Recomputing every column for them would be
+                                // 256 scans of a chunk to catch one.
+                                if y >= self.heights[column] && self.rules.air == Some(index) {
+                                    lowered = true;
+                                }
                             }
                         }
                     }
                     y -= 1;
                 }
-                // A rule may have written air at the top of the column, which
-                // lowers the height its neighbours' `steep` reads.
-                self.heights[column] = (min_y..top)
-                    .rev()
-                    .find(|&y| materials[(y - min_y) as usize * 256 + column] != 0)
-                    .unwrap_or(min_y - 1);
+                if lowered {
+                    // A rule wrote air at the top of the column, which lowers
+                    // the height its neighbours' `steep` reads.
+                    self.heights[column] = (min_y..=self.heights[column])
+                        .rev()
+                        .find(|&y| {
+                            let code = materials[(y - min_y) as usize * 256 + column];
+                            code != 0 && self.rules.air != Some(code.wrapping_sub(3))
+                        })
+                        .unwrap_or(min_y - 1);
+                }
             }
         }
     }
@@ -458,26 +502,35 @@ impl<'a> Painter<'a> {
             .saturating_sub(8);
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn start_block(
-        &mut self,
-        y: i32,
-        stone_above: i32,
-        stone_below: i32,
-        water_height: i32,
-        biomes: &mut crate::biome::Sampler<'_>,
-        zoom_seed: i64,
-    ) {
+    fn start_block(&mut self, y: i32, stone_above: i32, stone_below: i32, water_height: i32) {
         self.block_y = y;
         self.stone_above = stone_above;
         self.stone_below = stone_below;
         self.water_height = water_height;
-        let (qx, qy, qz) = crate::biome::blurred_quart(zoom_seed, self.block_x, y, self.block_z);
-        self.biome = biomes.biome(qx, qy, qz).unwrap_or(u32::MAX);
+        self.biome = None;
+    }
+
+    /// The biome `BiomeManager` would report at this block.
+    fn biome(&mut self, biomes: &mut crate::biome::Sampler<'_>) -> u32 {
+        if let Some(known) = self.biome {
+            return known;
+        }
+        let cell =
+            crate::biome::blurred_quart(self.zoom_seed, self.block_x, self.block_y, self.block_z);
+        let found = match self.memo {
+            Some((remembered, biome)) if remembered == cell => biome,
+            _ => {
+                let biome = biomes.biome(cell.0, cell.1, cell.2).unwrap_or(u32::MAX);
+                self.memo = Some((cell, biome));
+                biome
+            }
+        };
+        self.biome = Some(found);
+        found
     }
 
     /// Try one rule and hand back the palette index it claims, if any.
-    fn apply(&mut self, rule: u32) -> Option<u8> {
+    fn apply(&mut self, rule: u32, biomes: &mut crate::biome::Sampler<'_>) -> Option<u8> {
         match self.rules.rules[rule as usize] {
             Rule::Block(index) => Some(index),
             Rule::Bandlands => {
@@ -493,15 +546,15 @@ impl<'a> Painter<'a> {
             Rule::Sequence { start, end } => {
                 for index in start..end {
                     let child = self.rules.children[index as usize];
-                    if let Some(found) = self.apply(child) {
+                    if let Some(found) = self.apply(child, biomes) {
                         return Some(found);
                     }
                 }
                 None
             }
             Rule::Condition { test, then } => {
-                if self.test(test) {
-                    self.apply(then)
+                if self.test(test, biomes) {
+                    self.apply(then, biomes)
                 } else {
                     None
                 }
@@ -509,7 +562,7 @@ impl<'a> Painter<'a> {
         }
     }
 
-    fn test(&mut self, condition: u32) -> bool {
+    fn test(&mut self, condition: u32, biomes: &mut crate::biome::Sampler<'_>) -> bool {
         let stable = self.rules.stable[condition as usize];
         if stable {
             match self.cache[condition as usize] {
@@ -518,17 +571,18 @@ impl<'a> Painter<'a> {
                 _ => {}
             }
         }
-        let answer = self.evaluate(condition);
+        let answer = self.evaluate(condition, biomes);
         if stable {
             self.cache[condition as usize] = if answer { 2 } else { 1 };
         }
         answer
     }
 
-    fn evaluate(&mut self, condition: u32) -> bool {
+    fn evaluate(&mut self, condition: u32, biomes: &mut crate::biome::Sampler<'_>) -> bool {
         match self.rules.conditions[condition as usize] {
             Condition::Biome { start, end } => {
-                self.rules.biome_ids[start as usize..end as usize].contains(&self.biome)
+                let biome = self.biome(biomes);
+                self.rules.biome_ids[start as usize..end as usize].contains(&biome)
             }
             Condition::NoiseThreshold { noise, min, max } => {
                 let value = self.graph.noises[noise as usize].value(
@@ -610,7 +664,7 @@ impl<'a> Painter<'a> {
                 self.declined += 1;
                 false
             }
-            Condition::Not(inner) => !self.test(inner),
+            Condition::Not(inner) => !self.test(inner, biomes),
         }
     }
 
@@ -715,6 +769,11 @@ pub fn compile(
         )));
     }
 
+    let air = builder
+        .palette
+        .iter()
+        .position(|spec| spec.name == AIR && spec.properties.is_empty())
+        .map(|at| at as u8);
     let stable = {
         let all = &builder.conditions;
         all.iter().map(|c| c.stable_over_a_column(all)).collect()
@@ -735,6 +794,7 @@ pub fn compile(
         gradients,
         factory,
         bands,
+        air,
     })
 }
 
