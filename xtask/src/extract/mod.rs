@@ -930,20 +930,41 @@ fn constants_domain(context: &Context) -> Result<Outcome, String> {
         )?;
     }
 
-    // Step two.
+    // Step two. The unpacked jars are on the compile classpath as well as the
+    // run classpath, because the tag reader parses JSON with Gson — which is
+    // Minecraft's own JSON library, is there because Minecraft reads these
+    // same files with it, and saves the oracle carrying a parser of its own.
+    // Nothing in `xtask/oracle/` names a *Minecraft* class; that rule is about
+    // the identifiers a version rename would break, and a third-party library
+    // is not one of them.
+    let mut classpath = jars_under(&repo)?;
     let classes = cache.join(format!("oracle-{}/classes", context.version));
     std::fs::create_dir_all(&classes)
         .map_err(|e| format!("could not create {}: {e}", classes.display()))?;
+    let libraries = classpath
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(":");
     let sources = context.workspace_root.join("xtask/oracle/dustoracle");
-    let mut javac: Vec<String> = vec!["-d".to_owned(), classes.display().to_string()];
-    for name in ["Names.java", "BlockOracle.java"] {
+    let mut javac: Vec<String> = vec![
+        "-d".to_owned(),
+        classes.display().to_string(),
+        "-cp".to_owned(),
+        libraries,
+        // Minecraft's own dependencies carry annotation processors, and with
+        // them on the classpath javac finds and warns about them on every
+        // run. The oracle has no annotations; turning discovery off is the
+        // difference between a clean compile and a warning that means nothing.
+        "-proc:none".to_owned(),
+    ];
+    for name in ["Names.java", "ItemTags.java", "BlockOracle.java"] {
         javac.push(sources.join(name).display().to_string());
     }
     println!("compiling the oracle");
     run_tool("javac", &repo, &javac, "compiling the oracle")?;
 
     // Step three.
-    let mut classpath = jars_under(&repo)?;
     classpath.push(classes.clone());
     let joined = classpath
         .iter()
@@ -1080,8 +1101,8 @@ fn constants_domain(context: &Context) -> Result<Outcome, String> {
     let placement = PlacementSummary::of(&placements);
     println!("wrote {}", items.display());
     println!(
-        "  {} item(s), {} of which place a block",
-        placement.items, placement.placing
+        "  {} item(s), {} of which place a block, {} of which burn",
+        placement.items, placement.placing, placement.fuels
     );
     // Named, not counted, and this is the line worth reading twice: an item
     // that places a block of another name is where a server matching names
@@ -1102,6 +1123,26 @@ fn constants_domain(context: &Context) -> Result<Outcome, String> {
              does; `blockitem.block` resolved to the wrong member. Check \
              {}/names.properties against this version's mappings.",
             items.display(),
+            items.parent().unwrap_or(&items).display()
+        ));
+    }
+    // **A floor, not a zero check**, and the difference is the defect this
+    // exists to catch. `getFuel` expands six item tags, and if none of them
+    // were bound the map still comes back with its forty-one literal entries —
+    // coal, lava, a stick — so a run that lost every plank, log, slab and
+    // fence in the game would report fuels and look like it worked. On 1.21.1
+    // there are 248. A hundred is far enough below that to survive a version
+    // that moves one and far enough above forty-one to catch the tags going
+    // quiet, which is the failure that has actually happened here.
+    if placement.fuels <= FUEL_FLOOR {
+        return Err(format!(
+            "{} has only {} item(s) that burn, and every version of Minecraft \
+             has hundreds. The item tags did not bind, so `getFuel` expanded \
+             `#planks`, `#logs_that_burn` and the rest to nothing — check the \
+             `tagkey.*` and `registry.bind_tags` names in \
+             {}/names.properties against this version's mappings.",
+            items.display(),
+            placement.fuels,
             items.parent().unwrap_or(&items).display()
         ));
     }
@@ -1160,16 +1201,23 @@ fn constants_domain(context: &Context) -> Result<Outcome, String> {
     Ok(format!(
         "{rows} block states: light, occlusion, replacement, {} heightmap(s) and \
          {} sound group(s); \
-         {} item(s), {} placing; \
+         {} item(s), {} placing, {} burning; \
          {} block(s), {} drawing loot from elsewhere",
         summary.heightmaps.len(),
         summary.sounds.len(),
         placement.items,
         placement.placing,
+        placement.fuels,
         loot.blocks,
         loot.elsewhere
     ))
 }
+
+/// The fewest fuels a run may report before it is treated as a failure.
+///
+/// See the check that uses it: forty-one is what an unbound-tag run produces,
+/// and it is not zero, so only a floor above it catches the case.
+const FUEL_FLOOR: usize = 100;
 
 /// What an item-to-block table says, for a human reading a run of the oracle.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1178,6 +1226,8 @@ struct PlacementSummary {
     items: usize,
     /// How many of them place a block.
     placing: usize,
+    /// How many of them burn in a furnace.
+    fuels: usize,
     /// The ones that place a block of a *different* name, item then block.
     ///
     /// Kept because they are the whole reason this is a table: a server that
@@ -1203,12 +1253,19 @@ impl PlacementSummary {
         let (Some(item), Some(places)) = (named("item"), named("places")) else {
             return summary;
         };
+        let burn = named("burn");
         for line in table.lines().filter(|l| !l.starts_with('#')) {
             let fields: Vec<&str> = line.split('\t').collect();
             let (Some(item), Some(places)) = (fields.get(item), fields.get(places)) else {
                 continue;
             };
             summary.items += 1;
+            if burn
+                .and_then(|at| fields.get(at))
+                .is_some_and(|b| *b != "-")
+            {
+                summary.fuels += 1;
+            }
             if *places == "-" {
                 continue;
             }

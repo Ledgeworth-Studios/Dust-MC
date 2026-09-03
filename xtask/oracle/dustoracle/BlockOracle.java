@@ -12,6 +12,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.function.Predicate;
 
 /**
@@ -268,6 +269,14 @@ public final class BlockOracle {
      * the block's **wall** form where it has one. A number would be a position
      * in whichever Minecraft this ran against.
      *
+     * A sixth column, `burn`, is how many ticks the item burns for in a
+     * furnace, out of `AbstractFurnaceBlockEntity.getFuel()`. That map is Java
+     * code — literals for coal and lava, and whole item tags expanded for the
+     * wood — and no report and no data pack on 1.21.1 carries any of it. It is
+     * here rather than in a table of its own because it is a fact about an
+     * item, the file is already a row per item, and a second file would be a
+     * second thing an operator can forget to copy.
+     *
      * The wall form is `StandingAndWallBlockItem.wallBlock`, a second field on
      * a subclass of `BlockItem`, and it is the one thing a rule cannot get at:
      * a torch and a wall torch, a sign and a wall sign, are related only by the
@@ -286,11 +295,21 @@ public final class BlockOracle {
         Class<?> standingAndWall = names.type("standingandwall.class");
         Field wallBlock = names.field("standingandwall.class", "standingandwall.wall_block");
         Field attachment = names.field("standingandwall.class", "standingandwall.attachment");
+        // The item tags first, or six of `getFuel`'s lines expand to nothing
+        // and the column that comes out is forty-one fuels where the game has
+        // hundreds. See `ItemTags` for why that failure is silent.
+        int[] tags = ItemTags.bindInto(names, items);
+        System.out.println("item_tags=" + tags[0] + " tagged_items=" + tags[1]);
+        // Built once. `getFuel` rebuilds the whole map on every call — it
+        // expands six item tags to do it — and calling it per item would be
+        // eleven hundred rebuilds of the same table.
+        Map<?, ?> fuel = (Map<?, ?>) names.method("furnace.class", "furnace.get_fuel").invoke(null);
 
         int written = 0;
         int walls = 0;
+        int fuels = 0;
         try (BufferedWriter writer = Files.newBufferedWriter(out)) {
-            writer.write("# item_id\titem\tplaces\ton_wall\tattaches\n");
+            writer.write("# item_id\titem\tplaces\ton_wall\tattaches\tburn\n");
             for (Object item : (Iterable<?>) items) {
                 int id = (int) getId.invoke(items, item);
                 Object name = getKey.invoke(items, item);
@@ -308,12 +327,20 @@ public final class BlockOracle {
                     attaches = String.valueOf(attachment.get(item)).toLowerCase(Locale.ROOT);
                     walls++;
                 }
+                Object burns = fuel.get(item);
+                String burn = "-";
+                if (burns != null) {
+                    burn = String.valueOf(((Number) burns).intValue());
+                    fuels++;
+                }
                 writer.write(
-                    id + "\t" + name + "\t" + places + "\t" + onWall + "\t" + attaches + "\n");
+                    id + "\t" + name + "\t" + places + "\t" + onWall + "\t" + attaches
+                    + "\t" + burn + "\n");
                 written++;
             }
         }
         System.out.println("wall_items=" + walls);
+        System.out.println("fuel_items=" + fuels);
         return written;
     }
 
