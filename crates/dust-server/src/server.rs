@@ -966,7 +966,13 @@ impl Server {
             )))
         };
 
-        let world = std::sync::Arc::new(crate::net::edits::EditedWorld::new(source));
+        // The constants go into the world as well as into the session: the
+        // session needs the sound a block makes, and the world needs which of
+        // a block's faces are full, which is what says whether a fence beside
+        // it grows an arm.
+        let world = std::sync::Arc::new(
+            crate::net::edits::EditedWorld::new(source).with_constants(constants.clone()),
+        );
 
         // What players changed last time, and where they were standing. A
         // world that has never been played has no file and that is not an

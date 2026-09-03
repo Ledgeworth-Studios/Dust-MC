@@ -29,8 +29,9 @@ import java.util.function.Predicate;
  *
  * The output is tab-separated with a **named header**, and the names are load
  * bearing: `state_id`, `opacity`, `emission`, `occlude`, `replaceable`,
- * `place_sound`, `sound_volume`, `sound_pitch`, then one column per heightmap under the
- * serialization key Minecraft itself gives it. A reader that matched columns by
+ * `place_sound`, `sound_volume`, `sound_pitch`, one column per heightmap under the
+ * serialization key Minecraft itself gives it, then `STURDY_DOWN` through
+ * `STURDY_EAST`. A reader that matched columns by
  * position would silently change meaning the day a column was inserted; one
  * that reads the header can also say which columns a table it has been handed
  * does not have.
@@ -77,14 +78,50 @@ public final class BlockOracle {
 
         List<Heightmap> heightmaps = heightmaps(names);
 
+        // Whether the state has a full square face on each of the six sides,
+        // which is what a fence, a wall and a glass pane ask of the block
+        // beside them before they grow an arm towards it. It is the block's
+        // collision shape and so it is Java, in no report and no data pack —
+        // the same argument decision record 0008 makes about opacity, and the
+        // same route.
+        //
+        // **Six columns and not one.** A block can have a full face on one
+        // side and not another, and the commonest such block is a stair: the
+        // back of a bottom stair is a full square and its front is not, so a
+        // fence joins a stair from behind and not from in front. One column
+        // saying "is this a full cube" would answer no to both and would be
+        // wrong in a place a player looks at all the time.
+        Method isFaceSturdy = names.method(
+            "blockstate.class",
+            "blockstate.is_face_sturdy",
+            names.type("block_getter.class"),
+            names.type("blockpos.class"),
+            names.type("direction.class"));
+        String[] sideKeys = {
+            "direction.down", "direction.up", "direction.north",
+            "direction.south", "direction.west", "direction.east"
+        };
+        String[] sideNames = {
+            "STURDY_DOWN", "STURDY_UP", "STURDY_NORTH",
+            "STURDY_SOUTH", "STURDY_WEST", "STURDY_EAST"
+        };
+        Object[] sides = new Object[sideKeys.length];
+        for (int i = 0; i < sideKeys.length; i++) {
+            sides[i] = names.field("direction.class", sideKeys[i]).get(null);
+        }
+
         Method getId = names.method("idmapper.class", "idmapper.get_id", Object.class);
         int written = 0;
+        int sturdyFaces = 0;
         try (BufferedWriter out = Files.newBufferedWriter(Path.of(args[1]))) {
             StringBuilder header = new StringBuilder(
                 "# state_id\topacity\temission\tocclude\treplaceable"
                 + "\tplace_sound\tsound_volume\tsound_pitch");
             for (Heightmap heightmap : heightmaps) {
                 header.append('\t').append(heightmap.key);
+            }
+            for (String side : sideNames) {
+                header.append('\t').append(side);
             }
             out.write(header.append('\n').toString());
             for (Object state : (Iterable<?>) registry) {
@@ -106,12 +143,20 @@ public final class BlockOracle {
                 for (Heightmap heightmap : heightmaps) {
                     row.append('\t').append(heightmap.counts.test(state) ? 1 : 0);
                 }
+                for (Object side : sides) {
+                    boolean sturdy = (boolean) isFaceSturdy.invoke(state, emptyLevel, origin, side);
+                    row.append('\t').append(sturdy ? 1 : 0);
+                    if (sturdy) {
+                        sturdyFaces++;
+                    }
+                }
                 out.write(row.append('\n').toString());
                 written++;
             }
         }
         System.out.println("states=" + written);
         System.out.println("heightmaps=" + heightmaps.size());
+        System.out.println("sturdy_faces=" + sturdyFaces);
         System.out.println("sound_groups=" + sounds.seen());
         System.out.println("items=" + writeItems(names, Path.of(args[2])));
     }

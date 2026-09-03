@@ -1016,6 +1016,27 @@ fn constants_domain(context: &Context) -> Result<Outcome, String> {
             out.display()
         ));
     }
+    // The six sturdy columns come from six `Direction` fields handed to one
+    // method, and the way that goes wrong is that they resolve to the same
+    // field and the table carries six copies of one answer. A count is enough
+    // to refuse it: a bottom slab is sturdy underneath and not on top, so no
+    // two of the six columns count the same states in a table that is right.
+    let sturdy: Vec<(&String, &u64)> = summary
+        .heightmaps
+        .iter()
+        .filter(|(name, _)| name.starts_with("STURDY_"))
+        .collect();
+    if sturdy.len() == 6 && sturdy.iter().all(|(_, count)| **count == *sturdy[0].1) {
+        return Err(format!(
+            "{} says the same {} block states have a full face on all six \
+             sides, which no version of Minecraft does — a bottom slab has one \
+             underneath and not on top. The six `direction.*` fields resolved \
+             to the same constant; check {}/names.properties.",
+            out.display(),
+            sturdy[0].1,
+            out.parent().unwrap_or(&out).display()
+        ));
+    }
     // The sound groups, as a count and the three widest. A hundred and nine
     // lines is not a summary; a count of one would be the whole story.
     println!("  {} distinct block sound group(s)", summary.sounds.len());

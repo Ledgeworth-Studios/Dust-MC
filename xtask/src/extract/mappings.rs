@@ -262,6 +262,60 @@ pub const LIGHT_ORACLE: &[Wanted<'static>] = &[
         method: "canBeReplaced",
         parameters: &[],
     },
+    // Whether a state has a **full square face** on a given side, which is the
+    // one thing a fence, a wall and a glass pane ask of the block beside them.
+    // Same shape as `getLightBlock`: it wants a level and a position and takes
+    // `EmptyBlockGetter` for both, because the answer is the block's own
+    // collision shape and not anything about where it is.
+    //
+    // The three-argument overload and not the four. The four takes a
+    // `SupportType`, and `FULL` is what the three-argument one passes — so
+    // asking for it would be one more obfuscated enum to resolve for an answer
+    // already on the shorter method.
+    Wanted::Method {
+        key: "blockstate.is_face_sturdy",
+        class: BLOCK_STATE_BASE,
+        method: "isFaceSturdy",
+        parameters: &[BLOCK_GETTER, BLOCK_POS, DIRECTION],
+    },
+    Wanted::Class {
+        key: "direction.class",
+        class: DIRECTION,
+    },
+    // The six directions by name rather than by `values()` order. The order is
+    // right today and would go on being right silently if it ever changed;
+    // a name that stops resolving stops the extraction, which is the failure
+    // worth having.
+    Wanted::Field {
+        key: "direction.down",
+        class: DIRECTION,
+        field: "DOWN",
+    },
+    Wanted::Field {
+        key: "direction.up",
+        class: DIRECTION,
+        field: "UP",
+    },
+    Wanted::Field {
+        key: "direction.north",
+        class: DIRECTION,
+        field: "NORTH",
+    },
+    Wanted::Field {
+        key: "direction.south",
+        class: DIRECTION,
+        field: "SOUTH",
+    },
+    Wanted::Field {
+        key: "direction.west",
+        class: DIRECTION,
+        field: "WEST",
+    },
+    Wanted::Field {
+        key: "direction.east",
+        class: DIRECTION,
+        field: "EAST",
+    },
     Wanted::Method {
         key: "blockstate.propagates_skylight_down",
         class: BLOCK_STATE_BASE,
@@ -459,6 +513,7 @@ const BLOCK_STATE_BASE: &str =
     "net.minecraft.world.level.block.state.BlockBehaviour$BlockStateBase";
 const BLOCK_GETTER: &str = "net.minecraft.world.level.BlockGetter";
 const BLOCK_POS: &str = "net.minecraft.core.BlockPos";
+const DIRECTION: &str = "net.minecraft.core.Direction";
 const EMPTY_BLOCK_GETTER: &str = "net.minecraft.world.level.EmptyBlockGetter";
 const ID_MAPPER: &str = "net.minecraft.core.IdMapper";
 const SHARED_CONSTANTS: &str = "net.minecraft.SharedConstants";
