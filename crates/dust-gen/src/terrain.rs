@@ -20,11 +20,13 @@
 //!
 //! # What is not here yet
 //!
-//! Surface rules, which put grass on the stone; aquifers, which decide what
-//! fluid an enclosed pocket holds; carvers; and features. This is the output
-//! of vanilla's own noise stage and nothing beyond it — the default block, the
-//! default fluid below the sea level the settings name, and air. Decision
-//! record 0012 orders those and this is stage two of it.
+//! Aquifers, which decide what fluid an enclosed pocket holds; carvers; and
+//! features. This module is the output of vanilla's own noise stage and
+//! nothing beyond it — the default block, the default fluid below the sea
+//! level the settings name, and air. [`crate::surface`] is the stage after it
+//! and [`Columns::surface`] is the two together, which is what a server
+//! serves. Decision record 0012 orders the rest and records 0026 and 0032 are
+//! stages two and three of it.
 
 use std::path::Path;
 

@@ -10,18 +10,18 @@
 //!
 //! # What a player gets, and what they do not
 //!
-//! `dust_gen::terrain` is vanilla's **noise stage** and nothing past it: the
-//! dimension's default block where `final_density` is positive, its default
-//! fluid below the sea level its settings name, air above. So the ground is
-//! stone rather than grass and there are no trees, no ores, no carved caves
-//! and no villages. Mountains, valleys, overhangs, coastlines, oceans and
-//! sea floors are all there and all in the right place, and the biome a cell
-//! holds is the biome Minecraft would have put there.
+//! `dust_gen::terrain` is vanilla's **noise stage** and `dust_gen::surface` is
+//! the dimension's own surface rules painted over it. So a player lands on
+//! grass over dirt, sand on a beach, gravel on a shore and deepslate below,
+//! and the mountains, valleys, overhangs, coastlines, oceans and sea floors
+//! are all where Minecraft puts them, with the biome Minecraft would have put
+//! there. Decision record 0032 is what that is worth: 682 of the 1,089 columns
+//! around seed 0's spawn are grass, and every one of them was stone before it.
 //!
-//! Surface rules are the next stage and they are the reason this is stone.
-//! Inventing a rule for the top block — grass above the sea, sand beside it —
-//! would be right most of the time and wrong in a way no test here could name,
-//! and it would poison the measurement that is supposed to replace it.
+//! What is still missing is aquifers, carvers and features — no trees, no ore
+//! veins, no caves, no villages, and every pocket below the sea level holds
+//! water where vanilla would leave two thirds of it dry. Record 0032 prices
+//! each of those in cells on the same sample.
 //!
 //! # Why the light needs the four columns around it
 //!
