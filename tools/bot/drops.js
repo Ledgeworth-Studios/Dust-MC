@@ -38,6 +38,10 @@ const JOIN_TIMEOUT_MS = 30000
 const SETTLE_MS = 900
 const DIG_TIMEOUT_MS = 20000
 
+/// Where a survival arena is built. High enough to be above any terrain the
+/// world generated and below the build limit by a margin.
+const ARENA_Y = 200
+
 // One state, one drop, one count: if breaking this does not yield exactly one
 // cobblestone the run is not measuring what it thinks it is and stops before
 // printing a single answer. Every survey here has one and every one of them
@@ -325,16 +329,49 @@ async function main () {
   const items = watchItems(b)
   await wait(SETTLE_MS)
 
-  const stood = b.entity.position.floored()
+  let stood = b.entity.position.floored()
   // Two blocks away and one down: far enough that the bot is not standing on
   // the cell it is breaking, near enough to be in reach at any yaw.
-  const at = stood.offset(2, 0, 0)
+  let at = stood.offset(2, 0, 0)
 
   if (survival) {
+    // **The arena is built at a stated height and the player is put on it**,
+    // rather than built around wherever the bot landed. A world that has been
+    // surveyed before has holes in it: the first run of this against a world
+    // an earlier survey had dug through put the bot at y=-60, built its floor
+    // inside deepslate, and hung on the first block it could not reach. Where
+    // the arena is has to be a decision and not an observation.
+    stood = stood.offset(0, 0, 0)
+    stood.y = ARENA_Y
+    at = stood.offset(4, 0, 0)
+    // Survival, because **a creative player's break drops nothing** and a
+    // survey run in creative would record an empty answer for all 982 blocks
+    // and call it a measurement. Peaceful and haste because what is being
+    // measured is what a break yields, not whether a bot can survive a
+    // skeleton or swing fast enough; no random ticks because a crop that grew
+    // between the setblock and the dig is a row about the wrong state.
+    say('difficulty peaceful')
+    say('gamerule randomTickSpeed 0')
+    say('gamerule doTileDrops true')
     say(`gamemode survival Digger`)
+    say(`effect give Digger minecraft:haste 99999 5 true`)
+    say(`effect give Digger minecraft:saturation 99999 5 true`)
     say(`give Digger ${tool}`)
-    say(`fill ${at.x - 2} ${at.y - 1} ${at.z - 2} ${at.x + 2} ${at.y - 1} ${at.z + 2} minecraft:stone`)
+    // A floor to stand the blocks on, and air above it so nothing falls in.
+    say(`fill ${stood.x - 8} ${ARENA_Y} ${stood.z - 8} ${stood.x + 8} ${ARENA_Y + 4} ${stood.z + 8} minecraft:air`)
+    say(`fill ${stood.x - 8} ${ARENA_Y - 1} ${stood.z - 8} ${stood.x + 8} ${ARENA_Y - 1} ${stood.z + 8} minecraft:stone`)
     await wait(SETTLE_MS)
+    say(`tp Digger ${stood.x + 0.5} ${ARENA_Y} ${stood.z + 0.5}`)
+    await wait(SETTLE_MS)
+    // Believe the server's own answer about where the player ended up rather
+    // than the number that was asked for: a teleport into a cell the server
+    // will not accept is a survey aimed at somewhere else.
+    stood = b.entity.position.floored()
+    at = stood.offset(4, 0, 0)
+    // The tool has to be in hand, not in the pack. Slot zero is where `/give`
+    // puts the first thing a bot is given.
+    b._client.write('held_item_slot', { slotId: 0 })
+    await wait(300)
   }
 
   const rows = []

@@ -2,7 +2,7 @@
 //!
 //! # The shape every entity will get
 //!
-//! Decision record 0017 is the account. In short: **one flat vector under one
+//! Decision record 0023 is the account. In short: **one flat vector under one
 //! lock, ticked by one participant of the tick loop, announced on one
 //! broadcast channel.** Not a task per entity, not an ECS, not a quadtree.
 //! A thousand item entities is the number this has to survive, and at a
@@ -228,6 +228,24 @@ impl ItemWorld {
     /// How many drops were refused because the ceiling was already reached.
     pub fn over_ceiling(&self) -> usize {
         self.over_ceiling.load(Ordering::Relaxed)
+    }
+
+    /// How many items have come to rest.
+    ///
+    /// Public for the bench, and the reason is a defect class rather than a
+    /// convenience: an item that has settled takes an early return out of
+    /// `step`, so a bench that popped a thousand items and then ran a thousand
+    /// ticks would spend the first fifteen measuring physics and the other
+    /// nine hundred and eighty-five measuring a branch. **A bench whose
+    /// subject stops moving reports the cost of it having stopped.** This is
+    /// what lets the bench say which of the two it measured.
+    pub fn at_rest(&self) -> usize {
+        self.entities
+            .lock()
+            .expect("the item world is never poisoned")
+            .iter()
+            .filter(|entity| entity.settled)
+            .count()
     }
 
     /// Pop an item out of the centre of a block that just broke.

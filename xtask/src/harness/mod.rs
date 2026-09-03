@@ -60,6 +60,7 @@ pub mod cache;
 pub mod capture;
 pub mod compare;
 pub mod digest;
+mod drops;
 pub mod light;
 mod nbt;
 mod outline;
@@ -147,6 +148,16 @@ outside the repository (override with DUST_HARNESS_CACHE).
       not a gate, for the same reason `light` is: exit 0 unless the run itself
       failed. Decision record 0011 is why this exists.
 
+  drops --answers <file> [--tables <[data] path>] [--verbose]
+      Score what Dust says a broken block yields against the answers
+      `tools/bot/drops.js --survival` asked of a real Minecraft server in
+      survival mode -- survival because a creative player's break drops
+      nothing. A drop is a distribution, so a row agrees when the observed
+      drop is one Dust can produce, over two thousand rolls; it disagrees when
+      Dust never produces it, and then the worklist prints what Dust does
+      produce instead. A measurement and not a gate: exit 0 unless the run
+      failed. Decision record 0022 is why this exists.
+
   worldgen --version <v> [--seed <n>] [--radius <r>] [--at <x>,<z>]...
       Read a world Minecraft generated, build the same chunks with Dust's own
       generator, and count how far apart they are: surface height, surface
@@ -170,6 +181,7 @@ enum Verb {
     Registries(registries::Options),
     Light(light::Options),
     Placement(placement::Options),
+    Drops(drops::Options),
     Worldgen(worldgen::Options),
 }
 
@@ -205,6 +217,7 @@ pub fn dispatch(args: &[String]) -> Result<ExitCode, String> {
         Verb::Registries(options) => Ok(registries::run(&options)),
         Verb::Light(options) => Ok(light::run(&options)),
         Verb::Placement(options) => Ok(placement::run(&options)),
+        Verb::Drops(options) => Ok(drops::run(&options)),
         Verb::Worldgen(options) => Ok(worldgen::run(&options)),
     }
 }
@@ -223,10 +236,11 @@ fn parse(args: &[String]) -> Result<Verb, String> {
         "registries" => registries::parse(rest).map(Verb::Registries),
         "light" => light::parse(rest).map(Verb::Light),
         "placement" => placement::parse(rest).map(Verb::Placement),
+        "drops" => drops::parse(rest).map(Verb::Drops),
         "worldgen" => worldgen::parse(rest).map(Verb::Worldgen),
         other => Err(format!(
             "unknown harness verb `{other}`\n\nThe verbs are: provision, rcon, capture, \
-             compare, rewrite, registries, light, placement, worldgen."
+             compare, rewrite, registries, light, placement, drops, worldgen."
         )),
     }
 }
