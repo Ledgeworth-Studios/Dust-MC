@@ -52,8 +52,8 @@ use dust_world::coords::{ChunkPos, RegionPos};
 use dust_world::heightmap::WorldHeight;
 use dust_world::region::{FileStore, RegionFile};
 
-use super::residency::Residency;
 use super::generated::GeneratedWorld;
+use super::residency::Residency;
 use super::world::FlatWorld;
 
 /// Region files that have been opened, or found not to exist.

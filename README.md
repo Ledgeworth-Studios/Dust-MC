@@ -85,19 +85,26 @@ it — blocks, their properties, biomes, heightmaps — and streams them. It als
 writes Anvil: `cargo xtask harness rewrite` puts every chunk of a real world
 through Dust's reader and writer and then boots a vanilla server on the result,
 which reads back the world it started as and says nothing about it that it did
-not say about its own. Without a world source Dust generates a superflat and does
-not pretend otherwise: worldgen is Phase 6, and a column a real world does not
-contain falls back to the flat one, because a world is a disc in an infinite
-plane and a player can walk off the edge of it. How far that superflat is from
+not say about its own. Without a world source Dust
+generates the world its seed says is there: `dust-gen` samples the six climate
+values Minecraft picks a biome from and evaluates its `final_density` over
+Minecraft's own interpolation lattice, so the mountains, valleys, coastlines and
+sea floors are where vanilla puts them and the biome of a cell is the biome
+vanilla gives it. **Not** the surface rules, aquifers, carvers or features that
+come after, so the ground is stone and there are no trees. How far that is from
 the world Minecraft generates for the same seed is measured rather than
-estimated — `cargo xtask harness worldgen` scores it in five parts, and
-decision record
+estimated — `cargo xtask harness worldgen` scores it in five parts. Decision
+record
 [0012](docs/decisions/0012-what-worldgen-is-worth-measured-first.md) is what
-each stage of vanilla's pipeline is worth and the order to build them in. The
-first of those stages is built: `dust-gen` samples the six climate values
-Minecraft picks a biome from and gets 460,418 of 460,800 cells right on a sample
-that sees seventeen biomes, which is decision record
-[0021](docs/decisions/0021-which-biome-a-cell-gets.md).
+each stage of vanilla's pipeline is worth and the order to build them in,
+[0021](docs/decisions/0021-which-biome-a-cell-gets.md) is the biome source, and
+[0026](docs/decisions/0026-the-terrain-dust-serves-and-what-it-does-at-the-seam.md)
+is the terrain and what a served world does at the edge of a world file. A world
+is a disc in an infinite plane and a player can walk off the edge of it: with
+that world's own seed, read from the `level.dat` beside it, the far side is the
+terrain it would have had; without one, the superflat runs on as it always did,
+because generating from the wrong seed would put a cliff exactly where the disc
+ends.
 
 What exists either way is the whole path from the socket to the block table —
 framing, compression, encryption, the four connection states, the paletted
@@ -241,7 +248,15 @@ kilobytes, measured, not the megabyte three modules claimed. Decision record
 what it costs at 1, 10 and 100 players — which is *more* memory, for a reason
 that is about the player and not about the megabytes.
 
-**Not yet**, and each of these is stated where the code for it would go: no
+**Not yet**, and each of these is stated where the code for it would go: **no
+surface rules, aquifers, carvers or features**, so a generated world's ground is
+stone rather than grass, it has no trees or ore veins, and every pocket below
+sea level holds water where vanilla would leave it dry — decision record
+[0026](docs/decisions/0026-the-terrain-dust-serves-and-what-it-does-at-the-seam.md)
+is what each of those is worth on the same sample; **nothing keeps a generated
+column**, so a world with no file behind it builds every column a player walks
+toward on the thread that asked, which is what an Anvil column cost before
+record 0025; no
 physics or block updates, so a player is stopped from
 entering a block and never pushed out of one; **no residency for the chunks a
 client is looking at**, so a join still builds and sends 289 columns on the
@@ -575,21 +590,21 @@ last thirty-two, every one within a step of a chunk edge. Separating over-lighti
 from under-lighting is what made all three visible instead of letting them hide
 inside a number that already looked good.
 
-`worldgen` asks the same question of the terrain, and asks it in five parts.
-Dust generates a superflat; this counts how far that is from the world
-Minecraft generates for the same seed, and which stage of vanilla's pipeline
-owns which part of the gap. Seven models over the same chunks in one run, each
-row the one above it plus a single named change, and every figure a count of
-things **wrong**:
+`worldgen` asks the same question of the terrain, and asks it in five parts. It
+counts how far Dust's world is from the one Minecraft generates for the same
+seed, and which stage of vanilla's pipeline owns which part of the gap. Eight
+models over the same chunks in one run, each row the one above it plus a single
+named change, and every figure a count of things **wrong**:
 
 ```text
 seed 0, twelve 5x5 squares to sixteen thousand blocks out -- 17 biomes in view
 
   surface  surface     biome    caves     false      blocks  KiB/col
     short    block     short  missing     caves       short
-    76800    76800    435459        0   9598921    10005374      2.2  the flat world Dust serves
+    76800    76800    435459        0   9598921    10005374      2.2  the flat world Dust served
     74905    74931    435459   583625    795317    10475058     16.2  + the world's own sea level
     74905    74931       382   583625    795317    10475058     16.6  + Dust's biome source
+    28796    49128       382   588215     75560     6840919     18.8  + Dust's terrain
         0    60037         0   681715         0    10405644     19.6  + Minecraft's surface height
         0    60037         0        0         0     9723929     19.6  + Minecraft's carvers
         0        0         0        0         0       12140     20.6  + its blocks at and below it
@@ -617,6 +632,15 @@ Every one of the 382 is an **exact tie** in climate space, broken the other way;
 so are all 238 on seed 1. Decision record
 [0021](docs/decisions/0021-which-biome-a-cell-gets.md) is why matching them is
 declined.
+
+**Row four is what a server now serves.** `final_density` over the 4x8x4 cell
+Minecraft interpolates across takes 74,905 wrong columns to **28,796**, and 3.6M
+cells of block disagreement with it. Nearly every column left has a tree on it:
+`MOTION_BLOCKING` counts leaves, so a column whose ground is exactly right reads
+five short with an oak on it, and the summary names Minecraft's own surface
+block in the columns whose *height* disagrees — 25,938 of the 28,796 are leaves
+and 2,279 more are packed ice. Every delta is negative; Dust is never too high.
+Seed 1 goes 72,552 to **16,678** the same way.
 
 **Two seeds, because one cannot see.** Seed 1 spawns in open ocean, where every
 column has water underfoot and is short by *exactly one* under the sea-level
