@@ -86,6 +86,8 @@ pub struct GeneratedWorld {
     /// The dimension's own two blocks, resolved once at boot.
     solid: u32,
     fluid: u32,
+    /// `minecraft:lava`, which an aquifer writes and no data pack names.
+    lava: u32,
     /// The surface rules' own result blocks, resolved once at boot rather than
     /// per block. A generated column asks this table about ninety thousand
     /// times; a name lookup there would be the whole cost of the stage.
@@ -109,6 +111,10 @@ impl GeneratedWorld {
         let settings = generator.settings();
         let solid = state_of(&settings.default_block)?;
         let fluid = state_of(&settings.default_fluid)?;
+        // Resolved at boot beside the dimension's own two, and refused by name
+        // if this build's registry has no lava — a generator that quietly
+        // defaulted it would fill a deep cave with air and look right.
+        let lava = state_of(&dust_gen::aquifer::Aquifer::lava_block())?;
         let surface = match generator.surface() {
             Some(rules) => rules
                 .palette()
@@ -127,6 +133,7 @@ impl GeneratedWorld {
             constants,
             solid,
             fluid,
+            lava,
             surface,
             default_biome,
             biome_registry_size,
@@ -190,7 +197,7 @@ impl GeneratedWorld {
         let top = min_y + self.height.height() as i32;
         {
             let materials = if with_biomes {
-                columns.surface(pos.x, pos.z)
+                columns.aquifer(pos.x, pos.z)
             } else {
                 columns.terrain(pos.x, pos.z)
             };
@@ -209,6 +216,7 @@ impl GeneratedWorld {
                                 Material::Air => self.palette.air,
                                 Material::Solid => self.solid,
                                 Material::Fluid => self.fluid,
+                                Material::Lava => self.lava,
                                 Material::Surface(index) => self.surface[index as usize],
                             }
                         };

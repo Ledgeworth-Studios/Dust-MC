@@ -242,10 +242,18 @@ enum Rung {
     /// grass on dirt, sand on a beach, gravel on a shore, snow and ice where
     /// it is cold, and the deepslate the rules put under the stone.
     ///
-    /// **The last rung a server could run in.** Everything below it reads the
-    /// region file. Aquifers have still not run, so every pocket below the sea
-    /// level holds water where vanilla would leave most of it dry.
+    /// **The last rung a server could run in** until the one below it.
+    /// Aquifers have not run, so every pocket below the sea level holds water
+    /// where vanilla would leave most of it dry.
     Surface,
+    /// The same terrain and the same rules, with the dimension's own aquifers
+    /// deciding what an enclosed pocket holds before the rules are painted —
+    /// which is where vanilla puts them.
+    ///
+    /// **The last rung a server could run in.** Everything below it reads the
+    /// region file. Carvers have still not run, so a cave that is only a cave
+    /// because something dug it is not there at all.
+    Aquifers,
     /// The flat stack again, with each column's grass at the y Minecraft's
     /// `MOTION_BLOCKING` puts it. The terrain's *shape*, and nothing else:
     /// stone is still dirt, an ocean is still filled in solid.
@@ -270,12 +278,13 @@ enum Rung {
 
 impl Rung {
     /// The ladder, in order.
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::Flat,
         Self::FlatAtSeaLevel,
         Self::Biomes,
         Self::Density,
         Self::Surface,
+        Self::Aquifers,
         Self::Heights,
         Self::Carvers,
         Self::BelowTheSurface,
@@ -289,6 +298,7 @@ impl Rung {
             Self::Biomes => "+ Dust's biome source                    (the multi-noise climate)",
             Self::Density => "+ Dust's terrain                         (the density functions)",
             Self::Surface => "+ Dust's surface rules                   (the block underfoot)",
+            Self::Aquifers => "+ Dust's aquifers                        (whether a cave drowns you)",
             Self::Heights => "+ Minecraft's surface height             (the ceiling above it)",
             Self::Carvers => "+ Minecraft's carvers                    (caves)",
             Self::BelowTheSurface => {
@@ -303,7 +313,12 @@ impl Rung {
     fn reads_the_region_file(self) -> bool {
         !matches!(
             self,
-            Self::Flat | Self::FlatAtSeaLevel | Self::Biomes | Self::Density | Self::Surface
+            Self::Flat
+                | Self::FlatAtSeaLevel
+                | Self::Biomes
+                | Self::Density
+                | Self::Surface
+                | Self::Aquifers
         )
     }
 }
@@ -423,6 +438,8 @@ struct Model<'a> {
     fluid: u32,
     /// The surface rules' result blocks, resolved once.
     surface: &'a [u32],
+    /// `minecraft:lava`, which only an aquifer writes.
+    lava: u32,
 }
 
 /// Resolve a block the noise settings named, properties and all.
@@ -629,6 +646,7 @@ fn measure(options: &Options) -> Result<(), String> {
         constants: constants.as_ref().map(|(_, table)| table),
         solid: spec_state(&source.settings().default_block)?,
         fluid: spec_state(&source.settings().default_fluid)?,
+        lava: spec_state(&dust_gen::aquifer::Aquifer::lava_block())?,
         surface: &surface_states,
     };
 
@@ -659,7 +677,7 @@ fn measure(options: &Options) -> Result<(), String> {
             );
         }
         report(rung, &scores);
-        if rung == Rung::Surface {
+        if rung == Rung::Surface || rung == Rung::Aquifers {
             // Counted, not assumed. `minecraft:temperature` answers `false`
             // without looking and the badlands bands are the one table in the
             // rules that is not in the pack, so both are worth a number: a gap
@@ -672,6 +690,16 @@ fn measure(options: &Options) -> Result<(), String> {
                 scores.carved - scores.carved_open,
                 source.settings().default_fluid.name
             );
+            if rung == Rung::Aquifers {
+                println!(
+                    "      aquifers: {}",
+                    if source.has_aquifer() {
+                        "on, from this dimension's own `aquifers_enabled`"
+                    } else {
+                        "off — this dimension's settings say it has none, so this rung is                          the one above it"
+                    }
+                );
+            }
             let (temperature, bandlands) = sampler.declined();
             println!(
                 "      the rules asked `minecraft:temperature` {temperature} time(s), which this \
@@ -717,6 +745,7 @@ fn build(
         constants,
         solid,
         fluid,
+        lava,
         surface: surface_blocks,
     } = *model;
     // Rung zero is the server's own column, cloned rather than rebuilt: that
@@ -755,15 +784,15 @@ fn build(
     );
 
     let top = height.min_y() + height.height() as i32;
-    if rung == Rung::Density || rung == Rung::Surface {
+    if matches!(rung, Rung::Density | Rung::Surface | Rung::Aquifers) {
         // The world's own floor is bedrock on every rung of this ladder,
         // including the control, because vanilla's is: the bedrock gradient is
         // true at and below the bottom without a die being rolled. What is
         // above it here is the noise stage and nothing else.
-        let materials = if rung == Rung::Surface {
-            generator.surface(vanilla.pos().x, vanilla.pos().z)
-        } else {
-            generator.terrain(vanilla.pos().x, vanilla.pos().z)
+        let materials = match rung {
+            Rung::Aquifers => generator.aquifer(vanilla.pos().x, vanilla.pos().z),
+            Rung::Surface => generator.surface(vanilla.pos().x, vanilla.pos().z),
+            _ => generator.terrain(vanilla.pos().x, vanilla.pos().z),
         };
         for z in 0..16u32 {
             for x in 0..16u32 {
@@ -776,6 +805,7 @@ fn build(
                             Material::Air => air,
                             Material::Solid => solid,
                             Material::Fluid => fluid,
+                            Material::Lava => lava,
                             Material::Surface(index) => surface_blocks[index as usize],
                         }
                     };
@@ -793,7 +823,9 @@ fn build(
                 // level everywhere; the rest take it from Minecraft, and a column
                 // Minecraft left empty gets no ground at all rather than a guess.
                 let ground = match rung {
-                    Rung::Flat | Rung::Density | Rung::Surface => unreachable!("handled above"),
+                    Rung::Flat | Rung::Density | Rung::Surface | Rung::Aquifers => {
+                        unreachable!("handled above")
+                    }
                     Rung::FlatAtSeaLevel | Rung::Biomes => Some(SEA_LEVEL),
                     _ => surface[column],
                 };
@@ -802,7 +834,7 @@ fn build(
                         blocks.palette.bedrock
                     } else {
                         match rung {
-                            Rung::Flat | Rung::Density | Rung::Surface => {
+                            Rung::Flat | Rung::Density | Rung::Surface | Rung::Aquifers => {
                                 unreachable!("handled above")
                             }
                             Rung::FlatAtSeaLevel | Rung::Biomes | Rung::Heights => {
@@ -845,7 +877,10 @@ fn build(
                 }
             }
         }
-    } else if matches!(rung, Rung::Biomes | Rung::Density | Rung::Surface) {
+    } else if matches!(
+        rung,
+        Rung::Biomes | Rung::Density | Rung::Surface | Rung::Aquifers
+    ) {
         // Quart coordinates: the cell index, which is the block position
         // shifted down by two. The x and z of the chunk are added first,
         // because a climate is a fact about where in the world the column is
@@ -1343,6 +1378,7 @@ mod tests {
                "sea_level": 63,
                "default_block": {"Name": "minecraft:stone"},
                "default_fluid": {"Name": "minecraft:water", "Properties": {"level": "0"}},
+               "aquifers_enabled": false,
                "noise_router": {
                  "temperature": {
                    "type": "minecraft:y_clamped_gradient",
@@ -1419,6 +1455,10 @@ mod tests {
                 .id(),
             fluid: dust_registry::Block::from_name("minecraft:water")
                 .expect("water")
+                .default_state()
+                .id(),
+            lava: dust_registry::Block::from_name("minecraft:lava")
+                .expect("lava")
                 .default_state()
                 .id(),
         }

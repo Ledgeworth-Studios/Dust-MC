@@ -39,16 +39,22 @@ use crate::noise::density::Evaluator;
 /// caller's registry and not to a generator. A `u8` because a chunk's worth is
 /// ninety-six kibibytes of scratch and it is reused.
 ///
-/// The noise stage answers with the first three. [`Material::Surface`] is what
-/// a surface rule claimed, and its index is into the rules' own palette —
-/// which the caller resolves once, at boot, rather than per block.
+/// The noise stage answers with the first three. [`Material::Lava`] is the
+/// fourth and only an aquifer writes it; [`Material::Surface`] is what a
+/// surface rule claimed, and its index is into the rules' own palette — which
+/// the caller resolves once, at boot, rather than per block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Material {
     Air,
     /// The dimension's `default_block`.
     Solid,
-    /// The dimension's `default_fluid`, below the level the settings name.
+    /// The dimension's `default_fluid`, below the level the settings name or
+    /// below an aquifer's own.
     Fluid,
+    /// `minecraft:lava`. Named in `Aquifer.java` and in no data pack, which is
+    /// why it is a code of its own rather than a second `default_fluid`; see
+    /// [`crate::aquifer::Aquifer::lava_block`].
+    Lava,
     /// `crate::surface::Rules::palette()[index]`.
     Surface(u8),
 }
@@ -59,7 +65,8 @@ impl Material {
             0 => Self::Air,
             1 => Self::Solid,
             2 => Self::Fluid,
-            other => Self::Surface(other - 3),
+            3 => Self::Lava,
+            other => Self::Surface(other - 4),
         }
     }
 
@@ -68,8 +75,15 @@ impl Material {
             Self::Air => 0,
             Self::Solid => 1,
             Self::Fluid => 2,
-            Self::Surface(index) => 3 + index,
+            Self::Lava => 3,
+            Self::Surface(index) => 4 + index,
         }
+    }
+
+    /// Whether this material is a fluid of any kind, which is what a surface
+    /// rule's water height and a stone run's floor both ask.
+    pub fn is_fluid(self) -> bool {
+        matches!(self, Self::Fluid | Self::Lava)
     }
 }
 
@@ -88,6 +102,8 @@ pub struct Terrain {
     cells_y: usize,
     /// The cell index the world's floor is in.
     cell_min_y: i32,
+    /// The dimension's aquifers, or `None` when its settings say it has none.
+    aquifer: Option<crate::aquifer::Aquifer>,
 }
 
 impl Terrain {
@@ -124,6 +140,7 @@ impl Terrain {
             cells_xz: (16 / cell_width) as usize,
             cells_y: (settings.height / cell_height) as usize,
             cell_min_y: settings.min_y.div_euclid(cell_height),
+            aquifer: crate::aquifer::Aquifer::over(&router),
             router,
         })
     }
@@ -145,6 +162,11 @@ impl Terrain {
         256 * self.router.settings.height as usize
     }
 
+    /// Whether this dimension runs aquifers at all.
+    pub fn has_aquifer(&self) -> bool {
+        self.aquifer.is_some()
+    }
+
     /// One thread's scratch space.
     pub fn filler(&self) -> Filler<'_> {
         let corners = (self.cells_xz + 1) * (self.cells_y + 1);
@@ -158,6 +180,10 @@ impl Terrain {
             lerp: vec![Cell::default(); slots],
             skipped: 0,
             walked: 0,
+            flow: self
+                .aquifer
+                .as_ref()
+                .map(|aquifer| aquifer.flow(&self.router.graph)),
         }
     }
 }
@@ -191,6 +217,10 @@ pub struct Filler<'a> {
     /// more code in it.
     skipped: u64,
     walked: u64,
+    /// The aquifer's own scratch, when the dimension has one. A [`Filler`]
+    /// holds it rather than a caller because the aquifer needs the density at
+    /// the block, which only exists inside this walk.
+    flow: Option<crate::aquifer::Flow<'a>>,
 }
 
 impl Filler<'_> {
@@ -201,7 +231,19 @@ impl Filler<'_> {
     /// value because a server generating chunks forever should allocate this
     /// once per thread, not once per chunk.
     pub fn fill(&mut self, chunk_x: i32, chunk_z: i32, out: &mut [u8]) {
-        self.fill_inner(chunk_x, chunk_z, out, true);
+        self.fill_inner(chunk_x, chunk_z, out, true, false);
+    }
+
+    /// The same fill with the dimension's aquifers run over it: what a pocket
+    /// below the ground actually holds, instead of the flat "fluid below the
+    /// sea level" the noise stage alone can say.
+    ///
+    /// A separate entry point and not a flag on [`Terrain`], because the
+    /// ladder in `cargo xtask harness worldgen` scores the two as separate
+    /// rungs and a rung that could only be reached through the one above it
+    /// would not say what the aquifers bought.
+    pub fn fill_with_aquifer(&mut self, chunk_x: i32, chunk_z: i32, out: &mut [u8]) {
+        self.fill_inner(chunk_x, chunk_z, out, true, true);
     }
 
     /// The same fill with the whole-cell skip switched off: every block's
@@ -211,7 +253,18 @@ impl Filler<'_> {
     /// because a check that lives only inside the thing it checks is not a
     /// check. The two must agree byte for byte on every chunk.
     pub fn fill_without_skipping(&mut self, chunk_x: i32, chunk_z: i32, out: &mut [u8]) {
-        self.fill_inner(chunk_x, chunk_z, out, false);
+        self.fill_inner(chunk_x, chunk_z, out, false, false);
+    }
+
+    /// The aquifer fill with the whole-cell skip switched off, which is the
+    /// control the skip is checked against on a world that has aquifers.
+    pub fn fill_with_aquifer_without_skipping(
+        &mut self,
+        chunk_x: i32,
+        chunk_z: i32,
+        out: &mut [u8],
+    ) {
+        self.fill_inner(chunk_x, chunk_z, out, false, true);
     }
 
     /// Cells answered by the bounds walk, and cells walked block by block.
@@ -219,7 +272,14 @@ impl Filler<'_> {
         (self.skipped, self.walked)
     }
 
-    fn fill_inner(&mut self, chunk_x: i32, chunk_z: i32, out: &mut [u8], skip: bool) {
+    fn fill_inner(
+        &mut self,
+        chunk_x: i32,
+        chunk_z: i32,
+        out: &mut [u8],
+        skip: bool,
+        aquifer: bool,
+    ) {
         let terrain = self.terrain;
         let settings = &terrain.router.settings;
         assert_eq!(
@@ -234,6 +294,13 @@ impl Filler<'_> {
         let min_y = settings.min_y;
         let sea_level = settings.sea_level;
         let final_density = terrain.router.final_density;
+        let aquifer = aquifer && self.flow.is_some();
+        if aquifer {
+            self.flow
+                .as_mut()
+                .expect("checked above")
+                .enter_chunk(chunk_x, chunk_z);
+        }
 
         self.fill_slice(base_x, base_z, true);
         for cell_x in 0..terrain.cells_xz {
@@ -253,7 +320,14 @@ impl Filler<'_> {
                         let corners = &self.lerp;
                         self.evaluator.enter_cell(|slot| corners[slot].corner);
                         let (low, high) = self.evaluator.cell_bounds(final_density);
-                        if high <= 0.0 || low > 0.0 {
+                        // With an aquifer running, a cell that holds no rock
+                        // still has to be walked: what fills it is a function
+                        // of the density at each block and not of its sign, so
+                        // only the all-rock half of the skip survives. That is
+                        // the cost this stage pays and decision record 0034
+                        // prices it.
+                        let whole = if aquifer { low > 0.0 } else { high <= 0.0 || low > 0.0 };
+                        if whole {
                             self.skipped += 1;
                             let solid = low > 0.0;
                             let lx = cell_x * terrain.cell_width;
@@ -301,12 +375,28 @@ impl Filler<'_> {
                                 // record 0012 measured that off-by-one on
                                 // every ocean column of seed 1 before anything
                                 // was written.
-                                let material = if density > 0.0 {
-                                    Material::Solid
-                                } else if block_y < sea_level {
-                                    Material::Fluid
-                                } else {
-                                    Material::Air
+                                let material = match self.flow.as_mut() {
+                                    Some(flow) if aquifer => {
+                                        match flow.substance(block_x, block_y, block_z, density) {
+                                            crate::aquifer::Substance::Rock => Material::Solid,
+                                            crate::aquifer::Substance::Air => Material::Air,
+                                            crate::aquifer::Substance::Fluid(
+                                                crate::aquifer::Fluid::Default,
+                                            ) => Material::Fluid,
+                                            crate::aquifer::Substance::Fluid(
+                                                crate::aquifer::Fluid::Lava,
+                                            ) => Material::Lava,
+                                        }
+                                    }
+                                    _ => {
+                                        if density > 0.0 {
+                                            Material::Solid
+                                        } else if block_y < sea_level {
+                                            Material::Fluid
+                                        } else {
+                                            Material::Air
+                                        }
+                                    }
                                 };
                                 let row = (block_y - min_y) as usize;
                                 out[row * 256
@@ -445,6 +535,11 @@ impl Generator {
         &self.terrain
     }
 
+    /// Whether this dimension runs aquifers.
+    pub fn has_aquifer(&self) -> bool {
+        self.terrain.has_aquifer()
+    }
+
     pub fn settings(&self) -> &NoiseSettings {
         self.terrain.settings()
     }
@@ -498,6 +593,28 @@ impl<'a> Columns<'a> {
     /// would not say what the surface rules bought.
     pub fn terrain(&mut self, chunk_x: i32, chunk_z: i32) -> &[u8] {
         self.filler.fill(chunk_x, chunk_z, &mut self.materials);
+        &self.materials
+    }
+
+    /// The noise stage, the dimension's aquifers and its surface rules — the
+    /// three stages in the order vanilla runs them, which is the whole of what
+    /// a server generates today.
+    ///
+    /// The aquifers go *under* the rules and not over them because that is
+    /// where vanilla puts them: they are part of the noise stage, and a rule
+    /// that reads `water` reads what the aquifer decided.
+    pub fn aquifer(&mut self, chunk_x: i32, chunk_z: i32) -> &[u8] {
+        self.filler
+            .fill_with_aquifer(chunk_x, chunk_z, &mut self.materials);
+        if let Some(painter) = self.painter.as_mut() {
+            painter.paint(
+                chunk_x,
+                chunk_z,
+                &mut self.materials,
+                &mut self.biomes,
+                self.zoom_seed,
+            );
+        }
         &self.materials
     }
 
@@ -562,6 +679,7 @@ mod tests {
                     "sea_level": 63,
                     "default_block": {{"Name": "minecraft:stone"}},
                     "default_fluid": {{"Name": "minecraft:water"}},
+                    "aquifers_enabled": false,
                     "noise_router": {{"temperature": 0.0, "vegetation": 0.0,
                                       "continents": 0.0, "erosion": 0.0,
                                       "depth": 0.0, "ridges": 0.0,
