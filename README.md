@@ -253,10 +253,12 @@ so a player who says they are sprinting and airborne is measured at their feet
 rather than at their full height, because they might be swimming and no client
 ever says so — decision record
 [0019](docs/decisions/0019-how-tall-a-player-is.md) says what that costs and why
-it is the direction to be wrong in; **no tool check**, so breaking stone with a
-bare hand yields cobblestone where Minecraft yields nothing — that and the
-sixty wall blocks whose loot table is another block's are the same missing
-oracle column, and they are the two disagreements the drops survey found;
+it is the direction to be wrong in; **no break time**, so every block comes away
+on the first click however hard it is and whatever is in the hand — which is
+downstream of a game mode this server does not have, because the join packet
+says creative and a creative client sends a start and never a stop; decision
+record [0028](docs/decisions/0028-how-long-a-block-takes-to-break.md) has the
+rule, what a real server was measured doing, and the two things it waits on;
 **Q still destroys a stack rather than throwing it**, and item entities are not
 saved, so a restart clears the floor; no crafting, so the grid is
 five slots that store and never combine; a stack now carries its data
@@ -297,28 +299,35 @@ Then add `localhost` to a 1.21.1 client's server list. Set `online_mode = false`
 in `dust.toml` first unless you want Mojang consulted, and point
 `world_source` at a `region` directory if you have a world to serve.
 
-For light, block sounds and placing what you are holding, put Minecraft's own
-answers beside your data:
+For light, block sounds, placing what you are holding and getting the right
+thing out of what you break, put Minecraft's own answers beside your data:
 
 ```
 cargo xtask extract --version 1.21.1 --only constants
 cp .dust-extract/oracle-1.21.1/constants.tsv <[data] path>/dust-constants.tsv
 cp .dust-extract/oracle-1.21.1/items.tsv     <[data] path>/dust-items.tsv
+cp .dust-extract/oracle-1.21.1/blocks.tsv    <[data] path>/dust-blocks.tsv
 ```
 
 How much light a block stops, how much it gives off, which of the six heightmaps
 count it, whether a block placed there goes into it, what it sounds like going
-down, and which block each item puts down are Java code inside Minecraft rather than data, so they are in no report, no data
+down, whether it yields anything to the wrong tool, which block each item puts
+down and which loot table each block draws from are Java code inside Minecraft
+rather than data, so they are in no report, no data
 pack and no copy here — the extractor asks your own server jar for them and
 writes them to your own disk. Without the files, every block but air stops sky
 light, the sky starts above the grass rather than through it, a placed block
-makes no sound, and a right-click puts the world's own surface block on the face
-it clicked whatever the player is holding and whatever is already there; the
-server says so at boot. Decision record
-[0008](docs/decisions/0008-block-opacity-and-light-emission.md) is why they
-arrive this way rather than in the binary — including why both tables key on
-*names* rather than registry ids, and why sixteen items on 1.21.1 make the
-difference between a table and a name match.
+makes no sound, a right-click puts the world's own surface block on the face
+it clicked whatever the player is holding and whatever is already there, no
+block asks for the right tool, and about sixty wall signs, wall banners, wall
+heads and coral wall fans yield nothing at all because the file they draw from
+is named after another block; the server says so at boot. Decision records
+[0008](docs/decisions/0008-block-opacity-and-light-emission.md) and
+[0027](docs/decisions/0027-which-tool-a-block-wants.md) are why they arrive this
+way rather than in the binary — including why all three tables key on *names*
+rather than registry ids, why sixteen items on 1.21.1 make the difference
+between a table and a name match, and why fifty-eight blocks make the same
+difference in the other direction.
 
 The console takes `stop`, `list` and `say`, with or without a leading slash.
 

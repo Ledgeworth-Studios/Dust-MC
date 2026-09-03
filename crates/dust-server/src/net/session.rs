@@ -175,6 +175,15 @@ pub struct SessionContext {
     /// is the ordinary state of a server without a `[data] path`, and it means
     /// a placement is silent rather than guessed at.
     pub constants: Option<Arc<dust_registry::BlockConstants>>,
+    /// Where `requires_tool` sits in that table, resolved once at boot.
+    ///
+    /// A flag column is addressed by name and the name is compared against
+    /// every column in the header, so resolving it per break would be a
+    /// handful of string comparisons on the interaction path for an answer
+    /// that cannot change while the server runs. `None` is a table extracted
+    /// before the column existed, and it means no block asks for a tool —
+    /// which is the server an operator had before decision record 0027.
+    pub requires_tool: Option<dust_registry::constants::Flag>,
     /// Which block each item puts down, if the operator put a table beside
     /// their data.
     ///
@@ -2434,6 +2443,16 @@ fn spill(
         .collect();
     let context = dust_sim::drops::Break {
         state,
+        // Whether this state yields anything to the wrong tool. Read off the
+        // same table the sound comes from, with the column resolved at boot.
+        // Whether the tool in the hand is the *right* one is not asked here:
+        // that is the item's own `minecraft:tool` component, and `dust-sim`
+        // reads it, so the server and `cargo xtask harness drops` are asking
+        // one implementation rather than agreeing with each other.
+        requires_tool: match (ctx.constants.as_deref(), ctx.requires_tool) {
+            (Some(constants), Some(flag)) => constants.is_set(flag, previous),
+            _ => false,
+        },
         tool: dust_sim::drops::Tool {
             item: held,
             // A stack carries no data components yet, so it carries no

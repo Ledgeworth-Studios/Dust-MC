@@ -99,6 +99,10 @@ pub struct BlockConstants {
     /// What each state sounds like going down, when the table carries the
     /// columns for it. `None` for a table written before they existed.
     place: Option<Box<[PlaceSound]>>,
+    /// How long each state takes to break before any tool is considered —
+    /// Minecraft's `destroySpeed`, which is a hardness and not a rate.
+    /// `None` for a table written before the column.
+    hardness: Option<Box<[f32]>>,
     /// The flag columns, in header order.
     flags: Vec<FlagColumn>,
 }
@@ -243,6 +247,32 @@ impl BlockConstants {
             .map_or(0, |set| set.iter().filter(|r| **r).count())
     }
 
+    /// How long `state` takes to break, before any tool is considered.
+    ///
+    /// Minecraft calls it a destroy speed and it is a **hardness**: bigger is
+    /// slower, `-1` is unbreakable, and a player's progress per tick is their
+    /// own mining speed divided by this. Zero is a block that comes away
+    /// instantly, which is a real answer and not a missing one.
+    ///
+    /// `None` when the table carries no such column, which is a table
+    /// extracted before it existed. A caller with `None` should break
+    /// instantly rather than never — a server that will not let a player mine
+    /// looks broken, and a server that mines fast looks generous.
+    #[must_use]
+    pub fn destroy_speed(&self, state: u32) -> Option<f32> {
+        self.hardness.as_ref()?.get(state as usize).copied()
+    }
+
+    /// Whether this table carries the hardness column at all.
+    ///
+    /// Asked apart from the answer for the reason every other `has_` here is:
+    /// "every block breaks instantly" is both what an absent column reads as
+    /// and what no version of Minecraft says.
+    #[must_use]
+    pub fn has_destroy_speed(&self) -> bool {
+        self.hardness.is_some()
+    }
+
     /// The flag column called `name`, if this table carries one.
     ///
     /// `None` is not an error. A table written before a column existed is
@@ -322,6 +352,7 @@ impl BlockConstants {
         let mut occludes = vec![true; expected];
         let mut replaceable = header.replaceable.map(|_| vec![true; expected]);
         let mut place = header.sound.map(|_| vec![SILENCE; expected]);
+        let mut hardness = header.destroy_speed.map(|_| vec![0.0f32; expected]);
         let events = sound_events();
         let mut flags: Vec<FlagColumn> = header
             .flags
@@ -379,6 +410,9 @@ impl BlockConstants {
             if let (Some(column), Some(replaceable)) = (header.replaceable, replaceable.as_mut()) {
                 replaceable[state as usize] = boolean(at, "replaceable", cell(column))?;
             }
+            if let (Some(column), Some(hardness)) = (header.destroy_speed, hardness.as_mut()) {
+                hardness[state as usize] = decimal(at, "destroy_speed", cell(column))?;
+            }
             if let (Some(columns), Some(place)) = (header.sound, place.as_mut()) {
                 place[state as usize] = sound(
                     at,
@@ -407,6 +441,7 @@ impl BlockConstants {
             occludes: occludes.into_boxed_slice(),
             replaceable: replaceable.map(Vec::into_boxed_slice),
             place: place.map(Vec::into_boxed_slice),
+            hardness: hardness.map(Vec::into_boxed_slice),
             flags,
         })
     }
@@ -420,6 +455,7 @@ struct Header {
     emission: usize,
     occlude: Option<usize>,
     replaceable: Option<usize>,
+    destroy_speed: Option<usize>,
     /// The three sound columns, present or absent together.
     sound: Option<SoundColumns>,
     /// Every other column, by name and position.
@@ -459,6 +495,7 @@ impl Header {
         let emission = required("emission")?;
         let occlude = column("occlude");
         let replaceable = column("replaceable");
+        let destroy_speed = column("destroy_speed");
         // All three or none. Two of them describe a sound with no name or a
         // name with no loudness, and a reader that took what it could get
         // would turn an oracle that half-ran into a server that plays block
@@ -496,6 +533,7 @@ impl Header {
                 || at == emission
                 || Some(at) == occlude
                 || Some(at) == replaceable
+                || Some(at) == destroy_speed
                 || sound.is_some_and(|s| at == s.name || at == s.volume || at == s.pitch)
         };
         let flags = names
@@ -511,6 +549,7 @@ impl Header {
             emission,
             occlude,
             replaceable,
+            destroy_speed,
             sound,
             flags,
         })
@@ -590,6 +629,22 @@ fn sound(
         volume: loudness(line, "sound_volume", volume)?,
         pitch: loudness(line, "sound_pitch", pitch)?,
     })
+}
+
+/// Parse one hardness, and refuse anything that is not a finite number.
+///
+/// `-1` is Minecraft's own spelling for unbreakable and is accepted; anything
+/// else negative is not, because a block that takes a negative amount of time
+/// is a column that resolved to something else. No upper bound: bedrock is
+/// `-1`, obsidian is 50 and a data pack may say anything above that it likes.
+fn decimal(line: usize, field: &'static str, text: &str) -> Result<f32, ConstantsError> {
+    text.parse::<f32>()
+        .ok()
+        .filter(|v| v.is_finite() && (*v >= 0.0 || (*v - -1.0).abs() < f32::EPSILON))
+        .ok_or_else(|| ConstantsError::Malformed {
+            line,
+            detail: format!("{field} is {text:?}, and a hardness is -1 or a number at least 0"),
+        })
 }
 
 /// Parse one of the sound group's two floats, and refuse one that is not a

@@ -194,3 +194,85 @@ fn each_reader_looks_for_its_own_file_and_not_the_other() {
         "the block reader must not read the item table"
     );
 }
+
+/// A complete block-to-loot-table table, with any overrides the caller wants.
+fn blocks(overrides: &[(&str, &str)]) -> String {
+    let mut text = String::from("# block_id\tblock\tloot_table\n");
+    for block in dust_registry::Block::all() {
+        let name = block.name();
+        let (namespace, path) = name.split_once(':').expect("namespaced");
+        let drawn = overrides.iter().find(|(who, _)| *who == name).map_or_else(
+            || format!("{namespace}:blocks/{path}"),
+            |(_, to)| (*to).to_owned(),
+        );
+        text.push_str(&format!("{}\t{name}\t{drawn}\n", block.protocol_id()));
+    }
+    text
+}
+
+/// One loot table file under one namespace, in the layout Minecraft's own
+/// generator writes.
+fn loot_file(dir: &std::path::Path, stem: &str, json: &str) {
+    let under = dir.join("minecraft/loot_table/blocks");
+    std::fs::create_dir_all(&under).expect("create the loot directory");
+    std::fs::write(under.join(format!("{stem}.json")), json).expect("write the table");
+}
+
+const ONE_SIGN: &str = r#"{"type":"minecraft:block","pools":[{"rolls":1.0,"bonus_rolls":0.0,
+  "entries":[{"type":"minecraft:item","name":"minecraft:oak_sign"}]}]}"#;
+
+/// The whole of decision record 0027's first half, end to end: one file, and
+/// the block that borrows it gets a table.
+#[test]
+fn a_wall_block_draws_from_the_file_the_oracle_points_it_at() {
+    let dir = data_dir();
+    loot_file(&dir, "oak_sign", ONE_SIGN);
+    std::fs::write(
+        dir.join(constants::BLOCKS_FILE),
+        blocks(&[("minecraft:oak_wall_sign", "minecraft:blocks/oak_sign")]),
+    )
+    .expect("write the table");
+    let loot = constants::blocks_beside(&dir)
+        .expect("a well-formed table")
+        .expect("the file is there");
+    let (tables, report) = dust_server::registries::drops::beside(&dir, Some(&loot));
+    let wall = dust_registry::Block::from_name("minecraft:oak_wall_sign").expect("a block");
+    assert!(tables.table(wall).is_some(), "the wall sign has a table");
+    assert_eq!(tables.distinct(), 1, "compiled once, not twice");
+    assert_eq!(report.borrowed, 1);
+    assert!(report.relation_known);
+}
+
+/// The same data with the column taken away, which is the check watched
+/// failing: without `dust-blocks.tsv` the file is matched to the block of its
+/// own name and the wall sign has nothing.
+#[test]
+fn without_the_oracle_column_the_wall_block_has_no_table_at_all() {
+    let dir = data_dir();
+    loot_file(&dir, "oak_sign", ONE_SIGN);
+    assert!(constants::blocks_beside(&dir)
+        .expect("no file is not an error")
+        .is_none());
+    let (tables, report) = dust_server::registries::drops::beside(&dir, None);
+    let wall = dust_registry::Block::from_name("minecraft:oak_wall_sign").expect("a block");
+    let sign = dust_registry::Block::from_name("minecraft:oak_sign").expect("a block");
+    assert!(tables.table(sign).is_some(), "the sign still has one");
+    assert!(tables.table(wall).is_none(), "and the wall sign does not");
+    assert_eq!(report.borrowed, 0);
+    assert!(!report.relation_known);
+}
+
+#[test]
+fn a_block_table_that_is_there_and_wrong_is_refused_rather_than_skipped() {
+    let dir = data_dir();
+    std::fs::write(
+        dir.join(constants::BLOCKS_FILE),
+        "# block_id\tblock\tloot_table\n0\tminecraft:air\tminecraft:blocks/air\n",
+    )
+    .expect("write the table");
+    let error = constants::blocks_beside(&dir).expect_err("a table with one row in it");
+    assert!(
+        format!("{error}").contains("blocks"),
+        "the error names the file: {error}"
+    );
+}

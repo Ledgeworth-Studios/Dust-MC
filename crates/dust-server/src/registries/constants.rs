@@ -62,6 +62,7 @@
 
 use std::path::{Path, PathBuf};
 
+use dust_registry::loot::BlockLoot;
 use dust_registry::{BlockConstants, ItemBlocks};
 
 /// What the block-state table is called inside `[data] path`.
@@ -69,6 +70,9 @@ pub const FILE: &str = "dust-constants.tsv";
 
 /// What the item-to-block table is called inside `[data] path`.
 pub const ITEMS_FILE: &str = "dust-items.tsv";
+
+/// What the block-to-loot-table table is called inside `[data] path`.
+pub const BLOCKS_FILE: &str = "dust-blocks.tsv";
 
 /// Why a light table beside the data could not be used.
 #[derive(Debug)]
@@ -124,6 +128,37 @@ pub fn beside(root: impl AsRef<Path>) -> Result<Option<BlockConstants>, Constant
 /// alternative is a server that read the operator's file, put it down, and
 /// serves a world where half the blocks a player places are the wrong ones. A
 /// file that is not there is `Ok(None)`.
+/// Read the block-to-loot-table table beside a data directory, if there is one.
+///
+/// `root` is `[data] path` — the directory holding `minecraft/`.
+///
+/// Without it, a block's loot table is guessed from its own name, which is
+/// right for 982 of the 1,060 blocks on 1.21.1 and drops nothing for the other
+/// 78 — about sixty of which are wall signs, wall banners, wall heads and
+/// coral wall fans that a player breaks and receives nothing for. Decision
+/// record 0027 is the account.
+///
+/// # Errors
+///
+/// [`ConstantsFileError`], by the same rule [`beside`] follows: a file that is
+/// there and wrong stops the server, because the alternative is a server
+/// quietly dropping the wrong item for every block in the game.
+pub fn blocks_beside(root: impl AsRef<Path>) -> Result<Option<BlockLoot>, ConstantsFileError> {
+    let path = root.as_ref().join(BLOCKS_FILE);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| ConstantsFileError {
+        path: path.clone(),
+        detail: e.to_string(),
+    })?;
+    let table = BlockLoot::parse(&text).map_err(|e| ConstantsFileError {
+        path,
+        detail: e.to_string(),
+    })?;
+    Ok(Some(table))
+}
+
 pub fn items_beside(root: impl AsRef<Path>) -> Result<Option<ItemBlocks>, ConstantsFileError> {
     let path = root.as_ref().join(ITEMS_FILE);
     if !path.is_file() {

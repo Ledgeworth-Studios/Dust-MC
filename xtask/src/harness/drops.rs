@@ -29,7 +29,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use dust_registry::{Block, Item};
+use dust_registry::loot::BlockLoot;
+use dust_registry::{Block, BlockConstants, Item};
 use dust_sim::drops::{self, Break, Rng, Tables, Tool};
 
 /// How many times each block's table is rolled before its answer is believed.
@@ -63,6 +64,14 @@ enum Outcome {
 #[derive(Debug)]
 struct Answer {
     block: String,
+    /// What the survey held while it broke the block, or `None` for a bare
+    /// hand. Read from the answer file rather than assumed, because the two
+    /// rows that decision record 0022 left disagreeing were both about the
+    /// tool: a survey that reported which tool it used and a scorer that
+    /// hardcoded a netherite pickaxe could not have found them.
+    tool: Option<Item>,
+    /// The tool as the survey spelled it, for the worklist.
+    held: String,
     outcome: Outcome,
 }
 
@@ -84,19 +93,65 @@ pub fn run(options: &Options) -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     };
-    let tables = match load(&root) {
+    let loot = match block_loot(&root) {
+        Ok(loot) => loot,
+        Err(why) => {
+            eprintln!("{why}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    let tables = match load(&root, loot.as_ref()) {
         Ok(tables) => tables,
         Err(why) => {
             eprintln!("{why}");
             return std::process::ExitCode::from(2);
         }
     };
+    let constants = match constants(&root) {
+        Ok(constants) => constants,
+        Err(why) => {
+            eprintln!("{why}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    let needs_tool = constants
+        .as_ref()
+        .and_then(|table| table.flag("requires_tool").map(|flag| (table, flag)));
     println!(
         "{} answer(s) from {}, {} block table(s) from {}",
         answers.len(),
         options.answers.display(),
         tables.len(),
         root.display()
+    );
+    println!(
+        "  the block-to-table relation is {}",
+        match &loot {
+            Some(loot) => format!(
+                "known: {} block(s), {} drawing from another block's file",
+                loot.len(),
+                loot.elsewhere()
+            ),
+            None => format!(
+                "guessed from each file's own name, because {} holds no dust-blocks.tsv",
+                root.display()
+            ),
+        }
+    );
+    println!(
+        "  the tool requirement is {}",
+        match needs_tool {
+            Some((table, flag)) => format!(
+                "known: {} of {} state(s) want the right tool",
+                (0..table.len() as u32)
+                    .filter(|state| table.is_set(flag, *state))
+                    .count(),
+                table.len()
+            ),
+            None => "unknown, because there is no dust-constants.tsv with a \
+                     requires_tool column here"
+                .to_owned(),
+        }
     );
 
     let (mut agreed, mut disagreed, mut unmeasured, mut untabled) = (0u32, 0u32, 0u32, 0u32);
@@ -129,14 +184,16 @@ pub fn run(options: &Options) -> std::process::ExitCode {
             ));
             continue;
         };
-        let seen = distribution(table, block, ROLLS);
+        let requires_tool =
+            needs_tool.is_some_and(|(table, flag)| table.is_set(flag, block.default_state().id()));
+        let seen = distribution(table, block, answer.tool, requires_tool, ROLLS);
         let times = seen.get(&wanted).copied().unwrap_or(0);
         if times > 0 {
             agreed += 1;
             if options.verbose {
                 println!(
-                    "  agree       {:<34} {wanted}  ({} in {ROLLS})",
-                    answer.block, times
+                    "  agree       {:<34} {:<22} {wanted}  ({} in {ROLLS})",
+                    answer.block, answer.held, times
                 );
             }
         } else {
@@ -147,8 +204,9 @@ pub fn run(options: &Options) -> std::process::ExitCode {
                 .map(|(spelling, count)| format!("{spelling} ({count} in {ROLLS})"))
                 .unwrap_or_else(|| "nothing at all".to_owned());
             worklist.push(format!(
-                "{}: Minecraft gave {wanted}, Dust never does; its commonest is {likeliest}",
-                answer.block
+                "{} with {}: Minecraft gave {wanted}, Dust never does; its commonest \
+                 is {likeliest}",
+                answer.block, answer.held
             ));
         }
     }
@@ -187,19 +245,25 @@ pub fn run(options: &Options) -> std::process::ExitCode {
 /// broke: `/setblock minecraft:wheat` places `age=0`. A survey that named the
 /// state would be scored against the state; this one does not, so this does
 /// not invent one.
-fn distribution(table: &drops::Table, block: Block, rolls: u32) -> BTreeMap<String, u32> {
-    // A netherite pickaxe with nothing on it, which is what the survey held. A
-    // stack carries no data components yet, so `enchantments` is empty here
-    // for the same reason it is empty in the server — see decision record
-    // 0022.
+fn distribution(
+    table: &drops::Table,
+    block: Block,
+    held: Option<Item>,
+    requires_tool: bool,
+    rolls: u32,
+) -> BTreeMap<String, u32> {
+    // Whatever the survey held, including nothing. A stack carries no data
+    // components yet, so `enchantments` is empty here for the same reason it
+    // is empty in the server — see decision record 0022.
     let tool = Tool {
-        item: Item::from_name("minecraft:netherite_pickaxe"),
+        item: held,
         enchantments: &[],
     };
     let context = Break {
         state: block.default_state(),
         tool,
         broken_by_entity: true,
+        requires_tool,
         neighbours: &[],
     };
     let mut rng = Rng::from_seed(0xd005_5eed);
@@ -223,7 +287,36 @@ fn distribution(table: &drops::Table, block: Block, rolls: u32) -> BTreeMap<Stri
     out
 }
 
-fn load(root: &Path) -> Result<Tables, String> {
+/// The block-to-loot-table relation, if the operator's data carries it.
+///
+/// Optional here and not in the server, because this is a measurement tool and
+/// the number it prints without one is a real number about a real server: a
+/// reader who has not re-run the extractor should see the score they would get.
+fn block_loot(root: &Path) -> Result<Option<BlockLoot>, String> {
+    let path = root.join("dust-blocks.tsv");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    BlockLoot::parse(&text)
+        .map(Some)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn constants(root: &Path) -> Result<Option<BlockConstants>, String> {
+    let path = root.join("dust-constants.tsv");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    BlockConstants::parse(&text)
+        .map(Some)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn load(root: &Path, loot: Option<&BlockLoot>) -> Result<Tables, String> {
     let blocks = root.join("minecraft/loot_table/blocks");
     let entries = std::fs::read_dir(&blocks)
         .map_err(|e| format!("could not read {}: {e}", blocks.display()))?;
@@ -236,12 +329,20 @@ fn load(root: &Path) -> Result<Tables, String> {
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        let Some(block) = drops::block_of_file("minecraft", stem) else {
-            continue;
+        let drawn: Vec<Block> = match loot {
+            Some(loot) => loot
+                .drawing_from(&format!("minecraft:blocks/{stem}"))
+                .to_vec(),
+            None => drops::block_of_file("minecraft", stem)
+                .into_iter()
+                .collect(),
         };
+        if drawn.is_empty() {
+            continue;
+        }
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("could not read {}: {e}", path.display()))?;
-        if let Err(why) = tables.insert(block, &text) {
+        if let Err(why) = tables.insert_for(&drawn, &text) {
             return Err(format!("{}: {why}", path.display()));
         }
     }
@@ -287,8 +388,33 @@ fn read_answers(path: &Path) -> Result<Vec<Answer>, String> {
             "NOTHING" => Outcome::Nothing,
             other => Outcome::Unmeasured(format!("{other} ({})", fields[3])),
         };
+        // A bare hand is spelled `-`, which is what the survey writes when it
+        // put nothing in the player's hand at all. It is a tool the drop rules
+        // have a great deal to say about, and reading it as "no answer" would
+        // silently drop every row that is about it.
+        let held = fields[1].to_owned();
+        let tool = if held == "-" {
+            None
+        } else {
+            let namespaced = if held.contains(':') {
+                held.clone()
+            } else {
+                format!("minecraft:{held}")
+            };
+            let item = Item::from_name(&namespaced);
+            if item.is_none() {
+                return Err(format!(
+                    "line {}: `{held}` is not an item on this version, so the survey \
+                     was run against a different one",
+                    index + 1
+                ));
+            }
+            item
+        };
         out.push(Answer {
             block: fields[0].to_owned(),
+            tool,
+            held,
             outcome,
         });
     }
