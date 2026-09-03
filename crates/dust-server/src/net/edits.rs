@@ -332,10 +332,26 @@ impl EditedWorld {
     /// per cell — still has to ask about the edits, and there should be one
     /// answer to what "has this been edited" means.
     pub fn edited_block_at(&self, position: Position) -> Option<u32> {
-        let column = column_of(position);
-        let local = local_of(position);
-        let edits = self.edits.read().expect("the edit map is never poisoned");
-        edits.get(&column).and_then(|c| c.get(&local)).copied()
+        self.edits_now().at(position)
+    }
+
+    /// Every edit in the world, borrowed, for a caller that is about to ask
+    /// about a *box* of cells rather than one.
+    ///
+    /// [`EditedWorld::edited_block_at`] takes the map's read lock, and taking
+    /// a lock is most of what it costs. That is the right shape for a caller
+    /// asking one question and the wrong one for the movement check, which
+    /// asks about up to twelve cells for one packet twenty times a second per
+    /// player and was paying for twelve lock acquisitions to do it. This takes
+    /// it once. [`Edits::is_empty`] is the other half: a world nobody has
+    /// built in yet answers the whole box without a single hash of anything.
+    ///
+    /// The borrow is a read guard, so a placement lands the moment the box is
+    /// done rather than in the middle of it — which also makes the box read
+    /// against one state of the world rather than twelve.
+    #[must_use]
+    pub fn edits_now(&self) -> Edits<'_> {
+        Edits(self.edits.read().expect("the edit map is never poisoned"))
     }
 
     /// How far up and down this world goes.
@@ -578,6 +594,29 @@ fn column_of(position: Position) -> (i32, i32) {
 /// remaindered, because `-1 % 16` is `-1` and a chunk has no cell -1.
 fn local_of(position: Position) -> (i32, i32, i32) {
     (position.x & 15, position.y, position.z & 15)
+}
+
+/// Every edit in the world, held open. See [`EditedWorld::edits_now`].
+#[derive(Debug)]
+pub struct Edits<'a>(std::sync::RwLockReadGuard<'a, HashMap<ColumnKey, ColumnEdits>>);
+
+impl Edits<'_> {
+    /// Whether nothing anywhere has been edited. True for a world nobody has
+    /// built in, which is the common case for a server that has just started
+    /// and the case worth not hashing a key for.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The state at a block position, if an edit has changed it.
+    #[must_use]
+    pub fn at(&self, position: Position) -> Option<u32> {
+        self.0
+            .get(&column_of(position))
+            .and_then(|c| c.get(&local_of(position)))
+            .copied()
+    }
 }
 
 /// A handle sessions share.

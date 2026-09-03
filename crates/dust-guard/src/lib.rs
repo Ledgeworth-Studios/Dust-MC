@@ -17,7 +17,10 @@
 //!
 //! [`Reach`], which bounds how far a player may act from where they stand, and
 //! [`Movement`], which bounds where they may say they are — in time, through
-//! [`SpeedLimit`], and through solid ground, through [`Solidity`]. The rules
+//! [`SpeedLimit`], and through solid ground, through [`Solidity`]. [`Pose`] is
+//! what both of them measure: how tall a player is and where their eyes are,
+//! derived from the handful of things a 1.21.1 client actually tells a server
+//! about its own shape. The rules
 //! that are still missing are stated where the code for them would go rather
 //! than listed here, because a list in two places is a list that disagrees with
 //! itself.
@@ -116,17 +119,144 @@ impl Reach {
 
 /// How far above their feet a standing player's eyes are.
 ///
-/// Vanilla's `Player.DEFAULT_EYE_HEIGHT`. A crouching player's are 1.27 and a
-/// swimming one's 0.4, and **this does not track either** — which is why the
-/// configured limit is documented as needing slack rather than as being
-/// vanilla's number exactly. Half a block of slack covers the whole range of
-/// poses and then some; see `[server] interaction_range`.
+/// Vanilla's `Player.DEFAULT_EYE_HEIGHT`, and the eye height of
+/// [`Pose::Standing`]. Every other pose has its own; see [`Pose::eye_height`].
 pub const EYE_HEIGHT: f64 = 1.62;
 
-/// The eye position of a player standing at `feet`.
+/// What shape a player is.
+///
+/// # Why a server needs this at all
+///
+/// A player is not a point and not a fixed box. Standing they are 1.8 tall
+/// with their eyes at 1.62; crouching, 1.5 and 1.27; crawling, swimming or
+/// gliding, 0.6 and 0.4. Two of this crate's checks read those numbers and
+/// both of them were wrong without this type: [`Reach`] measured every player
+/// from a standing eye, so a crouching one was measured **0.35 too high** —
+/// which is exactly the wrong direction at a ledge edge, where crouching is
+/// the single most common thing a player does on purpose — and [`Movement`]
+/// measured only the bottom 0.6 of everybody, so a client could put its head
+/// through a wall while its feet stood in a legal cell.
+///
+/// # Where the numbers come from
+///
+/// Vanilla's `Player.POSES`, which pairs each `Pose` with an
+/// `EntityDimensions`. They are constants in Minecraft's code rather than rows
+/// in a table it ships, which is why they are written here and not extracted:
+/// there is no file in a jar to read them out of. The width — 0.6 — is the
+/// same for every pose but `SLEEPING`, and [`PLAYER_WIDTH`] holds it.
+///
+/// # What a server can actually know
+///
+/// Less than this enum can say, and that gap is the whole difficulty. A 1.21.1
+/// client tells the server about **crouching** (the sneak key, as a
+/// `player_command`) and about **gliding** (the elytra start), and about
+/// nothing else. Swimming and crawling are not sent: vanilla derives them,
+/// from water and from whether a taller pose fits. Dust does not read water on
+/// the movement path, so [`Movement`] treats swimming as a thing it cannot see
+/// and is permissive about — see [`Movement::measured_height`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Pose {
+    /// On their feet. 1.8 tall, eyes at 1.62.
+    #[default]
+    Standing,
+    /// Holding the sneak key, and not flying. 1.5 tall, eyes at 1.27.
+    ///
+    /// Vanilla's condition is `isShiftKeyDown() && !abilities.flying`: a
+    /// creative player who sneaks while flying descends rather than crouching,
+    /// and is still their full height.
+    Crouching,
+    /// Swimming, crawling, or spinning through the air on a riptide trident.
+    /// 0.6 tall, eyes at 0.4 — vanilla gives all three the same box.
+    Swimming,
+    /// Gliding on an elytra. 0.6 tall, eyes at 0.4.
+    Gliding,
+    /// In a bed. 0.2 tall, eyes at 0.2.
+    ///
+    /// Nothing in this server puts a player here yet — there are no beds — and
+    /// it is written down anyway because the day there are, a sleeping player
+    /// measured as 1.8 tall is a player refused for lying in a two-block
+    /// bedroom.
+    Sleeping,
+}
+
+impl Pose {
+    /// How tall a player in this pose is, in blocks.
+    #[must_use]
+    pub fn height(self) -> f64 {
+        match self {
+            Self::Standing => 1.8,
+            Self::Crouching => 1.5,
+            Self::Swimming | Self::Gliding => 0.6,
+            Self::Sleeping => 0.2,
+        }
+    }
+
+    /// How far above their feet a player in this pose has their eyes.
+    #[must_use]
+    pub fn eye_height(self) -> f64 {
+        match self {
+            Self::Standing => EYE_HEIGHT,
+            Self::Crouching => 1.27,
+            Self::Swimming | Self::Gliding => 0.4,
+            Self::Sleeping => 0.2,
+        }
+    }
+}
+
+/// What a client has said about itself, out of which a [`Pose`] is derived.
+///
+/// Five bits, all of them read straight off packets the server already decodes
+/// — three `player_command` actions, the abilities flags, and the on-ground
+/// flag every movement packet carries. Nothing here is inferred and nothing
+/// here costs a world lookup; the inference lives in [`Posture::pose`] and in
+/// [`Movement::measured_height`], where it can be read in one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Posture {
+    /// The sneak key is down. `player_command` `StartSneaking`/`StopSneaking`.
+    pub sneaking: bool,
+    /// The sprint key is down. `player_command`
+    /// `StartSprinting`/`StopSprinting`. Not a pose by itself — it is here
+    /// because vanilla's swimming pose requires it, and swimming is the one
+    /// pose this server cannot see.
+    pub sprinting: bool,
+    /// Flying, from `player_abilities`. Cancels crouching, as it does in
+    /// vanilla.
+    pub flying: bool,
+    /// Gliding on an elytra. `player_command` `StartFlyingWithElytra`.
+    ///
+    /// A client says when this *starts* and never when it stops — landing is
+    /// something vanilla's server works out for itself. A stale `true` here
+    /// makes a player shorter than they are, which is the direction that
+    /// believes them rather than the direction that refuses them.
+    pub gliding: bool,
+    /// The last movement packet said the player was standing on something.
+    pub on_ground: bool,
+}
+
+impl Posture {
+    /// The pose these signals describe.
+    ///
+    /// Vanilla's `Player.updatePlayerPose` in the order it tests them, with the
+    /// two branches this server cannot see — sleeping and swimming — left out.
+    /// It does **not** include vanilla's "and shrink until it fits" fallback;
+    /// that needs the world, and [`Movement::measured_height`] is where it
+    /// happens.
+    #[must_use]
+    pub fn pose(self) -> Pose {
+        if self.gliding {
+            Pose::Gliding
+        } else if self.sneaking && !self.flying {
+            Pose::Crouching
+        } else {
+            Pose::Standing
+        }
+    }
+}
+
+/// The eye position of a player at `feet` in `pose`.
 #[must_use]
-pub fn eye_of(feet: (f64, f64, f64)) -> (f64, f64, f64) {
-    (feet.0, feet.1 + EYE_HEIGHT, feet.2)
+pub fn eye_of(feet: (f64, f64, f64), pose: Pose) -> (f64, f64, f64) {
+    (feet.0, feet.1 + pose.eye_height(), feet.2)
 }
 
 /// How far a player may move in one tick, in blocks.
@@ -248,8 +378,9 @@ impl SpeedLimit {
 /// cannot answer is not "refused".
 ///
 /// `&mut self` so that an implementation may cache the column it just resolved;
-/// [`Movement::claimed`] asks at most twice per packet and the second question
-/// is nearly always about the same column as the first.
+/// [`Movement::claimed`] asks once per packet for a player in the open and up
+/// to four times for one standing inside terrain, and every one of those
+/// questions is about the same one to four columns.
 pub trait Solidity {
     /// The first solid cell in the inclusive box from `lo` to `hi`, or `None`
     /// if there is none. Which one, when there are several, is not specified —
@@ -276,19 +407,16 @@ impl Solidity for Open {
 /// 1.8F)` — the width, which no pose changes.
 pub const PLAYER_WIDTH: f64 = 0.6;
 
-/// How much of a player, upwards from their feet, this check watches.
+/// How much of a player, upwards from their feet, is checked whatever else is
+/// true.
 ///
-/// **Not their height, and deliberately not.** A standing player is 1.8 tall, a
-/// crouching one 1.5 and a crawling one 0.6, and this server does not track
-/// pose — so a check that measured 1.8 would refuse every player who crawled
-/// into a one-block gap, which is ordinary play and which the player did on
-/// purpose. Measuring the bottom 0.6 costs one thing: a cheat that puts its head
-/// through a wall while its feet stand in a hole underneath it. Everything else
-/// that walks through a wall walks its feet through it first.
-///
-/// 0.6 is also vanilla's own step height, which makes the rule sayable in one
-/// sentence: a player may not put their feet somewhere they could not have
-/// stepped.
+/// The shortest a player can be — [`Pose::Swimming`]'s 0.6 — and also vanilla's
+/// own step height, which makes the floor of this check sayable in one
+/// sentence: **a player may not put their feet somewhere they could not have
+/// stepped.** The rest of their height is checked on top of this and can be
+/// given up; this part never is. See [`Movement::measured_height`] for what
+/// decides the rest, and [`Movement::claimed`] for why the two are asked
+/// separately.
 pub const FOOT_HEIGHT: f64 = 0.6;
 
 /// How far inside a face a player has to be before they count as inside it.
@@ -317,13 +445,15 @@ const SAMPLE_SPAN: f64 = 1.0;
 /// refused, which is the direction to be wrong in.
 const MAX_SAMPLES: u32 = 64;
 
-/// The cells a player standing at `feet` is inside, inset by [`SKIN`].
+/// The cells a player `height` tall standing at `feet` is inside, inset by
+/// [`SKIN`].
 ///
-/// Inclusive on both ends. At most two cells across on x and z and two high,
-/// which is where the cost of the whole check comes from: eight cells at the
-/// worst and two when a player stands in the middle of one.
+/// Inclusive on both ends. At most two cells across on x and z, and as many
+/// high as the height reaches — one or two for a foot box, two or three for a
+/// standing one. That count is the cost of the whole check: every cell in here
+/// is a block state read.
 #[must_use]
-fn foot_cells(feet: (f64, f64, f64)) -> ((i32, i32, i32), (i32, i32, i32)) {
+fn cells(feet: (f64, f64, f64), height: f64) -> ((i32, i32, i32), (i32, i32, i32)) {
     let half = PLAYER_WIDTH / 2.0 - SKIN;
     let floor = |v: f64| v.floor() as i32;
     (
@@ -334,16 +464,20 @@ fn foot_cells(feet: (f64, f64, f64)) -> ((i32, i32, i32), (i32, i32, i32)) {
         ),
         (
             floor(feet.0 + half),
-            floor(feet.1 + FOOT_HEIGHT - SKIN),
+            floor(feet.1 + height - SKIN),
             floor(feet.2 + half),
         ),
     )
 }
 
-/// Whether a player standing at `feet` is inside solid ground.
+/// Whether a player `height` tall standing at `feet` is inside solid ground.
 #[must_use]
-fn inside(world: &mut impl Solidity, feet: (f64, f64, f64)) -> Option<(i32, i32, i32)> {
-    let (lo, hi) = foot_cells(feet);
+fn inside(
+    world: &mut impl Solidity,
+    feet: (f64, f64, f64),
+    height: f64,
+) -> Option<(i32, i32, i32)> {
+    let (lo, hi) = cells(feet, height);
     world.first_solid(lo, hi)
 }
 
@@ -435,6 +569,9 @@ pub struct Movement {
     /// them. `None` is the ordinary state: a player who is where they say
     /// they are never has one of these.
     awaiting: Option<(i32, (f64, f64, f64))>,
+    /// What the client has said about its own shape. Five bits; see
+    /// [`Posture`].
+    posture: Posture,
 }
 
 impl Movement {
@@ -445,7 +582,30 @@ impl Movement {
             limit,
             at,
             awaiting: None,
+            posture: Posture::default(),
         }
+    }
+
+    /// What this client has last said about its own shape.
+    ///
+    /// A movement packet's on-ground flag belongs here too, and every one of
+    /// them should set it before the position is judged — a client that says
+    /// it is airborne is measured differently from one that says it is
+    /// standing. See [`Movement::measured_height`].
+    pub fn posture(&mut self, posture: Posture) {
+        self.posture = posture;
+    }
+
+    /// The pose the client's own signals describe.
+    ///
+    /// This is what a reach check measures the eye height from — see
+    /// [`eye_of`] — and it is deliberately **not** the height the collision
+    /// check uses, which can be shorter than this and never taller. A reach
+    /// that guessed a player shorter than they are would refuse them for
+    /// looking up.
+    #[must_use]
+    pub fn pose(&self) -> Pose {
+        self.posture.pose()
     }
 
     /// Where the server believes this player is.
@@ -492,22 +652,38 @@ impl Movement {
     /// [`SAMPLE_SPAN`] — so a claim that jumps a wall is judged at the points
     /// between as well as at its end.
     ///
+    /// # How much of a player is measured
+    ///
+    /// All of them, up to the height of the pose the client's own signals
+    /// describe — see [`Pose`] and [`Movement::measured_height`]. That is what
+    /// closes the hole a foot-high box left open, where a client could put its
+    /// head through a wall while its feet stood in a legal cell.
+    ///
+    /// The bottom [`FOOT_HEIGHT`] of a player is asked about separately when
+    /// the taller question says "already inside", because a head in a low
+    /// ceiling is an entirely ordinary player and must not be a licence to
+    /// walk the rest of them through a wall. [`walked_into`](Self::walked_into)
+    /// spells the order out.
+    ///
     /// # What this deliberately allows
     ///
-    /// Standing on a stair, a slab, a farmland block or soul sand, and crawling
-    /// through a one-block gap: none of those are a full cube or are measured
-    /// against a full-height player, and all of them are ordinary play. Riding,
-    /// being pushed and being knocked back, which no part of this server does
-    /// yet, will all be moves the player did not make and will need a way to say
-    /// so before they exist. And a chunk the server has not loaded is not
-    /// solid, so a player walking into unloaded ground is believed.
+    /// Standing on a stair, a slab, a farmland block or soul sand: none of
+    /// those is a full cube. Crawling through a one-block gap, because a
+    /// player already inside a ceiling at their full height is believed.
+    /// Swimming, because a sprinting player who says they are airborne is
+    /// measured at their feet and this server cannot see water. Riding, being
+    /// pushed and being knocked back, which no part of this server does yet,
+    /// will all be moves the player did not make and will need a way to say so
+    /// before they exist. And a chunk the server has not loaded is not solid,
+    /// so a player walking into unloaded ground is believed.
     ///
     /// # Cost
     ///
-    /// One [`Solidity::first_solid`] call over a box of at most eight cells for
-    /// a step under a block long, which is every step a measured client takes.
-    /// A second call, over the position they came from, only when the first one
-    /// found something — which for a player in the open is never.
+    /// One [`Solidity::first_solid`] call over a box of at most twelve cells
+    /// for a step under a block long, which is every step a measured client
+    /// takes. The further calls, over the position they came from and over the
+    /// player's feet, are only made when the first one found something — which
+    /// for a player in the open is never.
     pub fn claimed(&mut self, to: (f64, f64, f64), ticks: u32, world: &mut impl Solidity) -> Claim {
         if !to.0.is_finite() || !to.1.is_finite() || !to.2.is_finite() {
             return Claim::Refused(Refusal::NotFinite);
@@ -535,6 +711,7 @@ impl Movement {
                     limit: self.limit,
                     at: target,
                     awaiting: None,
+                    posture: self.posture,
                 };
                 if back.walked_into(to, world).is_none() {
                     self.awaiting = None;
@@ -559,33 +736,113 @@ impl Movement {
         Claim::Accepted
     }
 
+    /// How much of this player, upwards from their feet, the collision check
+    /// measures.
+    ///
+    /// Never taller than the pose the client's own signals describe, and it is
+    /// the two places it is *shorter* that decide whether an honest player is
+    /// ever refused. Both are stated as permissions rather than discovered as
+    /// bugs:
+    ///
+    /// **A player who says they are not on the ground, while sprinting, is
+    /// measured at [`FOOT_HEIGHT`].** That is vanilla's own swimming
+    /// condition — `isSprinting() && isInWater()` — with the water left out,
+    /// because this server does not read fluids on the movement path and
+    /// cannot. A swimmer is 0.6 tall and a client never says so, so the choice
+    /// is between believing a sprinting airborne player is short and
+    /// rubber-banding every player who swims through a one-block gap in a
+    /// ravine or a kelp forest. It costs a cheat one bit — set the on-ground
+    /// flag false and hold sprint — and that cheat is exactly what every
+    /// client could already do before any of this existed, so the check is
+    /// still strictly a gain. Note what it does *not* give away: the feet are
+    /// checked whatever this returns.
+    ///
+    /// **A player whose taller box does not fit where they already are is
+    /// measured shorter**, and that is not here — it falls out of
+    /// [`claimed`](Self::claimed)'s already-inside rule for free, because a
+    /// crawler in a one-block tunnel has a standing box that is inside the
+    /// ceiling at both ends of every move they make. Vanilla does the same
+    /// thing explicitly, in `updatePlayerPose`: if the pose does not fit, try
+    /// crouching, then the 0.6 box.
+    #[must_use]
+    pub fn measured_height(&self) -> f64 {
+        if self.posture.sprinting && !self.posture.on_ground {
+            return FOOT_HEIGHT;
+        }
+        self.posture.pose().height().max(FOOT_HEIGHT)
+    }
+
     /// The block a move from `at` to `to` puts the player inside, having not
     /// been inside one to start with.
     ///
-    /// The sampling is by the largest single-axis displacement rather than by
-    /// the distance, and that is not an approximation of the distance: what has
-    /// to stay under a block's width is the step on each axis, and the largest
-    /// of the three is exactly what bounds all of them.
+    /// # Two boxes, asked in order, and why not one
+    ///
+    /// The whole player is asked about first. If nothing is in that box there
+    /// is nothing more to ask, and that is the case every walking player in
+    /// the open is in — **one world question, the same as before pose
+    /// existed.**
+    ///
+    /// When something *is* in it, the same box is asked about where the player
+    /// came from, and a player who was already inside one is believed. That
+    /// pair is the rule this crate has always had, now applied to the player's
+    /// real height rather than to their bottom 0.6.
+    ///
+    /// But "already inside" cannot be allowed to mean "and therefore anything
+    /// goes". A player with their head in a low ceiling is a completely
+    /// ordinary player — under a slab, in a cave, on a staircase — and if that
+    /// state licensed the rest of them to walk through a wall, then standing
+    /// under an overhang would be a cheat's front door. So when the tall pair
+    /// says "already inside", the [`FOOT_HEIGHT`] pair is asked as well, and a
+    /// player who walks their *feet* into a block is refused however blocked
+    /// their head was. Four world questions at the very worst, for a player
+    /// who is genuinely stuck inside terrain, and one for everybody else.
+    ///
+    /// # The sampling
+    ///
+    /// By the largest single-axis displacement rather than by the distance,
+    /// and that is not an approximation of the distance: what has to stay
+    /// under a block's width is the step on each axis, and the largest of the
+    /// three is exactly what bounds all of them.
     fn walked_into(
         &self,
         to: (f64, f64, f64),
         world: &mut impl Solidity,
     ) -> Option<(i32, i32, i32)> {
+        let height = self.measured_height();
         let from = self.at;
         let d = (to.0 - from.0, to.1 - from.1, to.2 - from.2);
         let span = d.0.abs().max(d.1.abs()).max(d.2.abs());
         let samples = ((span / SAMPLE_SPAN).ceil() as u32).clamp(1, MAX_SAMPLES);
+        // Where the player came from does not change between samples, so
+        // neither do these two answers. Asked at most once each, and only
+        // once a sample has found something — a player walking in the open
+        // never asks either.
+        let mut was_blocked: Option<bool> = None;
+        let mut feet_were_blocked: Option<bool> = None;
         for i in 1..=samples {
             let t = f64::from(i) / f64::from(samples);
             let at = (from.0 + d.0 * t, from.1 + d.1 * t, from.2 + d.2 * t);
-            if let Some(block) = inside(world, at) {
-                // Inside already, and on their way out. Believed — see this
-                // type's own documentation for why that is the important half.
-                return if inside(world, from).is_some() {
-                    None
-                } else {
-                    Some(block)
-                };
+            let Some(block) = inside(world, at, height) else {
+                continue;
+            };
+            let blocked = *was_blocked.get_or_insert_with(|| inside(world, from, height).is_some());
+            if !blocked {
+                // Somewhere clear, into somewhere that is not. Refused.
+                return Some(block);
+            }
+            // Already inside something at their full height, and on their way
+            // out — believed, *unless* the part of them that was clear is the
+            // part that just went into a block. See this method's own note.
+            if height <= FOOT_HEIGHT {
+                continue;
+            }
+            let Some(feet) = inside(world, at, FOOT_HEIGHT) else {
+                continue;
+            };
+            let feet_blocked = *feet_were_blocked
+                .get_or_insert_with(|| inside(world, from, FOOT_HEIGHT).is_some());
+            if !feet_blocked {
+                return Some(feet);
             }
         }
         None
@@ -633,7 +890,7 @@ mod tests {
 
     /// Standing at the origin, eyes at 1.62.
     fn eye() -> (f64, f64, f64) {
-        eye_of((0.5, 0.0, 0.5))
+        eye_of((0.5, 0.0, 0.5), Pose::Standing)
     }
 
     #[test]
@@ -1201,18 +1458,25 @@ mod tests {
         assert_eq!(world.asked, 100, "a step in the open asked more than once");
     }
 
-    #[test]
-    fn the_box_asked_about_is_the_bottom_of_a_player_and_never_their_head() {
-        // Pose is not tracked, so the check watches the bottom 0.6 of a
-        // player and not their 1.8. This is the test that says so: a player
-        // crawling along a one-block gap — floor under them, ceiling on top of
-        // them — is not refused, and a 1.8 box would refuse every packet of it.
-        let mut world = Ground::floor();
+    /// A ceiling of solid blocks at `y`, from -8 to 8 on both axes.
+    fn roofed(mut world: Ground, y: i32) -> Ground {
         for x in -8..8 {
             for z in -8..8 {
-                world.solid.insert((x, 1, z));
+                world.solid.insert((x, y, z));
             }
         }
+        world
+    }
+
+    #[test]
+    fn a_crawling_player_is_believed_for_every_packet_of_the_crawl() {
+        // The permissive half, and the one that matters. A player in a
+        // one-block gap — floor under them, ceiling on top of them — is 0.6
+        // tall in vanilla and their client never says so. What says so here is
+        // that their standing box is inside the ceiling at *both* ends of
+        // every move they make, which is `claimed`'s already-inside rule doing
+        // the job vanilla does with `updatePlayerPose`'s shrink-until-it-fits.
+        let mut world = roofed(Ground::floor(), 1);
         let mut player = stander();
         for i in 1..=10 {
             let to = (0.5 + f64::from(i) * 0.216, 0.0, 0.5);
@@ -1222,13 +1486,160 @@ mod tests {
                 "a crawling player was refused for having a ceiling"
             );
         }
-        // And the box really is 0.6 high: raise the ceiling into it and the
-        // same move is refused.
-        let (lo, hi) = foot_cells((0.5, 0.0, 0.5));
-        assert_eq!(lo, (0, 0, 0));
-        assert_eq!(hi, (0, 0, 0));
-        let (_, hi) = foot_cells((0.5, 0.5, 0.5));
-        assert_eq!(hi.1, 1, "the box does not reach 0.6 above the feet");
+    }
+
+    #[test]
+    fn a_crawling_player_may_not_put_their_feet_through_the_wall_of_the_tunnel() {
+        // The other side of the rule above: being already inside something at
+        // full height is not a licence to walk. A head in a ceiling is an
+        // ordinary player; a body through a wall is not, and the feet are
+        // checked whatever the head is doing.
+        let mut world = roofed(Ground::floor().with_wall(), 1);
+        let mut player = stander();
+        let mut x = 0.5;
+        let mut refused = None;
+        for _ in 0..20 {
+            x += 0.216;
+            if let Claim::Refused(Refusal::IntoSolid { block }) =
+                player.claimed((x, 0.0, 0.5), 1, &mut world)
+            {
+                refused = Some(block);
+                break;
+            }
+        }
+        assert_eq!(
+            refused,
+            Some((2, 0, 0)),
+            "a player under a ceiling walked their feet into a wall"
+        );
+    }
+
+    #[test]
+    fn a_client_may_not_put_its_head_through_a_wall_while_its_feet_are_legal() {
+        // The defect pose exists to close. A wall two blocks tall standing on
+        // the floor, and a cheat that claims a position where the cell its
+        // feet are in is open air and the cell its head is in is the wall.
+        let mut world = Ground::floor();
+        for z in -8..8 {
+            for y in 1..3 {
+                world.solid.insert((2, y, z));
+            }
+        }
+        let mut player = stander();
+        // Every step up to the face is believed: the wall starts a block above
+        // the feet, so nothing at foot height ever refuses this.
+        let mut x = 0.5;
+        let mut refused = None;
+        for _ in 0..20 {
+            x += 0.216;
+            if let Claim::Refused(Refusal::IntoSolid { block }) =
+                player.claimed((x, 0.0, 0.5), 1, &mut world)
+            {
+                refused = Some((x, block));
+                break;
+            }
+        }
+        let (x, block) = refused.expect("a head walked through a wall unrefused");
+        assert_eq!(block.0, 2, "refused by something that is not the wall");
+        assert!(
+            (1.7..1.92).contains(&x),
+            "refused at {x}, and the first step past the face at 1.7 is 1.796"
+        );
+    }
+
+    #[test]
+    fn a_sprinting_airborne_player_is_measured_at_their_feet() {
+        // The permission this server takes deliberately, because it cannot see
+        // water: a sprinting player who says they are not on the ground may be
+        // swimming, and a swimmer is 0.6 tall. Same wall, same claim, and the
+        // one that says it is swimming through is believed.
+        let mut world = Ground::floor();
+        for z in -8..8 {
+            for y in 1..3 {
+                world.solid.insert((2, y, z));
+            }
+        }
+        let mut player = stander();
+        player.posture(Posture {
+            sprinting: true,
+            on_ground: false,
+            ..Posture::default()
+        });
+        let mut x = 0.5;
+        for _ in 0..20 {
+            x += 0.216;
+            assert_eq!(
+                player.claimed((x, 0.0, 0.5), 1, &mut world),
+                Claim::Accepted,
+                "a swimmer was refused for a wall above their head"
+            );
+            if x > 1.9 {
+                break;
+            }
+        }
+        assert!(x > 1.9, "the walk stopped before it reached the wall");
+    }
+
+    #[test]
+    fn a_crouching_player_is_a_foot_and_a_half_of_player() {
+        // The number the reach check was getting wrong, and the height the
+        // collision check now uses. Vanilla's own `Player.POSES`.
+        assert!((Pose::Standing.height() - 1.8).abs() < 1e-9);
+        assert!((Pose::Crouching.height() - 1.5).abs() < 1e-9);
+        assert!((Pose::Standing.eye_height() - Pose::Crouching.eye_height() - 0.35).abs() < 1e-9);
+        // And a crouching player really is measured shorter. An overhang one
+        // block thick at y = 2, and a player part-way through a jump with
+        // their feet at 0.4: standing they are 2.2 of the way up and inside
+        // it, crouching they are 1.9 of the way up and clear of it. The step
+        // into the overhang's column is refused for one of them and not for
+        // the other, and nothing else about the two runs differs.
+        for (posture, expected) in [
+            (
+                Posture::default(),
+                Claim::Refused(Refusal::IntoSolid { block: (2, 2, 0) }),
+            ),
+            (
+                Posture {
+                    sneaking: true,
+                    ..Posture::default()
+                },
+                Claim::Accepted,
+            ),
+        ] {
+            let mut world = Ground::floor();
+            for z in -8..8 {
+                world.solid.insert((2, 2, z));
+            }
+            let mut player = Movement::new(SpeedLimit::new(DEFAULT), (1.5, 0.4, 0.5));
+            player.posture(posture);
+            assert_eq!(
+                player.claimed((1.75, 0.4, 0.5), 1, &mut world),
+                expected,
+                "a player with {:?} stepping under an overhang 1.6 above their feet",
+                posture.pose()
+            );
+        }
+    }
+
+    #[test]
+    fn sneaking_while_flying_is_not_crouching() {
+        // Vanilla's own condition. A creative player who holds shift while
+        // flying goes down; they do not get shorter, and a server that thought
+        // they did would measure their reach from 0.35 too low.
+        let flying = Posture {
+            sneaking: true,
+            flying: true,
+            ..Posture::default()
+        };
+        assert_eq!(flying.pose(), Pose::Standing);
+        assert_eq!(
+            Posture {
+                sneaking: true,
+                ..Posture::default()
+            }
+            .pose(),
+            Pose::Crouching
+        );
     }
 
     #[test]

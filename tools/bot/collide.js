@@ -92,11 +92,9 @@ async function main () {
   // One packet, one block down, which is a step no faster than walking: the
   // speed rule has nothing to say about it and the only thing that can refuse
   // it is the block the feet would be inside.
-  async function claim (what, dx, dy, dz, expectCorrection) {
+  async function claimAt (what, x, y, z, onGround, expectCorrection) {
     corrected = null
-    bot._client.write('position', {
-      x: here.x + dx, y: here.y + dy, z: here.z + dz, onGround: dy <= 0
-    })
+    bot._client.write('position', { x, y, z, onGround })
     await wait(CORRECTION_MS)
     const back = corrected
     say(Boolean(back) === expectCorrection, what,
@@ -109,6 +107,10 @@ async function main () {
       await wait(300)
     }
     corrected = null
+  }
+
+  async function claim (what, dx, dy, dz, expectCorrection) {
+    await claimAt(what, here.x + dx, here.y + dy, here.z + dz, dy <= 0, expectCorrection)
   }
 
   // Where the open air is, asked of the client's own copy of the world rather
@@ -142,6 +144,152 @@ async function main () {
   // cell the feet are in and not about whole numbers, so this has to be
   // refused for the same reason the first case is.
   await claim('half a block down into the ground is refused', 0, -0.5, 0, true)
+
+  // ---- The head, which is the half a 0.6-high box could not see ----
+  //
+  // Everything above is about a player's feet, and a check that only watched
+  // feet let a client walk with its head inside a wall. These cases build the
+  // one shape a superflat does not contain — solid with air under it — and ask
+  // about a position whose foot cell is open and whose head cell is not.
+
+  // A column two blocks away with something to stand on and three cells of air
+  // over it. Probed rather than assumed, for the same reason the controls above
+  // are: this file has to work on a superflat and on a hillside.
+  function empty (dx, dy, dz) {
+    const block = bot.blockAt(here.offset(dx, dy, dz).floored())
+    return Boolean(block) && block.boundingBox === 'empty'
+  }
+  function footing (dx, dz) {
+    const under = bot.blockAt(here.offset(dx, -1, dz).floored())
+    if (!under || under.boundingBox === 'empty') return false
+    if (!empty(dx, 0, dz) || !empty(dx, 1, dz) || !empty(dx, 2, dz)) return false
+    // And the way there has to be open too, a block either side of the line,
+    // because the claim below is one packet across several blocks and the
+    // server samples the points between. On a superflat that is free; on a
+    // hillside a straight line at a constant height walks into the hill, and
+    // a case that was refused for *that* would be a pass this file had not
+    // earned. Same lesson as the open-air control above.
+    const lo = [Math.min(0, dx), Math.min(0, dz)]
+    const hi = [Math.max(0, dx), Math.max(0, dz)]
+    for (let sx = lo[0]; sx <= hi[0]; sx++) {
+      for (let sz = lo[1]; sz <= hi[1]; sz++) {
+        if (!empty(sx, 0, sz) || !empty(sx, 1, sz)) return false
+      }
+    }
+    return true
+  }
+  // Every cell within three of the player, nearest first — nearest because a
+  // claim one block across is one sample and cannot be refused by something
+  // on the way, and three at the furthest because the block has to be
+  // *placed* as well as claimed and a placement beyond the interaction range
+  // is refused by the other check in this crate. On a superflat the first
+  // candidate wins; on a hillside most of them are inside the hill, which is
+  // why there are forty-eight of them.
+  const ring = []
+  for (let dx = -3; dx <= 3; dx++) {
+    for (let dz = -3; dz <= 3; dz++) {
+      if (dx !== 0 || dz !== 0) ring.push([dx, dz])
+    }
+  }
+  ring.sort((a, b) => (a[0] * a[0] + a[1] * a[1]) - (b[0] * b[0] + b[1] * b[1]))
+  const site = ring.find(c => footing(c[0], c[1]))
+
+  if (!site) {
+    console.log('--    the head cases — nowhere with a footing and headroom; not checked')
+  } else {
+    const air = here.offset(site[0], 0, site[1]).floored()
+    const support = air.offset(0, -1, 0)
+    const overhead = air.offset(0, 1, 0)
+
+    // Creative, so the block comes from the client's own slot. `check.js` does
+    // the same thing for the same reason: mineflayer will not place a block it
+    // cannot see in a hand.
+    bot._client.write('set_creative_slot', {
+      slot: 36,
+      item: {
+        itemCount: 4,
+        itemId: bot.registry.itemsByName.cobblestone.id,
+        addedComponentCount: 0,
+        removedComponentCount: 0,
+        components: [],
+        removeComponents: []
+      }
+    })
+    bot._client.write('held_item_slot', { slotId: 0 })
+    await wait(500)
+
+    // A two-block pillar, then the bottom of it taken away: solid at head
+    // height with open air underneath, which is the shape a wall makes for a
+    // player standing in a doorway and which a superflat has nowhere.
+    for (const on of [support, air]) {
+      bot._client.write('block_place', {
+        hand: 0,
+        location: { x: on.x, y: on.y, z: on.z },
+        direction: 1,
+        cursorX: 0.5,
+        cursorY: 1.0,
+        cursorZ: 0.5,
+        insideBlock: false,
+        sequence: 1
+      })
+      await wait(400)
+    }
+    bot._client.write('block_dig', {
+      status: 0,
+      location: { x: air.x, y: air.y, z: air.z },
+      face: 1,
+      sequence: 2
+    })
+    await wait(600)
+
+    const under = bot.blockAt(air)
+    const above = bot.blockAt(overhead)
+    const built = under && under.boundingBox === 'empty' && above && above.boundingBox !== 'empty'
+    say(built, 'an overhang was built: air at foot height, solid at head height',
+      built ? `${above.name} over ${under.name}` : 'the world did not end up that shape')
+
+    if (built) {
+      const x = air.x + 0.5
+      const z = air.z + 0.5
+      const y = air.y
+      // The cheat. The cell the feet are in is open air and a check that
+      // watched only the bottom 0.6 of a player accepted this.
+      await claimAt('a claim with the feet in air and the head in a block is refused',
+        x, y, z, true, true)
+      // Same claim, one bit different: a client that says it is sprinting and
+      // not on the ground may be swimming, and a swimmer is 0.6 tall. This is
+      // the permission the server takes deliberately because it cannot see
+      // water, and it is checked rather than left to be discovered.
+      bot._client.write('entity_action', {
+        entityId: bot.entity.id, actionId: 3, jumpBoost: 0
+      })
+      await wait(200)
+      await claimAt('the same claim from a client that says it is swimming is allowed',
+        x, y, z, false, false)
+      bot._client.write('entity_action', {
+        entityId: bot.entity.id, actionId: 4, jumpBoost: 0
+      })
+      await wait(200)
+
+      // And the differential: take the block away and nothing about the claim
+      // changes but the world, and it is allowed. Without this the case above
+      // could be passing because of the distance or the on-ground flag.
+      bot._client.write('block_dig', {
+        status: 0,
+        location: { x: overhead.x, y: overhead.y, z: overhead.z },
+        face: 1,
+        sequence: 3
+      })
+      await wait(600)
+      const gone = bot.blockAt(overhead)
+      if (gone && gone.boundingBox === 'empty') {
+        await claimAt('the same claim with the head block gone is allowed',
+          x, y, z, true, false)
+      } else {
+        console.log('--    the same claim with the head block gone — it did not break; not checked')
+      }
+    }
+  }
 
   try { bot.quit() } catch (e) { /* already gone */ }
   const passed = results.filter(Boolean).length

@@ -815,6 +815,13 @@ where
     // packet said. Until this existed they were the same thing, and the README
     // said so in its "Not yet" list.
     let mut movement = dust_guard::Movement::new(ctx.speed, start);
+    // What shape this player is, as far as anything they have sent says. Read
+    // by both checks: the collision half measures this much of them and the
+    // reach half measures from this pose's eye. Everything in it comes off a
+    // packet — three `player_command` actions, the abilities flags, and the
+    // on-ground flag every movement packet carries — and nothing in it costs a
+    // world lookup. See `dust_guard::Posture`.
+    let mut posture = dust_guard::Posture::default();
     // The world this player's movement is checked against, and the four
     // columns it keeps. `None` where the block table cannot say what is solid,
     // which is a server running without the operator's extracted constants or
@@ -1125,6 +1132,8 @@ where
                     // the spot has not changed which columns they can see.
                     Ok(play::serverbound::Packet::MovePlayerPos(m)) => {
                         let ticks = ticks_since(&mut last_move);
+                        posture.on_ground = m.on_ground;
+                        movement.posture(posture);
                         match judge(&mut movement, (m.x, m.y, m.z), ticks, &mut ground) {
                             dust_guard::Claim::Accepted => {
                                 position = movement.at();
@@ -1161,6 +1170,8 @@ where
                         // would leave the two out of step for no gain.
                         rotation = (m.yaw, m.pitch);
                         let ticks = ticks_since(&mut last_move);
+                        posture.on_ground = m.on_ground;
+                        movement.posture(posture);
                         match judge(&mut movement, (m.x, m.y, m.z), ticks, &mut ground) {
                             dust_guard::Claim::Accepted => {
                                 position = movement.at();
@@ -1207,11 +1218,13 @@ where
                         );
                         ctx.roster.swung(me.entity_id, packet.animation);
                     }
-                    // Crouching and running. The other seven actions this
-                    // packet carries are about horses, elytra and beds, none
-                    // of which exist here — and passing them to the roster
-                    // would put a metadata packet on every other player's wire
-                    // for something nothing models.
+                    // Crouching, running and gliding — which is everything a
+                    // 1.21.1 client ever tells a server about its own shape.
+                    // Two readers: the roster, so that everybody else sees the
+                    // animation, and `dust_guard`, which measures a crouching
+                    // player 0.3 shorter and their eyes 0.35 lower than a
+                    // standing one. The remaining actions are about horses and
+                    // beds, neither of which exists here.
                     Ok(play::serverbound::Packet::PlayerCommand(command)) => {
                         use play::serverbound::PlayerCommandAction as Action;
                         let (sneaking, sprinting) = match command.body.action_id {
@@ -1221,9 +1234,36 @@ where
                             Action::StopSprinting => (None, Some(false)),
                             _ => (None, None),
                         };
+                        // A client says when a glide starts and never when it
+                        // ends; vanilla's server works the landing out for
+                        // itself and this one cannot yet. A stale `true` makes
+                        // a player shorter than they are, which believes them
+                        // rather than refusing them, and the first accepted
+                        // move after they land clears it.
+                        if command.body.action_id == Action::StartFlyingWithElytra {
+                            posture.gliding = true;
+                        }
+                        if let Some(sneaking) = sneaking {
+                            posture.sneaking = sneaking;
+                        }
+                        if let Some(sprinting) = sprinting {
+                            posture.sprinting = sprinting;
+                        }
+                        movement.posture(posture);
                         if sneaking.is_some() || sprinting.is_some() {
                             ctx.roster.posture(me.entity_id, sneaking, sprinting);
                         }
+                    }
+                    // A player toggling flight. The only thing read out of it
+                    // is whether they are flying, because vanilla's crouch
+                    // condition is `isShiftKeyDown() && !abilities.flying`: a
+                    // creative player who holds shift while flying descends
+                    // and stays their full height.
+                    Ok(play::serverbound::Packet::PlayerAbilities(abilities)) => {
+                        posture.flying = abilities
+                            .flags
+                            .has(dust_protocol::packets::play::Abilities::FLYING);
+                        movement.posture(posture);
                     }
                     // A player changing their render distance in options.
                     // The server's setting is still the ceiling, and the view
@@ -1260,11 +1300,22 @@ where
                             );
                         }
                     }
+                    // Neither a move nor a turn: a player who landed or
+                    // jumped where they stood, and the timer this packet is
+                    // also sent on. It carries one bit and that bit is read —
+                    // a player who lands without moving has stopped being
+                    // airborne, and `Posture::on_ground` is what says so.
+                    Ok(play::serverbound::Packet::MovePlayerStatusOnly(m)) => {
+                        posture.on_ground = m.on_ground;
+                        movement.posture(posture);
+                    }
                     // Turning on the spot. It changes no column, so it does not
                     // stream — but it is what everybody else sees, so it does
                     // reach the roster.
                     Ok(play::serverbound::Packet::MovePlayerRot(m)) => {
                         rotation = (m.yaw, m.pitch);
+                        posture.on_ground = m.on_ground;
+                        movement.posture(posture);
                         ctx.roster.moved(
                             me.entity_id,
                             position.0,
@@ -1286,7 +1337,7 @@ where
                     Ok(play::serverbound::Packet::PlayerAction(action)) => {
                         use play::serverbound::PlayerActionKind::{FinishDigging, StartDigging};
                         if matches!(action.status, StartDigging | FinishDigging)
-                            && within_reach(ctx, position, action.location)
+                            && within_reach(ctx, position, movement.pose(), action.location)
                         {
                             // Through `break_block` and not `set_block`: the
                             // other players are shown the block breaking, and
@@ -1336,7 +1387,7 @@ where
                             holding,
                             rotation,
                         )
-                        .filter(|_| within_reach(ctx, position, use_on.hit.location));
+                        .filter(|_| within_reach(ctx, position, movement.pose(), use_on.hit.location));
                         if let Some(target) = target {
                             let state = held_block(
                                 holding,
@@ -1636,17 +1687,19 @@ fn cell(
 /// ends: this refuses acting far from where the player is, and the movement
 /// check refuses being somewhere they could not have got to.
 ///
-/// The eye height is a standing player's. Dust does not track a pose, so a
-/// crouching player is measured 0.35 too high; `[server] interaction_range`'s
-/// default carries half a block of slack for exactly that, and its own
-/// documentation says so.
+/// The eye height is the one that belongs to the pose the player's own packets
+/// describe: 1.62 standing, 1.27 crouching, 0.4 gliding. It used to be 1.62
+/// whatever they were doing, which measured a crouching player **0.35 too
+/// high** — the wrong direction at a ledge edge, where crouching is the single
+/// most common thing a player does deliberately.
 fn within_reach(
     ctx: &SessionContext,
     feet: (f64, f64, f64),
+    pose: dust_guard::Pose,
     location: dust_protocol::types::Position,
 ) -> bool {
     ctx.reach.allows(
-        dust_guard::eye_of(feet),
+        dust_guard::eye_of(feet, pose),
         (location.x, location.y, location.z),
     )
 }

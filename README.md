@@ -193,9 +193,12 @@ has the counts and says what it declined.
 
 **Not yet**, and each of these is stated where the code for it would go: no
 physics, block updates, drops or tool checks, so a player is stopped from
-entering a block and never pushed out of one, and **no pose**, so the box a
-movement check measures is 0.6 high rather than 1.8 and a cheat's head may pass
-through a wall its feet may not; **no item entities**, so a dropped stack is destroyed rather than
+entering a block and never pushed out of one; **no water on the movement path**,
+so a player who says they are sprinting and airborne is measured at their feet
+rather than at their full height, because they might be swimming and no client
+ever says so — decision record
+[0019](docs/decisions/0019-how-tall-a-player-is.md) says what that costs and why
+it is the direction to be wrong in; **no item entities**, so a dropped stack is destroyed rather than
 thrown, and nothing can be picked up off the ground; no crafting, so the grid is
 five slots that store and never combine; **no data components on a stack**, so a
 renamed block or an enchanted tool is stored and given back as the plain item,

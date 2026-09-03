@@ -76,8 +76,11 @@ pub struct ServerConfig {
     /// Beyond it the server ignores the action. Vanilla's own client reaches
     /// 4.5 blocks and its server refuses past 5.5, so anything at or under 5.5
     /// is a request an honest client can make; the extra half block here covers
-    /// a crouching player's lower eyes and a position a tick behind the one
-    /// they acted from. Raise it for a modded client that reaches further;
+    /// a position a tick behind the one they acted from. It used to cover a
+    /// crouching player's lower eyes as well, and no longer has to: the server
+    /// measures from the eye of the pose the player is actually in — see
+    /// `dust_guard::Pose` and decision record 0019. Raise it for a modded
+    /// client that reaches further;
     /// lowering it below about 5 starts refusing ordinary play.
     #[config(restart)]
     pub interaction_range: f64,

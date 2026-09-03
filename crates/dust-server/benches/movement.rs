@@ -27,6 +27,12 @@
 //!    the row the four-column cache exists for; run it with
 //!    `DUST_BENCH_REGION=<a world's region directory>`.
 //!
+//! Each of the world rows is then run again at the two shorter poses, because
+//! how much of a player is measured is the other input and a single number for
+//! "the movement check" cannot say how much of it belongs to the head. The
+//! feet-only row is what this check cost before it knew what shape a player
+//! was, measured in the same run rather than by checking out another commit.
+//!
 //! **Run it on an idle machine.** A reading taken beside a build is not a
 //! control; the same line read three times as long on this machine while three
 //! other agents were compiling.
@@ -41,7 +47,7 @@
 
 use std::time::Instant;
 
-use dust_guard::{Movement, SpeedLimit};
+use dust_guard::{Movement, Posture, SpeedLimit};
 use dust_server::net::collide::Ground;
 use dust_server::net::edits::EditedWorld;
 use dust_server::net::source::{AnvilWorld, RegistryNames, Source};
@@ -96,14 +102,14 @@ fn main() {
             |m, to| m.claimed(to, 1, &mut dust_guard::Open),
         )
     });
-    row("flat, in the open", || {
-        let mut ground = Ground::of(&world, Some(&constants)).expect("the table said it was solid");
-        walk(
-            &mut Movement::new(limit(), start(surface)),
-            surface,
-            |m, to| m.claimed(to, 1, &mut ground),
-        )
-    });
+    for (pose, posture) in POSES {
+        row(&format!("flat, in the open, {pose}"), || {
+            let mut ground =
+                Ground::of(&world, Some(&constants)).expect("the table said it was solid");
+            let mut player = player(surface, posture);
+            walk(&mut player, surface, |m, to| m.claimed(to, 1, &mut ground))
+        });
+    }
     // Feet one block under the surface, so every box question finds the grass
     // and every one of them asks the second question as well. A player cannot
     // get here honestly, which is the point: it is the ceiling on the cost and
@@ -111,7 +117,7 @@ fn main() {
     let sunk = surface - 1.0;
     row("flat, into the ground", || {
         let mut ground = Ground::of(&world, Some(&constants)).expect("the table said it was solid");
-        walk(&mut Movement::new(limit(), start(sunk)), sunk, |m, to| {
+        walk(&mut player(sunk, Posture::default()), sunk, |m, to| {
             m.claimed(to, 1, &mut ground)
         })
     });
@@ -155,12 +161,60 @@ fn main() {
     // Feet in the terrain, which is the worst case and the one that asks both
     // questions, over columns the region files really contain.
     let y = f64::from(top);
-    row("region files", || {
-        let mut ground = Ground::of(&world, Some(&constants)).expect("the table said it was solid");
-        walk(&mut Movement::new(limit(), (0.5, y, 0.5)), y, |m, to| {
-            m.claimed(to, 1, &mut ground)
-        })
-    });
+    for (pose, posture) in POSES {
+        row(&format!("region files, {pose}"), || {
+            let mut ground =
+                Ground::of(&world, Some(&constants)).expect("the table said it was solid");
+            walk(&mut player(y, posture), y, |m, to| {
+                m.claimed(to, 1, &mut ground)
+            })
+        });
+    }
+}
+
+/// The three heights a player is measured at, and the signals that produce
+/// each. Named by what the server thinks the player is doing, because that is
+/// what an operator reading the row wants to match up with a player.
+const POSES: [(&str, Posture); 3] = [
+    (
+        "standing (1.8)",
+        Posture {
+            sneaking: false,
+            sprinting: false,
+            flying: false,
+            gliding: false,
+            on_ground: true,
+        },
+    ),
+    (
+        "crouching (1.5)",
+        Posture {
+            sneaking: true,
+            sprinting: false,
+            flying: false,
+            gliding: false,
+            on_ground: true,
+        },
+    ),
+    // What this check measured before it knew what shape a player was: the
+    // bottom 0.6 and nothing above it.
+    (
+        "feet only (0.6)",
+        Posture {
+            sneaking: false,
+            sprinting: true,
+            flying: false,
+            gliding: false,
+            on_ground: false,
+        },
+    ),
+];
+
+/// A player at `y` who has told the server this much about their own shape.
+fn player(y: f64, posture: Posture) -> Movement {
+    let mut player = Movement::new(limit(), start(y));
+    player.posture(posture);
+    player
 }
 
 /// The highest solid block anywhere along the walk, or `None` if there is none.
@@ -216,6 +270,7 @@ where
 
 /// Run a workload `ROUNDS` times and print the median nanoseconds per packet.
 fn row<F: FnMut() -> u32>(name: &str, mut work: F) {
+    let name = format!("{name:<34}");
     let mut times = Vec::with_capacity(ROUNDS as usize);
     let mut accepted = 0;
     for _ in 0..ROUNDS {
@@ -225,7 +280,7 @@ fn row<F: FnMut() -> u32>(name: &str, mut work: F) {
     }
     times.sort_unstable();
     println!(
-        "  {name:<24} {:>7} ns/packet   (fastest {}, slowest {}, {accepted}/{PACKETS} accepted)",
+        "  {name} {:>7} ns/packet   (fastest {}, slowest {}, {accepted}/{PACKETS} accepted)",
         times[times.len() / 2],
         times[0],
         times[times.len() - 1],

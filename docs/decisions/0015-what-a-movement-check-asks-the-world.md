@@ -6,6 +6,10 @@ question is asked of the world as it is at that instant, of a box 0.6 across
 and 0.6 high measured up from the feet, and it costs 32 ns on a flat world and
 408 ns on a world read from region files.
 
+**Superseded in part by [D19](0019-how-tall-a-player-is.md), 2026-09-03**: the
+box is now the height of the pose the player's own packets describe, and 0.6 is
+the floor rather than the whole of it. Everything else here still holds.
+
 ## Context
 
 [D17](0017-how-fast-a-player-may-say-they-moved.md) put a speed limit on
