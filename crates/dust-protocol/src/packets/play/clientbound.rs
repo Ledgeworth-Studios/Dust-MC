@@ -476,6 +476,40 @@ packet_group! {
         window_id: u8,
     },
 
+    /// Every slot of a window at once, plus whatever is on the cursor.
+    ///
+    /// The expensive one, and the reason its neighbour exists: a container of
+    /// forty-six slots costs forty-seven stacks on the wire whether one slot
+    /// changed or all of them. Sent on join and after a click the client and
+    /// the server disagree about too widely to reconcile slot by slot;
+    /// [`ContainerSetSlot`] is for everything else.
+    ///
+    /// `state_id` is the sequence number a later
+    /// [`ClickContainer`](crate::packets::play::serverbound::ClickContainer)
+    /// quotes back. It is the server's, not the client's: a click carrying a
+    /// stale one is a click made against a window that has since moved.
+    "minecraft:container_set_content" => ContainerSetContent {
+        window_id: u8,
+        state_id: VarInt,
+        slots: Vec<crate::types::Slot>,
+        carried_item: crate::types::Slot,
+    },
+
+    /// One slot of one window.
+    ///
+    /// The window id is **signed** here where every other container packet on
+    /// this version has it unsigned, and the negative values are the whole
+    /// reason: `-1` addresses the cursor rather than a slot, and `-2` writes
+    /// the player's own inventory without the client checking `state_id`
+    /// against its own. Widening it to `u8` would make both unreachable and
+    /// the mistake would look like a working packet.
+    "minecraft:container_set_slot" => ContainerSetSlot {
+        window_id: i8,
+        state_id: VarInt,
+        slot: i16,
+        item: crate::types::Slot,
+    },
+
     /// A container's progress bars moved — furnace fuel, enchantment seed,
     /// stonecutter selection. Which property means what depends on the open
     /// screen, so both halves travel raw.

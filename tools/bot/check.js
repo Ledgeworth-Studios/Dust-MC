@@ -46,6 +46,48 @@ function spawned (username) {
 
 const wait = ms => new Promise(r => setTimeout(r, ms))
 
+// The two packets a client uses to write its own container, written by hand
+// because that is the point: prismarine builds them from its own reading of
+// the protocol and Dust decodes them with its own.
+function creativeSlot (b, slot, name, count) {
+  const item = name
+    ? {
+        itemCount: count,
+        itemId: b.registry.itemsByName[name].id,
+        addedComponentCount: 0,
+        removedComponentCount: 0,
+        components: [],
+        removeComponents: []
+      }
+    : { itemCount: 0 }
+  b._client.write('set_creative_slot', { slot, item })
+}
+
+// A click, with the client claiming nothing changed. That is legal — the
+// changed-slot list is the client's prediction and an empty one predicts
+// nothing — and it makes the server's push-back the only thing that can put
+// the right answer in this bot's inventory.
+function windowClick (b, slot, mouseButton, mode) {
+  b._client.write('window_click', {
+    windowId: 0,
+    stateId: 0,
+    slot,
+    mouseButton,
+    mode,
+    changedSlots: [],
+    cursorItem: { itemCount: 0 }
+  })
+}
+
+// Not `named` — `main` declares a `named` of its own for sound events, and a
+// const inside a function shadows a module-level one for the whole body. The
+// first version of this was called `named`, resolved to the sound lookup, and
+// reported every slot as `undefined` while the checks themselves passed.
+const carrying = (b, slot) => {
+  const item = b.inventory.slots[slot]
+  return item ? `${item.name} x${item.count}` : 'nothing'
+}
+
 async function main () {
   const watcher = await spawned('Watcher')
   check('a third-party client joins', true)
@@ -521,6 +563,102 @@ async function main () {
       : 'no block underground to click into'
   )
 
+  // ---------------------------------------------------------------------
+  // What a player is carrying, and whether it is still there next time.
+  //
+  // A third bot rather than the actor, whose hotbar the placement checks own.
+  // Its name is five characters because a mineflayer username under three
+  // never spawns and never errors — the bot simply does not arrive, and there
+  // is nothing in any log to say why.
+  // ---------------------------------------------------------------------
+  const carrier = await spawned('Carrier')
+
+  // Cleared first, so nothing below can pass on what a previous run left in
+  // this world. Slot 0 is the crafting output and no client may write it.
+  for (let slot = 1; slot <= 45; slot++) creativeSlot(carrier, slot, null, 0)
+  await wait(1000)
+
+  // A count that differs between runs, for the same reason. A fixed count
+  // would let a server that ignored every write below still pass, because the
+  // number it already had would be the number expected.
+  const many = 2 + (Date.now() % 40)
+
+  creativeSlot(carrier, 9, 'cobblestone', many)   // main inventory, with a count
+  creativeSlot(carrier, 5, 'iron_helmet', 1)      // armour: the head slot
+  creativeSlot(carrier, 45, 'water_bucket', 1)    // the offhand
+  // And one the server must refuse: a water bucket stacks to one, so
+  // sixty-four of them in a slot is a count no client should be able to ask
+  // for. An empty bucket stacks to sixteen, which is exactly why the number
+  // has to come from the item and not from a constant.
+  creativeSlot(carrier, 10, 'water_bucket', 64)
+  carrier._client.write('held_item_slot', { slotId: 3 })
+  await wait(SETTLE_MS)
+
+  check(
+    'a stack larger than that item allows is refused',
+    carrier.inventory.slots[10] == null,
+    carrying(carrier, 10)
+  )
+
+  // A click, replayed by the server and pushed back to a client that predicted
+  // nothing. Pick the stack up out of slot 9 and put it down in slot 20.
+  windowClick(carrier, 9, 0, 0)
+  await wait(500)
+  windowClick(carrier, 20, 0, 0)
+  await wait(SETTLE_MS)
+
+  const clicked = carrier.inventory.slots[20]
+  check(
+    'a click moves a stack to the slot it was dropped in',
+    Boolean(clicked) && clicked.name === 'cobblestone' && clicked.count === many,
+    `${carrying(carrier, 20)}, wanted cobblestone x${many}`
+  )
+  check(
+    'and out of the one it came from',
+    carrier.inventory.slots[9] == null,
+    carrying(carrier, 9)
+  )
+
+  // The one this whole cycle is about. Leave, come back under the same name,
+  // and look.
+  try { carrier.quit() } catch (e) { /* already gone */ }
+  await wait(2000)
+  const returned = await spawned('Carrier')
+  await wait(SETTLE_MS)
+
+  const kept = returned.inventory.slots[20]
+  check(
+    'what a player was carrying is still there after a relog',
+    Boolean(kept) && kept.name === 'cobblestone' && kept.count === many,
+    `${carrying(returned, 20)}, wanted cobblestone x${many}`
+  )
+  check(
+    'and so is their armour',
+    Boolean(returned.inventory.slots[5]) &&
+      returned.inventory.slots[5].name === 'iron_helmet',
+    carrying(returned, 5)
+  )
+  check(
+    'and their offhand',
+    Boolean(returned.inventory.slots[45]) &&
+      returned.inventory.slots[45].name === 'water_bucket',
+    carrying(returned, 45)
+  )
+  check(
+    'and the slot they had in hand',
+    returned.quickBarSlot === 3,
+    `hotbar slot ${returned.quickBarSlot}`
+  )
+  // The other side of the same coin: a slot emptied before the relog must
+  // still be empty. A server that saved nothing and a server that saved
+  // everything both fail this, in opposite directions.
+  check(
+    'and a slot they emptied is still empty',
+    returned.inventory.slots[9] == null && returned.inventory.slots[10] == null,
+    `${carrying(returned, 9)} / ${carrying(returned, 10)}`
+  )
+
+  try { returned.quit() } catch (e) { /* already gone */ }
   try { actor.quit() } catch (e) { /* already gone */ }
   try { watcher.quit() } catch (e) { /* already gone */ }
 }

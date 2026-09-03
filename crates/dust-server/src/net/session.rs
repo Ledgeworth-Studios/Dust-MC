@@ -47,7 +47,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use super::configure::{configure, Configured};
 use super::edits::{Edit, Player, SharedWorld};
 use super::finish;
-use super::hotbar::Hotbar;
+use super::inventory::{ClickMode, Inventory};
 use super::play as play_mod;
 use super::status::StatusPolicy;
 use super::view::{self, View};
@@ -182,6 +182,14 @@ pub struct SessionContext {
     /// obvious reason: the session that knows the position is the one that is
     /// ending.
     pub positions: super::save::SharedPositions,
+
+    /// What each player was carrying when they last left, by profile id.
+    ///
+    /// The same shape and the same reason as [`positions`](Self::positions),
+    /// with one difference that is the whole point of this cycle: this is what
+    /// makes a relog give a player their things back. See
+    /// [`super::inventory`].
+    pub inventories: super::save::SharedInventories,
 }
 
 /// The block states a session can put into the world.
@@ -822,10 +830,30 @@ where
     // packet that carries one, which arrives within a tick of joining.
     let mut rotation = (me.yaw, me.pitch);
 
-    // What this player is holding. Empty on join and filled by the client:
-    // there is no saved inventory, so a player who relogs is holding nothing
-    // until they pick something out of the creative menu again.
-    let mut hotbar = Hotbar::default();
+    // What this player is carrying. Restored from the last time they were
+    // here, which is the difference between a server people play on and one
+    // that empties their pockets at the door.
+    let mut inventory = ctx
+        .inventories
+        .lock()
+        .expect("the inventory map is never poisoned")
+        .get(&profile_id)
+        .map(|carried| Inventory::restored(carried.slots, carried.selected))
+        .unwrap_or_default();
+
+    // And told to the client, all forty-six slots at once. This is the one
+    // place the whole container goes out: a join has nothing to compare
+    // against, so there is nothing to send a difference of. Every change after
+    // this one is a single slot.
+    send_container(conn, ctx, &mut inventory).await?;
+    send_play(
+        conn,
+        play::clientbound::SetCarriedItem {
+            slot: inventory.selected(),
+        },
+        ctx.version,
+    )
+    .await?;
 
     let mut next_id: i64 = 1;
     // `interval`'s first tick fires immediately, and that is kept rather than
@@ -1273,7 +1301,7 @@ where
                     Ok(play::serverbound::Packet::UseItemOnBlock(use_on)) => {
                         let state = held_block(
                             ctx.item_blocks.as_deref(),
-                            hotbar.held(),
+                            inventory.held(),
                             ctx.blocks.placeable,
                             &use_on.hit,
                             rotation,
@@ -1308,15 +1336,57 @@ where
                     // no position, so nothing goes out — but the next
                     // right-click is a different block because of it.
                     Ok(play::serverbound::Packet::SetCarriedItem(carried)) => {
-                        hotbar.select(carried.slot);
+                        if inventory.select(carried.slot) {
+                            record_inventory(ctx, profile_id, &inventory);
+                        }
                     }
                     // A creative client writing a slot directly, which is the
-                    // one inventory write that needs no container open — and
-                    // the only one this server understands. Every player here
-                    // is in creative, so it is also the only way anything ever
-                    // gets into a hand.
+                    // one inventory write that needs no container open. Every
+                    // player here is in creative, so it is how most things get
+                    // into a hand — but no longer the only way: a click is the
+                    // other, and both land in the same container.
                     Ok(play::serverbound::Packet::SetCreativeModeSlot(set)) => {
-                        hotbar.set(set.slot, &set.item);
+                        match inventory.set_creative(set.slot, &set.item) {
+                            Ok(Some(index)) => {
+                                record_inventory(ctx, profile_id, &inventory);
+                                // Not echoed back. The client wrote the slot
+                                // itself and already draws it; a set-slot here
+                                // would be a packet per creative-menu click
+                                // that changes nothing on screen.
+                                let _ = index;
+                            }
+                            Ok(None) => {}
+                            // Refused — a count above the item's own maximum,
+                            // or an item this build has no entry for. The
+                            // client believes it put something there, so it has
+                            // to be told what is actually in that slot.
+                            Err(index) => {
+                                send_slot(conn, ctx, &mut inventory, index).await?;
+                            }
+                        }
+                    }
+                    // A survival client's click: left, right, shift, a number
+                    // key, the drags, all of it. Replayed over the server's own
+                    // container, and only the slots the client is now wrong
+                    // about are sent back.
+                    Ok(play::serverbound::Packet::ClickContainer(click)) => {
+                        if click.window_id == PLAYER_WINDOW {
+                            let changed =
+                                inventory.click(ClickMode::from(click.mode), click.slot, click.button);
+                            if !changed.is_empty() {
+                                record_inventory(ctx, profile_id, &inventory);
+                            }
+                            push_back(conn, ctx, &mut inventory, changed, &click).await?;
+                        }
+                    }
+                    // The player closed their own inventory. Whatever was on
+                    // the cursor and in the crafting grid goes back into the
+                    // inventory rather than nowhere; see `Inventory::closed`.
+                    Ok(play::serverbound::Packet::CloseContainer(closed)) => {
+                        if closed.window_id == PLAYER_WINDOW && !inventory.closed().is_empty() {
+                            record_inventory(ctx, profile_id, &inventory);
+                            send_container(conn, ctx, &mut inventory).await?;
+                        }
                     }
                     Ok(_) => {}
                     // A packet this server has no definition for is not a
@@ -1569,6 +1639,198 @@ fn offset(location: dust_protocol::types::Position, face: u8) -> dust_protocol::
         y: location.y + dy,
         z: location.z + dz,
     }
+}
+
+/// The window id a player's own inventory always has.
+///
+/// Zero, and it is a constant rather than a literal because every container
+/// packet carries one and the day a chest opens there will be a second answer.
+/// A click naming any other window is a click on a container this server never
+/// opened, and is ignored rather than replayed against the player's own.
+const PLAYER_WINDOW: u8 = 0;
+
+/// The window id a slot correction carries.
+///
+/// **Zero, and it was -2 until a second client said otherwise.** The protocol
+/// gives `container_set_slot` a signed window id so that `-2` can mean "the
+/// player's own inventory, and do not check the state id", which reads like
+/// exactly the right thing for a correction — Mojang's client honours it. It is
+/// still the wrong choice, and the reason is that it is the *only* thing that
+/// honours it: pointed at a server that corrected on `-2`, mineflayer dropped
+/// every correction on the floor, silently, because its handler resolves a
+/// window by id and there is no window `-2`. Four checks failed and nothing
+/// anywhere said why.
+///
+/// Zero is the id vanilla's own `ContainerSynchronizer` sends for a player's
+/// own menu, both clients honour it, and it is what this server has already
+/// told the client the window is. A correction one client cannot see is not a
+/// correction, and the fact that the other one can see it is not a defence.
+const CORRECTION_WINDOW: i8 = PLAYER_WINDOW as i8;
+
+/// Send the whole container, plus whatever is on the cursor.
+///
+/// Forty-seven stacks on the wire. Only on a join and after a close, because
+/// every other change knows which slot it was — see [`send_slot`].
+async fn send_container<W>(
+    conn: &mut Conn<W>,
+    ctx: &SessionContext,
+    inventory: &mut super::inventory::Inventory,
+) -> Result<(), SessionError>
+where
+    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let state_id = inventory.next_state_id();
+    let slots = inventory
+        .slots()
+        .iter()
+        .map(|stack| super::inventory::to_wire(*stack))
+        .collect();
+    send_play(
+        conn,
+        play::clientbound::ContainerSetContent {
+            window_id: PLAYER_WINDOW,
+            state_id: VarInt(state_id),
+            slots,
+            carried_item: super::inventory::to_wire(inventory.cursor()),
+        },
+        ctx.version,
+    )
+    .await
+}
+
+/// Send one slot.
+///
+/// The packet that exists so a pickup does not cost a whole container. One
+/// stack instead of forty-seven, for every player on every change.
+async fn send_slot<W>(
+    conn: &mut Conn<W>,
+    ctx: &SessionContext,
+    inventory: &mut super::inventory::Inventory,
+    index: usize,
+) -> Result<(), SessionError>
+where
+    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let state_id = inventory.next_state_id();
+    let item = super::inventory::to_wire(inventory.slot(index));
+    send_play(
+        conn,
+        play::clientbound::ContainerSetSlot {
+            window_id: CORRECTION_WINDOW,
+            state_id: VarInt(state_id),
+            slot: index as i16,
+            item,
+        },
+        ctx.version,
+    )
+    .await
+}
+
+/// Send the cursor.
+///
+/// Slot -1 of window -1, which is how the protocol addresses the thing that is
+/// not in the container at all — and unlike the correction above there is no
+/// second spelling to prefer, so this one stays negative. mineflayer ignores it
+/// too and keeps its own cursor; Mojang's client applies it. That asymmetry is
+/// why the bot check reads slots and not the cursor.
+async fn send_cursor<W>(
+    conn: &mut Conn<W>,
+    ctx: &SessionContext,
+    inventory: &mut super::inventory::Inventory,
+) -> Result<(), SessionError>
+where
+    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let state_id = inventory.next_state_id();
+    let item = super::inventory::to_wire(inventory.cursor());
+    send_play(
+        conn,
+        play::clientbound::ContainerSetSlot {
+            window_id: -1,
+            state_id: VarInt(state_id),
+            slot: -1,
+            item,
+        },
+        ctx.version,
+    )
+    .await
+}
+
+/// Tell the client the slots it is now wrong about, and only those.
+///
+/// A click packet carries the client's own opinion of what it changed, which is
+/// the whole design of `Click Container`: the client predicts, the server
+/// replays, and the disagreement — not the result — is what goes back. So the
+/// set to correct is the union of two things, and leaving either one out is a
+/// desynchronised inventory:
+///
+/// - **slots the server moved**, because a shift-click can move a stack the
+///   client put somewhere else, and
+/// - **slots the client says it moved**, because a click the server declined
+///   entirely moves nothing and would otherwise send nothing back.
+///
+/// A slot the client already agrees about is not sent. In the ordinary case —
+/// a left click the client predicted correctly — that is zero packets.
+async fn push_back<W>(
+    conn: &mut Conn<W>,
+    ctx: &SessionContext,
+    inventory: &mut super::inventory::Inventory,
+    changed: super::inventory::Changed,
+    click: &play::serverbound::ClickContainer,
+) -> Result<(), SessionError>
+where
+    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    for index in changed.iter() {
+        let claimed = click
+            .changed_slots
+            .iter()
+            .find(|slot| usize::try_from(slot.number) == Ok(index));
+        let agrees = claimed
+            .is_some_and(|slot| super::inventory::from_wire(&slot.item) == inventory.slot(index));
+        if !agrees {
+            send_slot(conn, ctx, inventory, index).await?;
+        }
+    }
+    for slot in &click.changed_slots {
+        let Ok(index) = usize::try_from(slot.number) else {
+            continue;
+        };
+        if index >= super::inventory::SLOTS || changed.has(index) {
+            continue;
+        }
+        if super::inventory::from_wire(&slot.item) != inventory.slot(index) {
+            send_slot(conn, ctx, inventory, index).await?;
+        }
+    }
+    if super::inventory::from_wire(&click.cursor_item) != inventory.cursor() {
+        send_cursor(conn, ctx, inventory).await?;
+    }
+    Ok(())
+}
+
+/// Put a player's inventory where a shutdown, and the next session, can find
+/// it.
+///
+/// Called when a slot moves rather than on a timer: a click is a few times a
+/// minute where a movement packet is twenty a second, so this can afford to
+/// copy the container while [`record`] cannot afford to copy three floats
+/// twice.
+fn record_inventory(
+    ctx: &SessionContext,
+    profile_id: [u8; 16],
+    inventory: &super::inventory::Inventory,
+) {
+    ctx.inventories
+        .lock()
+        .expect("the inventory map is never poisoned")
+        .insert(
+            profile_id,
+            super::save::Carried {
+                slots: *inventory.slots(),
+                selected: inventory.selected(),
+            },
+        );
 }
 
 /// Put a player's position where a shutdown can find it.

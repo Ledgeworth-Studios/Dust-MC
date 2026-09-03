@@ -445,6 +445,7 @@ pub struct Server {
 struct Saveable {
     world: crate::net::SharedWorld,
     positions: crate::net::save::SharedPositions,
+    inventories: crate::net::save::SharedInventories,
     world_dir: PathBuf,
 }
 
@@ -974,18 +975,42 @@ impl Server {
         // the next write.
         let world_dir = self.options.world_dir.clone();
         let positions: crate::net::save::SharedPositions = std::sync::Arc::default();
+        let inventories: crate::net::save::SharedInventories = std::sync::Arc::default();
         match crate::net::save::load(&world_dir) {
             Ok(Some(saved)) => {
                 let (blocks, unknown) = crate::net::save::resolve(&saved.blocks);
                 let applied = world.restore(blocks);
                 *positions.lock().expect("not poisoned") = crate::net::save::positions(&saved);
+                let (carried, unknown_items) = crate::net::save::inventories(&saved);
+                let stacks: usize = carried
+                    .values()
+                    .map(crate::net::save::stacks_of)
+                    .map(|s| s.len())
+                    .sum();
+                let carrying = carried.len();
+                *inventories.lock().expect("not poisoned") = carried;
                 self.options.logger.info(
                     "dust::server",
                     format!(
-                        "restored {applied} block change(s) and {} player position(s)",
+                        "restored {applied} block change(s), {} player position(s) and \
+                         {stacks} stack(s) across {carrying} inventory/ies",
                         saved.players.len()
                     ),
                 );
+                if !unknown_items.is_empty() {
+                    // Named for the same reason a block is: an operator who
+                    // changed Minecraft version needs to know which item their
+                    // players just lost.
+                    self.options.logger.warn(
+                        "dust::server",
+                        format!(
+                            "the save names {} item(s) this build has no entry for, and the \
+                             stacks holding them were dropped: {}",
+                            unknown_items.len(),
+                            unknown_items.join(", ")
+                        ),
+                    );
+                }
                 if !unknown.is_empty() {
                     // Named, not counted. An operator who renamed a block or
                     // changed Minecraft version needs to know *which* block
@@ -1066,6 +1091,7 @@ impl Server {
             },
             logger: self.options.logger.clone(),
             positions: std::sync::Arc::clone(&positions),
+            inventories: std::sync::Arc::clone(&inventories),
             roster: std::sync::Arc::clone(&roster),
             player_entity_type: crate::net::play::player_entity_type().ok_or_else(|| {
                 fail("the generated entity table has no minecraft:player".to_owned())
@@ -1110,6 +1136,7 @@ impl Server {
         self.saveable = Some(Saveable {
             world: std::sync::Arc::clone(&world),
             positions: std::sync::Arc::clone(&positions),
+            inventories: std::sync::Arc::clone(&inventories),
             world_dir,
         });
         Ok(())
@@ -1241,6 +1268,7 @@ impl Server {
             .collect();
         let players: Vec<crate::net::save::SavedPlayer> = {
             let held = saveable.positions.lock().expect("not poisoned");
+            let carried = saveable.inventories.lock().expect("not poisoned");
             let mut players: Vec<_> = held
                 .iter()
                 .map(|(id, (x, y, z))| crate::net::save::SavedPlayer {
@@ -1248,6 +1276,11 @@ impl Server {
                     x: *x,
                     y: *y,
                     z: *z,
+                    inventory: carried
+                        .get(id)
+                        .map(crate::net::save::stacks_of)
+                        .unwrap_or_default(),
+                    selected: carried.get(id).map_or(0, |c| c.selected),
                 })
                 .collect();
             // Ordered, so two saves of one world are the same file.
@@ -1255,8 +1288,9 @@ impl Server {
             players
         };
 
+        let stacks: usize = players.iter().map(|p| p.inventory.len()).sum();
         let counts = format!(
-            "{} block change(s) and {} player position(s)",
+            "{} block change(s), {} player position(s) and {stacks} carried stack(s)",
             blocks.len(),
             players.len()
         );

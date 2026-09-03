@@ -113,15 +113,32 @@ measured rather than chosen: `just movement` counts what a real client's
 packets contain, and over 1,217 of them covering walking, sprinting,
 sprint-jumping, creative flight, a 300-block free fall and a walk through a
 700 ms network stall, the largest single tick was 3.58 blocks. Decision record
-0012 has the table and says what it declined.
+[0012](docs/decisions/0012-how-fast-a-player-may-say-they-moved.md) has the
+table and says what it declined.
+
+And a player carries what they were carrying. All forty-six slots of the
+player's own container — the twenty-seven main slots, the nine hotbar, four
+armour, an offhand and the crafting grid — with counts bounded by each item's
+own `max_stack_size` out of the generated component table, never by a 64
+written here. A survival client's clicks are replayed over it: left, right,
+shift, the number keys and F, creative clone, Q and control-Q, the three drags
+and double-click-to-collect, with only the slots the client got wrong sent
+back. **And it survives a relog and a restart**, written by name into the same
+file beside the world that already held the block edits. `just bot` checks that
+with a third-party client: set slots, leave, come back, look. Decision record
+[0013](docs/decisions/0013-where-a-players-inventory-lives.md) says what the
+record does and does not promise.
 
 **Not yet**, and each of these is stated where the code for it would go: no
 physics, block updates, drops or tool checks; **no collision**, so movement is
 checked for speed and for being a number and not against the blocks it passed
 through, and a client may still walk into a wall so long as it walks at a
-walking pace; no inventory beyond the nine hotbar slots a
-creative client writes, so nothing is stored and nothing is carried between
-sessions; **no neighbour rules**, so a fence does not connect to what it touches,
+walking pace; **no item entities**, so a dropped stack is destroyed rather than
+thrown, and nothing can be picked up off the ground; no crafting, so the grid is
+five slots that store and never combine; **no data components on a stack**, so a
+renamed block or an enchanted tool is stored and given back as the plain item,
+and shift-clicking a helmet moves it rather than wearing it — that last one
+needs one more column of `dust-items.tsv`, and 0013 says which; **no neighbour rules**, so a fence does not connect to what it touches,
 a rail does not bend and a stair does not become a corner — sixty-one of the
 hundred and sixty blocks Dust still places wrongly are that, and the number is
 `cargo xtask harness placement`'s rather than this paragraph's; a block placed

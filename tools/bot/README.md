@@ -131,9 +131,11 @@ it is right.**
      the block coordinate would put the sound an eighth of the way to the
      origin: legal, decodable, and audible only as "that sounded far away".
 
-   The bot writes `block_place` by hand rather than through `bot.placeBlock`,
-   which wants a held item mineflayer can only get from an inventory this
-   server does not keep.
+   The bot writes `block_place` by hand rather than through `bot.placeBlock`.
+   That was once because the server kept no inventory for mineflayer to take a
+   held item from; it now does, and the packets stay hand-written for the
+   reason everything else here is — they come from a library that has never
+   seen Dust's encoder.
 10. **What the second bot was holding is what went into the world.** It writes
     `set_creative_slot` and `held_item_slot` — the two packets a creative client
     uses, and the only inventory writes this server understands — and the first
@@ -336,3 +338,44 @@ checks that need a particular arrangement of blocks **build it** rather than
 look for it. Run it three times in a row against one world and it says 21/21
 three times; that is the property being aimed for, and it is worth more than it
 sounds, because a check that decays over runs decays into a green tick.
+
+## The inventory checks, and what the third-party client found
+
+A third bot, `Carrier`, clears all forty-five writable slots, fills three of
+them, clicks a stack from one slot to another, leaves, and comes back under the
+same name. Six checks:
+
+- **a stack larger than that item allows is refused** — sixty-four water
+  buckets, which stack to one. An *empty* bucket stacks to sixteen, which is
+  why the number has to come from the item table and not from a constant.
+- **a click moves a stack to the slot it was dropped in**, and out of the one it
+  came from. The bot writes `window_click` with an **empty** changed-slot list,
+  so it predicts nothing and the server's push-back is the only thing that can
+  put the right answer in this bot's model.
+- **what a player was carrying is still there after a relog**, with the count,
+  plus their armour, their offhand, the hotbar slot they had in hand, and a slot
+  they emptied still empty. The count is `2 + (Date.now() % 40)` rather than a
+  fixed number, so a server that ignored every write above cannot pass on what
+  the last run left in the world.
+
+Watched to fail. With `record_inventory` made a no-op the run reports 25 of 29,
+and the four that go red are exactly the relog ones.
+
+**What it found on the way: mineflayer ignores `set_slot` on window `-2`.** The
+protocol gives that packet a signed window id so `-2` can mean "the player's own
+inventory, ignore the state id", Mojang's client honours it, and it reads like
+the right id for a correction. mineflayer's handler resolves a window by id,
+finds none, and returns — no error and no log line, on either side. Dust now
+corrects on window `0`, which is what vanilla's own synchronizer sends for a
+player's own menu and which both clients honour. See decision record 0012.
+
+The cursor is still sent on window `-1`, because there is no second spelling of
+the cursor to prefer. mineflayer ignores that too and keeps its own, which is
+why these checks read slots and never the cursor.
+
+**A `const` inside `main` shadows a module-level one for the whole function
+body.** The first version of these checks called its slot-describing helper
+`named`, `main` already declares `const named` for sound events, and every
+detail string came out as the literal `undefined` while the checks themselves
+passed. The helper is called `carrying` now. A detail string that lies is worse
+than none: it is what somebody reads when a check fails.

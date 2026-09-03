@@ -27,6 +27,26 @@
 //! rather than a failure: a world that refuses to load because one block was
 //! renamed is worse than a world that loads with a hole and says so.
 //!
+//! # Why an inventory is saved by name too, and what it does not promise
+//!
+//! The same argument, one register further: an item's protocol id is its
+//! position in a generated table, so a saved id would survive a version bump
+//! by turning into a different item. The name is written, and the count beside
+//! it, and the slot number is vanilla's own `0..=45`.
+//!
+//! **What it promises:** the forty-six slots, the item in each, and how many —
+//! plus which hotbar slot was in hand. Those come back exactly, and an item
+//! this build has no entry for is dropped and named the way a block is.
+//!
+//! **What it does not promise:** components. A stack's name is written and its
+//! data components are not, because Dust does not model them — a renamed
+//! block, an enchanted tool and a shulker box with things inside it all save
+//! and reload as the plain item. That is not a saving decision; it is
+//! `dust_protocol::types::Slot`'s wall, and this format cannot record what
+//! nothing upstream of it can read. It is written here rather than discovered
+//! later, because a saved record that quietly means less than it looks like it
+//! means is worse than one that refuses to be written.
+//!
 //! # Writing
 //!
 //! Written to a temporary file, flushed, and renamed over the original, because
@@ -53,7 +73,19 @@ pub struct SavedBlock {
     pub block: String,
 }
 
-/// Where a player was when they left.
+/// One stack in one slot, as it is written down.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedStack {
+    /// Vanilla's own container numbering, `0..=45`. See
+    /// [`crate::net::inventory`] for what each range is.
+    pub slot: u8,
+    /// The item's namespaced name, e.g. `minecraft:cobblestone`. Not its
+    /// protocol id; see the module docs.
+    pub item: String,
+    pub count: u8,
+}
+
+/// Where a player was when they left, and what they were carrying.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedPlayer {
     /// The profile id, hyphenated, which is what every other tool in this
@@ -62,6 +94,13 @@ pub struct SavedPlayer {
     pub x: f64,
     pub y: f64,
     pub z: f64,
+    /// Only the slots that hold something, in slot order. An empty inventory
+    /// writes an empty list rather than forty-six nulls.
+    #[serde(default)]
+    pub inventory: Vec<SavedStack>,
+    /// Which hotbar slot was in hand, `0..9`.
+    #[serde(default)]
+    pub selected: u8,
 }
 
 /// The whole file.
@@ -77,7 +116,12 @@ pub struct Save {
 }
 
 /// The version this build writes and is willing to read.
-pub const SAVE_VERSION: u32 = 1;
+///
+/// Bumped to 2 when player inventories joined the file. A version 1 file still
+/// loads — the new fields default to an empty inventory, which is exactly what
+/// a save written before there were any means — and it is only the other
+/// direction that is refused.
+pub const SAVE_VERSION: u32 = 2;
 
 /// The file's name inside the world directory.
 pub const SAVE_FILE: &str = "dust-edits.json";
@@ -237,6 +281,92 @@ pub fn positions(save: &Save) -> Positions {
         .collect()
 }
 
+/// What each player was carrying, by raw profile id.
+///
+/// A separate map from [`Positions`] on purpose, and the reason is the access
+/// pattern rather than tidiness. Positions are written twenty times a second
+/// per player; an inventory is written when a player clicks, which is a few
+/// times a minute at most. Putting them in one map would mean copying
+/// forty-six slots on every movement packet to record that nothing about the
+/// inventory changed.
+pub type Inventories = HashMap<[u8; 16], Carried>;
+
+/// The live, shared version of [`Inventories`]: written by a session when a
+/// slot moves and when it ends, read by the next session that starts.
+pub type SharedInventories = std::sync::Arc<std::sync::Mutex<Inventories>>;
+
+/// One player's container, as the live map holds it.
+///
+/// A fixed array and a byte: `Copy`, 185 bytes, no allocation. Names are only
+/// spelled out at the file's edge.
+#[derive(Debug, Clone, Copy)]
+pub struct Carried {
+    pub slots: crate::net::inventory::Slots,
+    pub selected: u8,
+}
+
+/// What each player was carrying, read out of a save.
+///
+/// An item name this build has no entry for is dropped and collected into the
+/// second return value, so a caller can name it rather than let the player
+/// discover a missing slot. The same trade as a renamed block, for the same
+/// reason: a world that refuses to load because one item was renamed is worse
+/// than one that loads and says what it lost.
+pub fn inventories(save: &Save) -> (Inventories, Vec<String>) {
+    let mut carried = Inventories::new();
+    let mut unknown = Vec::new();
+    for player in &save.players {
+        let Some(id) = parse_id(&player.id) else {
+            continue;
+        };
+        if player.inventory.is_empty() && player.selected == 0 {
+            continue;
+        }
+        let mut slots: crate::net::inventory::Slots = [None; crate::net::inventory::SLOTS];
+        for saved in &player.inventory {
+            let index = usize::from(saved.slot);
+            if index >= crate::net::inventory::SLOTS || saved.count == 0 {
+                continue;
+            }
+            match dust_registry::Item::from_name(&saved.item) {
+                Some(item) => {
+                    slots[index] = Some(crate::net::inventory::Stack::new(item, saved.count));
+                }
+                None => {
+                    if !unknown.contains(&saved.item) {
+                        unknown.push(saved.item.clone());
+                    }
+                }
+            }
+        }
+        carried.insert(
+            id,
+            Carried {
+                slots,
+                selected: player.selected,
+            },
+        );
+    }
+    (carried, unknown)
+}
+
+/// The slots that hold something, in slot order, ready to be written down.
+pub fn stacks_of(carried: &Carried) -> Vec<SavedStack> {
+    carried
+        .slots
+        .iter()
+        .enumerate()
+        .filter_map(|(index, stack)| {
+            let stack = (*stack)?;
+            Some(SavedStack {
+                slot: index as u8,
+                item: stack.item.name().to_owned(),
+                count: stack.count,
+            })
+        })
+        .collect()
+}
+
 /// Read a hyphenated profile id back into its bytes.
 ///
 /// `None` for anything that is not one. A save hand-edited into an id that is
@@ -309,6 +439,19 @@ mod tests {
                 x: 0.5,
                 y: -59.0,
                 z: -12.5,
+                inventory: vec![
+                    SavedStack {
+                        slot: 9,
+                        item: "minecraft:cobblestone".to_owned(),
+                        count: 17,
+                    },
+                    SavedStack {
+                        slot: 45,
+                        item: "minecraft:bucket".to_owned(),
+                        count: 1,
+                    },
+                ],
+                selected: 4,
             }],
         };
         store(&dir, &save).expect("written");
@@ -317,6 +460,86 @@ mod tests {
         assert_eq!(back.blocks[0].block, "minecraft:stone");
         assert_eq!(back.blocks[0].z, 4000);
         assert_eq!(back.players[0].z, -12.5);
+
+        // And the inventory comes back as slots, not as a list: the slot
+        // number is the record, and a save that renumbered them on the way
+        // through would put a player's things in the wrong hand.
+        let (carried, unknown) = inventories(&back);
+        assert!(unknown.is_empty(), "{unknown:?}");
+        let id = parse_id("f3d28cb0-7225-3cb1-baeb-2dadd2be89ae").expect("an id");
+        let mine = carried.get(&id).expect("this player carried something");
+        assert_eq!(mine.selected, 4);
+        assert_eq!(
+            mine.slots[9].map(|s| (s.item.name(), s.count)),
+            Some(("minecraft:cobblestone", 17))
+        );
+        assert_eq!(
+            mine.slots[45].map(|s| (s.item.name(), s.count)),
+            Some(("minecraft:bucket", 1))
+        );
+        assert!(mine.slots[10].is_none());
+        // And back out again, in slot order and holding only what is there.
+        let written = stacks_of(mine);
+        assert_eq!(written.len(), 2);
+        assert_eq!((written[0].slot, written[0].count), (9, 17));
+        assert_eq!(written[1].slot, 45);
+    }
+
+    #[test]
+    fn a_version_one_file_loads_with_an_empty_inventory_rather_than_failing() {
+        // The forward half of the version bump. A save written before players
+        // carried anything is not a broken save; it is a save from before, and
+        // reading it as an empty inventory is what it means.
+        let dir = temp_dir("v1");
+        let json = r#"{
+            "version": 1,
+            "blocks": [],
+            "players": [
+                { "id": "f3d28cb0-7225-3cb1-baeb-2dadd2be89ae", "x": 1.0, "y": 2.0, "z": 3.0 }
+            ]
+        }"#;
+        std::fs::write(path_in(&dir), json).expect("written");
+        let back = load(&dir).expect("read").expect("present");
+        assert_eq!(back.version, 1);
+        assert_eq!(back.players[0].x, 1.0);
+        assert!(back.players[0].inventory.is_empty());
+        let (carried, unknown) = inventories(&back);
+        assert!(carried.is_empty() && unknown.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_item_name_is_dropped_and_reported() {
+        // The same trade as an unknown block, one register up. An operator who
+        // changed version needs to know which item their players lost.
+        let save = Save {
+            version: SAVE_VERSION,
+            blocks: Vec::new(),
+            players: vec![SavedPlayer {
+                id: "f3d28cb0-7225-3cb1-baeb-2dadd2be89ae".to_owned(),
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                inventory: vec![
+                    SavedStack {
+                        slot: 9,
+                        item: "minecraft:cobblestone".to_owned(),
+                        count: 3,
+                    },
+                    SavedStack {
+                        slot: 10,
+                        item: "minecraft:unobtainium".to_owned(),
+                        count: 1,
+                    },
+                ],
+                selected: 0,
+            }],
+        };
+        let (carried, unknown) = inventories(&save);
+        assert_eq!(unknown, vec!["minecraft:unobtainium".to_owned()]);
+        let id = parse_id("f3d28cb0-7225-3cb1-baeb-2dadd2be89ae").expect("an id");
+        let mine = carried.get(&id).expect("present");
+        assert!(mine.slots[9].is_some());
+        assert!(mine.slots[10].is_none(), "the unknown one, and only it");
     }
 
     #[test]

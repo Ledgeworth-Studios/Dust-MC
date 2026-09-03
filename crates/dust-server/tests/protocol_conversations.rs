@@ -911,6 +911,29 @@ fn an_offline_login_runs_the_whole_configuration_exchange_and_reaches_play() {
         "full health"
     );
 
+    // What the player is carrying, all forty-six slots plus the cursor. This
+    // is the only place the whole container goes out: a join has nothing to
+    // compare against, and every change after it is a single slot.
+    //
+    // Sent *before* the arrival is announced, which is where vanilla sends it
+    // too — a client that is in the world with no inventory renders an empty
+    // hotbar for as long as the round trip takes.
+    let (id, container) = recv_compressed_frame(&mut stream);
+    assert_eq!(id, 19, "container_set_content");
+    let (window, rest) = (container[0], &container[1..]);
+    assert_eq!(window, 0, "the player's own inventory is window 0");
+    let (state_id, rest) = read_var_int_from(rest);
+    assert_eq!(state_id, 1, "the first sync of the session");
+    let (slots, rest) = read_var_int_from(rest);
+    assert_eq!(slots, 46, "vanilla's own 0..=45");
+    // A fresh player carries nothing, so every slot and the cursor are a
+    // single zero byte: forty-six slots plus the carried item.
+    assert_eq!(rest, vec![0u8; 47], "forty-seven empty stacks");
+
+    let (id, carried) = recv_compressed_frame(&mut stream);
+    assert_eq!(id, 83, "set_carried_item");
+    assert_eq!(carried, vec![0], "hotbar slot 0");
+
     // A player is told about their own arrival, as on every server since
     // 2010, and it comes before the keep-alive because the roster is joined
     // as soon as the world is on screen.
