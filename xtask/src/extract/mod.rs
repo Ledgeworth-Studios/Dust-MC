@@ -1428,10 +1428,62 @@ fn worldgen_domain(flat: &registries::Registries, context: &Context) -> Result<O
     )
     .map_err(|e| format!("could not write {}: {e}", path.display()))?;
     println!("wrote {}", path.display());
+
+    let biomes = biome_table(context)?;
     Ok(format!(
-        "ore baseline + vocabulary over {} density-function types",
+        "ore baseline + vocabulary over {} density-function types + {biomes} biome regions",
         parsed.density_function_types.len()
     ))
+}
+
+/// Write the overworld's biome-parameter list where a server can read it.
+///
+/// The table itself never enters the repository — it is 7,593 rows of Mojang's
+/// content and a datapack's to change. It goes to the extraction cache beside
+/// `constants.tsv` and `items.tsv`, and the operator copies it to their
+/// `[data] path`, which is the route decision record 0008 chose and the one
+/// `dust_gen::biome` reads.
+///
+/// The id on every row is the one **this checkout's** synced registry gives
+/// that name, so the table can be read without a registry to hand. The name is
+/// on the row beside it, and `BiomeParameters::rebind` re-checks the pairing
+/// against whatever registry is actually running: a version that renumbers a
+/// biome is then caught on the row it renumbered rather than by a player
+/// standing in the wrong forest.
+fn biome_table(context: &Context) -> Result<usize, String> {
+    let registry = dust_registry::synced::by_name("minecraft:worldgen/biome")
+        .ok_or("this checkout's synced registries hold no minecraft:worldgen/biome")?;
+    let regions =
+        worldgen::biome_regions(&context.reports()?.join("reports"), "overworld", |name| {
+            registry
+                .id_of(name)
+                .map(|id| u32::try_from(id).expect("a registry index fits in a u32"))
+        })?;
+    let distinct: std::collections::BTreeSet<&str> =
+        regions.iter().map(|r| r.biome.as_str()).collect();
+    let path = context
+        .workspace_root
+        .join(CACHE_DIR)
+        .join(format!("oracle-{}", context.version))
+        .join(dust_gen::biome::FILE);
+    std::fs::create_dir_all(path.parent().expect("has a parent"))
+        .map_err(|e| format!("could not create {}: {e}", path.display()))?;
+    std::fs::write(&path, worldgen::biome_table(&regions))
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    println!(
+        "wrote {} — {} overworld regions over {} biomes, every one of them with an id \
+         this checkout's registry agrees with",
+        path.display(),
+        regions.len(),
+        distinct.len()
+    );
+    println!("  to generate biomes the way Minecraft does, copy it beside your data:");
+    println!(
+        "    cp {} <[data] path>/{}",
+        path.display(),
+        dust_gen::biome::FILE
+    );
+    Ok(regions.len())
 }
 
 /// Print what the item report turned out to say.

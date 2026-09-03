@@ -99,9 +99,13 @@ outside the repository (override with DUST_HARNESS_CACHE).
       Defaults match what provision writes: 127.0.0.1:25575, password
       dust-harness.
 
-  capture --version <v> --seed <n> --radius <r> [--jar <path>] [--timeout <s>]
+  capture --version <v> --seed <n> --radius <r> [--at <x>,<z>]... [--jar <path>]
+          [--timeout <s>]
       Boot the provisioned server headless, force-generate the square of
-      chunks within <r> chunks of spawn, flush and stop it, then hash every
+      chunks within <r> chunks of each <x>,<z> (spawn by default; `--at` is
+      repeatable and is the same flag `worldgen` scores with, because a square
+      anywhere holds one climate and one boot can generate several),
+      flush and stop it, then hash every
       chunk directly out of the region files: a block-state multiset digest, a
       biome digest and per-heightmap digests per chunk. Writes chunks.bin plus
       a human-readable chunks.tsv into the cache. Refuses to run before
@@ -143,7 +147,7 @@ outside the repository (override with DUST_HARNESS_CACHE).
       not a gate, for the same reason `light` is: exit 0 unless the run itself
       failed. Decision record 0011 is why this exists.
 
-  worldgen --version <v> [--seed <n>] [--radius <r>] [--at <x>,<z>]
+  worldgen --version <v> [--seed <n>] [--radius <r>] [--at <x>,<z>]...
       Read a world Minecraft generated, build the same chunks with Dust's own
       generator, and count how far apart they are: surface height, surface
       block, biome, caves and every block state, as a ladder of seven models
@@ -241,6 +245,26 @@ fn take_value(
     if seen.iter().any(|(k, _)| *k == name) {
         return Err(format!("{name} given twice"));
     }
+    seen.push((name, value.clone()));
+    Ok(at + 1)
+}
+
+/// The same, for a flag that means one more of something rather than one
+/// setting of something.
+///
+/// Separate from [`take_value`] rather than a parameter on it: "refuse
+/// duplicates" is right for every flag that names a single answer and wrong for
+/// every flag that names a list, and a caller that got the wrong one would be
+/// told `--at given twice` for doing the thing `--at` exists to do.
+fn take_repeated_value(
+    seen: &mut Vec<(&'static str, String)>,
+    name: &'static str,
+    rest: &[String],
+    at: usize,
+) -> Result<usize, String> {
+    let value = rest
+        .get(at)
+        .ok_or_else(|| format!("{name} needs a value"))?;
     seen.push((name, value.clone()));
     Ok(at + 1)
 }

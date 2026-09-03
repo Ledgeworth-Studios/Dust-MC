@@ -10,5 +10,11 @@ authors.workspace = true
 [dependencies]
 dust-config.workspace = true
 
+# The density functions and noise parameters a biome source is built from are
+# vanilla's own JSON, read at run time out of the operator's copy rather than
+# compiled in. See `noise::build` for why this reads the directory itself
+# instead of going through `dust-data`.
+serde_json.workspace = true
+
 [lints]
 workspace = true

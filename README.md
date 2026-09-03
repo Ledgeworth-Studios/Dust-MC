@@ -93,7 +93,11 @@ the world Minecraft generates for the same seed is measured rather than
 estimated — `cargo xtask harness worldgen` scores it in five parts, and
 decision record
 [0012](docs/decisions/0012-what-worldgen-is-worth-measured-first.md) is what
-each stage of vanilla's pipeline is worth and the order to build them in.
+each stage of vanilla's pipeline is worth and the order to build them in. The
+first of those stages is built: `dust-gen` samples the six climate values
+Minecraft picks a biome from and gets 460,418 of 460,800 cells right on a sample
+that sees seventeen biomes, which is decision record
+[0021](docs/decisions/0021-which-biome-a-cell-gets.md).
 
 What exists either way is the whole path from the socket to the block table —
 framing, compression, encryption, the four connection states, the paletted
@@ -403,7 +407,7 @@ cargo xtask harness compare captures/a captures/b
 cargo xtask harness rewrite --version 1.21.1 --seed 0 --radius 2
 cargo xtask harness registries --version 1.21.1
 cargo xtask harness light --version 1.21.1 --seed 0 --radius 2
-cargo xtask harness worldgen --version 1.21.1 --seed 0 --radius 4
+cargo xtask harness worldgen --version 1.21.1 --seed 0 --radius 2 --at 0,0 --at 300,300
 ```
 
 `provision` resolves the server jar through the same manifest-and-SHA-1 path
@@ -528,50 +532,67 @@ row the one above it plus a single named change, and every figure a count of
 things **wrong**:
 
 ```text
-seed 0, radius 4 -- inland
+seed 0, twelve 5x5 squares to sixteen thousand blocks out -- 17 biomes in view
 
-  surface  surface     biome    caves    false      blocks  KiB/col
-    short    block     short  missing    caves       short
-    20736    20736    124416        0  2416513     2520828      2.2  the flat world Dust serves
-    17467    17551    124416   172558    52673     2627298     16.2  + the world's own sea level
-    17467    17551         0   172558    52673     2627298     16.6  + Minecraft's biomes
-        0    13497         0   198471        0     2632197     18.9  + Minecraft's surface height
-        0    13497         0        0        0     2433726     18.9  + Minecraft's carvers
-        0        0         0        0        0         360     19.6  + its blocks at and below it
-        0        0         0        0        0           0     19.6  + its blocks above it (control)
+  surface  surface     biome    caves     false      blocks  KiB/col
+    short    block     short  missing     caves       short
+    76800    76800    435459        0   9598921    10005374      2.2  the flat world Dust serves
+    74905    74931    435459   583625    795317    10475058     16.2  + the world's own sea level
+    74905    74931       382   583625    795317    10475058     16.6  + Dust's biome source
+        0    60037         0   681715         0    10405644     19.6  + Minecraft's surface height
+        0    60037         0        0         0     9723929     19.6  + Minecraft's carvers
+        0        0         0        0         0       12140     20.6  + its blocks at and below it
+        0        0         0        0         0           0     20.7  + its blocks above it (control)
 ```
 
-Out of 20,736 columns, 7,962,624 cells and 124,416 biome cells. The last row is
+Out of 76,800 columns, 29,491,200 cells and 460,800 biome cells. The last row is
 a control: it hands over every block and every biome, so a non-zero anywhere in
 it is the harness's fault and not the generator's. It is exact on both seeds,
 and it is checked in CI against chunks the harness builds itself — watched to
 fail in both directions.
 
 **Five scores and not one, because a percentage hides which half it is about.**
-Putting the flat world's grass at sea level fixes 3,269 columns' surface height
-and makes the block count **106,470 worse**; one number would have called that
+Putting the flat world's grass at sea level fixes 1,895 columns' surface height
+and makes the block count **469,684 worse**; one number would have called that
 a regression. The flat world scores 100% on caves — a world with no rock above
 y -60 contains every cave Minecraft carved — which is why the summary prints
 counts and a "false caves" column and no rate at all.
 
-**Two seeds, because one cannot see.** Seed 1 spawns in open ocean: every one
-of its 20,736 columns has water underfoot, all of them short by *exactly one*
-under the sea-level rung, because `sea_level: 63` names the level water reaches
-*to* and the topmost water block is at 62. Plants above the surface are 360
-cells inland and zero there.
+**Row two is Dust's own generator now.** The biome source samples the six
+climate values out of the operator's own density functions and matches them
+against their parameter list, and it takes 435,459 wrong cells to **382** — on a
+sample that reaches seventeen biomes rather than the two a single square holds.
+Every one of the 382 is an **exact tie** in climate space, broken the other way;
+so are all 238 on seed 1. Decision record
+[0021](docs/decisions/0021-which-biome-a-cell-gets.md) is why matching them is
+declined.
+
+**Two seeds, because one cannot see.** Seed 1 spawns in open ocean, where every
+column has water underfoot and is short by *exactly one* under the sea-level
+rung, because `sea_level: 63` names the level water reaches *to* and the topmost
+water block is at 62. It sees twenty biomes to seed 0's seventeen and agrees
+about almost no other number here.
+
+**The shape of the sample matters more than its size.** `--at` is repeatable:
+the twelve scattered 5x5 squares above hold not quite four times the chunks of a
+single 9x9 and reach eight to ten times as many biomes. A biome source scored on
+one square is not being scored, it is being asked whether one of two answers
+came out.
 
 Cost is scored beside accuracy, because this code runs for every chunk a player
-walks toward: a real column's blocks are 19.6 KiB against a flat one's 2.2, and
+walks toward: a real column's blocks are 20.7 KiB against a flat one's 2.2, and
 **light is 96 KiB more per column whatever the terrain** — at the default view
-distance a join is 5.5 MiB of blocks once terrain is real and 27 MiB of light
-either way. Decision record
-[0012](docs/decisions/0012-what-worldgen-is-worth-measured-first.md) is what
-the ladder was built to write: what each stage is worth, what it costs, and the
-order to build them in.
+distance a join is 5.8 MiB of blocks once terrain is real and 27 MiB of light
+either way. Decision records
+[0012](docs/decisions/0012-what-worldgen-is-worth-measured-first.md) and
+[0021](docs/decisions/0021-which-biome-a-cell-gets.md) are what the ladder was
+built to write: what each stage is worth, what it costs, and the order to build
+them in.
 
 `capture` boots the provisioned server headless, watches its own log for the
 readiness line, force-generates the square of chunks within `--radius` chunks
-of spawn with `forceload`, waits until every chunk has reached disk, flushes,
+of each `--at` centre with `forceload`, asks it to `save-all` every ten seconds
+until every chunk has reached disk, flushes,
 stops the server over RCON, and then reads the region files directly — anvil
 layout, chunk decompression, a minimal NBT walk — to produce one digest per
 chunk: a block-state multiset hash (order-independent), a biome hash, and

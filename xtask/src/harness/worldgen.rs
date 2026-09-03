@@ -46,17 +46,23 @@
 //! ```text
 //!   0  the flat world Dust serves today
 //!   1  + the world's own sea level
-//!   2  + Minecraft's biomes                     the biome source
+//!   2  + Dust's biome source                    the multi-noise climate
 //!   3  + Minecraft's surface height             the density functions
 //!   4  + Minecraft's carvers                    caves
 //!   5  + Minecraft's blocks at and below it     surface rules, ores, trees
 //!   6  + Minecraft's blocks above it            plants -- the control
 //! ```
 //!
-//! Rows 2 to 6 read their answer out of the region file. **None of them is a
+//! Rows 3 to 6 read their answer out of the region file. **None of them is a
 //! mode a server could run in** — that is the whole point of them, and it is
 //! the same device `harness light`'s last rung uses. What each row *buys* is
 //! what that stage of worldgen is worth, in cells, on this world.
+//!
+//! Row 2 used to be one of them and is not any more. It is Dust's own
+//! multi-noise biome source now, so it is a mode a server *could* run in, and
+//! the gap between it and row 3 — which hands Minecraft's biomes over — is
+//! what the biome source still gets wrong. That is how a stage graduates: the
+//! rung that stood in for it becomes the ceiling above it.
 //!
 //! **Row 6 is a control and has to be exact.** It hands every block and every
 //! biome over, so anything short of 100% on all five scores is the scorer
@@ -79,6 +85,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use dust_gen::biome::{BiomeParameters, BiomeSource, Sampler};
 use dust_server::net::source::RegistryNames;
 use dust_server::net::world::{self, FlatWorld, Palette};
 use dust_world::anvil::{Ids as _, Names as _};
@@ -89,7 +96,7 @@ use dust_world::heightmap::{HeightmapKind, WorldHeight};
 use super::{cache, digest, region};
 
 const USAGE: &str = "\
-harness worldgen --version <v> [--seed <n>] [--radius <r>] [--at <x>,<z>]
+harness worldgen --version <v> [--seed <n>] [--radius <r>] [--at <x>,<z>]...
 
 Reads a world Minecraft generated, builds the same chunks with Dust's own
 generator, and counts how far apart they are: surface height, surface block,
@@ -102,8 +109,12 @@ A measurement and not a gate: exit 0 unless the run itself failed.
   --seed <n>      The provisioned world's seed. Default 0. Score more than
                   one: seed 0 spawns inland and seed 1 in open ocean, and
                   they disagree about nearly every number here.
-  --at <x>,<z>    Centre the square on this chunk instead of 0,0.
-  --radius <r>    Chunks either side of the centre. Default 4 (a 9x9).
+  --at <x>,<z>    Centre a square on this chunk instead of 0,0. Repeatable,
+                  and repeating it is how a biome source gets scored: a square
+                  anywhere holds one climate, so several small squares far
+                  apart reach biomes a wide square never would. Score the same
+                  squares the capture generated.
+  --radius <r>    Chunks either side of each centre. Default 4 (a 9x9).
 ";
 
 /// Sea level in a 1.21.1 overworld: the y of the topmost water block.
@@ -119,14 +130,14 @@ pub struct Options {
     pub version: String,
     pub seed: i64,
     pub radius: i32,
-    pub centre: (i32, i32),
+    pub centres: Vec<(i32, i32)>,
 }
 
 pub fn parse(args: &[String]) -> Result<Options, String> {
     let mut version = None;
     let mut seed = 0i64;
     let mut radius = 4i32;
-    let mut centre = (0i32, 0i32);
+    let mut centres: Vec<(i32, i32)> = Vec::new();
     let mut seen: Vec<(&'static str, String)> = Vec::new();
     let mut at = 0;
     while at < args.len() {
@@ -154,19 +165,19 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
                     .map_err(|_| "--radius needs a whole number")?;
             }
             "--at" => {
-                at = super::take_value(&mut seen, "--at", args, at + 1)?;
+                at = super::take_repeated_value(&mut seen, "--at", args, at + 1)?;
                 let value = seen.last().expect("just stored").1.clone();
                 let (x, z) = value
                     .split_once(',')
                     .ok_or("--at needs two chunk coordinates, as `x,z`")?;
-                centre = (
+                centres.push((
                     x.trim()
                         .parse()
                         .map_err(|_| "--at's x is not a whole number")?,
                     z.trim()
                         .parse()
                         .map_err(|_| "--at's z is not a whole number")?,
-                );
+                ));
             }
             other => return Err(format!("unknown worldgen option `{other}`\n\n{USAGE}")),
         }
@@ -177,7 +188,11 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
         })?,
         seed,
         radius,
-        centre,
+        centres: if centres.is_empty() {
+            vec![(0, 0)]
+        } else {
+            centres
+        },
     })
 }
 
@@ -209,7 +224,9 @@ enum Rung {
     /// four blocks off its floor. The fill has to go somewhere and dirt is
     /// what the flat world fills with.
     FlatAtSeaLevel,
-    /// The biome of every cell, from Minecraft. Changes no block.
+    /// The biome of every cell, from **Dust's own** multi-noise biome source:
+    /// six climate values sampled out of the operator's density functions and
+    /// matched against their parameter list. Changes no block.
     Biomes,
     /// The flat stack again, with each column's grass at the y Minecraft's
     /// `MOTION_BLOCKING` puts it. The terrain's *shape*, and nothing else:
@@ -249,7 +266,7 @@ impl Rung {
         match self {
             Self::Flat => "the flat world Dust serves today",
             Self::FlatAtSeaLevel => "+ the world's own sea level",
-            Self::Biomes => "+ Minecraft's biomes                     (the biome source)",
+            Self::Biomes => "+ Dust's biome source                    (the multi-noise climate)",
             Self::Heights => "+ Minecraft's surface height             (the density functions)",
             Self::Carvers => "+ Minecraft's carvers                    (caves)",
             Self::BelowTheSurface => {
@@ -262,7 +279,7 @@ impl Rung {
     /// Whether this rung reads its answer out of the region file, and is
     /// therefore not a mode any server could run in.
     fn reads_the_region_file(self) -> bool {
-        !matches!(self, Self::Flat | Self::FlatAtSeaLevel)
+        !matches!(self, Self::Flat | Self::FlatAtSeaLevel | Self::Biomes)
     }
 }
 
@@ -321,6 +338,13 @@ struct Scores {
     biome_agree: u64,
     minecrafts_biomes: BTreeSet<String>,
     dusts_biomes: BTreeSet<String>,
+    /// `Minecraft's biome -> Dust's` for every cell they disagree on.
+    ///
+    /// Both sides and not just the wanted one, because a biome source is wrong
+    /// in *pairs*: "435,459 cells short" says nothing a reader can act on, and
+    /// "swamp where Minecraft has mangrove_swamp, 149 cells" names one region
+    /// of the parameter list and one boundary to go and look at.
+    biome_confusions: BTreeMap<String, u64>,
     /// Cells Minecraft left open strictly below its own surface.
     carved: u64,
     /// ... of which Dust also leaves open.
@@ -343,6 +367,77 @@ struct Scores {
     /// rung, which is the point of printing it apart: it is 96 KiB of every
     /// column whatever the terrain does.
     light_bytes: u64,
+}
+
+/// Everything a rung builds from that is the same for every chunk.
+///
+/// One struct rather than eight parameters, because the list stopped being
+/// readable and a caller that swapped two of them would still compile.
+struct Model<'a> {
+    flat: &'a FlatWorld,
+    blocks: &'a Blocks,
+    names: &'a RegistryNames,
+    height: WorldHeight,
+    constants: Option<&'a dust_registry::BlockConstants>,
+}
+
+/// Build Dust's biome source for this world, out of the operator's own data.
+///
+/// Two files, both outside the repository and both Mojang's: the density
+/// functions and noise parameters that `cargo xtask extract` unpacks from the
+/// server jar, and the `dust-biomes.tsv` the same command writes. Refused
+/// rather than defaulted when either is missing — a rung that quietly copied
+/// Minecraft's biomes instead would report a perfect biome score for a
+/// generator that had not run.
+fn biome_source(version: &str, seed: i64, names: &RegistryNames) -> Result<BiomeSource, String> {
+    let cache = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask lives one level below the workspace root")
+        .join(".dust-extract");
+    let table = cache
+        .join(format!("oracle-{version}"))
+        .join(dust_gen::biome::FILE);
+    let text = std::fs::read_to_string(&table).map_err(|e| {
+        format!(
+            "could not read {}: {e}\n\n`cargo xtask extract --version {version} --only worldgen` \
+             writes it",
+            table.display()
+        )
+    })?;
+    let mut parameters =
+        BiomeParameters::parse(&text).map_err(|e| format!("{}: {e}", table.display()))?;
+
+    // The table carries the id the extraction saw beside the name, and the
+    // name is what is checked here. They agree today because both came out of
+    // the same jar; the day they do not, this says which biome moved instead
+    // of putting a jungle in the tundra.
+    let moved = parameters.rebind(|name| names.biome(name));
+    if !moved.is_empty() {
+        println!(
+            "{} biome(s) in {} are not where this build's registry has them:",
+            moved.len(),
+            table.display()
+        );
+        for entry in &moved {
+            match entry.now {
+                Some(now) => println!("  {} moved from {} to {now}", entry.name, entry.was),
+                None => println!(
+                    "  {} is id {} in the table and is not in the registry at all",
+                    entry.name, entry.was
+                ),
+            }
+        }
+    }
+
+    let data = cache.join(format!("data-{version}/data"));
+    println!(
+        "biome source: {} regions over {} biomes from {}, density functions from {}",
+        parameters.len(),
+        parameters.distinct_biomes(),
+        table.display(),
+        data.display()
+    );
+    BiomeSource::new(&data, "overworld", seed, parameters).map_err(|e| e.to_string())
 }
 
 fn measure(options: &Options) -> Result<(), String> {
@@ -385,10 +480,7 @@ fn measure(options: &Options) -> Result<(), String> {
         ),
     }
 
-    let expected: Vec<(i32, i32)> = digest::expected_chunks(options.radius)
-        .into_iter()
-        .map(|(x, z)| (x + options.centre.0, z + options.centre.1))
-        .collect();
+    let expected = digest::expected_chunks_over(options.radius, &options.centres);
 
     // Only chunks vanilla finished. A chunk below `full` holds a partial
     // answer that looks like a complete one, which is why `digest::scan` and
@@ -430,21 +522,27 @@ fn measure(options: &Options) -> Result<(), String> {
         surfaces.push(surface_of(chunk));
     }
 
+    let source = biome_source(&options.version, options.seed, &names)?;
+    let model = Model {
+        flat: &flat,
+        blocks: &blocks,
+        names: &names,
+        height,
+        constants: constants.as_ref().map(|(_, table)| table),
+    };
+
     let mut ladder = Vec::new();
     for rung in Rung::ALL {
         let mut scores = Scores::default();
+        // One sampler per rung rather than per chunk: the `flat_cache` nodes
+        // hold a column's continentalness across its 96 biome cells, and a
+        // sampler rebuilt per chunk would still be correct and would throw
+        // that away at every boundary. It is scratch space, not state — the
+        // graph and every noise table are shared and immutable.
+        let mut sampler = source.sampler();
         for (chunk, surface) in vanilla.iter().zip(&surfaces) {
             let started = Instant::now();
-            let built = build(
-                rung,
-                chunk,
-                surface,
-                &flat,
-                &blocks,
-                &names,
-                height,
-                constants.as_ref().map(|(_, table)| table),
-            );
+            let built = build(rung, chunk, surface, &model, &mut sampler);
             scores.built += started.elapsed();
             weigh(&built, &mut scores);
             score(&built, chunk, surface, &blocks, &names, height, &mut scores);
@@ -477,12 +575,16 @@ fn build(
     rung: Rung,
     vanilla: &Chunk,
     surface: &[Option<i32>; 256],
-    flat: &FlatWorld,
-    blocks: &Blocks,
-    names: &RegistryNames,
-    height: WorldHeight,
-    constants: Option<&dust_registry::BlockConstants>,
+    model: &Model,
+    biomes: &mut Sampler,
 ) -> Chunk {
+    let Model {
+        flat,
+        blocks,
+        names,
+        height,
+        constants,
+    } = *model;
     // Rung zero is the server's own column, cloned rather than rebuilt: that
     // clone is also what `Source::column` hands out for a position a real
     // world does not contain, so it is the shipping answer and not a model of
@@ -564,14 +666,37 @@ fn build(
         }
     }
 
+    // Biome cells are 4x4x4 and the loops below walk them at their own stride
+    // rather than per block: sixty-four writes a section instead of four
+    // thousand and ninety-six, for the same answer.
     if rung.reads_the_region_file() {
-        // Biome cells are 4x4x4 and the loop walks them at their own stride
-        // rather than per block: sixty-four writes a section instead of four
-        // thousand and ninety-six, for the same answer.
         for y in (height.min_y()..top).step_by(4) {
             for z in (0..16u32).step_by(4) {
                 for x in (0..16u32).step_by(4) {
                     chunk.set_biome(x, y, z, vanilla.get_biome(x, y, z));
+                }
+            }
+        }
+    } else if rung == Rung::Biomes {
+        // Quart coordinates: the cell index, which is the block position
+        // shifted down by two. The x and z of the chunk are added first,
+        // because a climate is a fact about where in the world the column is
+        // and every chunk would otherwise be given the climate at the origin.
+        let base_x = vanilla.pos().x * 4;
+        let base_z = vanilla.pos().z * 4;
+        // **Column outermost, y innermost, and that is not a style choice.**
+        // Four of the six climate functions are wrapped in a `flat_cache`,
+        // which means they do not depend on y and the sampler holds them for
+        // as long as the column does not move. Walking y on the outside moves
+        // the column on every cell and throws that away.
+        for z in (0..16u32).step_by(4) {
+            for x in (0..16u32).step_by(4) {
+                let quart_x = base_x + (x as i32 >> 2);
+                let quart_z = base_z + (z as i32 >> 2);
+                for y in (height.min_y()..top).step_by(4) {
+                    if let Some(biome) = biomes.biome(quart_x, y >> 2, quart_z) {
+                        chunk.set_biome(x, y, z, biome);
+                    }
                 }
             }
         }
@@ -684,6 +809,13 @@ fn score(
                 scores.biome_cells += 1;
                 if wanted == built {
                     scores.biome_agree += 1;
+                } else {
+                    let pair = format!(
+                        "{} where Minecraft has {}",
+                        biome_name(names, built),
+                        biome_name(names, wanted)
+                    );
+                    *scores.biome_confusions.entry(pair).or_default() += 1;
                 }
                 if let Some(name) = names.biome_name(wanted) {
                     scores.minecrafts_biomes.insert(name.to_owned());
@@ -694,6 +826,17 @@ fn score(
             }
         }
     }
+}
+
+/// A biome's name, or its number when the registry does not know it.
+///
+/// Never a bare number silently: an id with no name is a table and a registry
+/// that have come apart, which is the thing `BiomeParameters::rebind` exists to
+/// say out loud.
+fn biome_name(names: &RegistryNames, id: u32) -> String {
+    names
+        .biome_name(id)
+        .map_or_else(|| format!("biome #{id}"), str::to_owned)
 }
 
 fn block_name(state: u32) -> String {
@@ -745,6 +888,10 @@ fn report(rung: Rung, scores: &Scores) {
         percent(scores.biome_agree, scores.biome_cells),
         scores.minecrafts_biomes.len(),
         scores.dusts_biomes.len()
+    );
+    histogram(
+        "      Dust has, where they disagree:",
+        &scores.biome_confusions,
     );
     println!(
         "  caves           {:>10} of {:>10} carved cell(s) open ({:.3}%); {} cell(s) Dust opened \
@@ -913,16 +1060,32 @@ fn read_chunk(
 mod tests {
     use super::*;
 
+    use crate::harness::testing::scratch_dir;
+
     /// A stand-in world with one hill, one cave and one tree's worth of
     /// leaves, built here rather than read from a file: this harness tests
     /// against bytes it constructed, never against Mojang's.
     fn synthetic(blocks: &Blocks, height: WorldHeight, plains: u32, other: u32) -> Chunk {
+        synthetic_at(ChunkPos::new(0, 0), blocks, height, plains, other)
+    }
+
+    /// The same stand-in, somewhere in particular.
+    ///
+    /// A chunk's position is an input to a biome source and to nothing else
+    /// here, which is why it is a parameter rather than always the origin.
+    fn synthetic_at(
+        pos: ChunkPos,
+        blocks: &Blocks,
+        height: WorldHeight,
+        plains: u32,
+        other: u32,
+    ) -> Chunk {
         let stone = dust_registry::Block::from_name("minecraft:stone")
             .expect("the block table has stone")
             .default_state()
             .id();
         let mut chunk = Chunk::uniform(
-            ChunkPos::new(0, 0),
+            pos,
             height,
             dust_registry::STATE_COUNT,
             64,
@@ -963,6 +1126,86 @@ mod tests {
         )
     }
 
+    /// A data pack written here, holding nothing of Mojang's.
+    ///
+    /// Six climate functions, of which two carry information: temperature is a
+    /// gradient in y, so what it says is arithmetic a reader can check, and
+    /// vegetation is a real Perlin noise in x and z, so the machinery that
+    /// actually samples one is exercised rather than stubbed. The other four
+    /// are constants.
+    ///
+    /// This is the same device the synthetic chunk above is: the harness is
+    /// tested against bytes it wrote.
+    fn scratch_pack(root: &Path) {
+        let write = |relative: &str, text: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().expect("has a parent")).expect("mkdir");
+            std::fs::write(path, text).expect("write");
+        };
+        write(
+            "minecraft/worldgen/noise/scratch.json",
+            r#"{"firstOctave": -7, "amplitudes": [1.0, 1.0]}"#,
+        );
+        write(
+            "minecraft/worldgen/noise_settings/overworld.json",
+            r#"{"noise_router": {
+                 "temperature": {
+                   "type": "minecraft:y_clamped_gradient",
+                   "from_y": -64, "to_y": 320, "from_value": -1.0, "to_value": 1.0
+                 },
+                 "vegetation": {
+                   "type": "minecraft:flat_cache",
+                   "argument": {
+                     "type": "minecraft:shifted_noise",
+                     "noise": "minecraft:scratch",
+                     "shift_x": 0.0, "shift_y": 0.0, "shift_z": 0.0,
+                     "xz_scale": 1.0, "y_scale": 0.0
+                   }
+                 },
+                 "continents": 0.0,
+                 "erosion": 0.0,
+                 "depth": 0.0,
+                 "ridges": 0.0
+               }}"#,
+        );
+    }
+
+    /// Two biomes split on temperature alone, so which one a cell gets is a
+    /// statement about its y that can be worked out by hand.
+    fn scratch_table(cold: u32, warm: u32) -> String {
+        let axes = "\t-10000\t10000".repeat(5);
+        format!(
+            "# biome_id\tbiome\ttemperature_min\ttemperature_max\thumidity_min\thumidity_max\
+             \tcontinentalness_min\tcontinentalness_max\terosion_min\terosion_max\
+             \tdepth_min\tdepth_max\tweirdness_min\tweirdness_max\toffset\n\
+             {cold}\tminecraft:snowy_plains\t-10000\t0{axes}\t0\n\
+             {warm}\tminecraft:desert\t0\t10000{axes}\t0\n"
+        )
+    }
+
+    fn scratch_source(root: &Path, cold: u32, warm: u32) -> BiomeSource {
+        scratch_pack(root);
+        let parameters =
+            BiomeParameters::parse(&scratch_table(cold, warm)).expect("the table parses");
+        assert_eq!(parameters.len(), 2);
+        BiomeSource::new(root, "overworld", 1234, parameters).expect("the pack compiles")
+    }
+
+    fn model<'a>(
+        flat: &'a FlatWorld,
+        blocks: &'a Blocks,
+        names: &'a RegistryNames,
+        height: WorldHeight,
+    ) -> Model<'a> {
+        Model {
+            flat,
+            blocks,
+            names,
+            height,
+            constants: None,
+        }
+    }
+
     /// The control rung reproduces the world exactly, on all five scores.
     ///
     /// Without this the ladder's last row could read 99.99% forever and nobody
@@ -977,15 +1220,14 @@ mod tests {
         let surface = surface_of(&vanilla);
         let flat = FlatWorld::new(blocks.palette, plains, names.biome_registry_size());
 
+        let scratch = scratch_dir("worldgen-control");
+        let source = scratch_source(&scratch, plains, other);
         let built = build(
             Rung::Everything,
             &vanilla,
             &surface,
-            &flat,
-            &blocks,
-            &names,
-            height,
-            None,
+            &model(&flat, &blocks, &names, height),
+            &mut source.sampler(),
         );
         let mut scores = Scores::default();
         score(
@@ -1022,15 +1264,14 @@ mod tests {
         vanilla.recompute_heightmaps(world::heightmap_predicate(blocks.palette.air, None));
         let surface = surface_of(&vanilla);
         let flat = FlatWorld::new(blocks.palette, plains, names.biome_registry_size());
+        let scratch = scratch_dir("worldgen-one-block");
+        let source = scratch_source(&scratch, plains, other);
         let mut built = build(
             Rung::Everything,
             &vanilla,
             &surface,
-            &flat,
-            &blocks,
-            &names,
-            height,
-            None,
+            &model(&flat, &blocks, &names, height),
+            &mut source.sampler(),
         );
         // Take the top block of one column away. The surface drops, the block
         // underfoot changes and one cell of the world differs.
@@ -1068,9 +1309,15 @@ mod tests {
         let surface = surface_of(&vanilla);
         let flat = FlatWorld::new(blocks.palette, plains, names.biome_registry_size());
 
+        let scratch = scratch_dir("worldgen-cave");
+        let source = scratch_source(&scratch, plains, other);
         for (rung, open) in [(Rung::Heights, false), (Rung::Carvers, true)] {
             let built = build(
-                rung, &vanilla, &surface, &flat, &blocks, &names, height, None,
+                rung,
+                &vanilla,
+                &surface,
+                &model(&flat, &blocks, &names, height),
+                &mut source.sampler(),
             );
             let mut scores = Scores::default();
             score(
@@ -1103,17 +1350,140 @@ mod tests {
         let flat = FlatWorld::new(blocks.palette, plains, names.biome_registry_size());
         let vanilla = synthetic(&blocks, height, plains, plains);
         let surface = surface_of(&vanilla);
+        let scratch = scratch_dir("worldgen-flat");
+        let source = scratch_source(&scratch, plains, plains);
         let built = build(
             Rung::Flat,
             &vanilla,
             &surface,
-            &flat,
-            &blocks,
-            &names,
-            height,
-            None,
+            &model(&flat, &blocks, &names, height),
+            &mut source.sampler(),
         );
         assert_eq!(&built, flat.column());
+    }
+
+    /// The biome rung answers out of Dust's own climate, and the answer is the
+    /// arithmetic the data pack states.
+    ///
+    /// The scratch pack's temperature is a gradient from -1 at y -64 to +1 at
+    /// y 320, so it crosses zero at y 128, and the two biomes are split there.
+    /// Every assertion below is that arithmetic and not a recorded output.
+    #[test]
+    fn the_biome_rung_reads_the_climate_and_not_the_region_file() {
+        let (blocks, height, names) = parts();
+        let plains = names.biome("minecraft:plains").expect("plains");
+        let cold = names.biome("minecraft:snowy_plains").expect("snowy plains");
+        let warm = names.biome("minecraft:desert").expect("desert");
+        let mut vanilla = synthetic(&blocks, height, plains, plains);
+        vanilla.recompute_heightmaps(world::heightmap_predicate(blocks.palette.air, None));
+        let surface = surface_of(&vanilla);
+        let flat = FlatWorld::new(blocks.palette, plains, names.biome_registry_size());
+        let scratch = scratch_dir("worldgen-biome-rung");
+        let source = scratch_source(&scratch, cold, warm);
+
+        let built = build(
+            Rung::Biomes,
+            &vanilla,
+            &surface,
+            &model(&flat, &blocks, &names, height),
+            &mut source.sampler(),
+        );
+
+        // Below the crossing and above it, on the cell either side of it.
+        assert_eq!(
+            built.get_biome(0, -64, 0),
+            cold,
+            "the world's floor is cold"
+        );
+        assert_eq!(built.get_biome(0, 124, 0), cold, "the cell below y 128");
+        assert_eq!(
+            built.get_biome(0, 128, 0),
+            cold,
+            "at y 128 the gradient is exactly zero, which is inside both spans, and the \
+             first row of the table wins the tie"
+        );
+        assert_eq!(built.get_biome(0, 132, 0), warm, "the cell above it");
+        assert_eq!(built.get_biome(12, 316, 12), warm, "the world's ceiling");
+
+        // **The negative half.** Vanilla's every cell here is plains. A rung
+        // that had gone on copying the region file would agree with it
+        // perfectly, and every assertion above would still be about a copy.
+        assert_ne!(
+            built.get_biome(0, -64, 0),
+            vanilla.get_biome(0, -64, 0),
+            "the rung must not be reading the world it is being scored against"
+        );
+    }
+
+    /// A climate is a fact about where in the world a column is.
+    ///
+    /// Dropping the chunk's own x and z is the single likeliest mistake in the
+    /// rung above — it compiles, it runs, and it gives every chunk in the world
+    /// the climate at the origin, which no score short of a biome count would
+    /// notice. So the two chunks are built from one source and compared.
+    #[test]
+    fn two_chunks_far_apart_are_given_different_climates() {
+        let (blocks, height, names) = parts();
+        let plains = names.biome("minecraft:plains").expect("plains");
+        let dry = names.biome("minecraft:savanna").expect("savanna");
+        let wet = names.biome("minecraft:jungle").expect("jungle");
+        let flat = FlatWorld::new(blocks.palette, plains, names.biome_registry_size());
+        let scratch = scratch_dir("worldgen-biome-position");
+        scratch_pack(&scratch);
+        // Split on vegetation, which the scratch pack samples as a real noise
+        // in x and z, so the answer moves with the column.
+        let axes = "\t-10000\t10000";
+        let table = format!(
+            "# biome_id\tbiome\ttemperature_min\ttemperature_max\thumidity_min\thumidity_max\
+             \tcontinentalness_min\tcontinentalness_max\terosion_min\terosion_max\
+             \tdepth_min\tdepth_max\tweirdness_min\tweirdness_max\toffset\n\
+             {dry}\tminecraft:savanna{axes}\t-10000\t0{axes}{axes}{axes}{axes}\t0\n\
+             {wet}\tminecraft:jungle{axes}\t0\t10000{axes}{axes}{axes}{axes}\t0\n"
+        );
+        let source = BiomeSource::new(
+            &scratch,
+            "overworld",
+            1234,
+            BiomeParameters::parse(&table).expect("the table parses"),
+        )
+        .expect("the pack compiles");
+        let mut sampler = source.sampler();
+
+        let here = ChunkPos::new(0, 0);
+        let far = ChunkPos::new(1000, -1000);
+        let built = [here, far].map(|pos| {
+            let mut vanilla = synthetic_at(pos, &blocks, height, plains, plains);
+            vanilla.recompute_heightmaps(world::heightmap_predicate(blocks.palette.air, None));
+            let surface = surface_of(&vanilla);
+            build(
+                Rung::Biomes,
+                &vanilla,
+                &surface,
+                &model(&flat, &blocks, &names, height),
+                &mut sampler,
+            )
+        });
+
+        let biomes = |chunk: &Chunk| -> Vec<u32> {
+            let top = height.min_y() + height.height() as i32;
+            (height.min_y()..top)
+                .step_by(4)
+                .flat_map(|y| {
+                    (0..16u32)
+                        .step_by(4)
+                        .flat_map(move |z| (0..16u32).step_by(4).map(move |x| (x, y, z)))
+                })
+                .map(|(x, y, z)| chunk.get_biome(x, y, z))
+                .collect()
+        };
+        let near = biomes(&built[0]);
+        let distant = biomes(&built[1]);
+        assert_eq!(near.len(), 1536, "4 x 4 x 96 cells");
+        assert_ne!(
+            near, distant,
+            "16,000 blocks apart and the same climate means the chunk's own position \
+             was thrown away"
+        );
     }
 
     #[test]
@@ -1123,7 +1493,11 @@ mod tests {
         assert_eq!(*Rung::ALL.last().expect("seven"), Rung::Everything);
         assert!(!Rung::Flat.reads_the_region_file());
         assert!(!Rung::FlatAtSeaLevel.reads_the_region_file());
-        assert!(Rung::Biomes.reads_the_region_file());
+        assert!(
+            !Rung::Biomes.reads_the_region_file(),
+            "the biome rung answers for itself now, so it is a mode a server could run in"
+        );
+        assert!(Rung::Heights.reads_the_region_file());
     }
 
     #[test]
@@ -1135,7 +1509,7 @@ mod tests {
         let options = parse(&args).expect("parses");
         assert_eq!(options.seed, 1);
         assert_eq!(options.radius, 3);
-        assert_eq!(options.centre, (0, 0));
+        assert_eq!(options.centres, vec![(0, 0)]);
         assert!(parse(&[]).is_err(), "no --version");
         assert!(parse(&["--nope".to_owned()]).is_err());
     }

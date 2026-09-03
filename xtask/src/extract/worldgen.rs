@@ -1589,6 +1589,164 @@ fn biome_points(reports_root: &Path, dimension: &str) -> Result<Vec<BiomePoint>,
     Ok(out)
 }
 
+/// One row of `dust-biomes.tsv`: a biome and the region of climate space it
+/// claims, already quantised.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BiomeRegion {
+    /// The id the running registry gives this name, at the moment of
+    /// extraction. `dust_gen::biome::BiomeParameters::rebind` checks it again
+    /// at load and says which biome moved if it ever stops being true.
+    pub id: u32,
+    pub biome: String,
+    /// Inclusive spans, in `dust_gen::biome::AXES` order.
+    pub axes: [(i64, i64); 6],
+    pub offset: i64,
+}
+
+/// The six climate axes, in the order `dust_gen::biome::AXES` holds them, with
+/// the name each has in the biome-parameter report.
+///
+/// The two spellings differ on two of the six and that is not a typo: the
+/// noise router calls them `vegetation` and `ridges`, and the parameter list
+/// calls the same two axes `humidity` and `weirdness`. Naming them together
+/// here is what stops the pairing being re-derived — or mis-derived — twice.
+const REPORT_AXES: [&str; 6] = [
+    "temperature",
+    "humidity",
+    "continentalness",
+    "erosion",
+    "depth",
+    "weirdness",
+];
+
+/// Minecraft's `Climate.quantizeCoord`.
+///
+/// The multiply is in **f32** and the narrowing is a truncation, because
+/// Minecraft's is: `(long)(f * 10000.0F)`. Doing it in f64 would be more
+/// accurate and would put some rows one ten-thousandth off the region vanilla
+/// actually compares against.
+fn quantise(value: f64) -> i64 {
+    ((value as f32) * 10_000.0f32) as i64
+}
+
+/// One parameter, which the report writes as a number when it is a point and
+/// as `[min, max]` when it is a span.
+fn span(value: &Value, what: &str, path: &Path) -> Result<(i64, i64), String> {
+    if let Some(number) = value.as_f64() {
+        let at = quantise(number);
+        return Ok((at, at));
+    }
+    let pair = value
+        .as_array()
+        .ok_or_else(|| format!("{}: {what} is neither a number nor a range", path.display()))?;
+    if pair.len() != 2 {
+        return Err(format!(
+            "{}: {what} is a range of {} value(s), not two",
+            path.display(),
+            pair.len()
+        ));
+    }
+    let min = quantise(
+        pair[0]
+            .as_f64()
+            .ok_or_else(|| format!("{}: {what}'s low end is not a number", path.display()))?,
+    );
+    let max = quantise(
+        pair[1]
+            .as_f64()
+            .ok_or_else(|| format!("{}: {what}'s high end is not a number", path.display()))?,
+    );
+    if min > max {
+        return Err(format!("{}: {what} runs backwards", path.display()));
+    }
+    Ok((min, max))
+}
+
+/// Read one dimension's whole biome-parameter list, ready to write out.
+///
+/// **This is world data and it does not enter the repository.** It is written
+/// to the extraction cache as a TSV the operator copies beside their own data,
+/// exactly as `dust-constants.tsv` and `dust-items.tsv` are, and for the reason
+/// decision records 0006, 0007 and 0008 give: a biome parameter list is
+/// Mojang's content and a datapack's to change.
+pub fn biome_regions(
+    reports_root: &Path,
+    dimension: &str,
+    id_of: impl Fn(&str) -> Option<u32>,
+) -> Result<Vec<BiomeRegion>, String> {
+    let path = reports_root
+        .join("biome_parameters/minecraft")
+        .join(format!("{dimension}.json"));
+    let text =
+        std::fs::read(&path).map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    let value: Value = serde_json::from_slice(&text)
+        .map_err(|e| format!("could not read {} as JSON: {e}", path.display()))?;
+    let mut out = Vec::new();
+    let mut unknown: BTreeSet<String> = BTreeSet::new();
+    for entry in as_array(field(&value, "biomes", &path)?, "biomes", &path)? {
+        let biome = as_str(field(entry, "biome", &path)?, "the entry's biome", &path)?.to_owned();
+        let parameters = field(entry, "parameters", &path)?;
+        let mut axes = [(0i64, 0i64); 6];
+        for (slot, name) in axes.iter_mut().zip(REPORT_AXES) {
+            *slot = span(field(parameters, name, &path)?, name, &path)?;
+        }
+        let offset = quantise(
+            field(parameters, "offset", &path)?
+                .as_f64()
+                .ok_or_else(|| format!("{}: {biome}'s offset is not a number", path.display()))?,
+        );
+        let Some(id) = id_of(&biome) else {
+            unknown.insert(biome);
+            continue;
+        };
+        out.push(BiomeRegion {
+            id,
+            biome,
+            axes,
+            offset,
+        });
+    }
+    // Refused rather than skipped. A biome the registry has never heard of is
+    // a row that can never be chosen, so a world generated from this table
+    // would quietly hold a hole exactly where that biome belongs — and the
+    // shape of the hole would be an ocean or a jungle, not an error.
+    if !unknown.is_empty() {
+        return Err(format!(
+            "{} names {} biome(s) the synced registry has no id for ({}). The parameter \
+             list and the registry came out of the same jar, so this means one of the two \
+             readers is looking at the wrong tree.",
+            path.display(),
+            unknown.len(),
+            unknown.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if out.is_empty() {
+        return Err(format!("{} named no biome regions", path.display()));
+    }
+    Ok(out)
+}
+
+/// The TSV `dust_gen::biome::BiomeParameters::parse` reads.
+///
+/// Row order is the report's order, which is the order vanilla's own parameter
+/// list is built in, because the search resolves an exact tie in favour of the
+/// first row.
+pub fn biome_table(regions: &[BiomeRegion]) -> String {
+    let mut out = String::from("# biome_id\tbiome");
+    for axis in REPORT_AXES {
+        out.push_str(&format!("\t{axis}_min\t{axis}_max"));
+    }
+    out.push_str("\toffset\n");
+    for region in regions {
+        out.push_str(&format!("{}\t{}", region.id, region.biome));
+        for (min, max) in region.axes {
+            out.push_str(&format!("\t{min}\t{max}"));
+        }
+        out.push_str(&format!("\t{}\n", region.offset));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1610,6 +1768,71 @@ mod tests {
             noise_min_y: 0,
             noise_height: 128,
         }
+    }
+
+    #[test]
+    fn a_climate_value_is_quantised_the_way_minecraft_quantises_it() {
+        assert_eq!(quantise(0.0), 0);
+        assert_eq!(quantise(1.0), 10_000);
+        assert_eq!(quantise(-1.2), -12_000);
+
+        // The width is not a style choice, and 1.21.1's own overworld report
+        // is what proves it. Of the 37 distinct parameter values in that file,
+        // two quantise differently in the two widths — and they are real
+        // bounds, on the temperature and weirdness axes of biomes a player
+        // walks through. Minecraft multiplies in f32; f64 is one
+        // ten-thousandth off on every region bounded at +/- 0.7666.
+        assert_eq!(quantise(0.7666), 7666);
+        assert_eq!(quantise(-0.7666), -7666);
+        assert_eq!(
+            (0.7666f64 * 10_000.0f64) as i64,
+            7665,
+            "which is the answer this must not give"
+        );
+    }
+
+    #[test]
+    fn a_parameter_is_read_as_a_point_or_as_a_range() {
+        let path = Path::new("overworld.json");
+        assert_eq!(
+            span(&serde_json::json!(0.0), "depth", path).expect("a point"),
+            (0, 0)
+        );
+        assert_eq!(
+            span(&serde_json::json!([-1.2, -1.05]), "continentalness", path).expect("a range"),
+            (-12_000, -10_500)
+        );
+        assert!(span(&serde_json::json!([0.5, -0.5]), "erosion", path).is_err());
+        assert!(span(&serde_json::json!([0.5]), "erosion", path).is_err());
+        assert!(span(&serde_json::json!("warm"), "temperature", path).is_err());
+    }
+
+    #[test]
+    fn the_table_is_the_one_the_reader_parses_and_keeps_the_reports_order() {
+        let regions = vec![
+            BiomeRegion {
+                id: 33,
+                biome: "minecraft:mushroom_fields".to_owned(),
+                axes: [(-10_000, 10_000); 6],
+                offset: 0,
+            },
+            BiomeRegion {
+                id: 1,
+                biome: "minecraft:plains".to_owned(),
+                axes: [(0, 1_000); 6],
+                offset: 500,
+            },
+        ];
+        let text = biome_table(&regions);
+        let parsed = dust_gen::biome::BiomeParameters::parse(&text)
+            .expect("the writer and the reader agree on the format");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed.distinct_biomes(), 2);
+        assert_eq!(parsed.regions()[0].name, "minecraft:mushroom_fields");
+        assert_eq!(parsed.regions()[0].id, 33);
+        assert_eq!(parsed.regions()[1].offset, 500);
+        assert_eq!(parsed.regions()[1].axes[0].min, 0);
+        assert_eq!(parsed.regions()[1].axes[5].max, 1_000);
     }
 
     #[test]

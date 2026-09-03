@@ -231,13 +231,32 @@ pub fn scan(region_dir: &Path, expected: &[(i32, i32)], seed: i64) -> Result<Dig
 
 /// The square of chunk coordinates within `radius` of origin, sorted.
 pub fn expected_chunks(radius: i32) -> Vec<(i32, i32)> {
-    let mut out = Vec::new();
-    for z in -radius..=radius {
-        for x in -radius..=radius {
-            out.push((x, z));
+    expected_chunks_at(radius, (0, 0))
+}
+
+/// The square of chunk coordinates within `radius` of `centre`, sorted.
+pub fn expected_chunks_at(radius: i32, centre: (i32, i32)) -> Vec<(i32, i32)> {
+    expected_chunks_over(radius, &[centre])
+}
+
+/// Every chunk within `radius` of any of `centres`, sorted and deduplicated.
+///
+/// Centres exist because a square anywhere is a sample of one climate.
+/// Minecraft has two biomes in a 9x9 wherever it is put, so scoring a biome
+/// source needs several squares far apart rather than one wide one. They are
+/// deduplicated because two centres close enough to overlap would otherwise
+/// have their shared chunks scored twice, which quietly weights that climate.
+pub fn expected_chunks_over(radius: i32, centres: &[(i32, i32)]) -> Vec<(i32, i32)> {
+    let mut out = Vec::with_capacity(centres.len() * ((2 * radius + 1) as usize).pow(2));
+    for &(cx, cz) in centres {
+        for z in -radius..=radius {
+            for x in -radius..=radius {
+                out.push((x + cx, z + cz));
+            }
         }
     }
     out.sort_unstable();
+    out.dedup();
     out
 }
 

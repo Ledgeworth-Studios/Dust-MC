@@ -168,7 +168,8 @@ fn attempt(options: &Options) -> Result<ExitCode, String> {
         ));
     }
 
-    let baseline_label = capture::capture_label(&options.version, options.seed, options.radius);
+    let baseline_label =
+        capture::capture_label(&options.version, options.seed, options.radius, &[(0, 0)]);
     let baseline_bin = layout.capture_dir(&baseline_label).join("chunks.bin");
     // Read before anything is copied or booted. The baseline is the thing this
     // whole run is measured against, and finding it missing after seven minutes
@@ -217,6 +218,7 @@ fn attempt(options: &Options) -> Result<ExitCode, String> {
         version: options.version.clone(),
         seed: options.seed,
         radius: options.radius,
+        centres: vec![(0, 0)],
         jar: Some(jar.clone()),
         timeout: options.timeout,
     };

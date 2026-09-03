@@ -58,6 +58,14 @@ pub struct Options {
     pub version: String,
     pub seed: i64,
     pub radius: i32,
+    /// The chunks the squares are centred on. Not a convenience: two biomes in
+    /// a 9x9 is the multi-noise field being smooth at that scale, so a biome
+    /// source cannot be *scored* on one square wherever it is put. Several
+    /// small squares far apart reach climate a wide square never would, at a
+    /// cost linear in chunks rather than in the square of the radius — and one
+    /// boot rather than one boot per square, which is the difference between
+    /// two minutes of vanilla and twelve.
+    pub centres: Vec<(i32, i32)>,
     /// A jar the operator has already obtained, instead of downloading.
     pub jar: Option<PathBuf>,
     /// Whole-run budget: boot, pregeneration, stop and scan together.
@@ -69,6 +77,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
     let mut version = None;
     let mut seed = None;
     let mut radius = None;
+    let mut centres: Vec<(i32, i32)> = Vec::new();
     let mut jar = None;
     let mut timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECS);
     let mut seen: Vec<(&'static str, String)> = Vec::new();
@@ -98,6 +107,21 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
                         .parse()
                         .map_err(|_| "--radius needs a chunk count")?,
                 );
+            }
+            "--at" => {
+                at = super::take_repeated_value(&mut seen, "--at", args, at + 1)?;
+                let value = seen.last().expect("just stored").1.clone();
+                let (x, z) = value
+                    .split_once(',')
+                    .ok_or("--at needs two chunk coordinates, as `x,z`")?;
+                centres.push((
+                    x.trim()
+                        .parse()
+                        .map_err(|_| "--at's x is not a whole number")?,
+                    z.trim()
+                        .parse()
+                        .map_err(|_| "--at's z is not a whole number")?,
+                ));
             }
             "--jar" => {
                 at = super::take_value(&mut seen, "--jar", args, at + 1)?;
@@ -133,6 +157,11 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
         version,
         seed,
         radius,
+        centres: if centres.is_empty() {
+            vec![(0, 0)]
+        } else {
+            centres
+        },
         jar,
         timeout,
     })
@@ -165,7 +194,12 @@ pub fn run(options: &Options) -> Result<(), String> {
         None => crate::extract::download::server_jar(&options.version, &layout.jars)?,
     };
 
-    let label = capture_label(&options.version, options.seed, options.radius);
+    let label = capture_label(
+        &options.version,
+        options.seed,
+        options.radius,
+        &options.centres,
+    );
     capture_from(options, &jar, &dir, &label, &layout, started)
 }
 
@@ -190,14 +224,15 @@ pub(super) fn capture_from(
     layout: &cache::Layout,
     started: Instant,
 ) -> Result<(), String> {
-    let expected = digest::expected_chunks(options.radius);
+    let expected = digest::expected_chunks_over(options.radius, &options.centres);
     println!(
-        "capturing {} seed {} from {}: {} chunks within radius {}, budget {}s",
+        "capturing {} seed {} from {}: {} chunks within radius {} of {}, budget {}s",
         options.version,
         options.seed,
         dir.display(),
         expected.len(),
         options.radius,
+        describe_centres(&options.centres),
         options.timeout.as_secs()
     );
 
@@ -298,7 +333,15 @@ fn supervise_run(
     // Every failure path below leaves a running server behind unless this
     // owns the shutdown: whatever goes wrong, the process does not outlive
     // the command that started it.
-    let outcome = run_phases(&rx, &mut child, region_dir, expected, deadline);
+    let outcome = run_phases(
+        &rx,
+        &mut child,
+        region_dir,
+        expected,
+        options.radius,
+        &options.centres,
+        deadline,
+    );
     if outcome.is_err() && child.try_wait().ok().flatten().is_none() {
         let _ = child.kill();
         let _ = child.wait();
@@ -321,10 +364,12 @@ fn run_phases(
     child: &mut std::process::Child,
     region_dir: &Path,
     expected: &[(i32, i32)],
+    radius: i32,
+    squares: &[(i32, i32)],
     deadline: Instant,
 ) -> Result<(), String> {
     wait_until_ready(rx, child, deadline)?;
-    pregenerate(expected, region_dir, deadline)?;
+    pregenerate(expected, radius, squares, region_dir, deadline)?;
     flush_and_stop(deadline)?;
     wait_for_exit(child, deadline)?;
 
@@ -410,20 +455,32 @@ pub(super) fn startup_complete(line: &str) -> bool {
 /// and pins them loaded so view-distance settings cannot thin the square out.
 fn pregenerate(
     expected: &[(i32, i32)],
+    radius: i32,
+    squares: &[(i32, i32)],
     region_dir: &Path,
     deadline: Instant,
 ) -> Result<(), String> {
-    let ((min_x, min_z), (max_x, max_z)) = forceload_box(expected);
+    // One command per square, not one over their bounding box. Two squares a
+    // thousand chunks apart share a box holding a million chunks, and vanilla
+    // would either refuse it or generate the lot; the whole point of scattering
+    // the sample is that the space between the squares is never visited.
+    let boxes: Vec<((i32, i32), (i32, i32))> = squares
+        .iter()
+        .map(|&centre| forceload_box(&digest::expected_chunks_at(radius, centre)))
+        .collect();
     rcon_with_retries(deadline, &mut |client: &mut rcon::Client| {
-        client.exec_delimited(&format!("forceload add {min_x} {min_z} {max_x} {max_z}"))?;
+        for ((min_x, min_z), (max_x, max_z)) in &boxes {
+            client.exec_delimited(&format!("forceload add {min_x} {min_z} {max_x} {max_z}"))?;
+        }
         Ok(())
     })?;
     println!(
-        "forced load over blocks ({min_x},{min_z})..({max_x},{max_z}); waiting for {} \
-         chunks to reach disk",
+        "forced load over {} square(s); waiting for {} chunks to reach disk",
+        boxes.len(),
         expected.len()
     );
 
+    let mut last_save = Instant::now() - SAVE_EVERY;
     loop {
         let pending = pending_chunks(region_dir, expected);
         if pending.is_empty() {
@@ -436,10 +493,32 @@ fn pregenerate(
                 &pending[..pending.len().min(5)]
             ));
         }
+        // **Ask for the save rather than waiting for one.** A forceloaded chunk
+        // is generated in seconds and then stays in memory: vanilla writes it
+        // when it autosaves, which is every 6,000 ticks, and a server this busy
+        // does not tick 6,000 times quickly. The poll's criterion is "on disk",
+        // so the poll is what should be asking. Without this a three-square
+        // capture spent nine minutes a square idle at 3% CPU, and the whole
+        // wait was for an autosave.
+        if last_save.elapsed() >= SAVE_EVERY {
+            last_save = Instant::now();
+            // Best effort on purpose. A save that fails is the next round's
+            // problem, and the deadline above is what decides the run.
+            let _ = rcon_with_retries(Instant::now() + SAVE_EVERY, &mut |client| {
+                client.exec_delimited("save-all").map(|_| ())
+            });
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         std::thread::sleep(Duration::from_secs(2).min(remaining));
     }
 }
+
+/// How often the poll asks the server to write what it has generated.
+///
+/// Ten seconds rather than every round: a `save-all` runs on the server thread
+/// and one every two seconds would compete with the generation it is waiting
+/// for.
+const SAVE_EVERY: Duration = Duration::from_secs(10);
 
 /// The inclusive block box covering every chunk in `expected`.
 ///
@@ -475,7 +554,14 @@ fn pending_chunks(region_dir: &Path, expected: &[(i32, i32)]) -> Vec<(i32, i32)>
     for &(x, z) in expected {
         let key = super::region::region_coords(x, z);
         let contents = files.entry(key).or_insert_with(|| {
-            std::fs::read(super::region::region_file_path(region_dir, key.0, key.1)).ok()
+            // `region_file_path` takes **chunk** coordinates and does the shift
+            // itself. Handing it the region coordinates shifts twice, and a
+            // second shift is silent: every chunk of the square around the
+            // origin is in region 0,0 either way, so this was right for as long
+            // as `--at` did not exist and wrong for every square it added. It
+            // named `r.9.9.mca` as `r.0.0.mca`, read the wrong file's header at
+            // the right slot, and answered about a chunk a thousand chunks away.
+            std::fs::read(region_dir.join(super::region::region_file_name(key.0, key.1))).ok()
         });
         let present = contents
             .as_deref()
@@ -575,8 +661,44 @@ fn jvm_flags() -> &'static [&'static str] {
 }
 
 /// The cache label one capture is filed under.
-pub(super) fn capture_label(version: &str, seed: i64, radius: i32) -> String {
-    format!("{version}-seed-{seed}-radius-{radius}")
+///
+/// A square centred on the origin keeps the label it has always had, so the
+/// captures already on disk stay findable and `rewrite`'s baseline lookup does
+/// not move. Anywhere else the centre is part of the name, because two squares
+/// of the same radius on the same seed are different worlds and a shared label
+/// would have the second silently overwrite the first.
+pub(super) fn capture_label(
+    version: &str,
+    seed: i64,
+    radius: i32,
+    centres: &[(i32, i32)],
+) -> String {
+    let base = format!("{version}-seed-{seed}-radius-{radius}");
+    // Sorted and deduplicated *before* the origin is recognised, not after.
+    // `--at 0,0 --at 0,0` names the same square twice and generates exactly the
+    // chunks `--at 0,0` does, so it has to reach the same label; checking the
+    // argument list first gave it its own, and a second name for one capture is
+    // a capture regenerated for nothing.
+    let mut sorted = centres.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted == [(0, 0)] {
+        return base;
+    }
+    let mut out = base;
+    for (x, z) in sorted {
+        out.push_str(&format!("-at-{x}_{z}"));
+    }
+    out
+}
+
+/// The centres, for the one line that says what is about to be generated.
+fn describe_centres(centres: &[(i32, i32)]) -> String {
+    centres
+        .iter()
+        .map(|(x, z)| format!("{x},{z}"))
+        .collect::<Vec<_>>()
+        .join(" / ")
 }
 
 #[cfg(test)]
@@ -697,6 +819,33 @@ mod tests {
         assert!(pending_chunks(&world, &expected).is_empty());
     }
 
+    /// The poll has to answer about a square that is not the one on the origin.
+    ///
+    /// Every chunk within four of 0,0 is in `r.0.0.mca`, so a poll that names
+    /// its region file wrongly still finds them. `--at` is what made that
+    /// reachable: chunk 300,300 is in `r.9.9.mca`, and the poll was shifting
+    /// the coordinates a second time and asking `r.0.0.mca` about it. It
+    /// answered about a chunk a thousand chunks away — sometimes present when
+    /// the far square was empty, and here absent when the far square is full,
+    /// which is a capture that never finishes.
+    #[test]
+    fn polling_answers_about_squares_that_are_not_at_the_origin() {
+        let world = scratch_dir("capture-pending-far").join("world/region");
+        // 300,300 is region 9,9; -450,180 is region -15,5; -1100,-1050 is
+        // region -35,-33. Three files that a doubly-shifted name would miss.
+        let far = vec![(300, 300), (-450, 180), (-1100, -1050)];
+        write_world(&world, &far);
+        assert!(
+            pending_chunks(&world, &far).is_empty(),
+            "written chunks a long way out must count as written"
+        );
+        assert_eq!(
+            pending_chunks(&world, &[(301, 300)]),
+            vec![(301, 300)],
+            "and an unwritten neighbour in the same far region must not"
+        );
+    }
+
     #[test]
     fn a_corrupt_region_file_counts_as_pending_rather_than_stopping_the_poll() {
         let world = scratch_dir("capture-pending-corrupt").join("world/region");
@@ -707,16 +856,39 @@ mod tests {
 
     #[test]
     fn the_label_keys_a_capture_by_every_input_that_moves_its_digest() {
-        assert_eq!(capture_label("1.21.1", 0, 2), "1.21.1-seed-0-radius-2");
+        assert_eq!(
+            capture_label("1.21.1", 0, 2, &[(0, 0)]),
+            "1.21.1-seed-0-radius-2",
+            "the square on the origin keeps the label it has always had"
+        );
+        assert_eq!(
+            capture_label("1.21.1", 0, 2, &[(-400, 900)]),
+            "1.21.1-seed-0-radius-2-at--400_900"
+        );
         assert_ne!(
-            capture_label("1.21.1", 0, 2),
-            capture_label("1.21.1", 1, 2),
+            capture_label("1.21.1", 0, 2, &[(0, 0)]),
+            capture_label("1.21.1", 1, 2, &[(0, 0)]),
             "seeds must not share a capture"
         );
         assert_ne!(
-            capture_label("1.21.1", 0, 2),
-            capture_label("1.21.1", 0, 3),
+            capture_label("1.21.1", 0, 2, &[(0, 0)]),
+            capture_label("1.21.1", 0, 3, &[(0, 0)]),
             "radii must not share a capture"
+        );
+        assert_ne!(
+            capture_label("1.21.1", 0, 2, &[(0, 0)]),
+            capture_label("1.21.1", 0, 2, &[(0, 0), (400, 400)]),
+            "a widened sample must not overwrite the square it widened"
+        );
+        assert_eq!(
+            capture_label("1.21.1", 0, 2, &[(400, 400), (0, 0)]),
+            capture_label("1.21.1", 0, 2, &[(0, 0), (400, 400)]),
+            "the same squares in either order name the same capture"
+        );
+        assert_eq!(
+            capture_label("1.21.1", 0, 2, &[(0, 0), (0, 0)]),
+            capture_label("1.21.1", 0, 2, &[(0, 0)]),
+            "a square given twice is one square"
         );
     }
 
