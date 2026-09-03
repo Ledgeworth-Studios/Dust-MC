@@ -145,8 +145,12 @@ own `max_stack_size` out of the generated component table, never by a 64
 written here. A survival client's clicks are replayed over it: left, right,
 shift, the number keys and F, creative clone, Q and control-Q, the three drags
 and double-click-to-collect, with only the slots the client got wrong sent
-back. **And it survives a relog and a restart**, written by name into the same
-file beside the world that already held the block edits. `just bot` checks that
+back. **A stack carries its data components** — its name, its enchantments, how
+worn it is, what is inside it — through the click, the wire and the save, and
+two stacks merge only if their components are equal, so a named stack poured
+onto a plain one swaps rather than taking the name off both. **And it survives a
+relog and a restart**, written by name into the same file beside the world that
+already held the block edits. `just bot` checks that
 with a third-party client: set slots, leave, come back, look. Decision record
 [0013](docs/decisions/0013-where-a-players-inventory-lives.md) says what the
 record does and does not promise.
@@ -232,12 +236,12 @@ sixty wall blocks whose loot table is another block's are the same missing
 oracle column, and they are the two disagreements the drops survey found;
 **Q still destroys a stack rather than throwing it**, and item entities are not
 saved, so a restart clears the floor; no crafting, so the grid is
-five slots that store and never combine; **no data components on a stack**, so a
-renamed block or an enchanted tool is stored and given back as the plain item,
-shift-clicking a helmet moves it rather than wearing it, every silk-touch and
-fortune branch of every loot table takes its unenchanted side, and a broken
-chest drops a chest without its contents — that first one needs one more column
-of `dust-items.tsv`, and 0013 says which; no
+five slots that store and never combine; a stack now carries its data
+components, but **nothing in the world reads them**, so every silk-touch and
+fortune branch of every loot table takes its unenchanted side and a broken chest
+drops a chest without its contents; **an armour slot's contents do nothing**, so
+a helmet on a player's head is invisible to everybody else and protects from
+nothing; no
 **redstone wire** and no **scaffolding distance**, which are the last two
 neighbour rules of the sixty-one decision record
 [0014](docs/decisions/0014-what-a-block-reads-from-the-cell-next-door.md)

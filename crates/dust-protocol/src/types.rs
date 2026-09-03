@@ -1003,40 +1003,28 @@ var_int_enum! {
 
 /// An item stack, in the data-component form 1.20.5 introduced.
 ///
-/// # Why this is not finished, and why finishing it halfway is not an option
+/// A count, and if it is positive an item id and a **component patch** — the
+/// components this stack adds to its item's defaults and the ones it strips
+/// from them. The patch is the whole of what makes one diamond sword different
+/// from another: its name, its enchantments, how worn it is, what is inside it.
 ///
-/// The envelope is simple: a count, and if it is positive an item id and two
-/// lists — components to add and component types to remove. The removals are
-/// bare VarInt type ids and decode fine. The additions do not, and the reason
-/// is structural rather than a matter of effort:
+/// # Why the patch is bytes rather than a type per component
 ///
-/// **A component carries no length.** It is a VarInt type id followed by that
-/// type's own layout, and there are around a hundred types, each different. So
-/// a reader that meets a component it does not know cannot skip it — it does
-/// not know where the component ends, and therefore does not know where the
-/// next one begins, or where the slot ends, or where the *packet* ends. There
-/// is no partial credit available: an implementation that handles the common
-/// components and guesses past the rest does not degrade, it desynchronises,
-/// and a desynchronised body corrupts every field after it rather than the one
-/// it failed on.
+/// A component carries no length. It is a VarInt type id followed by that
+/// type's own layout, and there are fifty-seven of them. A reader that meets
+/// one it cannot walk does not lose that component, it loses the position of
+/// every field after it — so there is no partial credit on offer and never was.
 ///
-/// So this decodes the envelope, decodes a stack with no added components, and
-/// returns [`DecodeError::Unsupported`] the moment one appears. A named refusal
-/// at the exact byte is the only honest option, and it is a much better thing
-/// to hand Phase 2 than a type that looks complete.
+/// What there *is*, and what this crate did not have when the refusal above was
+/// written, is the difference between **walking** a component and modelling
+/// one. [`crate::components`] walks all fifty-seven, and the bytes it walked
+/// are kept as they arrived, compared as they arrived, and sent back as they
+/// arrived. A server that never has to ask what an enchantment *is* can still
+/// carry one without losing it.
 ///
-/// # What finishing it needs
-///
-/// The type *ids* are extractable: `minecraft:data_component_type` is a real
-/// registry and it is in `reports/registries.json`, so the id-to-name half can
-/// be generated the way the packet ids were. The *layouts* are in none of
-/// Mojang's reports — the same wall that made packet bodies hand-written, and
-/// the same argument applies to the hundred component types as to the 41
-/// packets.
-///
-/// Nothing before Play carries a Slot, so this blocks nothing in this phase.
-/// It will block the first inventory packet, and this doc comment is where
-/// whoever hits that should start.
+/// See [`crate::components`] for the layouts, for how the type ids reach this
+/// crate without being written down in it, and for why two patches are equal
+/// when their canonical bytes are.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Slot {
     /// No item. On the wire, a count of zero and nothing else.
@@ -1045,8 +1033,8 @@ pub enum Slot {
     Present {
         count: i32,
         item_id: i32,
-        /// Component types to strip from the item's defaults.
-        removed_components: Vec<i32>,
+        /// What this stack adds to, and removes from, its item's defaults.
+        components: crate::components::ComponentPatch,
     },
 }
 
@@ -1060,27 +1048,11 @@ impl Decode for Slot {
             return Ok(Self::Empty);
         }
         let item_id = input.read_var_int()?;
-        let to_add = input.read_var_int()?;
-        let to_remove = input.read_var_int()?;
-        if to_add != 0 {
-            return Err(DecodeError::Unsupported {
-                field: "Slot components",
-                why: "a structured component carries no length, so an unknown one cannot be \
-                      skipped without losing the position of every field after it",
-            });
-        }
-        let to_remove = usize::try_from(to_remove).map_err(|_| DecodeError::NegativeLength {
-            field: "removed components",
-            value: to_remove,
-        })?;
-        let mut removed_components = Vec::with_capacity(to_remove.min(input.remaining()));
-        for _ in 0..to_remove {
-            removed_components.push(input.read_var_int()?);
-        }
+        let components = crate::components::ComponentPatch::decode(input)?;
         Ok(Self::Present {
             count,
             item_id,
-            removed_components,
+            components,
         })
     }
 }
@@ -1096,15 +1068,11 @@ impl Encode for Slot {
             Self::Present {
                 count,
                 item_id,
-                removed_components,
+                components,
             } => {
                 out.write_var_int(*count);
                 out.write_var_int(*item_id);
-                out.write_var_int(0);
-                out.write_var_int(removed_components.len() as i32);
-                for id in removed_components {
-                    out.write_var_int(*id);
-                }
+                components.encode(out)?;
             }
         }
         Ok(())

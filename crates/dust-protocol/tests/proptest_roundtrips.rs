@@ -456,7 +456,7 @@ mod wave_two {
         dust_protocol::types::Slot::Present {
             count: 1,
             item_id,
-            removed_components: vec![],
+            components: dust_protocol::components::ComponentPatch::EMPTY,
         }
     }
 

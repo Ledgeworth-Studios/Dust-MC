@@ -429,7 +429,11 @@ impl WireRead for Reader<'_> {
 /// total: every way [`crate::varint::VarIntError`] can refuse an input has a
 /// named home in [`DecodeError`], so nothing reaches a caller as a stringly
 /// loss.
-fn read_var(bytes: &[u8], position: usize, bits: u32) -> Result<(i64, usize), DecodeError> {
+pub(crate) fn read_var(
+    bytes: &[u8],
+    position: usize,
+    bits: u32,
+) -> Result<(i64, usize), DecodeError> {
     let rest = &bytes[position..];
     let outcome = if bits == 32 {
         crate::varint::read_var_int(rest).map(|(v, n)| (i64::from(v), n))

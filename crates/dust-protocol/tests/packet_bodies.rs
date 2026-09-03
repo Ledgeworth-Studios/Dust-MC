@@ -238,7 +238,7 @@ fn a_slot_with_components_is_refused_by_name_rather_than_guessed_at() {
     let stack = Slot::Present {
         count: 3,
         item_id: 1,
-        removed_components: vec![7, 9],
+        components: dust_protocol::components::ComponentPatch::removing(&[7, 9]),
     };
     let mut writer = Writer::new();
     stack.encode(&mut writer, v()).expect("encodes");

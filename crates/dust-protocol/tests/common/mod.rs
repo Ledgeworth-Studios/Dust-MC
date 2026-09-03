@@ -1060,7 +1060,9 @@ fn play_frames(out: &mut Vec<Frame>) {
                             icon: Slot::Present {
                                 count: 1,
                                 item_id: 42,
-                                removed_components: vec![7],
+                                components: dust_protocol::components::ComponentPatch::removing(&[
+                                    7
+                                ]),
                             },
                             frame: FrameType::Task,
                             flags: AdvancementDisplay::SHOW_TOAST,
@@ -1113,7 +1115,7 @@ fn play_frames(out: &mut Vec<Frame>) {
                     item: Slot::Present {
                         count: 1,
                         item_id: 9,
-                        removed_components: vec![],
+                        components: dust_protocol::components::ComponentPatch::EMPTY,
                     },
                 },
             ]),
@@ -1224,13 +1226,13 @@ fn play_frames(out: &mut Vec<Frame>) {
                             items: vec![Slot::Present {
                                 count: 1,
                                 item_id: 15,
-                                removed_components: vec![],
+                                components: dust_protocol::components::ComponentPatch::EMPTY,
                             }],
                         },
                         result: Slot::Present {
                             count: 1,
                             item_id: 16,
-                            removed_components: vec![],
+                            components: dust_protocol::components::ComponentPatch::EMPTY,
                         },
                     }),
                 },
@@ -1252,13 +1254,13 @@ fn play_frames(out: &mut Vec<Frame>) {
                                 items: vec![Slot::Present {
                                     count: 1,
                                     item_id: 144,
-                                    removed_components: vec![],
+                                    components: dust_protocol::components::ComponentPatch::EMPTY,
                                 }],
                             },
                             result: Slot::Present {
                                 count: 1,
                                 item_id: 145,
-                                removed_components: vec![],
+                                components: dust_protocol::components::ComponentPatch::EMPTY,
                             },
                             experience: 0.35,
                             cooking_time: VarInt(100),
@@ -1308,7 +1310,7 @@ fn play_frames(out: &mut Vec<Frame>) {
                     item: Slot::Present {
                         count: 16,
                         item_id: 33,
-                        removed_components: vec![1, 2],
+                        components: dust_protocol::components::ComponentPatch::removing(&[1, 2]),
                     },
                 },
             ],
@@ -1617,7 +1619,7 @@ fn play_frames(out: &mut Vec<Frame>) {
             item: Slot::Present {
                 count: 64,
                 item_id: 7,
-                removed_components: vec![],
+                components: dust_protocol::components::ComponentPatch::EMPTY,
             },
         }
     ));
@@ -1910,12 +1912,12 @@ fn play_frames(out: &mut Vec<Frame>) {
                 Slot::Present {
                     count: 64,
                     item_id: 1,
-                    removed_components: Vec::new(),
+                    components: dust_protocol::components::ComponentPatch::EMPTY,
                 },
                 Slot::Present {
                     count: 1,
                     item_id: 856,
-                    removed_components: vec![3, 9],
+                    components: dust_protocol::components::ComponentPatch::removing(&[3, 9]),
                 },
             ],
             carried_item: Slot::Empty,
@@ -1934,7 +1936,7 @@ fn play_frames(out: &mut Vec<Frame>) {
             item: Slot::Present {
                 count: 17,
                 item_id: 14,
-                removed_components: Vec::new(),
+                components: dust_protocol::components::ComponentPatch::EMPTY,
             },
         }
     ));
@@ -2125,7 +2127,7 @@ fn play_frames(out: &mut Vec<Frame>) {
                     Slot::Present {
                         count: 1,
                         item_id: 16,
-                        removed_components: vec![3],
+                        components: dust_protocol::components::ComponentPatch::removing(&[3]),
                     },
                 )],
                 villager_level: VarInt(3),

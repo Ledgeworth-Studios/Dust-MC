@@ -69,6 +69,7 @@
 //! three that can catch a field list that is self-consistent, agrees with every
 //! table here, and is not what Minecraft sends.
 
+pub mod components;
 pub mod conformance;
 pub mod generated;
 pub mod nbt;
