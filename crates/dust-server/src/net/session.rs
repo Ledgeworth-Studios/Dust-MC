@@ -1753,13 +1753,7 @@ where
     // that not happen: sixteen blocks of walking is 1.6 seconds at the fastest
     // speed this server will believe and the warm is about five milliseconds.
     if residence.move_to(centre) {
-        let world = ctx.world.clone();
-        // Deliberately not awaited. The handle is dropped, the task runs to
-        // completion on the blocking pool, and this session goes back to
-        // reading packets.
-        drop(tokio::task::spawn_blocking(move || {
-            world.warm(centre);
-        }));
+        ctx.world.want_ring(centre);
     }
     // A batch, not the whole difference. A player crossing a chunk boundary at
     // a large view distance wants dozens of columns at once, and sending them

@@ -369,6 +369,33 @@ impl EditedWorld {
         self.generated.release(centre);
     }
 
+    /// Claim named columns, for a caller whose working set is not a ring
+    /// around a player — the item entities, whose columns are wherever they
+    /// were dropped. See [`super::residency::Residency::hold_columns`].
+    pub fn hold_columns(&self, columns: &[ChunkPos]) {
+        self.generated.hold_columns(columns);
+    }
+
+    /// Give up a claim taken by [`EditedWorld::hold_columns`].
+    pub fn release_columns(&self, columns: &[ChunkPos]) {
+        self.generated.release_columns(columns);
+    }
+
+    /// Ask for claimed columns to be built and carry on, without waiting.
+    ///
+    /// The call every hot path wants: it hands the list to the world's own
+    /// warming thread. Safe from a session task and from the tick loop alike,
+    /// which is the point of it — those are different threads with different
+    /// rules and neither may read a region file.
+    pub fn want(&self, columns: Vec<ChunkPos>) {
+        self.generated.want(columns);
+    }
+
+    /// The same, for the ring around a player's column.
+    pub fn want_ring(&self, centre: ChunkPos) {
+        self.generated.want_ring(centre);
+    }
+
     /// Build the claimed-and-missing columns around `centre`, off the network
     /// path. Returns how many were built.
     ///

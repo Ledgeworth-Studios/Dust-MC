@@ -210,22 +210,68 @@ impl Residency {
                 entry.holders = entry.holders.saturating_sub(1);
             }
         }
+        Self::retire(&mut columns);
+    }
+
+    /// Drop every column nobody holds, but only once there are more of them
+    /// than the cap. See [`RETIRED_CAP`].
+    fn retire(columns: &mut HashMap<(i32, i32), Resident>) {
         if columns.values().filter(|c| c.holders == 0).count() > RETIRED_CAP {
             columns.retain(|_, c| c.holders > 0);
         }
+    }
+
+    /// Claim named columns for one holder, rather than a ring around a player.
+    ///
+    /// The second access pattern, and the reason `hold` is not the only way in.
+    /// A player is a moving window and the ring is the right shape for it; a
+    /// heap of item entities lying in a tunnel is a **static set** of whatever
+    /// columns they happen to be in, which may be four chunks from anybody —
+    /// `net::items::TICK_RADIUS` is 64 blocks — and is not a ring around
+    /// anything. Both end up as the same refcount on the same column, which is
+    /// the point: two players and a pile of cobblestone standing on one column
+    /// keep one copy of it between them.
+    pub fn hold_columns(&self, columns: &[ChunkPos]) {
+        let mut held = self.columns.write().expect("the residency is never poisoned");
+        for pos in columns {
+            held.entry((pos.x, pos.z))
+                .or_insert(Resident {
+                    chunk: None,
+                    holders: 0,
+                })
+                .holders += 1;
+        }
+    }
+
+    /// Give up a claim taken by [`Residency::hold_columns`].
+    pub fn release_columns(&self, columns: &[ChunkPos]) {
+        let mut held = self.columns.write().expect("the residency is never poisoned");
+        for pos in columns {
+            if let Some(entry) = held.get_mut(&(pos.x, pos.z)) {
+                entry.holders = entry.holders.saturating_sub(1);
+            }
+        }
+        Self::retire(&mut held);
     }
 
     /// The columns in the ring around `centre` that are held and not yet built.
     ///
     /// The list a warming thread works through. Taken as a snapshot under the
     /// read lock and then let go of, because building them is the part that
-    /// takes a millisecond each and no lock may be held across it.
+    /// takes a couple of milliseconds each and no lock may be held across it.
     #[must_use]
     pub fn cold(&self, centre: ChunkPos) -> Vec<ChunkPos> {
-        let columns = self.columns.read().expect("the residency is never poisoned");
-        ring(centre)
-            .filter(|key| columns.get(key).is_some_and(|c| c.chunk.is_none()))
-            .map(|(x, z)| ChunkPos::new(x, z))
+        self.cold_columns(&ring(centre).map(|(x, z)| ChunkPos::new(x, z)).collect::<Vec<_>>())
+    }
+
+    /// The same question about a named set of columns.
+    #[must_use]
+    pub fn cold_columns(&self, columns: &[ChunkPos]) -> Vec<ChunkPos> {
+        let held = self.columns.read().expect("the residency is never poisoned");
+        columns
+            .iter()
+            .filter(|pos| held.get(&(pos.x, pos.z)).is_some_and(|c| c.chunk.is_none()))
+            .copied()
             .collect()
     }
 
@@ -324,6 +370,85 @@ impl Drop for Residence {
         if let Some(centre) = self.centre {
             self.world.release(centre);
         }
+    }
+}
+
+/// A claim on a set of columns that is not a ring around anybody.
+///
+/// The second holder, and the reason [`Residency`] has two ways in. A player is
+/// a **moving window** — nine columns that slide along as they walk, which
+/// [`Residence`] handles by holding the new ring before letting the old one go.
+/// The item entities are a **static set**: a heap of cobblestone lies where it
+/// was dropped, is simulated from up to four chunks away
+/// (`net::items::TICK_RADIUS`), and belongs to no player's ring. Left to itself
+/// that set would rebuild its columns twenty times a second forever — W1's
+/// measurement of a falling item on a region world, 558,308 ns a tick against
+/// 38 on a flat one, is exactly that — and a claim that was never given up
+/// would pin those columns after the items had despawned.
+///
+/// So this holds a set and is told a new one. It works out the difference,
+/// takes the additions before it drops the removals so a column in both is
+/// never retired and rebuilt, and gives the whole thing up when it is dropped.
+pub struct ColumnClaim {
+    world: super::edits::SharedWorld,
+    held: Vec<ChunkPos>,
+}
+
+impl std::fmt::Debug for ColumnClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ColumnClaim")
+            .field("held", &self.held.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ColumnClaim {
+    #[must_use]
+    pub fn new(world: super::edits::SharedWorld) -> Self {
+        Self {
+            world,
+            held: Vec::new(),
+        }
+    }
+
+    /// Hold exactly `wanted` from now on, and ask for anything new in it to be
+    /// built off this thread.
+    ///
+    /// Sorted-vector difference rather than a hash set. The sets here are a
+    /// handful of columns — a mining player leaves items in one or two — and
+    /// the caller runs twenty times a second, so what matters is that the
+    /// common case, an unchanged set, costs one comparison of two short slices
+    /// and no allocation at all.
+    pub fn set(&mut self, wanted: &mut Vec<ChunkPos>) {
+        wanted.sort_unstable_by_key(|pos| (pos.x, pos.z));
+        wanted.dedup();
+        if self.held == *wanted {
+            return;
+        }
+        let added: Vec<ChunkPos> = wanted
+            .iter()
+            .filter(|pos| !self.held.contains(pos))
+            .copied()
+            .collect();
+        let dropped: Vec<ChunkPos> = self
+            .held
+            .iter()
+            .filter(|pos| !wanted.contains(pos))
+            .copied()
+            .collect();
+        self.world.hold_columns(&added);
+        self.world.release_columns(&dropped);
+        self.held.clear();
+        self.held.extend_from_slice(wanted);
+        if !added.is_empty() {
+            self.world.want(added);
+        }
+    }
+}
+
+impl Drop for ColumnClaim {
+    fn drop(&mut self) {
+        self.world.release_columns(&self.held);
     }
 }
 

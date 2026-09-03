@@ -56,6 +56,8 @@ use dust_protocol::types::{Angle, Slot, Uuid, VarInt};
 use dust_registry::Item;
 use tokio::sync::broadcast;
 
+use dust_world::coords::ChunkPos;
+
 use super::edits::EditedWorld;
 use super::players::Roster;
 
@@ -482,6 +484,44 @@ fn near_any(entity: &ItemEntity, players: &[(f64, f64, f64)]) -> bool {
     })
 }
 
+/// Which columns the items that will tick this tick are standing in.
+///
+/// The set `net::residency::ColumnClaim` keeps for the item world, and the
+/// reason it is a set of columns rather than a ring around anybody: an item is
+/// simulated from up to [`TICK_RADIUS`] away — four chunks — so a heap of
+/// cobblestone can be ticking in a column no player's own ring covers, and it
+/// would rebuild that column out of the region file twenty times a second
+/// forever. Bounded twice over: nothing outside `TICK_RADIUS` of a player is in
+/// it at all, and the whole thing goes when the items despawn.
+///
+/// Appended to a buffer the caller reuses, and not deduplicated here — the
+/// claim sorts and dedups, and a thousand items in one column would otherwise
+/// be a thousand `contains` scans on this side of it.
+pub fn footprint_into(items: &ItemWorld, players: &[(f64, f64, f64)], out: &mut Vec<ChunkPos>) {
+    out.clear();
+    let entities = items
+        .entities
+        .lock()
+        .expect("the item world is never poisoned");
+    let mut last: Option<ChunkPos> = None;
+    for entity in entities.iter() {
+        if !near_any(entity, players) {
+            continue;
+        }
+        // Items are stored in the order they were dropped and a heap of them
+        // shares a column, so remembering the last one answers almost every
+        // entity without touching the vector.
+        let pos = ChunkPos::new(
+            (entity.x.floor() as i32) >> 4,
+            (entity.z.floor() as i32) >> 4,
+        );
+        if last != Some(pos) {
+            out.push(pos);
+            last = Some(pos);
+        }
+    }
+}
+
 /// Whether two entities may become one, and what the survivor's count is.
 fn merged(entities: &[ItemEntity], left: usize, right: usize) -> Option<u8> {
     let (a, b) = (&entities[left], &entities[right]);
@@ -659,6 +699,12 @@ pub struct ItemTicker {
     players: Vec<(f64, f64, f64)>,
     /// Which entities were near enough to tick, reused for the same reason.
     near: Vec<usize>,
+    /// The columns those entities are in, reused for the same reason again.
+    footprint: Vec<ChunkPos>,
+    /// The server's claim on those columns, so that an item lying four chunks
+    /// from anybody is not read out of a region file on the tick thread twenty
+    /// times a second. Given up when this participant is dropped.
+    claim: super::residency::ColumnClaim,
 }
 
 impl ItemTicker {
@@ -670,11 +716,13 @@ impl ItemTicker {
     ) -> Self {
         Self {
             items,
+            claim: super::residency::ColumnClaim::new(std::sync::Arc::clone(&world)),
             world,
             roster,
             constants,
             players: Vec::new(),
             near: Vec::new(),
+            footprint: Vec::new(),
         }
     }
 }
@@ -708,6 +756,14 @@ impl crate::participant::TickParticipant for ItemTicker {
         if self.players.is_empty() {
             return;
         }
+        // Claimed before the tick that reads them, not after, so the warming
+        // thread has the whole tick's worth of wall clock to get ahead of the
+        // next one. The first tick after a heap of items appears still builds
+        // its own columns; every tick after it reads the server's copy.
+        footprint_into(&self.items, &self.players, &mut self.footprint);
+        let mut wanted = std::mem::take(&mut self.footprint);
+        self.claim.set(&mut wanted);
+        self.footprint = wanted;
         self.items.tick(
             &self.world,
             self.constants.as_deref(),

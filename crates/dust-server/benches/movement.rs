@@ -332,7 +332,6 @@ fn main() {
     // whether that was enough is not an argument — it is `built=` in the row,
     // which counts the columns the check had to build on its own thread
     // because the warm had not got there yet.
-    let (warm, warming) = warming_thread(&world);
     for (pose, posture) in POSES {
         row(&format!("region files, resident, in the open, {pose}"), || {
             let mut ground =
@@ -345,7 +344,7 @@ fn main() {
                     // claim, hand the build to another thread, let go of the
                     // ring behind. Nine hash lookups and a channel send.
                     world.hold(centre);
-                    let _ = warm.send(centre);
+                    world.want_ring(centre);
                     if let Some(previous) = here.replace(centre) {
                         world.release(previous);
                     }
@@ -365,9 +364,6 @@ fn main() {
          every one of them is retired and none is held",
         world.resident_columns(),
     );
-    drop(warm);
-    let _ = warming.join();
-
     // The two rows above are a warm residency and a player who moved faster
     // than any client can. This is the case the change is actually about.
     // A world each, and both cold. `warm_cost` builds the ring it times, so
@@ -406,8 +402,9 @@ fn main() {
 /// from the first crossing and the check builds its own columns. That is a
 /// measurement of a bench, not of a server.
 ///
-/// So this one sleeps. [`PACED_PACKETS`] packets at twenty a second is what a
-/// walking client sends, and the number that matters is not the mean: it is
+/// So this one sleeps. The warming is the world's own thread — the same one a
+/// server uses, not a stand-in for it. [`PACED_PACKETS`] packets at twenty a
+/// second is what a walking client sends, and the number that matters is not the mean: it is
 /// **the slowest single packet**, because a stall is not felt as an average.
 /// `built` beside it says whether the check ever had to read a region file
 /// itself.
@@ -420,7 +417,6 @@ fn paced(
     let Some(mut ground) = Ground::of(world, Some(constants)) else {
         return;
     };
-    let (warm, warming) = warming_thread(world);
     let posture = POSES[0].1;
     let mut player = player(y, posture);
     // The join, which claims and warms the ring before the player is let in
@@ -458,7 +454,7 @@ fn paced(
         let centre = column_of(to.0, to.2);
         if resident && here != Some(centre) {
             world.hold(centre);
-            let _ = warm.send(centre);
+            world.want_ring(centre);
             if let Some(previous) = here.replace(centre) {
                 world.release(previous);
             }
@@ -475,8 +471,6 @@ fn paced(
     if let Some(last) = here {
         world.release(last);
     }
-    drop(warm);
-    let _ = warming.join();
     println!(
         "  paced at 20 packets a second, {PACED_PACKETS} packets into a world nobody had been \
          in, {}: mean {} ns, WORST SINGLE PACKET {} ns, {} columns built on the check's own \
@@ -491,28 +485,6 @@ fn paced(
         ground.columns_built(),
         ground.columns_resident(),
     );
-}
-
-/// A thread that builds the columns the walk has claimed, standing in for the
-/// blocking pool a session hands its warming to.
-///
-/// One thread and not a pool, deliberately: a pool would hide a warm that could
-/// not keep up behind more threads, and the question this bench asks is whether
-/// *one* worker is ahead of a walking player.
-fn warming_thread(
-    world: &Arc<EditedWorld>,
-) -> (
-    std::sync::mpsc::Sender<ChunkPos>,
-    std::thread::JoinHandle<()>,
-) {
-    let (tx, rx) = std::sync::mpsc::channel::<ChunkPos>();
-    let world = Arc::clone(world);
-    let handle = std::thread::spawn(move || {
-        for centre in rx {
-            world.warm(centre);
-        }
-    });
-    (tx, handle)
 }
 
 /// What one column of this world costs to keep, measured rather than repeated.
