@@ -76,3 +76,7 @@ harness = false
 [[bench]]
 name = "items"
 harness = false
+
+[[bench]]
+name = "join"
+harness = false
