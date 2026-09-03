@@ -8,6 +8,7 @@
 // the measurement is the diff against a real 1.21.1 server.
 //
 //   node crafting.js <port> --out dust.json
+//   node crafting.js <port> --table --out dust-table.json
 //   node crafting.js <port> --out vanilla.json     (pointed at a vanilla server)
 //   node crafting.js --compare vanilla.json dust.json
 //
@@ -87,20 +88,35 @@ function tracker (b) {
     cursor: null,
     told: new Set(),
     setSlots: 0,
-    windowItems: 0
+    windowItems: 0,
+    // Which window the slots above belong to. Zero is the player's own, which
+    // is open until something else is.
+    window: 0,
+    menu: null,
+    opened: 0
   }
   const name = id => (b.registry.items[id] ? b.registry.items[id].name : `id:${id}`)
   const read = item => {
     if (!item || !item.itemCount || item.itemCount === 0) return null
     return { name: name(item.itemId), count: item.itemCount }
   }
+  // A second container the server opened, and the id it gave it. The slots
+  // below are always the *open* window's numbering, whichever that is, because
+  // that is what a click names and what the server corrects.
+  b._client.on('open_window', p => {
+    state.opened++
+    state.window = p.windowId
+    state.menu = p.inventoryType
+    state.slots = new Array(SLOTS).fill(null)
+    state.told = new Set()
+  })
   b._client.on('set_slot', p => {
     state.setSlots++
     if ((p.windowId === -1 || p.windowId === 255) && p.slot === -1) {
       state.cursor = read(p.item)
       return
     }
-    if (p.windowId !== 0) return
+    if (p.windowId !== state.window) return
     if (p.slot >= 0 && p.slot < SLOTS) {
       state.slots[p.slot] = read(p.item)
       state.told.add(p.slot)
@@ -108,7 +124,7 @@ function tracker (b) {
   })
   b._client.on('window_items', p => {
     state.windowItems++
-    if (p.windowId !== 0) return
+    if (p.windowId !== state.window) return
     for (let i = 0; i < p.items.length && i < SLOTS; i++) {
       state.slots[i] = read(p.items[i])
       state.told.add(i)
@@ -135,9 +151,9 @@ function creativeSlot (b, slot, itemName, count) {
   b._client.write('set_creative_slot', { slot, item: itemStack(b, itemName, count) })
 }
 
-function windowClick (b, slot, mouseButton, mode, changedSlots = [], cursorItem = { itemCount: 0 }) {
+function windowClick (b, slot, mouseButton, mode, changedSlots = [], cursorItem = { itemCount: 0 }, windowId = 0) {
   b._client.write('window_click', {
-    windowId: 0, stateId: 0, slot, mouseButton, mode, changedSlots, cursorItem
+    windowId, stateId: 0, slot, mouseButton, mode, changedSlots, cursorItem
   })
 }
 
@@ -397,6 +413,137 @@ async function refuse (port) {
   process.exit(failed === 0 ? 0 : 1)
 }
 
+// The 3x3, which is a different window and therefore a different script.
+//
+// A crafting table has to be *placed* and *right-clicked* before any of it can
+// be measured, so this is the one mode here that touches the world. What it
+// records is the same thing the recording above does — the container after
+// each step — but in the table's own numbering, where 0 is the result, 1..=9
+// the grid, 10..=36 the player's inventory and 37..=45 their hotbar.
+async function table (port, out) {
+  const bot = await spawned(port, 'Tabler')
+  const state = bot.tracked
+  await wait(SPAWN_SETTLE_MS)
+
+  for (let slot = 1; slot < SLOTS; slot++) creativeSlot(bot, slot, null, 0)
+  creativeSlot(bot, 36, 'crafting_table', 1)
+  creativeSlot(bot, 9, 'oak_planks', 16)
+  creativeSlot(bot, 10, 'wheat', 3)
+  bot._client.write('held_item_slot', { slotId: 0 })
+  await wait(SPAWN_SETTLE_MS)
+
+  // Somewhere to put it, **probed out of the client's own view of the world**
+  // rather than computed. The obvious spot — the block the player is standing
+  // on, placed against its top face — is the one that cannot work: it would
+  // put the table inside the player's own hitbox, and a real server refuses
+  // that placement while Dust does not. The first run of this script did
+  // exactly that, and it read as "vanilla never opens a crafting table".
+  //
+  // So: a solid block a step or two away with air above it, found by asking
+  // the bot what is there. A hard-coded offset would be a superflat-only
+  // control on a server that generates terrain.
+  const feet = bot.entity.position
+  let support = null
+  for (const [dx, dz] of [[2, 0], [-2, 0], [0, 2], [0, -2], [3, 0], [0, 3], [2, 2], [-2, -2]]) {
+    for (let dy = 0; dy >= -3 && !support; dy--) {
+      const at = {
+        x: Math.floor(feet.x) + dx,
+        y: Math.floor(feet.y) + dy - 1,
+        z: Math.floor(feet.z) + dz
+      }
+      const here = bot.blockAt(new (require('vec3').Vec3)(at.x, at.y, at.z))
+      const above = bot.blockAt(new (require('vec3').Vec3)(at.x, at.y + 1, at.z))
+      if (here && above && here.name !== 'air' && above.name === 'air') support = at
+    }
+    if (support) break
+  }
+  if (!support) throw new Error('no solid block with air above it within reach')
+  const placed = { x: support.x, y: support.y + 1, z: support.z }
+  let sequence = 1
+  bot._client.write('block_place', {
+    hand: 0,
+    location: support,
+    direction: 1,
+    cursorX: 0.5,
+    cursorY: 1.0,
+    cursorZ: 0.5,
+    insideBlock: false,
+    sequence: sequence++
+  })
+  await wait(SPAWN_SETTLE_MS)
+
+  const steps = []
+  const record = step => steps.push({
+    step,
+    window: state.window === 0 ? 'player' : 'table',
+    ...snapshot(state)
+  })
+  // Whether the table is actually there, out of the client's own world and not
+  // out of hope. A right-click on air opens nothing on either server, and two
+  // servers that both open nothing agree.
+  const there = bot.blockAt(new (require('vec3').Vec3)(placed.x, placed.y, placed.z))
+  steps.push({ step: 'the table is placed', placed: there ? there.name : 'nothing', window: 'player', slots: {}, cursor: null })
+
+  // And right-clicked. A player holding a crafting table right-clicking a
+  // crafting table opens it rather than stacking a second one on top, which is
+  // the arm this step is really testing: `useItemOn` asks the block first.
+  bot._client.write('block_place', {
+    hand: 0,
+    location: placed,
+    direction: 1,
+    cursorX: 0.5,
+    cursorY: 1.0,
+    cursorZ: 0.5,
+    insideBlock: false,
+    sequence: sequence++
+  })
+  await wait(SPAWN_SETTLE_MS)
+  record('the table is right-clicked')
+
+  const window = state.window
+  const click = (slot, button, mode) => windowClick(bot, slot, button, mode, [], { itemCount: 0 }, window)
+
+  // Eight planks around an empty middle. Menu slots 1..9 are the grid, and
+  // slot 5 is the hole in the middle of a chest.
+  const script = [
+    ['pick the planks up', 0, PICKUP, 10],
+    ['one plank into the top left', 1, PICKUP, 1],
+    ['one into the top middle', 1, PICKUP, 2],
+    ['one into the top right', 1, PICKUP, 3],
+    ['one into the middle left', 1, PICKUP, 4],
+    ['one into the middle right', 1, PICKUP, 6],
+    ['one into the bottom left', 1, PICKUP, 7],
+    ['one into the bottom middle', 1, PICKUP, 8],
+    ['one into the bottom right, which makes a chest', 1, PICKUP, 9],
+    ['put the rest of the planks back', 0, PICKUP, 10],
+    ['left click the chest onto the cursor', 0, PICKUP, 0],
+    ['put the chest down', 0, PICKUP, 11],
+    ['shift click three wheat into the grid', 0, QUICK_MOVE, 11],
+    ['shift click the bread out', 0, QUICK_MOVE, 0]
+  ]
+  for (const [name, button, mode, slot] of script) {
+    state.cursor = null
+    click(slot, button, mode)
+    await wait(CLICK_SETTLE_MS)
+    record(name)
+  }
+
+  // Closing hands the grid back into slots the table's numbering could not
+  // name, so what comes back is the player's own window again.
+  bot._client.write('close_window', { windowId: window })
+  await wait(CLICK_SETTLE_MS)
+  state.window = 0
+  bot._client.write('window_click', {
+    windowId: 0, stateId: 0, slot: 9, mouseButton: 0, mode: PICKUP, changedSlots: [], cursorItem: { itemCount: 0 }
+  })
+  await wait(CLICK_SETTLE_MS)
+  record('the window is closed and the player picks slot 9 up')
+
+  try { bot.quit() } catch (e) { /* already gone */ }
+  require('fs').writeFileSync(out, JSON.stringify(steps, null, 1))
+  console.log(`${steps.length} steps recorded to ${out} (window ${window}, menu ${state.menu})`)
+}
+
 function compare (left, right) {
   const a = JSON.parse(require('fs').readFileSync(left, 'utf8'))
   const b = JSON.parse(require('fs').readFileSync(right, 'utf8'))
@@ -414,6 +561,16 @@ function compare (left, right) {
     }
     if ((a[i].cursor || null) !== (b[i].cursor || null)) {
       differences.push(`cursor: ${a[i].cursor} / ${b[i].cursor}`)
+    }
+    // Which window is open is half of what the table script measures: a
+    // server that never opened one would otherwise agree on every slot,
+    // because a click naming a window that does not exist changes nothing on
+    // either side. Two servers that both do nothing agree.
+    if ((a[i].window || null) !== (b[i].window || null)) {
+      differences.push(`window: ${a[i].window} / ${b[i].window}`)
+    }
+    if ((a[i].placed || null) !== (b[i].placed || null)) {
+      differences.push(`placed: ${a[i].placed} / ${b[i].placed}`)
     }
     if (differences.length === 0) { agree++; continue }
     console.log(`\n${i}. ${a[i].step}`)
@@ -438,7 +595,8 @@ async function main () {
     console.log('need --out <file.json>')
     process.exit(2)
   }
-  await record(port, out)
+  if (args.includes('--table')) await table(port, out)
+  else await record(port, out)
   process.exit(0)
 }
 

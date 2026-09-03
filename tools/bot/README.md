@@ -142,6 +142,23 @@ refuses the craft. That step exists because step 26 — a result that fits
 which the diff calls agreement. A row that separates "does not fit" from "does
 not fit whole" had to be written on purpose.
 
+`--table` is the 3x3, which is a different window and therefore a different
+script. It places a crafting table, right-clicks it, lays eight planks around
+an empty middle, takes the chest, shift-clicks wheat in and takes the bread,
+recording the container in the *table's* numbering plus two things that are not
+slots: **which window is open** and **what block is actually there**. Both are
+load-bearing. A click naming a window that does not exist changes nothing on
+either server, so a Dust that never opened a table would agree with vanilla on
+every slot — and the first run of this script did exactly that from the other
+end, placing the table on the block the player was standing on, which a real
+server refuses because it is inside the player. Vanilla opened nothing, Dust
+had nothing to click in, and the reading would have been "vanilla does not open
+crafting tables". The support block is now probed out of the client's own view
+of the world, for the same reason the open-air control had to be: a hard-coded
+offset is a superflat-only control on a server that generates terrain. **17 of
+17 against a real 1.21.1 server, and 1 of 17 with the open-on-right-click
+branch removed.**
+
 `--refuse` is the same argument as `clicks.js --predict`. Every click in the
 recording claims nothing changed, so a click the server refuses is a click both
 ends already agree about and neither server sends a packet. `--refuse` claims
@@ -149,7 +166,7 @@ what a real client draws — the cobblestone it dropped into the output, and an
 empty hand — and requires both to be taken back. 6 of 6 on a real server, 6 of
 6 on Dust, and 3 of 6 when Dust is rebuilt without the output's own pickup
 path, which is what says the check can fail. Decision record 0033 is this
-script's output.
+script's output, and 0034 is `--table`'s.
 
 ## The equipment differential
 
