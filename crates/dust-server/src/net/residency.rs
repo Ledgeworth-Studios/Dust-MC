@@ -181,7 +181,10 @@ impl std::fmt::Debug for Residency {
     /// them nobody is standing near, which are the two numbers the policy is
     /// about.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let columns = self.columns.read().expect("the residency is never poisoned");
+        let columns = self
+            .columns
+            .read()
+            .expect("the residency is never poisoned");
         f.debug_struct("Residency")
             .field("columns", &columns.len())
             .field(
@@ -227,7 +230,10 @@ impl Residency {
     /// packet. [`Residency::cold`] and [`Residency::fill`] are the half that
     /// costs something, and they belong on another thread.
     pub fn hold(&self, centre: ChunkPos) {
-        let mut columns = self.columns.write().expect("the residency is never poisoned");
+        let mut columns = self
+            .columns
+            .write()
+            .expect("the residency is never poisoned");
         for key in ring(centre) {
             let entry = columns.entry(key).or_insert(Resident {
                 chunk: None,
@@ -243,7 +249,10 @@ impl Residency {
     /// zero — retired, not dropped — until there are more than [`RETIRED_CAP`]
     /// such columns, at which point all of them go at once.
     pub fn release(&self, centre: ChunkPos) {
-        let mut columns = self.columns.write().expect("the residency is never poisoned");
+        let mut columns = self
+            .columns
+            .write()
+            .expect("the residency is never poisoned");
         for key in ring(centre) {
             if let Some(entry) = columns.get_mut(&key) {
                 entry.holders = entry.holders.saturating_sub(1);
@@ -271,7 +280,10 @@ impl Residency {
     /// the point: two players and a pile of cobblestone standing on one column
     /// keep one copy of it between them.
     pub fn hold_columns(&self, columns: &[ChunkPos]) {
-        let mut held = self.columns.write().expect("the residency is never poisoned");
+        let mut held = self
+            .columns
+            .write()
+            .expect("the residency is never poisoned");
         for pos in columns {
             held.entry((pos.x, pos.z))
                 .or_insert(Resident {
@@ -284,7 +296,10 @@ impl Residency {
 
     /// Give up a claim taken by [`Residency::hold_columns`].
     pub fn release_columns(&self, columns: &[ChunkPos]) {
-        let mut held = self.columns.write().expect("the residency is never poisoned");
+        let mut held = self
+            .columns
+            .write()
+            .expect("the residency is never poisoned");
         for pos in columns {
             if let Some(entry) = held.get_mut(&(pos.x, pos.z)) {
                 entry.holders = entry.holders.saturating_sub(1);
@@ -300,13 +315,20 @@ impl Residency {
     /// takes a couple of milliseconds each and no lock may be held across it.
     #[must_use]
     pub fn cold(&self, centre: ChunkPos) -> Vec<ChunkPos> {
-        self.cold_columns(&ring(centre).map(|(x, z)| ChunkPos::new(x, z)).collect::<Vec<_>>())
+        self.cold_columns(
+            &ring(centre)
+                .map(|(x, z)| ChunkPos::new(x, z))
+                .collect::<Vec<_>>(),
+        )
     }
 
     /// The same question about a named set of columns.
     #[must_use]
     pub fn cold_columns(&self, columns: &[ChunkPos]) -> Vec<ChunkPos> {
-        let held = self.columns.read().expect("the residency is never poisoned");
+        let held = self
+            .columns
+            .read()
+            .expect("the residency is never poisoned");
         columns
             .iter()
             .filter(|pos| held.get(&(pos.x, pos.z)).is_some_and(|c| c.chunk.is_none()))
@@ -322,7 +344,10 @@ impl Residency {
     /// second one to arrive finds a chunk already there and its own copy is
     /// dropped on the spot. Duplicated work, never duplicated memory.
     pub fn fill(&self, pos: ChunkPos, chunk: Chunk) -> bool {
-        let mut columns = self.columns.write().expect("the residency is never poisoned");
+        let mut columns = self
+            .columns
+            .write()
+            .expect("the residency is never poisoned");
         match columns.get_mut(&(pos.x, pos.z)) {
             Some(entry) if entry.chunk.is_none() => {
                 entry.chunk = Some(Arc::new(chunk));
@@ -475,7 +500,9 @@ impl ColumnClaim {
     pub fn set(&mut self, wanted: &mut Vec<ChunkPos>) {
         wanted.sort_unstable_by_key(|pos| (pos.x, pos.z));
         wanted.dedup();
-        let Some(residency) = &self.residency else { return };
+        let Some(residency) = &self.residency else {
+            return;
+        };
         if self.held == *wanted {
             return;
         }

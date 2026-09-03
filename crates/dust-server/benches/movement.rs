@@ -127,7 +127,10 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        LIVE_BYTES.fetch_add(new_size as isize - layout.size() as isize, Ordering::Relaxed);
+        LIVE_BYTES.fetch_add(
+            new_size as isize - layout.size() as isize,
+            Ordering::Relaxed,
+        );
         System.realloc(ptr, layout, new_size)
     }
 }
@@ -333,31 +336,34 @@ fn main() {
     // which counts the columns the check had to build on its own thread
     // because the warm had not got there yet.
     for (pose, posture) in POSES {
-        row(&format!("region files, resident, in the open, {pose}"), || {
-            let mut ground =
-                Ground::of(&world, Some(&constants)).expect("the table said it was solid");
-            let mut here: Option<ChunkPos> = None;
-            let accepted = walk(&mut player(air, posture), air, posture, |m, to| {
-                let centre = column_of(to.0, to.2);
-                if here != Some(centre) {
-                    // Exactly what `net/session.rs` does on an accepted move:
-                    // claim, hand the build to another thread, let go of the
-                    // ring behind. Nine hash lookups and a channel send.
-                    world.hold(centre);
-                    world.want_ring(centre);
-                    if let Some(previous) = here.replace(centre) {
-                        world.release(previous);
+        row(
+            &format!("region files, resident, in the open, {pose}"),
+            || {
+                let mut ground =
+                    Ground::of(&world, Some(&constants)).expect("the table said it was solid");
+                let mut here: Option<ChunkPos> = None;
+                let accepted = walk(&mut player(air, posture), air, posture, |m, to| {
+                    let centre = column_of(to.0, to.2);
+                    if here != Some(centre) {
+                        // Exactly what `net/session.rs` does on an accepted move:
+                        // claim, hand the build to another thread, let go of the
+                        // ring behind. Nine hash lookups and a channel send.
+                        world.hold(centre);
+                        world.want_ring(centre);
+                        if let Some(previous) = here.replace(centre) {
+                            world.release(previous);
+                        }
                     }
+                    m.claimed(to, 1, &mut ground)
+                });
+                // A session ending gives its ring up; a row that did not would
+                // hold nine more columns for every round it ran.
+                if let Some(last) = here {
+                    world.release(last);
                 }
-                m.claimed(to, 1, &mut ground)
-            });
-            // A session ending gives its ring up; a row that did not would
-            // hold nine more columns for every round it ran.
-            if let Some(last) = here {
-                world.release(last);
-            }
-            tally(accepted, &ground)
-        });
+                tally(accepted, &ground)
+            },
+        );
     }
     println!(
         "  the server is keeping {} columns now that the walk has finished; \
@@ -446,7 +452,11 @@ fn paced(
     let mut crossings = 0;
     for i in 1..=PACED_PACKETS {
         let along = (f64::from(i) * 0.216) % (2.0 * SPAN);
-        let x = if along <= SPAN { along } else { 2.0 * SPAN - along };
+        let x = if along <= SPAN {
+            along
+        } else {
+            2.0 * SPAN - along
+        };
         let to = (0.5 + x, y, 0.5);
         // Timed around everything the session task does for one movement
         // packet: the claim, the hand-off, and the check itself.

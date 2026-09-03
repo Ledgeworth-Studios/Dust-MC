@@ -826,6 +826,11 @@ where
     Ok(())
 }
 
+// Nine, and the ninth is the residence. It is a guard whose whole job is to
+// outlive every way this loop can end, so it is created before the join
+// streams its first column — a hold taken inside the loop would leak the ring
+// for a session whose stream failed on the way in.
+#[allow(clippy::too_many_arguments)]
 async fn play_loop<W>(
     conn: &mut Conn<W>,
     ctx: &SessionContext,

@@ -418,7 +418,9 @@ impl AnvilWorld {
         opacity: dust_world::propagation::OpacityModel,
         constants: Option<std::sync::Arc<dust_registry::BlockConstants>>,
     ) -> Self {
-        let core = Arc::new(AnvilCore::new(directory, names, fallback, opacity, constants));
+        let core = Arc::new(AnvilCore::new(
+            directory, names, fallback, opacity, constants,
+        ));
         let residency = Arc::new(Residency::new());
         let (wanted, requests) = std::sync::mpsc::channel::<Vec<ChunkPos>>();
         let warming = std::thread::Builder::new()
@@ -461,7 +463,6 @@ impl AnvilWorld {
             })
         })
     }
-
 }
 
 impl AnvilCore {
