@@ -44,6 +44,7 @@ pub mod collide;
 pub mod configure;
 pub mod edits;
 pub mod favicon;
+pub mod generated;
 pub mod inventory;
 pub mod items;
 pub mod level;

@@ -327,6 +327,19 @@ impl Default for JvmConfig {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, ConfigSection)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorldgenConfig {
+    /// The seed a generated world is built from.
+    ///
+    /// Only used when there is no world to read a seed out of: a server with
+    /// `[server] world_source` set takes the seed from that world's own
+    /// `level.dat`, because generating the columns off its edge from a
+    /// different one would put a cliff where the disc ends.
+    ///
+    /// The default is zero rather than a random number. Two servers started
+    /// from the same configuration should serve the same world, and an
+    /// operator who wants a different one should be able to say which.
+    #[config(restart)]
+    pub seed: i64,
+
     /// How common each ore is, and where it generates.
     #[config(section)]
     pub ores: OresConfig,

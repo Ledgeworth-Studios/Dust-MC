@@ -53,6 +53,7 @@ use dust_world::heightmap::WorldHeight;
 use dust_world::region::{FileStore, RegionFile};
 
 use super::residency::Residency;
+use super::generated::GeneratedWorld;
 use super::world::FlatWorld;
 
 /// Region files that have been opened, or found not to exist.
@@ -111,13 +112,53 @@ impl Column<'_> {
 /// variant unboxed for a stated reason.
 pub enum Source {
     Flat(Box<FlatWorld>),
+    /// Built from noise, for a server with no world file: every column, out
+    /// to the edge of the coordinate space.
+    Generated(Box<GeneratedWorld>),
     Anvil(Box<AnvilWorld>),
+}
+
+/// What a position a world file does not contain is served with.
+///
+/// A world file is a disc in an infinite plane and a player can walk off the
+/// edge of it. The two answers are a plain that runs on, which is what Dust
+/// served before there was a generator, and the terrain the world's own seed
+/// says is there — which is the same terrain Minecraft would have generated,
+/// so the edge is a seam in the *materials* and not in the shape.
+///
+/// Which one an operator gets is not a setting: it is whether the world's own
+/// seed could be read. Generating the far side of the edge from a seed that is
+/// not the world's own would put a cliff where the disc ends, and a wrong
+/// answer that looks right is worse than an obviously artificial one.
+#[derive(Debug)]
+pub enum Fallback {
+    Flat(Box<FlatWorld>),
+    Generated(Box<GeneratedWorld>),
+}
+
+impl Fallback {
+    /// The flat world underneath, which both arms carry: it owns the block
+    /// palette and the world height everything else resolves against.
+    pub fn flat(&self) -> &FlatWorld {
+        match self {
+            Self::Flat(flat) => flat,
+            Self::Generated(world) => world.flat(),
+        }
+    }
+
+    fn column(&self, pos: ChunkPos) -> Chunk {
+        match self {
+            Self::Flat(flat) => flat.column().clone(),
+            Self::Generated(world) => world.column(pos),
+        }
+    }
 }
 
 impl std::fmt::Debug for Source {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Flat(_) => f.write_str("Flat"),
+            Self::Generated(_) => f.write_str("Generated"),
             Self::Anvil(world) => write!(f, "Anvil({})", world.core.directory.display()),
         }
     }
@@ -127,6 +168,11 @@ impl Source {
     pub fn column(&self, pos: ChunkPos) -> Column<'_> {
         match self {
             Self::Flat(flat) => Column::Shared(flat.column()),
+            // Nobody keeps a generated column yet. It is built on whatever
+            // thread asked, which is what an Anvil column was before residency
+            // existed; the two meet when residency stops being about a world
+            // that has a file.
+            Self::Generated(world) => Column::Built(world.column(pos)),
             Self::Anvil(world) => match world.residency.resident(pos) {
                 Some(chunk) => Column::Resident(chunk),
                 // Nobody is keeping this one. Built here, on whatever thread
@@ -241,7 +287,7 @@ impl Source {
     #[must_use]
     pub fn residency(&self) -> Option<Arc<Residency>> {
         match self {
-            Self::Flat(_) => None,
+            Self::Flat(_) | Self::Generated(_) => None,
             Self::Anvil(world) => Some(Arc::clone(&world.residency)),
         }
     }
@@ -252,7 +298,7 @@ impl Source {
     #[must_use]
     pub fn warming(&self) -> Option<std::sync::mpsc::Sender<Vec<ChunkPos>>> {
         match self {
-            Self::Flat(_) => None,
+            Self::Flat(_) | Self::Generated(_) => None,
             Self::Anvil(world) => world.wanted.clone(),
         }
     }
@@ -261,7 +307,7 @@ impl Source {
     #[must_use]
     pub fn resident_columns(&self) -> usize {
         match self {
-            Self::Flat(_) => 0,
+            Self::Flat(_) | Self::Generated(_) => 0,
             Self::Anvil(world) => world.residency.len(),
         }
     }
@@ -272,7 +318,8 @@ impl Source {
     pub fn flat(&self) -> &FlatWorld {
         match self {
             Self::Flat(flat) => flat,
-            Self::Anvil(world) => &world.core.fallback,
+            Self::Generated(world) => world.flat(),
+            Self::Anvil(world) => world.core.fallback.flat(),
         }
     }
 }
@@ -325,7 +372,7 @@ struct AnvilCore {
     regions: Mutex<OpenRegions>,
     names: RegistryNames,
     height: WorldHeight,
-    fallback: FlatWorld,
+    fallback: Fallback,
     /// How much light entering each block state costs. Built once at boot,
     /// because with a table in it this is 26,684 bytes and the alternative is
     /// building one per column served.
@@ -390,7 +437,7 @@ impl AnvilCore {
     fn new(
         directory: PathBuf,
         names: RegistryNames,
-        fallback: FlatWorld,
+        fallback: Fallback,
         opacity: dust_world::propagation::OpacityModel,
         constants: Option<std::sync::Arc<dust_registry::BlockConstants>>,
     ) -> Self {
@@ -398,7 +445,7 @@ impl AnvilCore {
             directory,
             regions: Mutex::new(HashMap::new()),
             names,
-            height: fallback.height(),
+            height: fallback.flat().height(),
             emission: super::world::emission_of(constants.as_deref()),
             fallback,
             opacity,
@@ -415,6 +462,40 @@ impl AnvilWorld {
         directory: PathBuf,
         names: RegistryNames,
         fallback: FlatWorld,
+        opacity: dust_world::propagation::OpacityModel,
+        constants: Option<std::sync::Arc<dust_registry::BlockConstants>>,
+    ) -> Self {
+        Self::with_fallback(
+            directory,
+            names,
+            Fallback::Flat(Box::new(fallback)),
+            opacity,
+            constants,
+        )
+    }
+
+    /// The same world with the generator underneath it, for a save whose own
+    /// seed this server could read.
+    pub fn generating(
+        directory: PathBuf,
+        names: RegistryNames,
+        fallback: GeneratedWorld,
+        opacity: dust_world::propagation::OpacityModel,
+        constants: Option<std::sync::Arc<dust_registry::BlockConstants>>,
+    ) -> Self {
+        Self::with_fallback(
+            directory,
+            names,
+            Fallback::Generated(Box::new(fallback)),
+            opacity,
+            constants,
+        )
+    }
+
+    fn with_fallback(
+        directory: PathBuf,
+        names: RegistryNames,
+        fallback: Fallback,
         opacity: dust_world::propagation::OpacityModel,
         constants: Option<std::sync::Arc<dust_registry::BlockConstants>>,
     ) -> Self {
@@ -483,12 +564,12 @@ impl AnvilCore {
         let floors = match self.read(pos) {
             Some(mut chunk) => {
                 chunk.recompute_heightmaps(super::world::heightmap_predicate(
-                    self.fallback.palette().air,
+                    self.fallback.flat().palette().air,
                     self.constants.as_deref(),
                 ));
                 SkyFloor::of(&chunk)
             }
-            None => SkyFloor::of(self.fallback.column()),
+            None => SkyFloor::of(&self.fallback.column(pos)),
         };
         self.remember(pos, floors);
         floors
@@ -533,7 +614,7 @@ impl AnvilCore {
                 // through here: `harness rewrite` reads and writes without
                 // this step, so a round trip keeps the file's own answers.
                 chunk.recompute_heightmaps(super::world::heightmap_predicate(
-                    self.fallback.palette().air,
+                    self.fallback.flat().palette().air,
                     self.constants.as_deref(),
                 ));
                 // Light is computed, not read. A chunk's stored light is a
@@ -552,7 +633,7 @@ impl AnvilCore {
             }
             // Off the edge of what was generated. See the module note: a plain
             // running on beats an error or a hole.
-            None => self.fallback.column().clone(),
+            None => self.fallback.column(pos),
         }
     }
 
