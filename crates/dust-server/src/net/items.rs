@@ -620,7 +620,11 @@ pub fn contents(id: i32, item: Item, count: u8) -> play::clientbound::SetEntityD
             value: play::metadata::MetadataValue::Slot(Slot::Present {
                 count: i32::from(count),
                 item_id: item.protocol_id() as i32,
-                removed_components: Vec::new(),
+                // A block drop comes out of a loot table, which names an
+                // item and never a component patch. When Q starts throwing a
+                // player's stack instead of destroying it, that stack's own
+                // components come through here.
+                components: dust_protocol::components::ComponentPatch::EMPTY,
             }),
         }]),
     }

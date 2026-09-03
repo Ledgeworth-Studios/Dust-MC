@@ -145,7 +145,7 @@ fn metadata_offsets_distinguish_absent_from_zero() {
     let stack = MetadataValue::Slot(dust_protocol::types::Slot::Present {
         count: 3,
         item_id: 42,
-        removed_components: Vec::new(),
+        components: dust_protocol::components::ComponentPatch::EMPTY,
     });
     let mut writer = Writer::new();
     stack.encode(&mut writer, v()).expect("encodes");
