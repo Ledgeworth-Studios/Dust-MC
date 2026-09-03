@@ -56,28 +56,73 @@ is the seam `net/mod.rs` was waiting for.
 ## What it costs, measured
 
 `cargo bench -p dust-server --bench items`, on an otherwise busy ten-core
-machine (so these are ceilings, not floors). A thousand ticks per round, median
-of five, each row the one above it plus a single named change:
+machine, so these are ceilings rather than floors. Median of five rounds, each
+row the one above it plus a single named change. **An item has two costs and
+they differ by four times**, so there are two groups: the fifteen ticks between
+a block breaking and the item landing, and every tick after that.
 
 ```text
-  nothing on the floor                  8 ns/tick
-  1 item, somebody near                47 ns/tick     47 ns/item
-  100 items, somebody near          5,398 ns/tick     53 ns/item
-  1,000 items, somebody near      113,865 ns/tick    113 ns/item
-  1,000 items, nobody near            717 ns/tick
+  falling
+    nothing on the floor                  8 ns/tick
+    1 item, somebody near                38 ns/tick     38 ns/item
+    100 items, somebody near          5,463 ns/tick     54 ns/item
+    1,000 items, somebody near      424,366 ns/tick    424 ns/item
+
+  at rest
+    1 item, somebody near                23 ns/tick     23 ns/item
+    100 items, somebody near          3,838 ns/tick     38 ns/item
+    1,000 items, somebody near      109,563 ns/tick    109 ns/item
+    1,000 items, nobody near            616 ns/tick
 ```
 
-A tick is 50,000,000 ns. **A thousand item entities beside a player is 0.23% of
-one**, and the same thousand with nobody near is 0.0014% — one hundred and
-fifty-nine times cheaper. The per-item cost doubling between a hundred and a
-thousand is the merge pass, which is quadratic over the items *near a player*;
-at the ceiling that is 114 microseconds and the ceiling is where it stops,
-because of the third mechanism below.
+A tick is 50,000,000 ns. **A thousand items lying beside a player is 0.22% of
+one**, the same thousand mid-air is 0.85%, and the same thousand with nobody
+near is 0.0012% — one hundred and seventy-eight times cheaper than the at-rest
+row above it. The per-item cost rising between a hundred and a thousand is the
+merge pass, which is quadratic over the items *near a player*; at the ceiling
+that is 424 microseconds, and the ceiling is where it stops because of the
+third mechanism below.
+
+**Measuring only the second group was a real hazard here rather than a
+theoretical one.** An item takes an early return out of `step` once it has
+settled, so the first version of this bench popped a thousand items, ran a
+thousand ticks, and spent fifteen of them measuring physics and nine hundred
+and eighty-five measuring a branch — then printed the average as though it were
+the cost of an item. Each falling row now reports how many of its items were
+still moving when it finished and says so if none were. W2 found the identical
+shape in the movement bench the same day: a bench whose subject stops is
+measuring it having stopped.
+
+### And the world underneath is not free, which is the finding
+
+Every row above is over a flat world. Over a world read out of region files,
+with `DUST_BENCH_REGION` set:
+
+```text
+  1 falling item, flat                     38 ns/tick
+  1 falling item, region files        558,308 ns/tick    14,700x
+  100 falling items, region files   5,299,738 ns/tick    10.6% of a tick
+```
+
+`Ground` is built inside every `ItemWorld::tick`, so its four-column cache
+lives for one tick and is thrown away — and on an Anvil world a miss is a
+column decompressed and rebuilt, about half a millisecond. One falling item
+therefore rebuilds one column, twenty times a second, for the second and a half
+it is in the air.
+
+**This is not fixed here, and the reason is that the fix is not in this
+module.** A cache that outlives a tick belongs to `collide.rs`, which is where
+`Ground` lives and which another track is working in. What is recorded is the
+number, so that whoever gives `Ground` a longer-lived cache knows what it buys
+and can check it. Until then: a break on a saved world costs about half a
+millisecond a tick while the drop is falling, which is fine for the eight
+blocks of a vein and is not fine for a hundred at once — and a hundred at once
+needs an explosion, which Dust does not have.
 
 ## The three mechanisms, and each is load-bearing
 
 1. **Nothing more than 64 blocks from any player is ticked.** No physics, no
-   merging, no despawn clock — one bounds check. This is the 159x above, and it
+   merging, no despawn clock — one bounds check. This is the 178x above, and it
    is why a tunnel of dropped cobblestone nobody is standing in is free.
 2. **Two of the same item lying together become one.** What stops a mined-out
    vein being sixty entities, and also what a player expects to see.
@@ -126,6 +171,8 @@ there.**
 
 ## What is not decided here
 
+- **A column cache that outlives a tick.** The section above measures what its
+  absence costs a falling item on a saved world, and the fix is `collide.rs`'s.
 - **Sideways collision.** An item is a quarter of a block wide and only ever
   meets the surface under it in ordinary play, so `step` handles landing and
   nothing else. Entities with real boxes want `dust-guard`'s shapes, and that
