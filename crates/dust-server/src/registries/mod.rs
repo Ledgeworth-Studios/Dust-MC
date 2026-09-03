@@ -34,6 +34,7 @@
 
 pub mod constants;
 pub mod convert;
+pub mod drops;
 pub mod schema;
 pub mod source;
 

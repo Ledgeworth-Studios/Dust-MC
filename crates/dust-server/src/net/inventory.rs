@@ -588,6 +588,23 @@ impl Inventory {
         changed
     }
 
+    /// Take a stack up off the ground.
+    ///
+    /// The same placement [`Inventory::closed`] uses — partial stacks first,
+    /// then the main inventory, then the hotbar — because it is the placement
+    /// vanilla uses and a player has forty hours of habit about where a picked
+    /// up stack lands.
+    ///
+    /// Returns what did **not** fit. A full inventory is a real state and the
+    /// item stays on the ground for it; deleting the overflow would be a
+    /// player watching their pickaxe vanish because their pockets were full.
+    pub fn collect(&mut self, stack: Stack) -> (Changed, Option<Stack>) {
+        let mut changed = Changed::default();
+        let mut left = stack;
+        self.move_to(MAIN_START..HOTBAR_END, &mut left, &mut changed);
+        (changed, (left.count > 0).then_some(left))
+    }
+
     /// Put a stack into the main inventory and hotbar, merging into partial
     /// stacks first. Whatever does not fit is dropped, which is the only
     /// caller-visible loss and only happens with a full inventory.
