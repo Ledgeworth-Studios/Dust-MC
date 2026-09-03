@@ -545,6 +545,57 @@ pub const LIGHT_ORACLE: &[Wanted<'static>] = &[
         method: "getKey",
         parameters: &["java.lang.Object"],
     },
+    // What a broken block yields, as the one thing that is *not* in the loot
+    // data an operator already holds. Every table is a file; **which file a
+    // block uses is Java** — `BlockBehaviour.getLootTable()` — and 78 of the
+    // 1,060 blocks on 1.21.1 do not point at a table of their own name. About
+    // sixty of those point at another block's: `oak_wall_sign` yields an
+    // `oak_sign` out of `blocks/oak_sign.json`. A reader matching names is
+    // right about 982 blocks and silently drops nothing for the rest, which is
+    // this project's own "a rule that is right 98% of the time" one more time.
+    Wanted::Class {
+        key: "blockbehaviour.class",
+        class: BLOCK_BEHAVIOUR,
+    },
+    Wanted::Method {
+        key: "blockbehaviour.get_loot_table",
+        class: BLOCK_BEHAVIOUR,
+        method: "getLootTable",
+        parameters: &[],
+    },
+    // The key's own `location()`, because `ResourceKey.toString()` renders
+    // `ResourceKey[minecraft:loot_table / minecraft:blocks/stone]` and the id
+    // is the second half of it. Three no-argument methods on this class —
+    // `location`, `registry`, `registryKey` — are `a`, `b` and `c`, so the
+    // name is what tells them apart.
+    Wanted::Class {
+        key: "resourcekey.class",
+        class: RESOURCE_KEY,
+    },
+    Wanted::Method {
+        key: "resourcekey.location",
+        class: RESOURCE_KEY,
+        method: "location",
+        parameters: &[],
+    },
+    // Whether a block yields anything at all to the wrong tool. `snow` wants a
+    // shovel and `cobweb` wants shears, and a server without this hands a
+    // bare-handed player a stack of cobblestone — which is not a survival game
+    // with a missing feature, it is a creative one wearing survival's clothes.
+    Wanted::Method {
+        key: "blockstate.requires_correct_tool_for_drops",
+        class: BLOCK_STATE_BASE,
+        method: "requiresCorrectToolForDrops",
+        parameters: &[],
+    },
+    // How long the block takes, before any tool is considered. The field and
+    // not `getDestroySpeed(BlockGetter, BlockPos)`, for the reason
+    // `lightEmission` is read as a field: it needs no arguments and no level.
+    Wanted::Field {
+        key: "blockstate.destroy_speed",
+        class: BLOCK_STATE_BASE,
+        field: "destroySpeed",
+    },
 ];
 
 const BLOCK_STATE_BASE: &str =
@@ -558,6 +609,8 @@ const SHARED_CONSTANTS: &str = "net.minecraft.SharedConstants";
 const HEIGHTMAP_TYPES: &str = "net.minecraft.world.level.levelgen.Heightmap$Types";
 const SOUND_TYPE: &str = "net.minecraft.world.level.block.SoundType";
 const SOUND_EVENT: &str = "net.minecraft.sounds.SoundEvent";
+const BLOCK_BEHAVIOUR: &str = "net.minecraft.world.level.block.state.BlockBehaviour";
+const RESOURCE_KEY: &str = "net.minecraft.resources.ResourceKey";
 const BLOCK_ITEM: &str = "net.minecraft.world.item.BlockItem";
 const STANDING_AND_WALL_BLOCK_ITEM: &str = "net.minecraft.world.item.StandingAndWallBlockItem";
 const BUILT_IN_REGISTRIES: &str = "net.minecraft.core.registries.BuiltInRegistries";

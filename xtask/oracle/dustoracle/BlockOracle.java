@@ -46,9 +46,10 @@ import java.util.function.Predicate;
 public final class BlockOracle {
 
     public static void main(String[] args) throws Exception {
-        if (args.length != 3) {
+        if (args.length != 4) {
             System.err.println(
-                "usage: BlockOracle <names.properties> <states.tsv> <items.tsv>");
+                "usage: BlockOracle <names.properties> <states.tsv> <items.tsv> "
+                + "<blocks.tsv>");
             System.exit(2);
         }
         Names names = new Names(args[0]);
@@ -67,6 +68,15 @@ public final class BlockOracle {
             names.type("block_getter.class"),
             names.type("blockpos.class"));
         Method canOcclude = names.method("blockstate.class", "blockstate.can_occlude");
+        // Whether the block yields anything at all to the wrong tool, and how
+        // long it takes before a tool is considered. Both are per *state* in
+        // the game — the field and the method are on `BlockStateBase` — so
+        // both are read per state here rather than per block, which costs one
+        // column each and asks nothing about whether vanilla happens to keep
+        // them uniform across a block's states today.
+        Method requiresCorrectTool = names.method(
+            "blockstate.class", "blockstate.requires_correct_tool_for_drops");
+        Field destroySpeed = names.field("blockstate.class", "blockstate.destroy_speed");
         Method canBeReplaced = names.method("blockstate.class", "blockstate.can_be_replaced");
         // Whether the *collision* shape is the whole cube, which is not any of
         // the other booleans here. A stair, a slab, a farmland block and a lump
@@ -127,7 +137,7 @@ public final class BlockOracle {
         try (BufferedWriter out = Files.newBufferedWriter(Path.of(args[1]))) {
             StringBuilder header = new StringBuilder(
                 "# state_id\topacity\temission\tocclude\treplaceable"
-                + "\tfull_collision"
+                + "\tfull_collision\trequires_tool\tdestroy_speed"
                 + "\tplace_sound\tsound_volume\tsound_pitch");
             for (Heightmap heightmap : heightmaps) {
                 header.append('\t').append(heightmap.key);
@@ -152,6 +162,8 @@ public final class BlockOracle {
                    .append(occludes ? 1 : 0).append('\t')
                    .append(replaceable ? 1 : 0).append('\t')
                    .append(fullCollision ? 1 : 0).append('\t')
+                   .append((boolean) requiresCorrectTool.invoke(state) ? 1 : 0).append('\t')
+                   .append(destroySpeed.getFloat(state)).append('\t')
                    .append(sound.placeSound).append('\t')
                    .append(sound.volume).append('\t')
                    .append(sound.pitch);
@@ -174,6 +186,7 @@ public final class BlockOracle {
         System.out.println("sturdy_faces=" + sturdyFaces);
         System.out.println("sound_groups=" + sounds.seen());
         System.out.println("items=" + writeItems(names, Path.of(args[2])));
+        System.out.println("blocks=" + writeBlocks(names, Path.of(args[3])));
     }
 
     /** One heightmap: the name a chunk's NBT calls it, and what it counts. */
@@ -218,9 +231,17 @@ public final class BlockOracle {
      *
      * Minecraft logs to stdout during static initialisation, and this
      * program's stdout is a line the extractor parses.
+     *
+     * **Both streams are put back afterwards, and `System.err` is the one that
+     * matters.** `Bootstrap.bootStrap()` ends by wrapping both of them into a
+     * logger that has no appender configured here, so a stack trace thrown
+     * after this point goes nowhere at all: the JVM prints
+     * `Exception in thread "main"` and then nothing, which reads like a
+     * crash with no cause rather than like a redirected stream.
      */
     private static void runBootstrap(Names names) throws Exception {
         PrintStream out = System.out;
+        PrintStream err = System.err;
         System.setOut(new PrintStream(OutputStream.nullOutputStream()));
         try {
             names.method("sharedconstants.class", "sharedconstants.try_detect_version")
@@ -228,6 +249,7 @@ public final class BlockOracle {
             names.method("bootstrap.class", "bootstrap.boot").invoke(null);
         } finally {
             System.setOut(out);
+            System.setErr(err);
         }
     }
 
@@ -293,6 +315,68 @@ public final class BlockOracle {
         }
         System.out.println("wall_items=" + walls);
         return written;
+    }
+
+
+    /**
+     * Write, for every block, the loot table it draws from.
+     *
+     * `Block.getLootTable()` is a **code** constant. Every table itself is a
+     * file in the data pack the operator already holds, and 982 of the 1,060
+     * blocks on 1.21.1 draw from a table of their own name — so a server that
+     * matched file names to block names would be right about 982 of them and
+     * would drop nothing for the other 78. About sixty of those 78 are wall
+     * forms: `oak_wall_sign` draws from `blocks/oak_sign.json`, and there is
+     * no rule about names that gets there, because `coral_wall_fan` does not
+     * follow the same rule that `wall_sign` does and `potted_cactus` follows
+     * neither.
+     *
+     * Three columns, two of them names: the block's own registry id is here
+     * because the Rust side is indexed by it, and the two names are here
+     * because a name is a thing both sides know independently.
+     */
+    private static int writeBlocks(Names names, Path out) throws Exception {
+        Object blocks = names.field("builtin_registries.class", "builtin_registries.block").get(null);
+        Method getId = names.method("registry.class", "registry.get_id", Object.class);
+        Method getKey = names.method("registry.class", "registry.get_key", Object.class);
+        Method getLootTable = names.method("blockbehaviour.class", "blockbehaviour.get_loot_table");
+        Method location = names.method("resourcekey.class", "resourcekey.location");
+
+        int written = 0;
+        int elsewhere = 0;
+        try (BufferedWriter writer = Files.newBufferedWriter(out)) {
+            writer.write("# block_id\tblock\tloot_table\n");
+            for (Object block : (Iterable<?>) blocks) {
+                int id = (int) getId.invoke(blocks, block);
+                String name = getKey.invoke(blocks, block).toString();
+                String table = location.invoke(getLootTable.invoke(block)).toString();
+                // `minecraft:stone` draws from `minecraft:blocks/stone`; the
+                // comparison is against that spelling and not against the bare
+                // name, because the namespace is part of both.
+                String own = own(name);
+                if (!table.equals(own)) {
+                    elsewhere++;
+                }
+                writer.write(id + "\t" + name + "\t" + table + "\n");
+                written++;
+            }
+        }
+        System.out.println("blocks_drawing_elsewhere=" + elsewhere);
+        if (elsewhere == 0) {
+            throw new IllegalStateException(
+                "every block draws from a table of its own name, which no version of "
+                + "Minecraft says; `blockbehaviour.get_loot_table` resolved to something "
+                + "that answers the same shape for every block");
+        }
+        return written;
+    }
+
+    /** The table id a block of this name would draw from if it drew from its own. */
+    private static String own(String block) {
+        int colon = block.indexOf(':');
+        return colon < 0
+            ? "minecraft:blocks/" + block
+            : block.substring(0, colon + 1) + "blocks/" + block.substring(colon + 1);
     }
 
     /** One block sound group: what placing it sounds like, and how loud. */

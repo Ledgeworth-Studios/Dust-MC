@@ -952,6 +952,7 @@ fn constants_domain(context: &Context) -> Result<Outcome, String> {
         .join(":");
     let out = cache.join(format!("oracle-{}/constants.tsv", context.version));
     let items = cache.join(format!("oracle-{}/items.tsv", context.version));
+    let blocks = cache.join(format!("oracle-{}/blocks.tsv", context.version));
     println!(
         "asking Minecraft what every block state does to light, to a heightmap, and sounds like"
     );
@@ -964,6 +965,7 @@ fn constants_domain(context: &Context) -> Result<Outcome, String> {
             names.display().to_string(),
             out.display().to_string(),
             items.display().to_string(),
+            blocks.display().to_string(),
         ],
         "running the block oracle",
     )?;
@@ -1104,6 +1106,30 @@ fn constants_domain(context: &Context) -> Result<Outcome, String> {
         ));
     }
 
+    // The third table: which loot table each block draws from. A code
+    // constant like the two above and on the same argument — and the one that
+    // decides whether about sixty wall blocks yield anything at all.
+    let drawn = std::fs::read_to_string(&blocks)
+        .map_err(|e| format!("could not read {}: {e}", blocks.display()))?;
+    let loot = LootSummary::of(&drawn);
+    println!("wrote {}", blocks.display());
+    println!(
+        "  {} block(s), {} drawing from a table of another block's name",
+        loot.blocks, loot.elsewhere
+    );
+    if loot.blocks == 0 || loot.elsewhere == 0 {
+        return Err(format!(
+            "{} says {} of {} block(s) draw from a table of another name, and \
+             Minecraft says about sixty do — every wall sign, wall banner, wall \
+             head and coral wall fan. `blockbehaviour.get_loot_table` resolved \
+             to the wrong member; check {}/names.properties.",
+            blocks.display(),
+            loot.elsewhere,
+            loot.blocks,
+            blocks.parent().unwrap_or(&blocks).display()
+        ));
+    }
+
     // The route, printed where somebody who just ran this is looking. The
     // tables are read from `[data] path` — decision record 0008 chose that over
     // a new `dust` subcommand, a JDK on the server's boot path and a second
@@ -1115,6 +1141,8 @@ fn constants_domain(context: &Context) -> Result<Outcome, String> {
     println!("  Minecraft places, copy both beside your data:");
     println!("    cp {} <[data] path>/dust-constants.tsv", out.display());
     println!("    cp {} <[data] path>/dust-items.tsv", items.display());
+    println!("  and to give about sixty wall blocks the loot table they actually draw from:");
+    println!("    cp {} <[data] path>/dust-blocks.tsv", blocks.display());
 
     // Every light level Minecraft has is 0..=15, so a value outside that did
     // not come from the field or method this asked for — it came from a
@@ -1132,11 +1160,14 @@ fn constants_domain(context: &Context) -> Result<Outcome, String> {
     Ok(format!(
         "{rows} block states: light, occlusion, replacement, {} heightmap(s) and \
          {} sound group(s); \
-         {} item(s), {} placing",
+         {} item(s), {} placing; \
+         {} block(s), {} drawing loot from elsewhere",
         summary.heightmaps.len(),
         summary.sounds.len(),
         placement.items,
-        placement.placing
+        placement.placing,
+        loot.blocks,
+        loot.elsewhere
     ))
 }
 
@@ -1186,6 +1217,41 @@ impl PlacementSummary {
                 summary
                     .renamed
                     .push(((*item).to_owned(), (*places).to_owned()));
+            }
+        }
+        summary
+    }
+}
+
+/// What the block-to-loot-table table says, as counts.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LootSummary {
+    /// How many blocks the table describes.
+    blocks: usize,
+    /// How many of them draw from a table named after a *different* block.
+    ///
+    /// The whole reason this column exists, and the number to look at: it is
+    /// 78 on 1.21.1, about sixty of which are wall forms. Zero would mean the
+    /// column is telling a story a rule about names could have told, and that
+    /// story has never been true.
+    elsewhere: usize,
+}
+
+impl LootSummary {
+    fn of(table: &str) -> Self {
+        let mut summary = Self::default();
+        for line in table
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+        {
+            let fields: Vec<&str> = line.split('\t').collect();
+            let (Some(block), Some(draws)) = (fields.get(1), fields.get(2)) else {
+                continue;
+            };
+            summary.blocks += 1;
+            let (namespace, path) = block.split_once(':').unwrap_or(("minecraft", block));
+            if *draws != format!("{namespace}:blocks/{path}") {
+                summary.elsewhere += 1;
             }
         }
         summary
@@ -1271,6 +1337,7 @@ impl ConstantsSummary {
                         | "occlude"
                         | "replaceable"
                         | "full_collision"
+                        | "destroy_speed"
                         | "place_sound"
                         | "sound_volume"
                         | "sound_pitch"
