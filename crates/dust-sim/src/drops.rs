@@ -111,6 +111,21 @@ pub struct Break<'a> {
     /// Whether an entity broke it. A block that fell, was pushed or was
     /// dissolved by a piston has no `this` entity, and two tables ask.
     pub broken_by_entity: bool,
+    /// Whether this state yields nothing to the wrong tool — Minecraft's
+    /// `requiresCorrectToolForDrops`, which is a Java constant and reaches
+    /// here out of `dust-constants.tsv`'s `requires_tool` column.
+    ///
+    /// **The caller supplies whether the block cares; this module works out
+    /// whether the tool is right.** The two are different questions with
+    /// different sources: the first is a property of the block state and the
+    /// second is the held item's `minecraft:tool` component read against the
+    /// block, and a server that conflated them would either hand a
+    /// bare-handed player cobblestone or refuse a shovel its dirt.
+    ///
+    /// `false` for a table with no such column, which is what a server
+    /// extracted before the column existed does — and it is the direction that
+    /// is generous rather than the one that quietly stops a player mining.
+    pub requires_tool: bool,
     /// The states of cells around the broken one, as `(y offset, state)`.
     /// Two tables read them — the two double-tall plants, which check the half
     /// above or below to decide which of the pair is the one that drops.
@@ -328,7 +343,25 @@ impl Table {
     /// Appends rather than returns so a caller breaking many blocks reuses one
     /// buffer: a `Vec` per break is an allocation per break, and this runs on
     /// the tick loop.
+    ///
+    /// # The tool gate comes first, and it is not a condition
+    ///
+    /// A block that wants a correct tool and did not get one yields nothing at
+    /// all, and it yields nothing *outside* the table: Minecraft never calls
+    /// `playerDestroy`, so no pool is rolled, no function runs and no
+    /// `survives_explosion` is asked. Writing it as one more condition would
+    /// give the same answer for every vanilla table today and a different one
+    /// the day a table has a pool nobody expected to be reachable.
+    ///
+    /// It is here rather than in the caller so that everything asking this
+    /// module what a break yields is asked the same question — the server, the
+    /// tests and `cargo xtask harness drops`, which scores Dust against a real
+    /// vanilla server and would otherwise be scoring a rule the server has and
+    /// it does not.
     pub fn roll(&self, ctx: &Break<'_>, rng: &mut Rng, out: &mut Vec<Drop>) {
+        if !harvestable(ctx) {
+            return;
+        }
         let start = out.len();
         for pool in &self.pools {
             if !all_pass(&pool.conditions, ctx, rng) {
@@ -416,6 +449,21 @@ impl Table {
 /// only question left is whether the tool is in it.
 fn tool_in_tag(tag: &str, item: Item) -> bool {
     tags::from_id(TagRegistry::Item, tag).is_some_and(|def| def.contains(item.name()))
+}
+
+/// Whether this break gets anything at all.
+///
+/// Minecraft's `Player.hasCorrectToolForDrops`: a state that does not require
+/// a correct tool always yields, and one that does yields only to an item
+/// whose `minecraft:tool` component says so. A wooden pickaxe on diamond ore
+/// is the case the whole rule exists for — it breaks the block, faster than a
+/// bare hand, and hands the player nothing.
+///
+/// **The block still breaks.** Nothing here refuses the break; a server that
+/// left the block standing because the tool was wrong would feel broken rather
+/// than strict, and it is not what vanilla does.
+fn harvestable(ctx: &Break<'_>) -> bool {
+    !ctx.requires_tool || dust_registry::mining::correct_for_drops(ctx.tool.item, ctx.state.block())
 }
 
 fn all_pass(conditions: &[Cond], ctx: &Break<'_>, rng: &mut Rng) -> bool {
@@ -544,7 +592,15 @@ fn apply(function: &Func, drop: &mut Drop, ctx: &Break<'_>, rng: &mut Rng) {
 /// call site, and a break should not hash a string to find out what it yielded.
 #[derive(Debug, Default)]
 pub struct Tables {
-    by_block: Vec<Option<Table>>,
+    /// Every table read, in the order the files were offered.
+    compiled: Vec<Table>,
+    /// Per block, which of them it draws from.
+    ///
+    /// An index and not a table, because a table is shared: about sixty blocks
+    /// on 1.21.1 draw from another block's file, and `blocks/oak_sign.json`
+    /// serves `oak_sign` and `oak_wall_sign` both. Compiling it twice would be
+    /// two answers to one question and twice the memory for them.
+    by_block: Vec<Option<u32>>,
     files: u32,
     refused_files: u32,
 }
@@ -556,13 +612,29 @@ impl Tables {
     /// `minecraft:stone` — which is the convention every vanilla block table
     /// follows. See [`Tables::table`] for what this does *not* claim.
     pub fn insert(&mut self, block: Block, json: &str) -> Result<(), CompileError> {
+        self.insert_for(std::slice::from_ref(&block), json)
+    }
+
+    /// Compile one file **once** and point every block that draws from it at
+    /// the result.
+    ///
+    /// Which blocks those are is `dust-blocks.tsv`'s answer and not this
+    /// module's: `Block.getLootTable` is a Java constant, `blocks/oak_sign.json`
+    /// serves two blocks and `blocks/bamboo.json` serves one, and there is no
+    /// rule about file names that says which. See
+    /// [`dust_registry::loot::BlockLoot`].
+    pub fn insert_for(&mut self, blocks: &[Block], json: &str) -> Result<(), CompileError> {
         self.files += 1;
         let table = compile(json)?;
-        let index = block.protocol_id() as usize;
-        if self.by_block.len() <= index {
-            self.by_block.resize_with(index + 1, || None);
+        let at = self.compiled.len() as u32;
+        self.compiled.push(table);
+        for block in blocks {
+            let index = block.protocol_id() as usize;
+            if self.by_block.len() <= index {
+                self.by_block.resize_with(index + 1, || None);
+            }
+            self.by_block[index] = Some(at);
         }
-        self.by_block[index] = Some(table);
         Ok(())
     }
 
@@ -584,12 +656,22 @@ impl Tables {
     /// about the second, which is why this answers the question it was asked
     /// and leaves the reading to the reader.
     pub fn table(&self, block: Block) -> Option<&Table> {
-        self.by_block.get(block.protocol_id() as usize)?.as_ref()
+        let at = (*self.by_block.get(block.protocol_id() as usize)?)?;
+        self.compiled.get(at as usize)
     }
 
     /// How many blocks have a table here.
     pub fn len(&self) -> usize {
         self.by_block.iter().filter(|slot| slot.is_some()).count()
+    }
+
+    /// How many distinct tables were compiled.
+    ///
+    /// Not the same number as [`Tables::len`] once a file can serve several
+    /// blocks, and the gap between them is what says the wall forms found
+    /// theirs: 982 files covering 1,042 blocks on 1.21.1.
+    pub fn distinct(&self) -> usize {
+        self.compiled.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -608,20 +690,12 @@ impl Tables {
 
     /// Entries refused across every table here.
     pub fn refused_entries(&self) -> u32 {
-        self.by_block
-            .iter()
-            .flatten()
-            .map(|table| table.refused())
-            .sum()
+        self.compiled.iter().map(Table::refused).sum()
     }
 
     /// Functions across every table here that want a block entity.
     pub fn needs_block_entity(&self) -> u32 {
-        self.by_block
-            .iter()
-            .flatten()
-            .map(|table| table.needs_block_entity())
-            .sum()
+        self.compiled.iter().map(Table::needs_block_entity).sum()
     }
 }
 

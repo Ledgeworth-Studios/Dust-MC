@@ -33,6 +33,7 @@ fn plain(state: BlockState) -> Break<'static> {
         state,
         tool: Tool::default(),
         broken_by_entity: true,
+        requires_tool: false,
         neighbours: &[],
     }
 }
@@ -43,6 +44,97 @@ fn roll(json: &str, ctx: &Break<'_>, seed: u64) -> Vec<Drop> {
     let mut out = Vec::new();
     table.roll(ctx, &mut Rng::from_seed(seed), &mut out);
     out
+}
+
+/// The rule a player feels in the first ten seconds of a survival world.
+///
+/// The block requires a correct tool, the hand is empty, and nothing comes
+/// out. The same break with a pickaxe gives the cobblestone — so the check has
+/// both halves, and a gate that refused everything would fail the second one.
+#[test]
+fn a_block_that_wants_a_tool_gives_a_bare_hand_nothing() {
+    let json = r#"{"type":"minecraft:block","pools":[{"rolls":1.0,"bonus_rolls":0.0,
+      "entries":[{"type":"minecraft:item","name":"minecraft:cobblestone"}]}]}"#;
+    let mut ctx = plain(state("minecraft:stone"));
+    ctx.requires_tool = true;
+    assert_eq!(roll(json, &ctx, 1), vec![]);
+    ctx.tool = Tool {
+        item: Some(item("minecraft:wooden_pickaxe")),
+        enchantments: &[],
+    };
+    assert_eq!(
+        roll(json, &ctx, 1),
+        vec![Drop {
+            item: item("minecraft:cobblestone"),
+            count: 1,
+        }]
+    );
+}
+
+/// The tier, which is the half of the rule a shovel cannot show. A wooden
+/// pickaxe mines diamond ore faster than a hand and gets nothing for it; an
+/// iron one gets the diamond.
+#[test]
+fn a_tool_below_the_tier_breaks_the_block_and_yields_nothing() {
+    let json = r#"{"type":"minecraft:block","pools":[{"rolls":1.0,"bonus_rolls":0.0,
+      "entries":[{"type":"minecraft:item","name":"minecraft:diamond"}]}]}"#;
+    let mut ctx = plain(state("minecraft:diamond_ore"));
+    ctx.requires_tool = true;
+    ctx.tool = Tool {
+        item: Some(item("minecraft:wooden_pickaxe")),
+        enchantments: &[],
+    };
+    assert_eq!(roll(json, &ctx, 1), vec![]);
+    ctx.tool = Tool {
+        item: Some(item("minecraft:iron_pickaxe")),
+        enchantments: &[],
+    };
+    assert_eq!(roll(json, &ctx, 1).len(), 1);
+}
+
+/// A block that does not ask is never refused, whatever is in the hand. The
+/// direction that would otherwise go wrong quietly: dirt with a bare hand is
+/// most of what a new player breaks.
+#[test]
+fn a_block_that_does_not_ask_yields_to_anything() {
+    let json = r#"{"type":"minecraft:block","pools":[{"rolls":1.0,"bonus_rolls":0.0,
+      "entries":[{"type":"minecraft:item","name":"minecraft:dirt"}]}]}"#;
+    let ctx = plain(state("minecraft:dirt"));
+    assert_eq!(roll(json, &ctx, 1).len(), 1);
+}
+
+/// One file, two blocks. `minecraft:oak_wall_sign` draws from
+/// `blocks/oak_sign.json`, which is a fact about `Block.getLootTable` and not
+/// about either name; what this pins is that `Tables` can hold it.
+#[test]
+fn one_table_can_serve_several_blocks() {
+    let json = r#"{"type":"minecraft:block","pools":[{"rolls":1.0,"bonus_rolls":0.0,
+      "entries":[{"type":"minecraft:item","name":"minecraft:oak_sign"}]}]}"#;
+    let sign = Block::from_name("minecraft:oak_sign").expect("a 1.21.1 block");
+    let wall = Block::from_name("minecraft:oak_wall_sign").expect("a 1.21.1 block");
+    let mut tables = Tables::default();
+    tables
+        .insert_for(&[sign, wall], json)
+        .expect("a table this test wrote");
+    assert_eq!(tables.len(), 2, "two blocks covered");
+    assert_eq!(tables.distinct(), 1, "out of one compiled table");
+    for block in [sign, wall] {
+        let mut out = Vec::new();
+        tables.table(block).expect("a table").roll(
+            &plain(block.default_state()),
+            &mut Rng::from_seed(7),
+            &mut out,
+        );
+        assert_eq!(
+            out,
+            vec![Drop {
+                item: item("minecraft:oak_sign"),
+                count: 1,
+            }],
+            "{}",
+            block.name()
+        );
+    }
 }
 
 /// One pool, one item entry, no conditions: the simplest table there is.

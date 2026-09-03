@@ -48,6 +48,7 @@ pub mod fluids;
 pub mod generated;
 pub mod items;
 pub mod loot;
+pub mod mining;
 pub mod placement;
 pub mod recipes;
 pub mod registry;

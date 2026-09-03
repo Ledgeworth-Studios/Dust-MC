@@ -17,6 +17,15 @@
 //   ( tail -f /tmp/mc-console | java -jar server.jar nogui > /tmp/mc.log 2>&1 & )
 //   DUST_SERVER_CONSOLE=/tmp/mc-console node drops.js 25701 blocks.txt --survival
 //
+// `--tool` takes a comma-separated list and every block is broken with every
+// one of them, because what a block drops is a question about the pair and not
+// about the block. `-` in that list is a **bare hand**, which is the row the
+// whole tool requirement is about: `stone` bare-handed yields nothing, and a
+// survey that only ever held a netherite pickaxe cannot see it.
+//
+//   DUST_SERVER_CONSOLE=/tmp/mc-console node drops.js 25701 blocks.txt \
+//     --survival --tool -,wooden_pickaxe,iron_pickaxe,shears
+//
 // Output is TSV on stdout and belongs in the operator's own scratch directory,
 // never in the repository: what a block drops is Minecraft's data.
 //
@@ -62,14 +71,18 @@ const port = Number(argv[0])
 if (!port) usage('a port is the first argument')
 let survival = false
 let gate = false
-let tool = 'netherite_pickaxe'
+let tools = ['netherite_pickaxe']
 const rest = []
 for (let i = 1; i < argv.length; i++) {
   if (argv[i] === '--survival') survival = true
   else if (argv[i] === '--check') gate = true
-  else if (argv[i] === '--tool') tool = argv[++i]
+  else if (argv[i] === '--tool') tools = argv[++i].split(',').filter(Boolean)
   else rest.push(argv[i])
 }
+// A bare hand is spelled `-` on the command line and in the output, because an
+// empty field in a TSV is invisible and a row whose tool column vanished reads
+// as one that was never written.
+const BARE = '-' 
 const console_path = process.env.DUST_SERVER_CONSOLE
 if (survival && !console_path) {
   usage('--survival builds its arena from the server console, so DUST_SERVER_CONSOLE must be set')
@@ -354,9 +367,14 @@ async function main () {
     say('gamerule randomTickSpeed 0')
     say('gamerule doTileDrops true')
     say(`gamemode survival Digger`)
-    say(`effect give Digger minecraft:haste 99999 5 true`)
+    // Haste at the top of its range and not at 5. A bare hand on obsidian is
+    // 5,000 ticks; at amplifier 5 that is still 113 seconds and every such row
+    // times out and reads as NOT BROKEN, which is a tool failure wearing a
+    // measurement's clothes. Haste changes how long a break takes and nothing
+    // about what comes out of it, so this survey can have as much of it as the
+    // game will give.
+    say(`effect give Digger minecraft:haste 99999 255 true`)
     say(`effect give Digger minecraft:saturation 99999 5 true`)
-    say(`give Digger ${tool}`)
     // A floor to stand the blocks on, and air above it so nothing falls in.
     say(`fill ${stood.x - 8} ${ARENA_Y} ${stood.z - 8} ${stood.x + 8} ${ARENA_Y + 4} ${stood.z + 8} minecraft:air`)
     say(`fill ${stood.x - 8} ${ARENA_Y - 1} ${stood.z - 8} ${stood.x + 8} ${ARENA_Y - 1} ${stood.z + 8} minecraft:stone`)
@@ -368,14 +386,42 @@ async function main () {
     // will not accept is a survey aimed at somewhere else.
     stood = b.entity.position.floored()
     at = stood.offset(4, 0, 0)
-    // The tool has to be in hand, not in the pack. Slot zero is where `/give`
-    // puts the first thing a bot is given.
+  }
+
+  // Put one tool in the player's hand, or nothing at all.
+  //
+  // The inventory is emptied first every time, because `/give` fills the next
+  // free slot rather than slot zero: a second `/give` without a clear leaves
+  // the first tool in hand and every row after it is about the wrong tool.
+  async function hold (which) {
+    if (!survival) return true
+    say(`clear Digger`)
+    await wait(250)
+    if (which !== BARE) {
+      say(`give Digger ${which}`)
+      await wait(300)
+    }
     b._client.write('held_item_slot', { slotId: 0 })
-    await wait(300)
+    await wait(250)
+    if (which === BARE) return true
+    const held = b.inventory.slots[36]
+    return Boolean(held) && held.name === which.replace('minecraft:', '')
   }
 
   const rows = []
-  for (const block of blocks) {
+  const pairs = []
+  for (const which of tools) {
+    for (const block of blocks) pairs.push([block, which])
+  }
+  let holding = null
+  for (const [block, tool] of pairs) {
+    if (tool !== holding) {
+      if (!(await hold(tool))) {
+        rows.push([block, tool, 'NO SUCH ITEM', 'not in hand'])
+        continue
+      }
+      holding = tool
+    }
     const name = block.replace('minecraft:', '')
     // Clear the cell first, so what is measured is this run's block and not
     // whatever the last one left.
@@ -446,15 +492,36 @@ async function main () {
     rows.push([block, tool, fresh.length ? 'BROKE' : 'NOTHING', spelled])
   }
 
-  const control = rows.find(row => row[0] === 'minecraft:' + CONTROL)
+  // Two controls and not one, and the second is the new half.
+  //
+  // A survey where every row says NOTHING and a survey where every row says
+  // NOTHING *because the tool was wrong* are the same file. So the positive
+  // control asks that a pickaxe on stone gives exactly one cobblestone, and
+  // where the run held a bare hand at all, the negative control asks that the
+  // same block with an empty hand gives nothing — the rule this survey exists
+  // to measure, checked in the direction that a broken harness cannot fake.
+  const control = rows.find(row => row[0] === 'minecraft:' + CONTROL && row[1] !== BARE)
   if (!control || control[2] !== 'BROKE' || control[3] !== CONTROL_YIELDS) {
     console.error(
-      `control failed: breaking ${CONTROL} with a ${tool} gave ` +
+      `control failed: breaking ${CONTROL} with ${control ? control[1] : 'a tool'} gave ` +
       `${control ? control[2] + ' ' + control[3] : 'no row at all'}, ` +
       `and it has to give ${CONTROL_YIELDS}. Nothing else this run saw is trustworthy.`
     )
     b.quit()
     process.exit(1)
+  }
+  if (survival && tools.includes(BARE)) {
+    const bare = rows.find(row => row[0] === 'minecraft:' + CONTROL && row[1] === BARE)
+    if (!bare || bare[2] !== 'NOTHING') {
+      console.error(
+        `negative control failed: breaking ${CONTROL} bare-handed gave ` +
+        `${bare ? bare[2] + ' ' + bare[3] : 'no row at all'}, and it has to break ` +
+        `and yield nothing. A run where the hand was never empty measures nothing ` +
+        `about the tool requirement.`
+      )
+      b.quit()
+      process.exit(1)
+    }
   }
 
   console.log('# block\ttool\toutcome\tdrops')

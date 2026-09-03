@@ -20,19 +20,24 @@
 //! registry for `<namespace>:<stem>` — which is why a namespace this build has
 //! never heard of contributes nothing rather than shadowing something.
 //!
-//! # What it does not do, and says so
+//! # Which block a file belongs to is the oracle's answer, not the name's
 //!
 //! Minecraft's block-to-table relation is a **code** constant
 //! (`Block.getLootTable`), and 982 of the 1,060 blocks on 1.21.1 point at a
 //! table of their own name while 78 do not. Some of those 78 genuinely drop
-//! nothing — bedrock, air, the command blocks — and about sixty point at
-//! another block's table: `minecraft:oak_wall_sign` drops an `oak_sign` out of
-//! `blocks/oak_sign.json`. **This reader has no way to know which is which**,
-//! so it reports the count and drops nothing for all 78, and the fix is one
-//! more column from the oracle rather than a rule about names.
+//! nothing — bedrock and air point at `minecraft:empty` — and about sixty
+//! point at another block's table: `minecraft:oak_wall_sign` drops an
+//! `oak_sign` out of `blocks/oak_sign.json`.
+//!
+//! `dust-blocks.tsv` is that relation, and with it here a file is compiled
+//! once and pointed at **every** block that draws from it. Without it this
+//! falls back to the file's own name, which is what it did before and is right
+//! about 982 blocks — so an operator who has not re-run the extractor keeps
+//! the server they had rather than losing one.
 
 use std::path::{Path, PathBuf};
 
+use dust_registry::loot::BlockLoot;
 use dust_sim::drops::Tables;
 
 /// Where the block tables live inside one namespace.
@@ -43,6 +48,13 @@ const UNDER: &str = "loot_table/blocks";
 pub struct Report {
     /// Namespaces that had a `loot_table/blocks` directory at all.
     pub namespaces: Vec<String>,
+    /// Whether the block-to-table relation was known, rather than guessed from
+    /// each file's own name.
+    pub relation_known: bool,
+    /// Blocks that draw from a file under another block's name — the wall
+    /// signs, wall banners, wall heads and coral wall fans. Zero without
+    /// `dust-blocks.tsv`, and that zero is the defect it fixes.
+    pub borrowed: usize,
     /// Files offered.
     pub files: u32,
     /// Blocks that now have a table.
@@ -72,10 +84,13 @@ const NAMED_ERRORS: usize = 5;
 /// will not parse makes exactly one block drop nothing, is named in the boot
 /// log, and a server that refused to start over one file in a data pack would
 /// be a server an operator cannot run.
-pub fn beside(root: impl AsRef<Path>) -> (Tables, Report) {
+pub fn beside(root: impl AsRef<Path>, loot: Option<&BlockLoot>) -> (Tables, Report) {
     let root = root.as_ref();
     let mut tables = Tables::default();
-    let mut report = Report::default();
+    let mut report = Report {
+        relation_known: loot.is_some(),
+        ..Report::default()
+    };
 
     let Ok(namespaces) = std::fs::read_dir(root) else {
         return (tables, report);
@@ -110,11 +125,29 @@ pub fn beside(root: impl AsRef<Path>) -> (Tables, Report) {
                 tables.refuse();
                 continue;
             };
-            let Some(block) = dust_sim::drops::block_of_file(&namespace, stem) else {
+            // Which blocks this file serves. The table id a file has is
+            // `<namespace>:blocks/<stem>` — that is the id Minecraft's own
+            // generator wrote it under — and the oracle's table says which
+            // blocks point at it. Falling back to the file's own name is the
+            // pre-0027 behaviour and is kept for an operator who has not
+            // re-run the extractor.
+            let drawn: Vec<dust_registry::Block> = match loot {
+                Some(loot) => loot
+                    .drawing_from(&format!("{namespace}:blocks/{stem}"))
+                    .to_vec(),
+                None => dust_sim::drops::block_of_file(&namespace, stem)
+                    .into_iter()
+                    .collect(),
+            };
+            if drawn.is_empty() {
                 report.unnamed += 1;
                 tables.refuse();
                 continue;
-            };
+            }
+            report.borrowed += drawn
+                .iter()
+                .filter(|block| block.name() != format!("{namespace}:{stem}"))
+                .count();
             let Ok(text) = std::fs::read_to_string(&path) else {
                 report
                     .errors
@@ -122,7 +155,7 @@ pub fn beside(root: impl AsRef<Path>) -> (Tables, Report) {
                 tables.refuse();
                 continue;
             };
-            if let Err(why) = tables.insert(block, &text) {
+            if let Err(why) = tables.insert_for(&drawn, &text) {
                 report.errors.push(format!("{namespace}:{stem}: {why}"));
             }
         }
@@ -145,7 +178,18 @@ impl Report {
             self.compiled
         );
         if self.unnamed > 0 {
-            line.push_str(&format!(", {} named after no block here", self.unnamed));
+            line.push_str(&format!(", {} no block draws from", self.unnamed));
+        }
+        if self.relation_known {
+            line.push_str(&format!(
+                ", {} of them drawing from another block's file",
+                self.borrowed
+            ));
+        } else {
+            line.push_str(
+                ", each matched to the block of its own name because there is no \
+                 dust-blocks.tsv, so about sixty wall blocks drop nothing",
+            );
         }
         if self.refused_entries > 0 {
             line.push_str(&format!(

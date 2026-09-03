@@ -927,13 +927,43 @@ impl Server {
         }
         let item_blocks = item_blocks.map(std::sync::Arc::new);
 
+        // Which loot table each block draws from, which is a Java constant and
+        // so comes from the oracle rather than from the data pack. Read before
+        // the tables themselves, because it is what says which blocks a file
+        // serves. See decision record 0027.
+        let block_loot = match data_path.as_deref() {
+            None => None,
+            Some(path) => crate::registries::constants::blocks_beside(path)
+                .map_err(|e| fail(format!("{e}")))?,
+        };
+        match &block_loot {
+            Some(table) => self.options.logger.info(
+                "dust::data",
+                format!(
+                    "block loot: {} block(s) over {} table(s), {} drawing from a table \
+                     named after another block",
+                    table.len(),
+                    table.tables(),
+                    table.elsewhere()
+                ),
+            ),
+            None => self.options.logger.info(
+                "dust::data",
+                format!(
+                    "no {} under [data] path, so a loot table is matched to the block \
+                     of its own name and about sixty wall blocks drop nothing",
+                    crate::registries::constants::BLOCKS_FILE
+                ),
+            ),
+        }
+
         // The third thing read out of `[data] path`, and the only one that is
         // Minecraft's own file rather than a table extracted from its jar:
         // what a broken block yields. See `registries::drops`.
         let (drops, drops_report) = match data_path.as_deref() {
             None => (dust_sim::drops::Tables::default(), None),
             Some(path) => {
-                let (tables, report) = crate::registries::drops::beside(path);
+                let (tables, report) = crate::registries::drops::beside(path, block_loot.as_ref());
                 (tables, Some(report))
             }
         };
@@ -1151,6 +1181,12 @@ impl Server {
             })?,
             counters: std::sync::Arc::clone(&counters),
             constants: constants.clone(),
+            // Resolved once here rather than per break. `None` when the table
+            // predates the column, which reads as "no block wants a tool" —
+            // the generous direction, and the server the operator had.
+            requires_tool: constants
+                .as_deref()
+                .and_then(|table| table.flag("requires_tool")),
             item_blocks,
             registry_contents,
             items: std::sync::Arc::clone(&items),
