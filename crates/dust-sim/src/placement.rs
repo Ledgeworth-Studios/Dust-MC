@@ -53,7 +53,7 @@
 
 use dust_registry::constants::Flag;
 use dust_registry::tags::TagRegistry;
-use dust_registry::{Block, BlockConstants, BlockState};
+use dust_registry::{Block, BlockConstants, BlockState, WallForm};
 
 /// Which face of a block was clicked.
 ///
@@ -196,6 +196,66 @@ pub fn state_for(block: Block, click: Click) -> BlockState {
     watered(oriented(block, click), click)
 }
 
+/// The state an item with **two** blocks puts down.
+///
+/// A sign, a torch, a banner and a head each have a standing form and a wall
+/// form, and which one goes down is decided by the face that was clicked. The
+/// item carries both blocks — `StandingAndWallBlockItem` in Java, two more
+/// columns of `dust-items.tsv` here — because nothing else relates them: a
+/// torch and a wall torch share no property and no name a rule could derive.
+///
+/// **The attachment direction is data and not an assumption.** A sign stands
+/// on the ground and attaches `down`, so clicking the *top* of a block puts a
+/// standing sign above it. A **hanging** sign attaches `up`, so the same click
+/// puts nothing at all and clicking the *underside* is what hangs one.
+///
+/// Three of the six faces are settled here and the other three are not, which
+/// is what the survey could say:
+///
+/// * the face **opposite** the attachment puts down the standing form;
+/// * the four **horizontal** faces put down the wall form, facing out of the
+///   wall — measured, and it is the clicked face rather than the player's look;
+/// * the attachment's own face puts down neither and vanilla refuses. This
+///   keeps the standing form there, which is what it did before and is right
+///   for a skull, whose standing form needs nothing to hold it up.
+///
+/// **A hanging sign keeps its old answer on a wall**, deliberately. Its wall
+/// form faces *across* the wall rather than out of it — a north face gives
+/// `west` and an east face gives `south`, which is not a function of the
+/// clicked face — and the grid was taken at one yaw, so it cannot say which of
+/// the two perpendicular directions wins. A wall block facing the wrong way is
+/// wrong in a way a player sees; the standing form is wrong in the way it
+/// already was.
+#[must_use]
+pub fn state_for_item(standing: Block, wall: Option<WallForm>, click: Click) -> BlockState {
+    let Some(form) = wall else {
+        return state_for(standing, click);
+    };
+    let Some(attaches) = Face::from_direction(form.attaches) else {
+        return state_for(standing, click);
+    };
+    if click.face == attaches.opposite() || form.attaches != "down" {
+        return state_for(standing, click);
+    }
+    let Some(facing) = on_wall(form.block, click) else {
+        return state_for(standing, click);
+    };
+    watered(facing, click)
+}
+
+/// The wall form's own state: it faces out of the wall it is on.
+///
+/// `None` for a block with no horizontal `facing`, which no wall form in this
+/// version is — asked rather than assumed, because the answer decides whether
+/// the wall form is used at all.
+fn on_wall(block: Block, click: Click) -> Option<BlockState> {
+    let values = values_of(block, "facing")?;
+    if !same_set(values, HORIZONTAL) {
+        return None;
+    }
+    block.default_state().with("facing", click.face.direction())
+}
+
 /// The state the click's four numbers alone imply.
 fn oriented(block: Block, click: Click) -> BlockState {
     let state = block.default_state();
@@ -227,6 +287,9 @@ fn oriented(block: Block, click: Click) -> BlockState {
         return state;
     }
     if let Some(state) = as_leaves(block, state) {
+        return state;
+    }
+    if let Some(state) = as_turned(block, state, click) {
         return state;
     }
     state
@@ -326,6 +389,39 @@ fn as_doubled(block: Block, click: Click) -> Option<BlockState> {
         Some(dry) => dry,
         None => doubled,
     })
+}
+
+/// A sign, a banner or a head standing on the ground: sixteen ways round.
+///
+/// One property and **two** rules, which is the thing worth writing down. A
+/// sign and a banner face *the player*, so their segment is taken of the yaw
+/// turned half round; a head faces *the same way as the player*, so its
+/// segment is taken of the yaw itself. Both were read off the grid: at yaw 180
+/// a sign is `rotation=0` and a skull is `rotation=8`, and no single rule gives
+/// both.
+///
+/// Which of the two a block gets is `powered` — a head has it and a sign does
+/// not — and that is a shape rather than a list of seven skulls.
+///
+/// The arithmetic is Minecraft's `RotationSegment.convertToSegment`: sixteen
+/// segments of 22.5 degrees, rounded to the nearest and wrapped. Written with
+/// `rem_euclid` for the same reason `looking` is: a yaw off the wire may be
+/// negative, and a mask on a negative number is not the segment.
+fn as_turned(block: Block, state: BlockState, click: Click) -> Option<BlockState> {
+    let values = values_of(block, "rotation")?;
+    if values.len() != 16 {
+        return None;
+    }
+    let facing_away = values_of(block, "powered").is_some();
+    let degrees = if facing_away {
+        click.yaw
+    } else {
+        click.yaw + 180.0
+    };
+    let segment = (f64::from(degrees) * 16.0 / 360.0 + 0.5)
+        .floor()
+        .rem_euclid(16.0);
+    state.with("rotation", values[segment as usize])
 }
 
 /// Leaves a **player** put down do not decay.
@@ -1641,6 +1737,105 @@ mod tests {
             block("minecraft:scaffolding").default_state()
         )
         .is_none());
+    }
+
+    /// The wall form an item carries, as the item table hands it over.
+    fn wall(name: &str, attaches: &'static str) -> WallForm {
+        WallForm {
+            block: block(name),
+            attaches,
+        }
+    }
+
+    #[test]
+    fn a_torch_on_a_wall_is_a_wall_torch_and_on_the_ground_is_a_torch() {
+        let torch = block("minecraft:torch");
+        let form = Some(wall("minecraft:wall_torch", "down"));
+        // The top of a block: it stands on it.
+        let up = state_for_item(torch, form, click(Face::Up, 0.0, 0.25));
+        assert_eq!(up.block().name(), "minecraft:torch");
+        // A side: it goes on the wall, facing out of it. Measured — the
+        // clicked face and not the player's look, which at yaw 0 would have
+        // given south for every one of these.
+        for (face, facing) in [
+            (Face::North, "north"),
+            (Face::South, "south"),
+            (Face::East, "east"),
+            (Face::West, "west"),
+        ] {
+            let on = state_for_item(torch, form, click(face, 0.0, 0.25));
+            assert_eq!(on.block().name(), "minecraft:wall_torch", "{facing}");
+            assert_eq!(value(&on.properties(), "facing"), facing);
+        }
+    }
+
+    #[test]
+    fn an_item_with_no_wall_form_is_untouched_by_the_rule() {
+        // The 872 items that have one block, and the case a table written
+        // before the columns puts *every* item in.
+        let stone = block("minecraft:stone");
+        for face in [Face::Up, Face::North, Face::Down] {
+            assert_eq!(
+                state_for_item(stone, None, click(face, 0.0, 0.25)),
+                state_for(stone, click(face, 0.0, 0.25))
+            );
+        }
+        let sign = block("minecraft:oak_sign");
+        assert_eq!(
+            state_for_item(sign, None, click(Face::North, 0.0, 0.25)).block(),
+            sign,
+            "no table, no wall sign — the answer it always gave"
+        );
+    }
+
+    #[test]
+    fn a_hanging_sign_attaches_upward_and_keeps_its_old_answer_on_a_wall() {
+        // The attachment direction is why the columns carry it. The face that
+        // stands a sign up hangs nothing, and the face that hangs one is the
+        // one a sign refuses.
+        let hanging = block("minecraft:oak_hanging_sign");
+        let form = Some(wall("minecraft:oak_wall_hanging_sign", "up"));
+        assert_eq!(
+            state_for_item(hanging, form, click(Face::Down, 0.0, 0.25)).block(),
+            hanging
+        );
+        // And on a wall it is left alone, because the wall form faces *across*
+        // the wall rather than out of it and the grid was taken at one yaw.
+        assert_eq!(
+            state_for_item(hanging, form, click(Face::North, 0.0, 0.25)).block(),
+            hanging
+        );
+    }
+
+    #[test]
+    fn a_sign_faces_the_player_and_a_skull_faces_the_way_they_look() {
+        // One property, two rules, and no single one gives both: at yaw 180 a
+        // sign is segment 0 and a skull is segment 8.
+        let checks = [
+            ("minecraft:oak_sign", 180.0, "0"),
+            ("minecraft:oak_sign", 90.0, "12"),
+            ("minecraft:black_banner", 90.0, "12"),
+            ("minecraft:skeleton_skull", 180.0, "8"),
+            ("minecraft:skeleton_skull", 90.0, "4"),
+        ];
+        for (name, yaw, segment) in checks {
+            assert_eq!(
+                value(
+                    &state_for(block(name), click(Face::Up, yaw, 0.25)).properties(),
+                    "rotation"
+                ),
+                segment,
+                "{name} at {yaw}"
+            );
+        }
+        // A yaw that has gone round more than once still lands in the sixteen.
+        assert_eq!(
+            value(
+                &state_for(block("minecraft:oak_sign"), click(Face::Up, -270.0, 0.25)).properties(),
+                "rotation"
+            ),
+            "12"
+        );
     }
 
     #[test]

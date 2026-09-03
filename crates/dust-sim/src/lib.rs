@@ -14,4 +14,4 @@
 
 pub mod placement;
 
-pub use placement::{replaces_beside, replaces_clicked, state_for, Click, Face};
+pub use placement::{replaces_beside, replaces_clicked, state_for, state_for_item, Click, Face};

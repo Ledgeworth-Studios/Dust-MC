@@ -1555,13 +1555,13 @@ where
 /// server with no `[data] path` behaving the way it always has rather than
 /// refusing right-clicks.
 fn held_block(
-    holding: Option<dust_registry::Block>,
+    holding: Option<(dust_registry::Block, Option<dust_registry::WallForm>)>,
     fallback: u32,
     hit: &play::serverbound::BlockHit,
     rotation: (f32, f32),
     into: dust_registry::BlockState,
 ) -> u32 {
-    let Some(block) = holding else {
+    let Some((block, wall)) = holding else {
         return fallback;
     };
     // A face the protocol does not have is one this server has no answer for;
@@ -1572,7 +1572,7 @@ fn held_block(
     let Some(click) = click(hit, rotation, into) else {
         return block.default_state().id();
     };
-    dust_sim::placement::state_for(block, click).id()
+    dust_sim::placement::state_for_item(block, wall, click).id()
 }
 
 /// The block a held item puts down, if there is a table to ask and an item to
@@ -1585,8 +1585,15 @@ fn held_block(
 fn held_place(
     table: Option<&dust_registry::ItemBlocks>,
     held: Option<dust_registry::Item>,
-) -> Option<dust_registry::Block> {
-    table.zip(held).and_then(|(table, item)| table.places(item))
+) -> Option<(dust_registry::Block, Option<dust_registry::WallForm>)> {
+    let (table, item) = table.zip(held)?;
+    let block = table.places(item)?;
+    // The wall form, for the fifty-three items that have two blocks. A table
+    // written before those columns says nothing rather than *no*, and
+    // `has_walls` is the question that tells the two apart — the same trap the
+    // `replaceable` column already paid for once.
+    let wall = table.has_walls().then(|| table.on_wall(item)).flatten();
+    Some((block, wall))
 }
 
 /// A right-click, as `dust_sim::placement` reads one.
@@ -1686,7 +1693,7 @@ fn placement(
     constants: Option<&dust_registry::BlockConstants>,
     clicked: dust_protocol::types::Position,
     hit: &play::serverbound::BlockHit,
-    holding: Option<dust_registry::Block>,
+    holding: Option<(dust_registry::Block, Option<dust_registry::WallForm>)>,
     rotation: (f32, f32),
 ) -> Option<dust_protocol::types::Position> {
     let beside = offset(clicked, hit.face);
@@ -1702,7 +1709,8 @@ fn placement(
     // And with no block in hand there is nothing for the item-aware half of
     // the rule to be about, so it is the plain column on its own — exactly
     // what this did before that half existed.
-    let (Some(block), Some(click)) = (holding, click(hit, rotation, cell(world, clicked))) else {
+    let (Some((block, _)), Some(click)) = (holding, click(hit, rotation, cell(world, clicked)))
+    else {
         return if table.replaceable(world.block_at(clicked)) {
             Some(clicked)
         } else {
@@ -2305,7 +2313,7 @@ mod tests {
                 Some(&table),
                 at,
                 &hit(1, 0.5),
-                Some(snow),
+                Some((snow, None)),
                 (0.0, 0.0)
             ),
             Some(Position { y: at.y + 1, ..at }),
@@ -2324,16 +2332,22 @@ mod tests {
                 Some(&table),
                 at,
                 &hit(1, 0.5),
-                Some(snow),
+                Some((snow, None)),
                 (0.0, 0.0)
             ),
             Some(at),
             "into the drift, which then gets a fourth layer"
         );
         assert_eq!(
-            held_block(Some(snow), FALLBACK, &hit(1, 0.5), (0.0, 0.0), shallow)
-                .pipe_state()
-                .property("layers"),
+            held_block(
+                Some((snow, None)),
+                FALLBACK,
+                &hit(1, 0.5),
+                (0.0, 0.0),
+                shallow
+            )
+            .pipe_state()
+            .property("layers"),
             Some("4")
         );
     }
@@ -2357,13 +2371,13 @@ mod tests {
             Some(&table),
             at,
             &hit(1, 0.5),
-            Some(fence),
+            Some((fence, None)),
             (0.0, 0.0),
         );
         assert_eq!(target, Some(at), "into the water and not above it");
         assert_eq!(
             held_block(
-                Some(fence),
+                Some((fence, None)),
                 FALLBACK,
                 &hit(1, 0.5),
                 (0.0, 0.0),

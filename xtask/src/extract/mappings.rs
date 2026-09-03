@@ -490,6 +490,31 @@ pub const LIGHT_ORACLE: &[Wanted<'static>] = &[
         class: BLOCK_ITEM,
         field: "block",
     },
+    // The other block an item can put down. A sign, a torch, a banner and a
+    // head each have a **wall** form, and the item carries it in a field of
+    // `StandingAndWallBlockItem` — a second `Block`, alongside `BlockItem`'s
+    // own. Which of the two goes down is a rule; *which block the wall form
+    // is* is data, and there is nowhere else to get it: the two blocks are
+    // related only by the item that holds both.
+    //
+    // `attachmentDirection` beside it is what a rule cannot guess. A sign
+    // stands on the ground and hangs from a wall, so its attachment is `down`;
+    // a **hanging** sign hangs from the ceiling and its attachment is `up`, and
+    // the same clicked face gives the two of them different answers.
+    Wanted::Class {
+        key: "standingandwall.class",
+        class: STANDING_AND_WALL_BLOCK_ITEM,
+    },
+    Wanted::Field {
+        key: "standingandwall.wall_block",
+        class: STANDING_AND_WALL_BLOCK_ITEM,
+        field: "wallBlock",
+    },
+    Wanted::Field {
+        key: "standingandwall.attachment",
+        class: STANDING_AND_WALL_BLOCK_ITEM,
+        field: "attachmentDirection",
+    },
     Wanted::Class {
         key: "builtin_registries.class",
         class: BUILT_IN_REGISTRIES,
@@ -534,6 +559,7 @@ const HEIGHTMAP_TYPES: &str = "net.minecraft.world.level.levelgen.Heightmap$Type
 const SOUND_TYPE: &str = "net.minecraft.world.level.block.SoundType";
 const SOUND_EVENT: &str = "net.minecraft.sounds.SoundEvent";
 const BLOCK_ITEM: &str = "net.minecraft.world.item.BlockItem";
+const STANDING_AND_WALL_BLOCK_ITEM: &str = "net.minecraft.world.item.StandingAndWallBlockItem";
 const BUILT_IN_REGISTRIES: &str = "net.minecraft.core.registries.BuiltInRegistries";
 const REGISTRY: &str = "net.minecraft.core.Registry";
 

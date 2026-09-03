@@ -477,6 +477,14 @@ fn dust_state_id(
         // Reported rather than silently assumed: `measure` says which it used.
         None => Block::from_name(item.name())?,
     };
+    // The **second** block, for the fifty-three items that have one. Absent
+    // from a table written before the columns, and asking `has_walls` rather
+    // than reading `None` off `on_wall` is the difference between "this item
+    // has no wall form" and "this file cannot say".
+    let wall = items
+        .as_ref()
+        .filter(|table| table.has_walls())
+        .and_then(|table| table.on_wall(item));
     let click = Click {
         face: Face::from_protocol(answer.face)?,
         cursor_y: answer.cursor_y.parse().ok()?,
@@ -484,7 +492,7 @@ fn dust_state_id(
         pitch: answer.pitch,
         into: into(answer),
     };
-    let placed = dust_sim::placement::state_for(block, click);
+    let placed = dust_sim::placement::state_for_item(block, wall, click);
     let Some(solid) = solid else {
         return Some(placed);
     };
@@ -669,11 +677,21 @@ fn load_items(given: Option<&Path>) -> Result<Option<ItemBlocks>, String> {
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("could not read {}: {e}", path.display()))?;
     let table = ItemBlocks::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    println!(
-        "items: {} placements from {}",
-        table.placing(),
-        path.display()
-    );
+    if table.has_walls() {
+        println!(
+            "items: {} placements and {} wall forms from {}",
+            table.placing(),
+            table.on_walls(),
+            path.display()
+        );
+    } else {
+        println!(
+            "items: {} placements from {}, which is a table written before the wall columns — \
+             so a sign, a torch and a banner go down standing on every face",
+            table.placing(),
+            path.display()
+        );
+    }
     Ok(Some(table))
 }
 
