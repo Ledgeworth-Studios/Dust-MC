@@ -17,7 +17,7 @@
 //! anywhere they walked to. Only a column nobody is keeping is **built** here,
 //! on the session's own task, which is what every column cost before
 //! [`super::residency`] existed. See
-//! [D21](../../../../docs/decisions/0021-who-keeps-a-chunk-column.md).
+//! [D25](../../../../docs/decisions/0025-who-keeps-a-chunk-column.md).
 //!
 //! The four-entry cache below is still worth having and is now a different
 //! thing: it saves the residency's read lock, not a region read. What it holds

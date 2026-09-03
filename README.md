@@ -216,16 +216,24 @@ microseconds of a 50-millisecond tick, and a thousand with nobody near cost
 [0022](docs/decisions/0022-what-a-broken-block-yields.md) and
 [0023](docs/decisions/0023-what-shape-an-entity-has.md) are the accounts.
 
+The server **keeps the columns its players and its falling items are near**,
+once, shared, and reads region files on a thread of the world's own rather than
+on the network path or the tick loop. On a world Minecraft wrote, the worst
+single movement packet of a walk into new terrain went from 19.2 milliseconds to
+0.074, and a falling item's tick from 555 microseconds to 75. A column is 111
+kilobytes, measured, not the megabyte three modules claimed. Decision record
+[0025](docs/decisions/0025-who-keeps-a-chunk-column.md) is the account, and says
+what it costs at 1, 10 and 100 players — which is *more* memory, for a reason
+that is about the player and not about the megabytes.
+
 **Not yet**, and each of these is stated where the code for it would go: no
 physics or block updates, so a player is stopped from
-entering a block and never pushed out of one; **no chunk residency**, so a
-movement check on a world read from region files rebuilds a column out of a
-region file every time a walking player leaves the four they carry, and costs
-8.8 microseconds a packet instead of 0.4 — decision record
-[0020](docs/decisions/0020-what-a-movement-check-really-costs-on-a-saved-world.md)
-has the counts, and the same missing cache is what makes a *falling item* on
-such a world cost 558 microseconds a tick against 38 on a flat one; **no water
-on the movement path**,
+entering a block and never pushed out of one; **no residency for the chunks a
+client is looking at**, so a join still builds and sends 289 columns on the
+session's own task — which is now the largest blocking region-file cost left in
+the server, larger than the one residency removed, and record
+[0025](docs/decisions/0025-who-keeps-a-chunk-column.md) says so at the end;
+**no water on the movement path**,
 so a player who says they are sprinting and airborne is measured at their feet
 rather than at their full height, because they might be swimming and no client
 ever says so — decision record
