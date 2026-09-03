@@ -388,6 +388,9 @@ struct Scores {
     /// produce one, so a run with any is a run with something unexplained in
     /// it.
     opened_wrongly: u64,
+    /// Cells below Minecraft's surface that Minecraft left open and Dust
+    /// filled with the dimension's fluid — what an aquifer would be worth.
+    flooded: u64,
     cells: u64,
     block_agree: u64,
     /// What Minecraft has where Dust is wrong, most common first.
@@ -644,9 +647,38 @@ fn measure(options: &Options) -> Result<(), String> {
             let built = build(rung, chunk, surface, &model, &mut sampler);
             scores.built += started.elapsed();
             weigh(&built, &mut scores);
-            score(&built, chunk, surface, &blocks, &names, height, &mut scores);
+            score(
+                &built,
+                chunk,
+                surface,
+                &blocks,
+                &names,
+                height,
+                model.fluid,
+                &mut scores,
+            );
         }
         report(rung, &scores);
+        if rung == Rung::Surface {
+            // Counted, not assumed. `minecraft:temperature` answers `false`
+            // without looking and the badlands bands are the one table in the
+            // rules that is not in the pack, so both are worth a number: a gap
+            // nobody's world reaches is not a gap, and one that every column
+            // reaches is the next piece of work.
+            println!(
+                "      {} of those {} missing cave cell(s) are pockets Dust flooded with {}, \
+                 which is what an aquifer would be worth",
+                scores.flooded,
+                scores.carved - scores.carved_open,
+                source.settings().default_fluid.name
+            );
+            let (temperature, bandlands) = sampler.declined();
+            println!(
+                "      the rules asked `minecraft:temperature` {temperature} time(s), which this \
+                 generator answers `false` without looking, and a badlands band decided \
+                 {bandlands} block(s)"
+            );
+        }
         ladder.push((rung, scores));
     }
     summary(&ladder);
@@ -871,6 +903,7 @@ fn weigh(chunk: &Chunk, scores: &mut Scores) {
 }
 
 /// Score one built chunk against the one Minecraft wrote.
+#[allow(clippy::too_many_arguments)]
 fn score(
     dust: &Chunk,
     vanilla: &Chunk,
@@ -878,6 +911,7 @@ fn score(
     blocks: &Blocks,
     names: &RegistryNames,
     height: WorldHeight,
+    model_fluid: u32,
     scores: &mut Scores,
 ) {
     let dust_surface = surface_of(dust);
@@ -933,7 +967,20 @@ fn score(
                         scores.carved += 1;
                         scores.carved_open += 1;
                     }
-                    (true, false) => scores.carved += 1,
+                    (true, false) => {
+                        scores.carved += 1;
+                        // ... and of those, the ones Dust filled with the
+                        // dimension's own fluid rather than its rock. That is
+                        // the aquifer's share of the cave score: vanilla runs
+                        // its noise caves through an aquifer that leaves most
+                        // of them dry, and a generator without one floods
+                        // every pocket below the sea level. Kept apart because
+                        // it is a *different* stage from carving and a single
+                        // "caves missing" count cannot say which owns it.
+                        if built == model_fluid {
+                            scores.flooded += 1;
+                        }
+                    }
                     (false, true) => scores.opened_wrongly += 1,
                     (false, false) => {}
                 }
@@ -1401,6 +1448,10 @@ mod tests {
             &mut source.columns(),
         );
         let mut scores = Scores::default();
+        let water = dust_registry::Block::from_name("minecraft:water")
+            .expect("water")
+            .default_state()
+            .id();
         score(
             &built,
             &vanilla,
@@ -1408,6 +1459,7 @@ mod tests {
             &blocks,
             &names,
             height,
+            water,
             &mut scores,
         );
         assert_eq!(scores.block_agree, scores.cells, "blocks");
@@ -1451,6 +1503,10 @@ mod tests {
         built.recompute_heightmaps(world::heightmap_predicate(blocks.palette.air, None));
 
         let mut scores = Scores::default();
+        let water = dust_registry::Block::from_name("minecraft:water")
+            .expect("water")
+            .default_state()
+            .id();
         score(
             &built,
             &vanilla,
@@ -1458,6 +1514,7 @@ mod tests {
             &blocks,
             &names,
             height,
+            water,
             &mut scores,
         );
         assert_eq!(scores.block_agree, scores.cells - 1, "exactly one cell");
@@ -1498,6 +1555,10 @@ mod tests {
                 &blocks,
                 &names,
                 height,
+                dust_registry::Block::from_name("minecraft:water")
+                    .expect("water")
+                    .default_state()
+                    .id(),
                 &mut scores,
             );
             assert_eq!(scores.carved, 16, "4x4 cells of cave_air");
