@@ -272,7 +272,33 @@ const SCRIPT = [
   ['it takes an armour slot', DRAG, 6, 1],
   ['it takes an ordinary slot', DRAG, 17, 1],
   ['and ends', DRAG, OUTSIDE, 2],
-  ['put the remainder down', PICKUP, 18, 0]
+  ['put the remainder down', PICKUP, 18, 0],
+
+  // A second reseed, for the rules the section above still cannot reach. Every
+  // wearable in it above is worn one to a slot *and* stacks to one, so a
+  // container that never asked the slot for its limit and only ever asked the
+  // item would agree with the game on all of them. `minecraft:player_head` is
+  // the case that separates the two: worn on the head and stacks to 64. The
+  // elytra and the carved pumpkin are here because they are worn and are in no
+  // tag that says so.
+  ['clear the board for the stacking wearables', SEED_STEP, 0, 0],
+  ['shift click a stack of nine heads', QUICK_MOVE, 9, 0],
+  ['shift click an elytra', QUICK_MOVE, 10, 0],
+  ['shift click a shield into an empty offhand', QUICK_MOVE, 12, 0],
+  ['shift click the head back off', QUICK_MOVE, 5, 0],
+  ['pick up a carved pumpkin', PICKUP, 11, 0],
+  ['left click it onto the head', PICKUP, 5, 0],
+  ['pick up the stack of heads', PICKUP, 9, 0],
+  ['left click nine heads at a head wearing a pumpkin', PICKUP, 5, 0],
+  ['swap them for the helmet in the inventory', PICKUP, 13, 0],
+  ['right click that helmet onto the head', PICKUP, 5, 1],
+  ['pick up three heads with the pumpkin in hand', PICKUP, 14, 0],
+  ['shift click the boots out of the hotbar', QUICK_MOVE, 37, 0],
+  ['right click three heads at a head wearing a helmet', PICKUP, 5, 1],
+  ['shift the helmet off with a full hand', QUICK_MOVE, 5, 0],
+  ['right click one head onto the bare head', PICKUP, 5, 1],
+  ['put the rest down', PICKUP, 16, 0],
+  ['Q the elytra off the chest', THROW, 6, 1]
 ]
 
 // What the mid-script reseed writes. Slot 0 is the crafting output and is
@@ -297,6 +323,32 @@ const RESEED = new Map([
   [37, ['netherite_helmet', 1]],
   [45, ['egg', 2]]
 ])
+
+// The second reseed. Nothing here stacks the same way twice: nine heads at 64,
+// an elytra and a carved pumpkin at 1, and a helmet to be swapped for.
+const RESEED2 = new Map([
+  [1, [null, 0]],
+  [5, [null, 0]],
+  [6, [null, 0]],
+  [7, [null, 0]],
+  [8, [null, 0]],
+  [9, ['player_head', 9]],
+  [10, ['elytra', 1]],
+  [11, ['carved_pumpkin', 1]],
+  [12, ['shield', 1]],
+  [13, ['diamond_helmet', 1]],
+  [14, ['player_head', 3]],
+  [15, [null, 0]],
+  [16, [null, 0]],
+  [17, [null, 0]],
+  [18, [null, 0]],
+  [36, [null, 0]],
+  [37, ['iron_boots', 1]],
+  [45, [null, 0]]
+])
+
+// The reseeds in the order the script reaches them.
+const RESEEDS = [RESEED, RESEED2]
 
 async function record (port, out) {
   const bot = await spawned(port, 'Clicker')
@@ -329,12 +381,14 @@ async function record (port, out) {
   }
 
   const steps = [{ step: 'seeded', ...snapshot(state) }]
+  let reseeds = 0
   for (const [name, mode, slot, button] of SCRIPT) {
     if (mode === SEED_STEP) {
+      const reseed = RESEEDS[reseeds++]
       state.told.clear()
-      for (const [at, [what, count]] of RESEED) creativeSlot(bot, at, what, count)
+      for (const [at, [what, count]] of reseed) creativeSlot(bot, at, what, count)
       await wait(SPAWN_SETTLE_MS)
-      for (const [at, [what, count]] of RESEED) {
+      for (const [at, [what, count]] of reseed) {
         if (state.told.has(at)) continue
         state.slots[at] = what ? { name: what, count } : null
       }

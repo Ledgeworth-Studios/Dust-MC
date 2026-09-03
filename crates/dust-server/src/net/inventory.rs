@@ -733,6 +733,49 @@ impl Inventory {
 
     /// Shift-click: send the stack where a real client sends it.
     ///
+    /// Vanilla's `AbstractContainerMenu.clicked` does not call
+    /// `quickMoveStack` once. It calls it **in a loop**, until a call moves
+    /// nothing or the slot no longer holds the same item, and that loop is not
+    /// a detail — it is the only reason shift-clicking a stack of nine player
+    /// heads works. The first pass sees an empty head slot and moves one head
+    /// there, because an armour slot holds one. The second pass sees the head
+    /// slot occupied, takes a different arm entirely, and sends the other eight
+    /// to the hotbar. A single pass leaves eight heads sitting in the slot the
+    /// player shift-clicked, which is what this did until a real server was
+    /// asked.
+    fn quick_move(&mut self, slot: i16, changed: &mut Changed) {
+        let Ok(index) = usize::try_from(slot) else {
+            return;
+        };
+        if index >= SLOTS {
+            return;
+        }
+        loop {
+            let Some(mut stack) = self.slots[index] else {
+                return;
+            };
+            let destination = self.quick_move_destination(index, stack.item);
+            self.slots[index] = None;
+            let before = stack.count;
+            self.move_to(destination, &mut stack, changed);
+            if stack.count == before {
+                // Nowhere for any of it to go. Vanilla leaves the slot alone
+                // and so does this: a shift-click that moves nothing must not
+                // report a change, or the client redraws a slot that did not
+                // move.
+                self.slots[index] = Some(stack);
+                return;
+            }
+            changed.mark(index);
+            if stack.count == 0 {
+                return;
+            }
+            self.slots[index] = Some(stack);
+        }
+    }
+
+    /// Where one pass of a shift-click sends what is in this slot.
+    ///
     /// Vanilla's `InventoryMenu.quickMoveStack`, arm for arm and in its order,
     /// because the order *is* the rule: the equipment arms sit between the
     /// container's two halves, so a helmet in the main inventory goes to the
@@ -746,40 +789,20 @@ impl Inventory {
     /// - the main inventory goes to the hotbar,
     /// - the hotbar goes to the main inventory,
     /// - anything else — the offhand — goes to the inventory as a whole.
-    fn quick_move(&mut self, slot: i16, changed: &mut Changed) {
-        let Ok(index) = usize::try_from(slot) else {
-            return;
-        };
-        if index >= SLOTS {
-            return;
+    fn quick_move_destination(&self, index: usize, item: Item) -> std::ops::Range<usize> {
+        if index < ARMOUR_END {
+            return MAIN_START..HOTBAR_END;
         }
-        let Some(mut stack) = self.slots[index] else {
-            return;
-        };
-        let worn = worn_in(stack.item).filter(|&to| self.slots[to].is_none());
-        let destination = if index < ARMOUR_END {
-            MAIN_START..HOTBAR_END
-        } else if let Some(to) = worn {
-            to..to + 1
-        } else if (MAIN_START..MAIN_END).contains(&index) {
+        if let Some(to) = worn_in(item).filter(|&to| self.slots[to].is_none()) {
+            return to..to + 1;
+        }
+        if (MAIN_START..MAIN_END).contains(&index) {
             HOTBAR_START..HOTBAR_END
         } else if (HOTBAR_START..HOTBAR_END).contains(&index) {
             MAIN_START..MAIN_END
         } else {
             MAIN_START..HOTBAR_END
-        };
-        self.slots[index] = None;
-        let before = stack.count;
-        self.move_to(destination, &mut stack, changed);
-        if stack.count == before {
-            // Nowhere for any of it to go. Vanilla leaves the slot alone and
-            // so does this: a shift-click that moves nothing must not report a
-            // change, or the client redraws a slot that did not move.
-            self.slots[index] = Some(stack);
-            return;
         }
-        self.slots[index] = (stack.count > 0).then_some(stack);
-        changed.mark(index);
     }
 
     /// A number key or F: swap this slot with a hotbar slot or the offhand.
@@ -1768,11 +1791,15 @@ mod tests {
         assert_eq!(inventory.slot(ARMOUR_HEAD), Some(Stack::new(head(), 1)));
         assert_eq!(inventory.cursor(), Some(Stack::new(head(), 8)));
 
-        // And a shift-click moves one of them, not nine.
+        // And a shift-click puts one on the head and then keeps going: the
+        // second pass finds the head slot occupied, takes the ordinary arm and
+        // sends the other eight to the hotbar. Measured against a real server;
+        // a single pass leaves them in the slot that was clicked.
         let mut inventory = with(&[(MAIN_START, head(), 9)]);
         inventory.click(ClickMode::QuickMove, MAIN_START as i16, 0);
         assert_eq!(inventory.slot(ARMOUR_HEAD), Some(Stack::new(head(), 1)));
-        assert_eq!(inventory.slot(MAIN_START), Some(Stack::new(head(), 8)));
+        assert_eq!(inventory.slot(MAIN_START), None);
+        assert_eq!(inventory.slot(HOTBAR_START), Some(Stack::new(head(), 8)));
     }
 
     #[test]
