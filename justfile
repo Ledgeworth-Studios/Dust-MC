@@ -70,7 +70,7 @@ soak port="25565" minutes="10":
 # with `check`, whether the server corrects one that lies.
 #
 # Outside `verify` for the same reason `bot` is: it needs a server already
-# running and an npm install. It is what decision record 0012's table came
+# running and an npm install. It is what decision record 0017's table came
 # from, and re-running it is how a change to `[server] movement_speed_limit`
 # is argued about with numbers rather than opinions.
 movement port="25565" check="":

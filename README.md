@@ -113,7 +113,7 @@ measured rather than chosen: `just movement` counts what a real client's
 packets contain, and over 1,217 of them covering walking, sprinting,
 sprint-jumping, creative flight, a 300-block free fall and a walk through a
 700 ms network stall, the largest single tick was 3.58 blocks. Decision record
-[0012](docs/decisions/0012-how-fast-a-player-may-say-they-moved.md) has the
+[0017](docs/decisions/0017-how-fast-a-player-may-say-they-moved.md) has the
 table and says what it declined.
 
 And a player cannot walk into a wall. A movement packet is checked against the
@@ -188,7 +188,7 @@ and its attachment direction are two more columns off the operator's own jar.
 Against Minecraft's own answers the grid's 496 wrong states are down to 62 and
 its 101 wrong items to 21, and 108 placements into a cell that already held
 something agree exactly. Decision record
-[0016](docs/decisions/0016-what-a-placed-block-reads-from-the-cell-it-lands-in.md)
+[0018](docs/decisions/0018-what-a-placed-block-reads-from-the-cell-it-lands-in.md)
 has the counts and says what it declined.
 
 **Not yet**, and each of these is stated where the code for it would go: no

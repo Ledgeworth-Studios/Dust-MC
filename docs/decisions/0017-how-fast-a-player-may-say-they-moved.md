@@ -1,4 +1,4 @@
-# D12 — How fast a player may say they moved
+# D17 — How fast a player may say they moved
 
 **Status:** Decided, 2026-09-02. Ten blocks per tick, checked on every movement
 packet, corrected with a teleport. Collision against the world is **not** part

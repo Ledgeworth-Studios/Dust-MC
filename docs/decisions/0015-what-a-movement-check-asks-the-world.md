@@ -8,7 +8,7 @@ and 0.6 high measured up from the feet, and it costs 32 ns on a flat world and
 
 ## Context
 
-[D12](0012-how-fast-a-player-may-say-they-moved.md) put a speed limit on
+[D17](0017-how-fast-a-player-may-say-they-moved.md) put a speed limit on
 movement packets and said, in its last section, that collision was a separate
 decision rather than an omission: a speed check is arithmetic on two positions
 and a collision check needs the world, twenty times a second, for every player
