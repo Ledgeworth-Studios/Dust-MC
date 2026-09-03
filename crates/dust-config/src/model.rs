@@ -95,6 +95,23 @@ pub struct ServerConfig {
     #[config(restart)]
     pub movement_speed_limit: f64,
 
+    /// Whether a player may walk into a block. With this on, a movement packet
+    /// that puts a player's feet inside a block they were not already inside is
+    /// refused and the player is teleported back to the last position they
+    /// legitimately reached. A player who is already inside a block — because
+    /// somebody placed one on them, or because they spawned in terrain — is
+    /// never refused for moving, which is how they get out.
+    ///
+    /// Only blocks whose collision shape is the whole cube count, so standing
+    /// on a stair, a slab, a farmland block or soul sand is not walking into
+    /// one; and only the bottom 0.6 of a player is measured, so crawling
+    /// through a one-block gap is not either. Turning it off is how an operator
+    /// with a movement mod, or a server whose block table predates the
+    /// `full_collision` column, gets the old behaviour deliberately rather than
+    /// by accident.
+    #[config(restart)]
+    pub movement_collision: bool,
+
     /// The lowest severity the server logs: one of `error`, `warn`, `info`,
     /// `debug`, `trace`. Everything less severe than the chosen level is
     /// suppressed.
@@ -169,6 +186,13 @@ impl Default for ServerConfig {
             // names is a client that claims to be somewhere it could not have
             // walked to.
             movement_speed_limit: 10.0,
+            // On, for the reason the speed limit is on: the check was measured
+            // against a real client before it was believed, and a rule nobody
+            // has to turn on is a rule that protects the servers whose
+            // operators never read the configuration reference. What it costs
+            // is one box of at most eight block cells per movement packet, and
+            // on a flat world that is an array index.
+            movement_collision: true,
             log_level: LogLevel::default(),
             world_source: String::new(),
             favicon: String::new(),

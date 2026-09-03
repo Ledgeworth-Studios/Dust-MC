@@ -991,6 +991,10 @@ fn constants_domain(context: &Context) -> Result<Outcome, String> {
         "  {} state(s) a placement replaces rather than goes beside",
         summary.replaceable
     );
+    println!(
+        "  {} state(s) a player cannot stand inside",
+        summary.full_collision
+    );
     // The heightmap predicates, one line each. A count per heightmap is what
     // says the columns are the six Minecraft declares and are not six copies
     // of one predicate — the failure a single "6 heightmaps" line would pass.
@@ -1006,6 +1010,18 @@ fn constants_domain(context: &Context) -> Result<Outcome, String> {
              obfuscated name — check {}/names.properties.",
             out.display(),
             summary.replaceable,
+            out.parent().unwrap_or(&out).display()
+        ));
+    }
+    if summary.full_collision == 0 || summary.full_collision as usize == rows {
+        return Err(format!(
+            "{} says {} of {rows} block states have a full collision shape, and \
+             Minecraft says neither none nor all of them; \
+             `blockstate.is_collision_shape_full_block` resolved to a method \
+             that answers the same thing every time. Check \
+             {}/names.properties.",
+            out.display(),
+            summary.full_collision,
             out.parent().unwrap_or(&out).display()
         ));
     }
@@ -1192,6 +1208,15 @@ struct ConstantsSummary {
     /// wrong in a recognisable way: zero is a method that resolved to something
     /// answering false, and all of them is one answering true.
     replaceable: u64,
+    /// How many states a player cannot stand inside — the ones whose collision
+    /// shape is the whole cube.
+    ///
+    /// Printed and checked for the same reason as `replaceable`, and it is the
+    /// column most able to be quietly wrong: three other booleans in that Java
+    /// class are nearly this one, all of them true for a stair, and picking any
+    /// of them would give a number that looks entirely reasonable and refuses
+    /// players for standing on stairs.
+    full_collision: u64,
     /// How many states each heightmap counts, by the name in the header.
     ///
     /// **A count per heightmap and not a count of heightmaps.** Six columns
@@ -1245,6 +1270,7 @@ impl ConstantsSummary {
                         | "emission"
                         | "occlude"
                         | "replaceable"
+                        | "full_collision"
                         | "place_sound"
                         | "sound_volume"
                         | "sound_pitch"
@@ -1270,6 +1296,9 @@ impl ConstantsSummary {
             }
             if at(named("replaceable")) == Some("1") {
                 summary.replaceable += 1;
+            }
+            if at(named("full_collision")) == Some("1") {
+                summary.full_collision += 1;
             }
             for (name, column) in &flags {
                 let entry = summary.heightmaps.entry((*name).to_owned()).or_default();

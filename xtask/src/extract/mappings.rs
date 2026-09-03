@@ -316,6 +316,19 @@ pub const LIGHT_ORACLE: &[Wanted<'static>] = &[
         class: DIRECTION,
         field: "EAST",
     },
+    // Whether this state's *collision* shape is the whole cube. The one
+    // question a movement check has for a block, and the only property in
+    // this class that answers it: `canOcclude` is about drawing, `isSolid`
+    // and `blocksMotion` are both true for a stair, and `isSolidRender` —
+    // which is what `opacity == 15` means — is the *occlusion* shape, which
+    // is a full cube for soul sand and not for glass. Both of those are
+    // wrong in the direction that refuses an honest player.
+    Wanted::Method {
+        key: "blockstate.is_collision_shape_full_block",
+        class: BLOCK_STATE_BASE,
+        method: "isCollisionShapeFullBlock",
+        parameters: &[BLOCK_GETTER, BLOCK_POS],
+    },
     Wanted::Method {
         key: "blockstate.propagates_skylight_down",
         class: BLOCK_STATE_BASE,

@@ -16,8 +16,8 @@ import java.util.function.Predicate;
 /**
  * Prints, for every block state Minecraft has, the constants that exist only
  * as Java code: how much light entering the state costs, how much it emits,
- * whether it occludes, which of the six heightmaps count it, and the sound it
- * makes when somebody puts it down.
+ * whether it occludes, whether a player can stand inside it, which of the six
+ * heightmaps count it, and the sound it makes when somebody puts it down.
  *
  * None of it is in any `--reports` output or any data pack, which is decision
  * record 0008 for the light values and the sound group, and 0010 for the
@@ -29,9 +29,9 @@ import java.util.function.Predicate;
  *
  * The output is tab-separated with a **named header**, and the names are load
  * bearing: `state_id`, `opacity`, `emission`, `occlude`, `replaceable`,
- * `place_sound`, `sound_volume`, `sound_pitch`, one column per heightmap under the
- * serialization key Minecraft itself gives it, then `STURDY_DOWN` through
- * `STURDY_EAST`. A reader that matched columns by
+ * `full_collision`, `place_sound`, `sound_volume`, `sound_pitch`, one column per
+ * heightmap under the serialization key Minecraft itself gives it, then
+ * `STURDY_DOWN` through `STURDY_EAST`. A reader that matched columns by
  * position would silently change meaning the day a column was inserted; one
  * that reads the header can also say which columns a table it has been handed
  * does not have.
@@ -67,6 +67,16 @@ public final class BlockOracle {
             names.type("blockpos.class"));
         Method canOcclude = names.method("blockstate.class", "blockstate.can_occlude");
         Method canBeReplaced = names.method("blockstate.class", "blockstate.can_be_replaced");
+        // Whether the *collision* shape is the whole cube, which is not any of
+        // the other booleans here. A stair, a slab, a farmland block and a lump
+        // of soul sand all block motion and all let a player stand somewhere
+        // inside the cube they occupy; glass is not opaque and stops a player
+        // dead. This is the only one of them a movement check can use.
+        Method isCollisionShapeFullBlock = names.method(
+            "blockstate.class",
+            "blockstate.is_collision_shape_full_block",
+            names.type("block_getter.class"),
+            names.type("blockpos.class"));
         SoundGroups sounds = new SoundGroups(names);
 
         // The level Minecraft itself passes where there is no world, and the
@@ -116,6 +126,7 @@ public final class BlockOracle {
         try (BufferedWriter out = Files.newBufferedWriter(Path.of(args[1]))) {
             StringBuilder header = new StringBuilder(
                 "# state_id\topacity\temission\tocclude\treplaceable"
+                + "\tfull_collision"
                 + "\tplace_sound\tsound_volume\tsound_pitch");
             for (Heightmap heightmap : heightmaps) {
                 header.append('\t').append(heightmap.key);
@@ -130,6 +141,8 @@ public final class BlockOracle {
                 int emission = lightEmission.getInt(state);
                 boolean occludes = (boolean) canOcclude.invoke(state);
                 boolean replaceable = (boolean) canBeReplaced.invoke(state);
+                boolean fullCollision = (boolean)
+                    isCollisionShapeFullBlock.invoke(state, emptyLevel, origin);
                 SoundGroup sound = sounds.of(state);
                 StringBuilder row = new StringBuilder();
                 row.append(id).append('\t')
@@ -137,6 +150,7 @@ public final class BlockOracle {
                    .append(emission).append('\t')
                    .append(occludes ? 1 : 0).append('\t')
                    .append(replaceable ? 1 : 0).append('\t')
+                   .append(fullCollision ? 1 : 0).append('\t')
                    .append(sound.placeSound).append('\t')
                    .append(sound.volume).append('\t')
                    .append(sound.pitch);

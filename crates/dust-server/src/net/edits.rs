@@ -323,14 +323,39 @@ impl EditedWorld {
         self.generated.column(pos)
     }
 
-    /// The state at a block position.
-    pub fn block_at(&self, position: Position) -> u32 {
+    /// The state at a block position, if an edit has changed it.
+    ///
+    /// `None` means the world as generated still answers for that cell, not
+    /// that the cell is empty. Separate from [`EditedWorld::block_at`] because
+    /// a caller that has already resolved the column — which is the expensive
+    /// half, and the half worth doing once for a box of cells rather than once
+    /// per cell — still has to ask about the edits, and there should be one
+    /// answer to what "has this been edited" means.
+    pub fn edited_block_at(&self, position: Position) -> Option<u32> {
         let column = column_of(position);
         let local = local_of(position);
         let edits = self.edits.read().expect("the edit map is never poisoned");
-        if let Some(state) = edits.get(&column).and_then(|c| c.get(&local)) {
-            return *state;
+        edits.get(&column).and_then(|c| c.get(&local)).copied()
+    }
+
+    /// How far up and down this world goes.
+    pub fn height(&self) -> dust_world::heightmap::WorldHeight {
+        self.generated.flat().height()
+    }
+
+    /// The state at a block position.
+    ///
+    /// # Panics
+    ///
+    /// If `position.y` is outside the world's height and no edit has touched
+    /// that cell. Every caller here reaches this from a position a client
+    /// clicked, which the reach check has already bounded.
+    pub fn block_at(&self, position: Position) -> u32 {
+        if let Some(state) = self.edited_block_at(position) {
+            return state;
         }
+        let column = column_of(position);
+        let local = local_of(position);
         self.generated
             .column(ChunkPos::new(column.0, column.1))
             .as_chunk()
