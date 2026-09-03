@@ -1480,8 +1480,74 @@ mod tests {
         assert_eq!(&built, flat.column());
     }
 
+    /// The terrain rung is built from the data pack's density and not from
+    /// the region file.
+    ///
+    /// The scratch pack's `final_density` falls from +1 at y -64 to -1 at
+    /// y 144, so it crosses zero at y 40, and it is wrapped in `interpolated`
+    /// — which for a straight line is exact, so every assertion below is that
+    /// arithmetic and not a recorded output. Above the crossing and below the
+    /// sea level of 63 the answer is water; above both it is air.
+    ///
+    /// Watched to fail: the synthetic chunk this is scored beside is solid
+    /// stone to y 100 with a cave in it, so a rung that copied the region file
+    /// would disagree with every line here.
+    #[test]
+    fn the_density_rung_builds_the_stack_the_data_pack_states() {
+        let (blocks, height, names) = parts();
+        let plains = names.biome("minecraft:plains").expect("plains");
+        let mut vanilla = synthetic(&blocks, height, plains, plains);
+        vanilla.recompute_heightmaps(world::heightmap_predicate(blocks.palette.air, None));
+        let surface = surface_of(&vanilla);
+        let flat = FlatWorld::new(blocks.palette, plains, names.biome_registry_size());
+        let scratch = scratch_dir("worldgen-density-rung");
+        let source = scratch_source(&scratch, plains, plains);
+        let built = build(
+            Rung::Density,
+            &vanilla,
+            &surface,
+            &model(&flat, &blocks, &names, height),
+            &mut source.columns(),
+        );
+
+        let stone = dust_registry::Block::from_name("minecraft:stone")
+            .expect("stone")
+            .default_state()
+            .id();
+        let water = dust_registry::Block::from_name("minecraft:water")
+            .expect("water")
+            .default_state()
+            .id();
+        assert_eq!(
+            built.get_block(3, height.min_y(), 9),
+            blocks.palette.bedrock
+        );
+        assert_eq!(built.get_block(3, height.min_y() + 1, 9), stone);
+        assert_eq!(built.get_block(3, SCRATCH_GROUND - 1, 9), stone);
+        assert_eq!(
+            built.get_block(3, SCRATCH_GROUND, 9),
+            water,
+            "the density is exactly zero at the crossing, which is not solid"
+        );
+        assert_eq!(built.get_block(3, SEA_LEVEL - 1, 9), water);
+        assert_eq!(
+            built.get_block(3, SEA_LEVEL, 9),
+            blocks.palette.air,
+            "the sea level names the surface the water reaches to"
+        );
+        // And it is not the world it was scored against: the synthetic chunk
+        // is stone up to a sloping grass surface near y 62, where this is
+        // water, and it has a cave of `cave_air` at y 20 where this is rock.
+        assert_ne!(
+            built.get_block(3, SEA_LEVEL - 2, 9),
+            vanilla.get_block(3, SEA_LEVEL - 2, 9)
+        );
+        assert_eq!(built.get_block(3, 21, 5), stone, "the region file's cave");
+        assert_eq!(vanilla.get_block(3, 21, 5), blocks.airs[1]);
+    }
+
     /// The biome rung answers out of Dust's own climate, and the answer is the
-    /// arithmetic the data pack states.
+    /// arithmetic the data pack states."""
     ///
     /// The scratch pack's temperature is a gradient from -1 at y -64 to +1 at
     /// y 320, so it crosses zero at y 128, and the two biomes are split there.
