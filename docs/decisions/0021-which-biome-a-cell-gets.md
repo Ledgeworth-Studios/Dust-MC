@@ -1,4 +1,4 @@
-# D20 — Which biome a cell gets, and the 620 cells that are a coin toss
+# D21 — Which biome a cell gets, and the 620 cells that are a coin toss
 
 **Status:** Built and measured. Stage one of decision record
 [0012](0012-what-worldgen-is-worth-measured-first.md) is done:

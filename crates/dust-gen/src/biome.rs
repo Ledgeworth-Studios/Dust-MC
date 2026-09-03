@@ -126,7 +126,7 @@ struct Run {
 /// chunks the ladder scores: 16 and 32 rows per run come out at about 200
 /// chunk columns per second and 64 at about 290, because a smaller run pays
 /// its own box test more often than the rows it saves. Wider than 64 the boxes
-/// stop being tight enough to skip anything. See decision record 0020.
+/// stop being tight enough to skip anything. See decision record 0021.
 const RUN: usize = 64;
 
 impl Run {

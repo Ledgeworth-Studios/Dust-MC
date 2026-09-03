@@ -65,7 +65,7 @@ impl Xoroshiro {
     /// Not `next(32)`, which is the high 32 and is what the legacy source
     /// returns. The two differ on every draw and both produce a plausible
     /// world, so nothing but a comparison against Minecraft's own can tell them
-    /// apart — see the biome scores in decision record 0020.
+    /// apart — see the biome scores in decision record 0021.
     fn next_u32(&mut self) -> u32 {
         self.next_u64() as u32
     }

@@ -97,7 +97,7 @@ each stage of vanilla's pipeline is worth and the order to build them in. The
 first of those stages is built: `dust-gen` samples the six climate values
 Minecraft picks a biome from and gets 460,418 of 460,800 cells right on a sample
 that sees seventeen biomes, which is decision record
-[0020](docs/decisions/0020-which-biome-a-cell-gets.md).
+[0021](docs/decisions/0021-which-biome-a-cell-gets.md).
 
 What exists either way is the whole path from the socket to the block table —
 framing, compression, encryption, the four connection states, the paletted
@@ -564,7 +564,7 @@ against their parameter list, and it takes 435,459 wrong cells to **382** — on
 sample that reaches seventeen biomes rather than the two a single square holds.
 Every one of the 382 is an **exact tie** in climate space, broken the other way;
 so are all 238 on seed 1. Decision record
-[0020](docs/decisions/0020-which-biome-a-cell-gets.md) is why matching them is
+[0021](docs/decisions/0021-which-biome-a-cell-gets.md) is why matching them is
 declined.
 
 **Two seeds, because one cannot see.** Seed 1 spawns in open ocean, where every
@@ -585,7 +585,7 @@ walks toward: a real column's blocks are 20.7 KiB against a flat one's 2.2, and
 distance a join is 5.8 MiB of blocks once terrain is real and 27 MiB of light
 either way. Decision records
 [0012](docs/decisions/0012-what-worldgen-is-worth-measured-first.md) and
-[0020](docs/decisions/0020-which-biome-a-cell-gets.md) are what the ladder was
+[0021](docs/decisions/0021-which-biome-a-cell-gets.md) are what the ladder was
 built to write: what each stage is worth, what it costs, and the order to build
 them in.
 
