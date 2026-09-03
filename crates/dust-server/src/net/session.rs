@@ -36,6 +36,7 @@ use dust_net::session::{
     TlsTransport,
 };
 use dust_net::state::{Intent, State};
+use dust_protocol::packets::play::Gamemode;
 use dust_protocol::packets::{configuration, handshake, play, status};
 use dust_protocol::text::{Color, Component, NamedColor};
 use dust_protocol::types::{ProtocolString, VarInt};
@@ -189,6 +190,13 @@ pub struct SessionContext {
     /// before the column existed, and it means no block asks for a tool —
     /// which is the server an operator had before decision record 0027.
     pub requires_tool: Option<dust_registry::constants::Flag>,
+    /// The game mode every joining player is put in, from `[server] game_mode`.
+    ///
+    /// Read on the interaction path, where it decides whether a break is timed
+    /// at all. Creative is the mode where it is not: the client has already
+    /// removed the block and is only telling the server, so a server that made
+    /// it wait would put a block back on a screen that had moved on.
+    pub game_mode: dust_config::model::GameMode,
     /// Which block each item puts down, if the operator put a table beside
     /// their data.
     ///
@@ -583,6 +591,10 @@ where
             ctx.status.max_players(),
             view_distance,
             ctx.overworld_dimension_type,
+            match ctx.game_mode {
+                dust_config::model::GameMode::Survival => Gamemode::Survival,
+                dust_config::model::GameMode::Creative => Gamemode::Creative,
+            },
         )?,
         version,
     )
@@ -591,7 +603,12 @@ where
     // Abilities before the position, as a real server sends them. This is
     // where creative flight is *granted*: the game mode in the join packet
     // does not grant it, and a client that is never sent this walks.
-    send_play(conn, play_mod::abilities(true), version).await?;
+    // The abilities follow the mode, and `INSTANT_BREAK` is the flag that
+    // matters here: with it the client does not animate a break at all, and
+    // without it the client runs its own break timer against the same numbers
+    // the server is about to run against.
+    let creative = ctx.game_mode == dust_config::model::GameMode::Creative;
+    send_play(conn, play_mod::abilities(creative), version).await?;
     send_play(conn, play_mod::frozen_at_noon(), version).await?;
     send_play(conn, play_mod::default_spawn(spawn), version).await?;
 
@@ -972,6 +989,11 @@ where
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_nanos() as u64);
 
+    // The break in flight, if any. One per player and at most one: a client
+    // that starts a second break has abandoned the first, which is what
+    // replacing this says.
+    let mut digging: Option<Digging> = None;
+
     let mut next_id: i64 = 1;
     // `interval`'s first tick fires immediately, and that is kept rather than
     // skipped: one keep-alive right after the chunks proves the round trip
@@ -1023,6 +1045,39 @@ where
                 next_id = next_id.wrapping_add(1);
             }
             _ = pickups.tick() => {
+                // A break whose stop came in too early finishes here, on the
+                // server's own count. This arm already runs once a tick for
+                // the pickups, so the whole cost of the delayed path is one
+                // `Option` test on a player who is not mining — which is why
+                // it lives here rather than in a timer of its own.
+                if let Some(dig) = digging.filter(|dig| dig.delayed) {
+                    let elapsed = dust_sim::mining::Progress::ticks_elapsed(
+                        dig.started.elapsed().as_millis(),
+                    );
+                    if dig.progress.server_done(elapsed) {
+                        digging = None;
+                        let previous = ctx.world.block_at(dig.at);
+                        let neighbours = [
+                            (-1i8, ctx.world.block_at(below(dig.at))),
+                            (1i8, ctx.world.block_at(above(dig.at))),
+                        ];
+                        let broke =
+                            ctx.world.break_block(dig.at, ctx.blocks.air, me.entity_id);
+                        if broke {
+                            drop_seed = drop_seed
+                                .wrapping_mul(6_364_136_223_846_793_005)
+                                .wrapping_add(1_442_695_040_888_963_407);
+                            spill(
+                                ctx,
+                                dig.at,
+                                previous,
+                                &neighbours,
+                                inventory.held(),
+                                drop_seed,
+                            );
+                        }
+                    }
+                }
                 if !ctx.items.is_empty() {
                     collected.clear();
                     ctx.items.claim_near(me.entity_id, position, &mut collected);
@@ -1510,20 +1565,112 @@ where
                             m.pitch,
                         );
                     }
-                    // Digging. Only the finish counts: the start and the
-                    // cancel are a client telling the server what its
-                    // animation is doing, and a server that broke a block on
-                    // the start would break blocks the player let go of.
+                    // Digging, and which packet finishes it depends on the
+                    // mode the player was told they are in.
                     //
-                    // In creative mode the client sends only StartDigging and
-                    // expects the block gone, which is why that is honoured
-                    // too — the join packet says creative, so this is the case
-                    // that actually happens.
+                    // **In creative the start is the whole of it.** The client
+                    // removes the block locally the instant it is clicked and
+                    // never sends a stop, so the server that made it wait
+                    // would be answering a screen that had moved on. The
+                    // finish is honoured too, because a client that mines
+                    // through sends both and setting air twice is idempotent.
+                    //
+                    // **In survival the start only starts a clock.** How long
+                    // that clock runs is `dust_sim::mining`, against the
+                    // block's own hardness and the tool in the hand, and the
+                    // stop the client sends when its animation ends is
+                    // believed at 70% — see decision record 0028 and the
+                    // header of [`dust_sim::mining`] for why the two
+                    // thresholds are different numbers.
                     Ok(play::serverbound::Packet::PlayerAction(action)) => {
-                        use play::serverbound::PlayerActionKind::{FinishDigging, StartDigging};
-                        if matches!(action.status, StartDigging | FinishDigging)
-                            && within_reach(ctx, position, movement.pose(), action.location)
-                        {
+                        use play::serverbound::PlayerActionKind::{
+                            CancelDigging, FinishDigging, StartDigging,
+                        };
+                        let creative =
+                            ctx.game_mode == dust_config::model::GameMode::Creative;
+                        let reachable = matches!(
+                            action.status,
+                            StartDigging | CancelDigging | FinishDigging
+                        ) && within_reach(
+                            ctx,
+                            position,
+                            movement.pose(),
+                            action.location,
+                        );
+                        // Whether this packet is the one that takes the block
+                        // away. Everything above decides it; one place below
+                        // acts on it, so the destroy path is written once.
+                        let destroy = match action.status {
+                            StartDigging if reachable && creative => true,
+                            FinishDigging if reachable && creative => true,
+                            StartDigging if reachable => {
+                                // **One read of the world, here.** The state
+                                // is what carries the hardness and what the
+                                // tool is judged correct against, and both
+                                // come out of the same lookup. The break
+                                // itself reads again when it happens, because
+                                // by then the cell may hold something else —
+                                // that is a second interaction, not a second
+                                // read of this one.
+                                let state = ctx.world.block_at(action.location);
+                                let progress = break_progress(
+                                    ctx,
+                                    state,
+                                    inventory.held(),
+                                    posture.on_ground,
+                                );
+                                if progress.instant() {
+                                    digging = None;
+                                    true
+                                } else {
+                                    // Kept even when the block cannot be
+                                    // broken at all: `possible()` is false for
+                                    // bedrock, and neither threshold is ever
+                                    // reached, so the entry expires by never
+                                    // firing rather than by a second branch.
+                                    digging = Some(Digging {
+                                        at: action.location,
+                                        started: std::time::Instant::now(),
+                                        progress,
+                                        delayed: false,
+                                    });
+                                    false
+                                }
+                            }
+                            FinishDigging if reachable => match digging.as_mut() {
+                                Some(dig) if dig.at == action.location => {
+                                    let elapsed = dust_sim::mining::Progress::ticks_elapsed(
+                                        dig.started.elapsed().as_millis(),
+                                    );
+                                    if dig.progress.stop_accepted(elapsed) {
+                                        digging = None;
+                                        true
+                                    } else {
+                                        // Too early to believe, and **not a
+                                        // refusal**: the block still goes, on
+                                        // the server's own count, from the
+                                        // tick loop below. A client that
+                                        // spams stops gets one armed entry and
+                                        // not a queue of them.
+                                        dig.delayed = true;
+                                        false
+                                    }
+                                }
+                                // A stop for a block this player never started
+                                // on. Acknowledged and otherwise ignored.
+                                _ => false,
+                            },
+                            // Letting go. The client has stopped animating and
+                            // so does the server; an armed delayed destroy is
+                            // dropped with it, which is what a player who
+                            // changed their mind means.
+                            CancelDigging => {
+                                digging = None;
+                                false
+                            }
+                            _ => false,
+                        };
+                        if destroy {
                             // Read before the break, because after it the
                             // cell is air and a loot table asks what *was*
                             // there. The two cells above and below come with
@@ -2461,6 +2608,83 @@ fn below(position: dust_protocol::types::Position) -> dust_protocol::types::Posi
 /// this layer knows what a stack is: a loot table's `set_count` of eight and a
 /// fortune-multiplied ore are both one number that has nothing to do with the
 /// sixty-four a chest slot holds.
+/// A break a survival player has started and the server has not finished.
+///
+/// Four fields and no allocation, held for the length of one break by the
+/// session that is running it. **The progress is computed once, when the click
+/// arrives, and never again** — the hardness of the block and the speed of the
+/// tool cannot change under a player who is holding the button down, and
+/// asking the world again every tick would put a chunk lookup on the tick loop
+/// of every mining player for an answer that is already known.
+#[derive(Debug, Clone, Copy)]
+struct Digging {
+    /// The cell. A start on a different cell replaces this one, which is what
+    /// a player who looked away and clicked something else means.
+    at: dust_protocol::types::Position,
+    /// When the start packet arrived. Wall time rather than a server tick
+    /// count: see [`dust_sim::mining::Progress::ticks_elapsed`].
+    started: std::time::Instant,
+    /// How much of the break one tick is worth.
+    progress: dust_sim::mining::Progress,
+    /// Set by a stop that arrived before the 70% the server believes. The
+    /// break then finishes on the server's own count instead of being refused,
+    /// which is the difference between a block that goes late and a block that
+    /// does not go at all.
+    delayed: bool,
+}
+
+/// How fast this player breaks this block, from one state and one held item.
+///
+/// The hardness comes out of `dust-constants.tsv` and the tool speed out of
+/// the item's own `minecraft:tool` component, so **both numbers are the
+/// operator's jar's and neither is Dust's guess**. A table with no hardness
+/// column at all is a table extracted before decision record 0027, and the
+/// answer for it is an instant break: a server that mines fast looks generous
+/// and a server that will not let a player mine looks broken.
+fn break_progress(
+    ctx: &SessionContext,
+    state: u32,
+    held: Option<dust_registry::Item>,
+    on_ground: bool,
+) -> dust_sim::mining::Progress {
+    let Some(constants) = ctx.constants.as_deref() else {
+        return dust_sim::mining::Progress::of(0.0, &dust_sim::mining::Digger::bare());
+    };
+    let Some(hardness) = constants.destroy_speed(state) else {
+        return dust_sim::mining::Progress::of(0.0, &dust_sim::mining::Digger::bare());
+    };
+    let Some(block) = dust_registry::BlockState::from_id(state).map(|s| s.block()) else {
+        return dust_sim::mining::Progress::of(0.0, &dust_sim::mining::Digger::bare());
+    };
+    let digger = dust_sim::mining::Digger {
+        speed: dust_registry::mining::speed(held, block),
+        // A stack carries its components as bytes and nothing decodes
+        // `minecraft:enchantments` out of them yet, so every efficiency
+        // branch takes its unenchanted side. That is a gap in the stack and
+        // not in the rule: the day a stack knows, this line is where it
+        // starts working, and it is the same seam `spill` names for silk
+        // touch and fortune.
+        efficiency: 0,
+        // **Both facts, composed — and this is the line a real server was
+        // measured correcting.** The drops verdict alone says a bare hand is
+        // wrong for dirt, and Minecraft says it is right: a block that asks
+        // for no tool is correctly tooled by anything, so dirt bare-handed is
+        // 15 ticks and not 50. See `dust_sim::mining::tool_is_correct`.
+        correct: dust_sim::mining::tool_is_correct(
+            match ctx.requires_tool {
+                Some(flag) => constants.is_set(flag, state),
+                // No column: no block asks for a tool, so every hand is the
+                // right one. The generous direction, and the same reading
+                // `spill` takes of the same absent column.
+                None => false,
+            },
+            dust_registry::mining::correct_for_drops(held, block),
+        ),
+        on_ground,
+    };
+    dust_sim::mining::Progress::of(hardness, &digger)
+}
+
 fn spill(
     ctx: &SessionContext,
     at: dust_protocol::types::Position,

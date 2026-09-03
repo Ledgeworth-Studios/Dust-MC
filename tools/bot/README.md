@@ -582,6 +582,45 @@ one break. Fifty blocks, 44 of 46 scorable rows agreeing, and both misses the
 same missing thing: `minecraft:snow` and `minecraft:cobweb` need a shovel and
 shears, and Dust has no tool check.
 
+### And how long a break takes
+
+The same script, with `--times`, times the server rather than reading what came
+out. `--check-times` is its gate.
+
+```
+node drops.js 25601 --check-times                       the gate, against Dust
+DUST_SERVER_CONSOLE=/tmp/mc-console \
+  node drops.js 25701 blocks.txt --survival --times     the measurement
+```
+
+**The gate needs a Dust server whose `[server] game_mode` is survival.** On a
+creative server every answer is one tick, correctly, and a check that passed on
+both would be a check about nothing — so its first row asserts against exactly
+that.
+
+**A start with no stop is never broken, and finding that out cost forty
+minutes.** The obvious shape — send `START_DESTROY_BLOCK` and watch the cell —
+times out on every row. `ServerPlayerGameMode.tick` has two branches and only
+`hasDelayedDestroy` takes a block away; `isDestroyingBlock` only sends the
+crack overlay. The block a player holds the button down on is destroyed by the
+*stop*. So the timer sends a start and a stop back to back: the stop is far
+below the 70% the server believes, which arms the delayed destroy, and that
+path reports the server's own full break time in one round trip.
+
+The control is stone with a wooden pickaxe, which is 23 ticks, and it is
+compared with both names un-namespaced — the first version compared a
+namespaced block against an un-namespaced tool column, found nothing, and threw
+away ten minutes of measurement. Every timing row is echoed to stderr as it
+lands, because stdout is written once at the end and a run that dies before the
+end writes no file at all.
+
+`cargo xtask harness break --answers <file>` scores `dust_sim::mining` against
+the result; `--without-hardness` withholds the column and is the negative
+control. Twenty rows, 20/20 agreeing within a tick, and 0/20 with the column
+withheld. Decision record 0028 is its output, and eight of those twenty rows
+caught a real defect: a block that asks for no tool is correctly tooled by a
+bare hand, so dirt is 15 ticks and not 50.
+
 ## The long one
 
 ```

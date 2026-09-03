@@ -301,12 +301,19 @@ so a player who says they are sprinting and airborne is measured at their feet
 rather than at their full height, because they might be swimming and no client
 ever says so — decision record
 [0019](docs/decisions/0019-how-tall-a-player-is.md) says what that costs and why
-it is the direction to be wrong in; **no break time**, so every block comes away
-on the first click however hard it is and whatever is in the hand — which is
-downstream of a game mode this server does not have, because the join packet
-says creative and a creative client sends a start and never a stop; decision
-record [0028](docs/decisions/0028-how-long-a-block-takes-to-break.md) has the
-rule, what a real server was measured doing, and the two things it waits on;
+it is the direction to be wrong in; **break time is survival-only**, because
+`[server] game_mode` defaults to creative and a creative break is instant on
+both sides — set it to survival and every block takes Minecraft's own number,
+scored 20/20 within a tick against a real 1.21.1 server by
+`cargo xtask harness break`, with `just break` as the gate on a running one;
+what a survival player has to do with that world is mine, and nothing else,
+which is why the default has not moved. Decision record
+[0028](docs/decisions/0028-how-long-a-block-takes-to-break.md) has the rule,
+the two thresholds a client and a server disagree across, and the eight rows
+that caught a bare hand being the right tool for dirt;
+**no haste, no mining fatigue and no underwater mining penalty**, the last of
+them left out on purpose rather than approximated because a five-fold error
+would break the very agreement that keeps a predicted block from coming back;
 **Q still destroys a stack rather than throwing it**, and item entities are not
 saved, so a restart clears the floor; **no crafting table**, so the 2x2 a
 player carries crafts and every three-wide recipe — a pickaxe, a bed, a chest,

@@ -58,11 +58,22 @@ const ARENA_Y = 200
 const CONTROL = 'stone'
 const CONTROL_YIELDS = 'minecraft:cobblestone*1'
 
+// The same idea for `--times`, where the rows are numbers and not drops.
+// Stone is hardness 1.5, a wooden pickaxe has speed 2 and is correct for its
+// drops, so progress is 2 / 1.5 / 30 per tick and the break is 23 ticks. That
+// number is on every published break-time table and was measured against a
+// real 1.21.1 server before it was written down here.
+const CONTROL_TIME_BLOCK = 'stone'
+const CONTROL_TIME_TOOL = 'minecraft:wooden_pickaxe'
+const CONTROL_TICKS = 23
+
 const wait = ms => new Promise(r => setTimeout(r, ms))
 
 function usage (why) {
   console.error(why)
-  console.error('usage: [DUST_SERVER_CONSOLE=<fifo>] node drops.js <port> <blocks|file> [--survival] [--tool <item>]')
+  console.error('usage: [DUST_SERVER_CONSOLE=<fifo>] node drops.js <port> <blocks|file> [--survival] [--times] [--tool <item>]')
+  console.error('       node drops.js <port> --check          gate: what a break yields')
+  console.error('       node drops.js <port> --check-times    gate: how long a break takes, survival only')
   process.exit(2)
 }
 
@@ -72,12 +83,14 @@ if (!port) usage('a port is the first argument')
 let survival = false
 let gate = false
 let times = false
+let timeGate = false
 let tools = ['netherite_pickaxe']
 const rest = []
 for (let i = 1; i < argv.length; i++) {
   if (argv[i] === '--survival') survival = true
   else if (argv[i] === '--times') times = true
   else if (argv[i] === '--check') gate = true
+  else if (argv[i] === '--check-times') timeGate = true
   else if (argv[i] === '--tool') tools = argv[++i].split(',').filter(Boolean)
   else rest.push(argv[i])
 }
@@ -91,7 +104,7 @@ if (survival && !console_path) {
 }
 
 let blocks = []
-if (rest.length === 0 && !gate) usage('name the blocks to break, or a file of them')
+if (rest.length === 0 && !gate && !timeGate) usage('name the blocks to break, or a file of them')
 if (rest.length === 0) {
   blocks = []
 } else if (fs.existsSync(rest[0])) {
@@ -100,7 +113,7 @@ if (rest.length === 0) {
   blocks = rest.join(',').split(',').filter(Boolean)
 }
 blocks = blocks.map(name => (name.includes(':') ? name : 'minecraft:' + name))
-if (!gate && !blocks.includes('minecraft:' + CONTROL)) blocks.unshift('minecraft:' + CONTROL)
+if (!gate && !timeGate && !blocks.includes('minecraft:' + CONTROL)) blocks.unshift('minecraft:' + CONTROL)
 
 function say (command) {
   fs.appendFileSync(console_path, command + '\n')
@@ -232,23 +245,34 @@ async function walkTo (b, x, y, z) {
 ///
 /// Not `bot.dig`, and the difference is the whole measurement: mineflayer
 /// computes its own break time from its own copy of Minecraft's numbers, waits
-/// that long and then says it is done, so timing it measures prismarine. This
-/// sends `START_DESTROY_BLOCK` once, never sends a stop, and waits for the cell
-/// to become air — because a vanilla server that is never told to stop keeps
-/// counting on its own and destroys the block when *its* progress reaches one.
-/// What comes back is the server's own answer in milliseconds.
+/// that long and then says it is done, so timing it measures prismarine.
+///
+/// # A start with no stop is never broken, and that cost forty minutes
+///
+/// The obvious shape — send `START_DESTROY_BLOCK`, send nothing else, wait for
+/// the cell to go — measures nothing, and 42 consecutive rows timed out at two
+/// minutes each proving it. **A vanilla server counts a break it was never
+/// told to stop but never destroys it.** `ServerPlayerGameMode.tick` has two
+/// branches and only one of them takes a block away: `hasDelayedDestroy`,
+/// which finishes at progress 1.0, and `isDestroyingBlock`, which only sends
+/// the crack overlay. The block a player is holding the button down on is
+/// destroyed by the *stop*, not by the count.
+///
+/// So this sends both, back to back. The stop arrives long before the 70% the
+/// server believes, which is exactly what arms `hasDelayedDestroy` — and the
+/// delayed path then finishes the break on the server's own clock, from the
+/// tick the start arrived on. What comes back is the server's own full break
+/// time in milliseconds, in one round trip and with no guess about how long to
+/// hold.
 ///
 /// A poll rather than a packet listener, at half a tick, because the answer
 /// wanted is "which tick did it go" and any read finer than that is measuring
 /// the poll.
 async function timeBreak (b, at) {
   const started = Date.now()
-  b._client.write('block_dig', {
-    status: 0,
-    location: { x: at.x, y: at.y, z: at.z },
-    face: 1,
-    sequence: 1
-  })
+  const where = { x: at.x, y: at.y, z: at.z }
+  b._client.write('block_dig', { status: 0, location: where, face: 1, sequence: 1 })
+  b._client.write('block_dig', { status: 2, location: where, face: 1, sequence: 2 })
   while (Date.now() - started < TIME_LIMIT_MS) {
     const now = b.blockAt(at)
     if (now && now.name === 'air') return Date.now() - started
@@ -258,7 +282,184 @@ async function timeBreak (b, at) {
 }
 
 /// How long a timing run waits before calling a break impossible.
-const TIME_LIMIT_MS = 120000
+///
+/// Forty seconds, which is 800 ticks and comfortably past the slowest pair any
+/// sane block list holds — a bare hand on deepslate is 300. It was two minutes
+/// and that was a mistake of a specific kind: a run that loses its connection
+/// mid-survey sits at the limit for every remaining row, so the limit is also
+/// how long a broken run takes to admit it is broken.
+const TIME_LIMIT_MS = 40000
+
+/// Send one dig packet. Status 0 is a start, 1 a cancel, 2 a stop.
+function digPacket (b, at, status, sequence) {
+  b._client.write('block_dig', {
+    status,
+    location: { x: at.x, y: at.y, z: at.z },
+    face: 1,
+    sequence
+  })
+}
+
+/// How long a break takes on a **Dust** server in survival, asked the way a
+/// client asks it.
+///
+/// Start, then stop after `holdTicks` ticks. With `holdTicks` at zero this is
+/// what [`timeBreak`] does against vanilla and measures the server's own full
+/// count; with it set to a real number it measures whether the server believes
+/// a client that says it has finished. Returns milliseconds, or `null`.
+async function timedDig (b, at, holdTicks, sequence) {
+  const started = Date.now()
+  digPacket(b, at, 0, sequence)
+  // **What the cell held the moment before the stop**, and it is the field
+  // that keeps a held run from passing vacuously. A server with no hardness at
+  // all breaks on the start; the poll below only begins after the hold, so it
+  // would report the length of the hold and read as a correct answer. This
+  // says whether the block survived to be stopped.
+  let heldThrough = true
+  if (holdTicks > 0) {
+    await wait(holdTicks * 50)
+    const mid = b.blockAt(at)
+    heldThrough = Boolean(mid) && mid.name !== 'air'
+  }
+  digPacket(b, at, 2, sequence + 1)
+  while (Date.now() - started < 20000) {
+    const now = b.blockAt(at)
+    if (now && now.name === 'air') {
+      return { ms: Date.now() - started, heldThrough }
+    }
+    await wait(25)
+  }
+  return { ms: null, heldThrough }
+}
+
+/// What a survival player feels when they hold the button down.
+///
+/// Its own gate and not part of [`gateRun`], because it needs a server whose
+/// `[server] game_mode` is survival — on a creative server every one of these
+/// answers is zero, correctly, and a check that passed on both would be a
+/// check about nothing.
+///
+/// **The negative control is a column.** Take `destroy_speed` out of
+/// `dust-constants.tsv` and the server has no hardness to count against, so it
+/// breaks every block at once and rows 2, 3 and 5 go red. That is the run to
+/// do before believing this file; decision record 0028 records what it said.
+async function timeGateRun () {
+  const b = await spawned('Timer')
+  await wait(SETTLE_MS)
+  const stood = b.entity.position.floored()
+  const at = stood.offset(4, 0, 0)
+  let sequence = 1
+
+  async function put (block) {
+    const target = b.blockAt(at)
+    if (target && target.name !== 'air') {
+      digPacket(b, at, 0, sequence++)
+      digPacket(b, at, 2, sequence++)
+      await wait(600)
+    }
+    creativeSlot(b, 36, block)
+    b._client.write('held_item_slot', { slotId: 0 })
+    await wait(150)
+    const under = b.blockAt(at.offset(0, -1, 0))
+    b._client.write('block_place', {
+      hand: 0,
+      location: { x: under.position.x, y: under.position.y, z: under.position.z },
+      direction: 1,
+      cursorX: 0.5,
+      cursorY: 1.0,
+      cursorZ: 0.5,
+      insideBlock: false,
+      sequence: sequence++
+    })
+    await wait(400)
+    return b.blockAt(at)
+  }
+
+  async function hand (tool) {
+    if (tool) creativeSlot(b, 43, tool)
+    b._client.write('held_item_slot', { slotId: tool ? 7 : 8 })
+    await wait(200)
+  }
+
+  /// Ticks, from milliseconds, with the poll's own resolution allowed for.
+  const ticksOf = ms => (ms === null ? null : Math.round(ms / 50))
+
+  // 1. The block is there to break, and the run is really in survival. A
+  // creative server answers every row below in a single tick, so this is the
+  // check that stops the whole file passing vacuously.
+  let placed = await put('minecraft:stone')
+  await hand('minecraft:wooden_pickaxe')
+  let dug = await timedDig(b, at, 0, sequence)
+  let took = ticksOf(dug.ms)
+  sequence += 2
+  check('stone with a wooden pickaxe takes 23 ticks, not none',
+    Boolean(placed) && placed.name === 'stone' && took !== null &&
+      took >= 22 && took <= 25,
+    `${took === null ? 'never broke' : took + ' tick(s)'}`)
+
+  // 2. The same block with nothing in the hand. 150 ticks against 23: the
+  // divisor is 100 rather than 30 and the speed is 1 rather than 2, and a
+  // server that had only one of those right would land between them.
+  placed = await put('minecraft:stone')
+  await hand(null)
+  dug = await timedDig(b, at, 0, sequence)
+  took = ticksOf(dug.ms)
+  sequence += 2
+  check('stone bare-handed takes 150 ticks',
+    Boolean(placed) && took !== null && took >= 149 && took <= 152,
+    `${took === null ? 'never broke' : took + ' tick(s)'}`)
+
+  // 3. And with the right tool at the top of its tier, which is the row that
+  // says the tool table is being read and not just the hardness column.
+  placed = await put('minecraft:stone')
+  await hand('minecraft:netherite_pickaxe')
+  dug = await timedDig(b, at, 0, sequence)
+  took = ticksOf(dug.ms)
+  sequence += 2
+  // A range and not a ceiling. Five ticks is fast and one tick is instant, and
+  // a check written as "at most seven" cannot tell them apart — which is
+  // exactly the answer a server with no hardness column gives.
+  check('stone with a netherite pickaxe takes 5 ticks and not none',
+    Boolean(placed) && took !== null && took >= 4 && took <= 7,
+    `${took === null ? 'never broke' : took + ' tick(s)'}`)
+
+  // 4. **The client is believed before the server has finished counting.**
+  // A stop 16 ticks into a 23-tick break is past 70% and is honoured at once;
+  // the break that would otherwise still have seven ticks to run ends within
+  // one. This is the check that a player never sees a block shatter and come
+  // back, and it is the only one here that would still pass if the server
+  // refused early stops — so it asserts the *speed* of the answer and not
+  // only that one arrived.
+  placed = await put('minecraft:stone')
+  await hand('minecraft:wooden_pickaxe')
+  dug = await timedDig(b, at, 16, sequence)
+  took = ticksOf(dug.ms)
+  sequence += 2
+  check('a stop at 70% is believed rather than refused',
+    Boolean(placed) && dug.heldThrough && took !== null && took <= 19,
+    `${dug.heldThrough ? 'still there at the stop' : 'gone before the stop'}, ` +
+      `${took === null ? 'never broke' : took + ' tick(s)'} after a 16-tick hold`)
+
+  // 5. Letting go abandons the break. Start, cancel, wait out the whole 23
+  // ticks and more: the block is still there. Without this the timing could
+  // be a delay rather than a count, and a delay would break blocks the player
+  // released.
+  placed = await put('minecraft:stone')
+  await hand('minecraft:wooden_pickaxe')
+  digPacket(b, at, 0, sequence++)
+  await wait(200)
+  digPacket(b, at, 1, sequence++)
+  await wait(2000)
+  let still = b.blockAt(at)
+  check('a break the player let go of does not happen',
+    Boolean(placed) && still && still.name === 'stone',
+    still ? still.name : 'unloaded')
+
+  const failed = results.filter(r => !r.ok)
+  console.log(`${results.length - failed.length}/${results.length} checks passed`)
+  b.quit()
+  process.exit(failed.length === 0 ? 0 : 1)
+}
 
 /// What a player feels, asked of a running server.
 async function gateRun () {
@@ -440,6 +641,7 @@ async function gateRun () {
 }
 
 async function main () {
+  if (timeGate) return timeGateRun()
   if (gate) return gateRun()
   const b = await spawned('Digger')
   const items = watchItems(b)
@@ -582,8 +784,15 @@ async function main () {
 
     if (times) {
       const took = await timeBreak(b, at)
-      rows.push([block, tool, took === null ? 'TIMED OUT' : String(took),
-        took === null ? '-' : String(Math.round(took / 50))])
+      const row = [block, tool, took === null ? 'TIMED OUT' : String(took),
+        took === null ? '-' : String(Math.round(took / 50))]
+      rows.push(row)
+      // Every row as it lands, on stderr. A timing survey is minutes of real
+      // time and a run that dies at row 30 of 42 used to leave nothing at all
+      // — stdout is written in one go at the end, after the control, and a
+      // process that never reaches the end writes no file. This is the record
+      // that survives it.
+      console.error('  ' + row.join('\t'))
       continue
     }
     const mark = items.mark()
@@ -625,6 +834,47 @@ async function main () {
   // where the run held a bare hand at all, the negative control asks that the
   // same block with an empty hand gives nothing — the rule this survey exists
   // to measure, checked in the direction that a broken harness cannot fake.
+  // A timing run's rows are milliseconds and ticks, so the drop controls above
+  // cannot read them. Its own control is the number every published table of
+  // break times agrees on: **stone with a wooden pickaxe is 23 ticks.** A run
+  // that gets that right measured the server; a run that gets it wrong is
+  // measuring its own polling, its own latency, or a haste effect somebody
+  // left on, and every other row in the file is worth nothing.
+  //
+  // Two ticks of slack, which is one poll either side. Not more: the whole
+  // point of the control is that a harness which drifted would be caught, and
+  // a control with room for a five-tick error cannot catch a five-tick error.
+  if (times) {
+    // Both names are compared un-namespaced. The block column is written
+    // namespaced and the tool column is written exactly as `--tool` spelled
+    // it, which is one of the two, and a control that assumed either one
+    // silently fails to find its own row — which is what a control looks like
+    // when it is not a control. Ten minutes of measurement were thrown away
+    // finding that out.
+    const plain = name => String(name).replace('minecraft:', '')
+    const timed = rows.find(row => plain(row[0]) === plain(CONTROL_TIME_BLOCK) &&
+                                   plain(row[1]) === plain(CONTROL_TIME_TOOL))
+    const got = timed ? Number(timed[3]) : NaN
+    if (!Number.isFinite(got) || Math.abs(got - CONTROL_TICKS) > 2) {
+      console.error(
+        `timing control failed: ${CONTROL_TIME_BLOCK} with ${CONTROL_TIME_TOOL} took ` +
+        `${timed ? timed[2] + ' ms (' + timed[3] + ' ticks)' : 'no row at all'}, and it ` +
+        `has to take ${CONTROL_TICKS} ticks. Nothing else this run timed is trustworthy.`
+      )
+      // On stderr and never on stdout. The rows are untrustworthy and must not
+      // reach a scorer, but a run of this costs ten minutes of real time and a
+      // reader looking at why the control failed needs to see what it saw.
+      for (const row of rows) console.error('  ' + row.join('\t'))
+      b.quit()
+      process.exit(1)
+    }
+    console.log('# block\ttool\tms\tticks')
+    for (const row of rows) console.log(row.join('\t'))
+    console.error(`${rows.length} timing(s), control ${got} ticks`)
+    b.quit()
+    process.exit(0)
+  }
+
   const control = rows.find(row => row[0] === 'minecraft:' + CONTROL && row[1] !== BARE)
   if (!control || control[2] !== 'BROKE' || control[3] !== CONTROL_YIELDS) {
     console.error(
@@ -649,13 +899,6 @@ async function main () {
     }
   }
 
-  if (times) {
-    console.log('# block\ttool\tms\tticks')
-    for (const row of rows) console.log(row.join('\t'))
-    console.error(`${rows.length} timing(s)`)
-    b.quit()
-    process.exit(0)
-  }
   console.log('# block\ttool\toutcome\tdrops')
   for (const row of rows) console.log(row.join('\t'))
   console.error(`${rows.length} block(s), ${items.collected.length} picked up`)

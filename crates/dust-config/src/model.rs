@@ -121,6 +121,23 @@ pub struct ServerConfig {
     #[config(restart)]
     pub log_level: LogLevel,
 
+    /// Which game mode joining players are put in: `survival` or `creative`.
+    ///
+    /// It is not a cosmetic byte. A creative client removes a block locally the
+    /// moment it is clicked and never sends a stop, so on a creative server a
+    /// break is instant on both sides and there is nothing to time. A survival
+    /// client animates the break itself and waits, so on a survival server the
+    /// server times it too, against Minecraft's own hardness and tool speeds —
+    /// see `dust_sim::mining` and decision record 0028.
+    ///
+    /// The default is creative because that is the mode Dust's content is: a
+    /// survival player has no crafting table, no furnace, no hunger and no
+    /// health, and the only way they get a block is by mining one. Break
+    /// timing works either way; what an operator is choosing here is which of
+    /// the two half-finished games their players get.
+    #[config(restart)]
+    pub game_mode: GameMode,
+
     /// Path to a directory of `.mca` region files to serve, or empty to
     /// generate a flat world. A column the files do not contain is generated
     /// flat, because a world is a disc in an infinite plane and a player may
@@ -197,6 +214,7 @@ impl Default for ServerConfig {
             // on a flat world that is an array index.
             movement_collision: true,
             log_level: LogLevel::default(),
+            game_mode: GameMode::default(),
             world_source: String::new(),
             favicon: String::new(),
         }
@@ -264,6 +282,52 @@ impl ServerConfig {
                 "must be at most 32, which is Minecraft's own maximum; beyond                  that a join sends more columns than it can finish",
             ));
         }
+    }
+}
+
+/// Which game mode joining players are put in.
+///
+/// An enum for the reason [`LogLevel`] is one: a typo fails at parse time
+/// naming the field rather than at play time as a server that quietly serves
+/// the wrong game.
+///
+/// The two modes Dust serves are the two whose *break* behaviour differs. A
+/// creative client breaks locally and tells the server after the fact; a
+/// survival client animates a break of a length it computes itself and expects
+/// the server to have computed the same one. Adventure and spectator are not
+/// here because neither is a mode Dust can honour yet — adventure needs
+/// `can_break` on a stack's components and spectator needs a camera that
+/// passes through blocks — and a byte that says a mode the server does not
+/// implement is worse than no setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GameMode {
+    /// Blocks take time to break, a wrong tool costs that time, and what a
+    /// break yields is the loot table's answer.
+    Survival,
+    /// Every block comes away on the first click and yields nothing, which is
+    /// what a creative client draws locally before the server is asked.
+    #[default]
+    Creative,
+}
+
+impl GameMode {
+    /// The byte the join and respawn packets carry.
+    #[must_use]
+    pub fn wire_id(self) -> u8 {
+        match self {
+            Self::Survival => 0,
+            Self::Creative => 1,
+        }
+    }
+}
+
+impl std::fmt::Display for GameMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Survival => "survival",
+            Self::Creative => "creative",
+        })
     }
 }
 

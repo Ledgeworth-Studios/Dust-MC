@@ -1313,6 +1313,7 @@ impl Server {
             requires_tool: constants
                 .as_deref()
                 .and_then(|table| table.flag("requires_tool")),
+            game_mode: config.server.game_mode,
             item_blocks,
             registry_contents,
             items: std::sync::Arc::clone(&items),

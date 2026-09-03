@@ -10,13 +10,18 @@
 //! without running a server — the same argument `dust-guard` makes about the
 //! reach check, and the same reason both are crates rather than functions
 //! inside the session.
+//!
+//! [`mining`] is the other half of a break: [`drops`] says what comes out of
+//! one and `mining` says how long it takes.
 
 #![forbid(unsafe_code)]
 
 pub mod crafting;
 pub mod drops;
+pub mod mining;
 pub mod placement;
 
 pub use crafting::{Recipe, Recipes};
 pub use drops::{compile, Break, Drop, Rng, Table, Tables, Tool};
+pub use mining::{tool_is_correct, Digger, Progress};
 pub use placement::{replaces_beside, replaces_clicked, state_for, state_for_item, Click, Face};
