@@ -1786,9 +1786,9 @@ mod tests {
 
     #[test]
     fn the_ladder_changes_one_thing_per_rung_and_ends_at_the_control() {
-        assert_eq!(Rung::ALL.len(), 8);
+        assert_eq!(Rung::ALL.len(), 9);
         assert_eq!(Rung::ALL[0], Rung::Flat);
-        assert_eq!(*Rung::ALL.last().expect("eight"), Rung::Everything);
+        assert_eq!(*Rung::ALL.last().expect("nine"), Rung::Everything);
         assert!(!Rung::Flat.reads_the_region_file());
         assert!(!Rung::FlatAtSeaLevel.reads_the_region_file());
         assert!(
@@ -1797,7 +1797,12 @@ mod tests {
         );
         assert!(
             !Rung::Density.reads_the_region_file(),
-            "the terrain rung answers for itself too, and is the last rung that does"
+            "the terrain rung answers for itself too"
+        );
+        assert!(
+            !Rung::Surface.reads_the_region_file(),
+            "the surface rung reads the operator's own data pack and is the last rung \
+             a server could run in"
         );
         assert!(Rung::Heights.reads_the_region_file());
     }

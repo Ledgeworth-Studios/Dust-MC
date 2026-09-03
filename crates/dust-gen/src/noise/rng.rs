@@ -167,9 +167,8 @@ impl Positional {
 /// The shift is arithmetic and the multiply wraps, both deliberately — this is
 /// a hash and not an arithmetic identity.
 pub fn position_seed(x: i32, y: i32, z: i32) -> u64 {
-    let mut seed = (i64::from(x.wrapping_mul(3129871))
-        ^ (i64::from(z).wrapping_mul(116129781))
-        ^ i64::from(y)) as i64;
+    let mut seed =
+        i64::from(x.wrapping_mul(3129871)) ^ i64::from(z).wrapping_mul(116129781) ^ i64::from(y);
     seed = seed
         .wrapping_mul(seed)
         .wrapping_mul(42317861)
