@@ -43,7 +43,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use dust_world::anvil::{self, Ids, Names};
 use dust_world::chunk::Chunk;
@@ -52,6 +52,7 @@ use dust_world::coords::{ChunkPos, RegionPos};
 use dust_world::heightmap::WorldHeight;
 use dust_world::region::{FileStore, RegionFile};
 
+use super::residency::Residency;
 use super::world::FlatWorld;
 
 /// Region files that have been opened, or found not to exist.
@@ -61,20 +62,29 @@ use super::world::FlatWorld;
 /// player walking outward.
 type OpenRegions = HashMap<(i32, i32), Option<RegionFile<FileStore>>>;
 
-/// A column, borrowed when it can be and built when it cannot.
+/// A column, borrowed when it can be, shared when the server is keeping one,
+/// and built when neither.
 ///
-/// The two variants differ in size by about a megabyte, and that is the point
+/// The variants differ in size by about a megabyte, and that is the point
 /// rather than an oversight: the borrowed one is what a flat world hands out
 /// once per column per join without allocating — 289 times at the default view
 /// distance — and boxing it to even the
 /// variants out would put an allocation on exactly the path the borrow exists
 /// to keep free. The value is a temporary — a caller sends the column and drops
 /// it — so the large variant never sits in a collection.
+///
+/// [`Column::Resident`] is the one that is *not* a temporary, and it is an
+/// `Arc` for that reason: it is a handle on a column the whole server is
+/// keeping, and a caller may hold it for as long as it likes without stopping
+/// the residency from retiring its own entry. See [`Residency`].
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Column<'a> {
     /// Every position shares this one. See [`FlatWorld`].
     Shared(&'a Chunk),
+    /// One the server is keeping because a player is near it. See
+    /// [`Residency`].
+    Resident(Arc<Chunk>),
     /// Read from disk for this position.
     Built(Chunk),
 }
@@ -83,6 +93,7 @@ impl Column<'_> {
     pub fn as_chunk(&self) -> &Chunk {
         match self {
             Self::Shared(chunk) => chunk,
+            Self::Resident(chunk) => chunk,
             Self::Built(chunk) => chunk,
         }
     }
@@ -107,7 +118,7 @@ impl std::fmt::Debug for Source {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Flat(_) => f.write_str("Flat"),
-            Self::Anvil(world) => write!(f, "Anvil({})", world.directory.display()),
+            Self::Anvil(world) => write!(f, "Anvil({})", world.core.directory.display()),
         }
     }
 }
@@ -116,7 +127,142 @@ impl Source {
     pub fn column(&self, pos: ChunkPos) -> Column<'_> {
         match self {
             Self::Flat(flat) => Column::Shared(flat.column()),
-            Self::Anvil(world) => Column::Built(world.column(pos)),
+            Self::Anvil(world) => match world.residency.resident(pos) {
+                Some(chunk) => Column::Resident(chunk),
+                // Nobody is keeping this one. Built here, on whatever thread
+                // asked, which is what every caller did before residency
+                // existed: this path can only ever be as slow as it was.
+                None => Column::Built(world.core.column(pos)),
+            },
+        }
+    }
+
+    /// Claim the columns around `centre` for one player.
+    ///
+    /// Refcounts only — see [`Residency::hold`]. Nothing here reads a file, so
+    /// a session may call it from the task that just judged a movement packet;
+    /// [`Source::warm`] is the half that must not be.
+    ///
+    /// A flat world has nothing to keep: it lends one template column to every
+    /// position, so residency would be a refcount on a borrow.
+    pub fn hold(&self, centre: ChunkPos) {
+        if let Self::Anvil(world) = self {
+            world.residency.hold(centre);
+        }
+    }
+
+    /// Give up one player's claim on the columns around `centre`.
+    pub fn release(&self, centre: ChunkPos) {
+        if let Self::Anvil(world) = self {
+            world.residency.release(centre);
+        }
+    }
+
+    /// Claim named columns for one holder, for a caller whose working set is
+    /// not a ring around a player. See [`Residency::hold_columns`].
+    pub fn hold_columns(&self, columns: &[ChunkPos]) {
+        if let Self::Anvil(world) = self {
+            world.residency.hold_columns(columns);
+        }
+    }
+
+    /// Give up a claim taken by [`Source::hold_columns`].
+    pub fn release_columns(&self, columns: &[ChunkPos]) {
+        if let Self::Anvil(world) = self {
+            world.residency.release_columns(columns);
+        }
+    }
+
+    /// Ask for these columns to be built, and carry on.
+    ///
+    /// **This is the call every caller on a hot path wants** and the only one
+    /// that is safe from all of them: it hands a list to the world's own
+    /// warming thread and returns. A session task and the tick loop are
+    /// different threads with different rules about blocking, and neither of
+    /// them may read a region file; this is the one door both can use.
+    ///
+    /// Nothing waits on the result. A caller that reaches a column before the
+    /// thread does builds it, which is what every caller did before residency
+    /// existed — the floor is the old behaviour, never a hole in the world.
+    pub fn want(&self, columns: Vec<ChunkPos>) {
+        if let Self::Anvil(world) = self {
+            if let Some(wanted) = &world.wanted {
+                // Fails only if the warming thread has gone, which happens
+                // while the world is being dropped. There is nothing to warm
+                // for a world that is going away.
+                let _ = wanted.send(columns);
+            }
+        }
+    }
+
+    /// Ask for the ring around `centre` to be built, and carry on.
+    pub fn want_ring(&self, centre: ChunkPos) {
+        if let Self::Anvil(world) = self {
+            self.want(world.residency.cold(centre));
+        }
+    }
+
+    /// Build whatever around `centre` is claimed and not yet there, **on this
+    /// thread**, and return how many columns that was.
+    ///
+    /// The blocking form, for the two callers that have a reason to wait: a
+    /// join, which has no movement packet held up behind it and wants the
+    /// ground under the player there before the loading screen ends, and a
+    /// bench, which is measuring the cost itself. Everything else calls
+    /// [`Source::want`].
+    pub fn warm(&self, centre: ChunkPos) -> u32 {
+        let Self::Anvil(world) = self else { return 0 };
+        self.warm_columns(&world.residency.cold(centre))
+    }
+
+    /// The same, for a named set of columns rather than a ring.
+    pub fn warm_columns(&self, columns: &[ChunkPos]) -> u32 {
+        let Self::Anvil(world) = self else { return 0 };
+        let mut built = 0;
+        for pos in world.residency.cold_columns(columns) {
+            // Built with no lock held, then offered. A player who walked away
+            // in the meantime, or another thread that got there first, means
+            // the column is dropped here rather than kept — see
+            // [`Residency::fill`].
+            let chunk = world.core.column(pos);
+            world.residency.fill(pos, chunk);
+            built += 1;
+        }
+        built
+    }
+
+    /// The server's resident set, for a caller that keeps a claim on it —
+    /// `net::residency::Residence` for a session and
+    /// `net::residency::ColumnClaim` for the item entities.
+    ///
+    /// `None` on a flat world, which lends one template column to every
+    /// position and has nothing to keep. A claim on `None` does nothing and
+    /// that is the right nothing: there is no column to hold.
+    #[must_use]
+    pub fn residency(&self) -> Option<Arc<Residency>> {
+        match self {
+            Self::Flat(_) => None,
+            Self::Anvil(world) => Some(Arc::clone(&world.residency)),
+        }
+    }
+
+    /// Where a claim sends the columns it has just taken, to be built off the
+    /// caller's own thread. `None` where the world builds nothing or its
+    /// warming thread would not start.
+    #[must_use]
+    pub fn warming(&self) -> Option<std::sync::mpsc::Sender<Vec<ChunkPos>>> {
+        match self {
+            Self::Flat(_) => None,
+            Self::Anvil(world) => world.wanted.clone(),
+        }
+    }
+
+    /// How many columns the server is keeping. Zero on a flat world.
+    #[must_use]
+    pub fn resident_columns(&self) -> usize {
+        match self {
+            Self::Flat(_) => 0,
+            Self::Anvil(world) => world.residency.len(),
         }
     }
 
@@ -126,13 +272,52 @@ impl Source {
     pub fn flat(&self) -> &FlatWorld {
         match self {
             Self::Flat(flat) => flat,
-            Self::Anvil(world) => &world.fallback,
+            Self::Anvil(world) => &world.core.fallback,
         }
     }
 }
 
-/// A world on disk.
+/// A world on disk, and the thread that reads it ahead of the players.
+///
+/// Two halves on purpose. [`AnvilCore`] is everything that answers a question
+/// about the world, behind an `Arc` so that the warming thread can hold it; the
+/// wrapper is the residency, the channel and the thread's own lifetime, which
+/// belong to the world rather than to anything asking it for a column.
+///
+/// The thread is the answer to a question the server asks in two places and
+/// cannot answer the same way in either. A session runs on a tokio worker and a
+/// tick participant runs on the engine's own `std` thread; neither may block on
+/// a region file, and `tokio::task::spawn_blocking` exists only for the first.
+/// One thread here serves both, and neither caller has to know it is there.
 pub struct AnvilWorld {
+    core: Arc<AnvilCore>,
+    /// The columns the server is keeping because players or items are near
+    /// them. Shared with the warming thread; see [`Residency`] for what it is
+    /// serialised against.
+    residency: Arc<Residency>,
+    /// Columns somebody has claimed and nobody has built yet. `None` where the
+    /// thread could not be started, which is a world that warms nothing and
+    /// still works: every caller builds its own column, exactly as they did
+    /// before any of this.
+    wanted: Option<std::sync::mpsc::Sender<Vec<ChunkPos>>>,
+    warming: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for AnvilWorld {
+    /// The sender goes first, which ends the thread's loop, and then the thread
+    /// is waited for. Not detached: a warming thread still holding the region
+    /// mutex while the process tears the world down is a shutdown that hangs
+    /// on a lock nobody owns any more.
+    fn drop(&mut self) {
+        self.wanted = None;
+        if let Some(thread) = self.warming.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Everything that answers a question about a world on disk.
+struct AnvilCore {
     directory: PathBuf,
     /// Open region files, by the region they cover. Behind a mutex because a
     /// `RegionFile` seeks as it reads and every session's task asks it for
@@ -168,18 +353,20 @@ const SKY_FLOOR_CACHE_CAP: usize = 4096;
 impl std::fmt::Debug for AnvilWorld {
     /// The open region files are file handles and seek positions, and the name
     /// tables are three hundred strings. What a reader wants is which world
-    /// this is and how much of it is open.
+    /// this is, how much of it is open and how much of it is being kept.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AnvilWorld")
-            .field("directory", &self.directory)
+            .field("directory", &self.core.directory)
             .field(
                 "regions_open",
                 &self
+                    .core
                     .regions
                     .lock()
                     .map(|open| open.len())
                     .unwrap_or_default(),
             )
+            .field("resident_columns", &self.residency.len())
             .finish_non_exhaustive()
     }
 }
@@ -192,7 +379,7 @@ impl std::fmt::Debug for RegistryNames {
     }
 }
 
-impl AnvilWorld {
+impl AnvilCore {
     /// `opacity` is what the columns are lit with — see
     /// [`world::opacity_of`](super::world::opacity_of), which is the one place
     /// that decides between Minecraft's own numbers and the air-only stand-in.
@@ -200,7 +387,7 @@ impl AnvilWorld {
     /// The flat `fallback` keeps its own model and that is not an oversight: it
     /// is made of bedrock, dirt and grass, every one of which both models agree
     /// is a wall, so the two answers are the same answer.
-    pub fn new(
+    fn new(
         directory: PathBuf,
         names: RegistryNames,
         fallback: FlatWorld,
@@ -219,6 +406,50 @@ impl AnvilWorld {
             sky_floors: Mutex::new(HashMap::new()),
         }
     }
+}
+
+impl AnvilWorld {
+    /// `opacity` is what the columns are lit with — see
+    /// [`world::opacity_of`](super::world::opacity_of).
+    pub fn new(
+        directory: PathBuf,
+        names: RegistryNames,
+        fallback: FlatWorld,
+        opacity: dust_world::propagation::OpacityModel,
+        constants: Option<std::sync::Arc<dust_registry::BlockConstants>>,
+    ) -> Self {
+        let core = Arc::new(AnvilCore::new(
+            directory, names, fallback, opacity, constants,
+        ));
+        let residency = Arc::new(Residency::new());
+        let (wanted, requests) = std::sync::mpsc::channel::<Vec<ChunkPos>>();
+        let warming = std::thread::Builder::new()
+            .name("dust-warming".to_owned())
+            .spawn({
+                let core = Arc::clone(&core);
+                let residency = Arc::clone(&residency);
+                move || {
+                    // Ends when the world drops its sender. Nothing here holds
+                    // a lock across a build: `cold` takes a snapshot, the
+                    // column is read with nothing held, and `fill` takes the
+                    // write lock for one insert.
+                    while let Ok(columns) = requests.recv() {
+                        for pos in residency.cold_columns(&columns) {
+                            residency.fill(pos, core.column(pos));
+                        }
+                    }
+                }
+            })
+            .ok();
+        Self {
+            core,
+            residency,
+            // A thread that would not start leaves every caller building its
+            // own columns, which is what they all did before this existed.
+            wanted: warming.is_some().then_some(wanted),
+            warming,
+        }
+    }
 
     /// Whether this looks like a world directory at all, checked at boot so an
     /// operator who mistyped a path is told then rather than by an empty world.
@@ -232,7 +463,9 @@ impl AnvilWorld {
             })
         })
     }
+}
 
+impl AnvilCore {
     /// Where the sky reaches in one column, read or remembered.
     ///
     /// A column the world does not contain answers with the flat fallback's

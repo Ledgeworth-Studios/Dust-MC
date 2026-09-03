@@ -354,6 +354,83 @@ impl EditedWorld {
         Edits(self.edits.read().expect("the edit map is never poisoned"))
     }
 
+    /// Claim the columns around `centre` for one player, so that a movement
+    /// check near them reads a column the server already has rather than one
+    /// it has to build.
+    ///
+    /// Refcounts and no file reads: safe on a session's own task. See
+    /// [`super::residency::Residency`] for who owns a column and when it goes.
+    pub fn hold(&self, centre: ChunkPos) {
+        self.generated.hold(centre);
+    }
+
+    /// Give up one player's claim on the columns around `centre`.
+    pub fn release(&self, centre: ChunkPos) {
+        self.generated.release(centre);
+    }
+
+    /// Claim named columns, for a caller whose working set is not a ring
+    /// around a player — the item entities, whose columns are wherever they
+    /// were dropped. See [`super::residency::Residency::hold_columns`].
+    pub fn hold_columns(&self, columns: &[ChunkPos]) {
+        self.generated.hold_columns(columns);
+    }
+
+    /// Give up a claim taken by [`EditedWorld::hold_columns`].
+    pub fn release_columns(&self, columns: &[ChunkPos]) {
+        self.generated.release_columns(columns);
+    }
+
+    /// Ask for claimed columns to be built and carry on, without waiting.
+    ///
+    /// The call every hot path wants: it hands the list to the world's own
+    /// warming thread. Safe from a session task and from the tick loop alike,
+    /// which is the point of it — those are different threads with different
+    /// rules and neither may read a region file.
+    pub fn want(&self, columns: Vec<ChunkPos>) {
+        self.generated.want(columns);
+    }
+
+    /// The same, for the ring around a player's column.
+    pub fn want_ring(&self, centre: ChunkPos) {
+        self.generated.want_ring(centre);
+    }
+
+    /// Build the claimed-and-missing columns around `centre`, off the network
+    /// path. Returns how many were built.
+    ///
+    /// **Reads region files.** The caller is a blocking thread, never a
+    /// session task — that is the whole point of it being a separate call from
+    /// [`EditedWorld::hold`].
+    pub fn warm(&self, centre: ChunkPos) -> u32 {
+        self.generated.warm(centre)
+    }
+
+    /// The same, on this thread, for a named set of columns.
+    pub fn warm_columns(&self, columns: &[ChunkPos]) -> u32 {
+        self.generated.warm_columns(columns)
+    }
+
+    /// The server's resident set and the channel its builds go down, for a
+    /// caller that keeps a claim on them. See
+    /// [`super::source::Source::residency`].
+    #[must_use]
+    pub fn residency(&self) -> Option<Arc<super::residency::Residency>> {
+        self.generated.residency()
+    }
+
+    /// See [`super::source::Source::warming`].
+    #[must_use]
+    pub fn warming(&self) -> Option<std::sync::mpsc::Sender<Vec<ChunkPos>>> {
+        self.generated.warming()
+    }
+
+    /// How many columns the server is keeping resident, across all players.
+    #[must_use]
+    pub fn resident_columns(&self) -> usize {
+        self.generated.resident_columns()
+    }
+
     /// How far up and down this world goes.
     pub fn height(&self) -> dust_world::heightmap::WorldHeight {
         self.generated.flat().height()

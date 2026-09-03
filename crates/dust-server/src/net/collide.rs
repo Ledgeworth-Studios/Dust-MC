@@ -7,6 +7,23 @@
 //! `dust-guard` and knows nothing about a chunk; this is the half that knows
 //! about chunks and nothing about the rule.
 //!
+//! # Where a column comes from now
+//!
+//! Three answers, cheapest first. A flat world **lends** one template column to
+//! every position and this module owns nothing. A world read from region files
+//! is asked for a **resident** column — one the server is keeping because a
+//! player is near it, held as an `Arc` and shared between every session that
+//! wants it — and that is the ordinary case for a player who is standing
+//! anywhere they walked to. Only a column nobody is keeping is **built** here,
+//! on the session's own task, which is what every column cost before
+//! [`super::residency`] existed. See
+//! [D25](../../../../docs/decisions/0025-who-keeps-a-chunk-column.md).
+//!
+//! The four-entry cache below is still worth having and is now a different
+//! thing: it saves the residency's read lock, not a region read. What it holds
+//! is an `Arc`, so a hit costs a pointer comparison and a miss costs a refcount
+//! bump rather than a megabyte.
+//!
 //! # Why the cache, and why it needs no invalidation
 //!
 //! A movement packet arrives about twenty times a second per player, and
@@ -75,20 +92,40 @@ pub struct Ground<'a> {
     world: &'a EditedWorld,
     constants: &'a BlockConstants,
     solid: Flag,
-    /// The columns as generated, where the source had to build them. A flat
+    /// The columns as generated, where the source did not lend one. A flat
     /// world lends its template and never fills this.
-    built: [Option<(ChunkPos, Chunk)>; CACHED_COLUMNS],
+    ///
+    /// `Arc` rather than `Chunk` because most entries now come from
+    /// [`super::residency`] and are the server's one copy: keeping a handle on
+    /// it costs a refcount instead of a megabyte, and holding that handle is
+    /// what makes a column safe to read after the residency has retired its
+    /// own entry.
+    built: [Option<(ChunkPos, std::sync::Arc<Chunk>)>; CACHED_COLUMNS],
     /// Which entry the next build replaces. Round robin rather than least
     /// recently used: with four entries and at most four columns in play there
     /// is nothing for a better policy to be better than.
     next: usize,
-    /// How many columns this session has had to build. Counted rather than
-    /// reasoned about: a build is a file read, a decompress, an NBT parse and
-    /// a light pass, and it is three orders of magnitude more expensive than
-    /// reading a cell out of the result — so whether this number is small is
-    /// the whole question about what a movement check costs on a real world.
-    /// `benches/movement.rs` prints it.
+    /// How many columns this session has had to build **on its own task**.
+    /// Counted rather than reasoned about: a build is a file read, a
+    /// decompress, an NBT parse and a light pass, and it is three orders of
+    /// magnitude more expensive than reading a cell out of the result — so
+    /// whether this number is small is the whole question about what a movement
+    /// check costs on a real world. `benches/movement.rs` prints it.
+    ///
+    /// With residency working this is expected to be **zero**: a column under a
+    /// player was claimed and built before they could reach it. A number that
+    /// is not zero is the measurement of how often a player outran the warming
+    /// thread, and it is the one that must be watched.
     built_columns: u32,
+    /// How many columns this session took out of the residency instead.
+    ///
+    /// Counted beside `built_columns` and not folded into it, because the two
+    /// answer different questions and a single "columns resolved" would hide
+    /// the one that matters. A row where both are zero is a flat world; a row
+    /// where this is high and `built_columns` is zero is residency working; a
+    /// row where both are zero on a region world would be a check reading
+    /// nothing at all.
+    resident_columns: u32,
 }
 
 impl<'a> Ground<'a> {
@@ -113,6 +150,7 @@ impl<'a> Ground<'a> {
             built: [const { None }; CACHED_COLUMNS],
             next: 0,
             built_columns: 0,
+            resident_columns: 0,
         })
     }
 
@@ -124,6 +162,14 @@ impl<'a> Ground<'a> {
     #[must_use]
     pub fn columns_built(&self) -> u32 {
         self.built_columns
+    }
+
+    /// How many columns this session read out of the server's resident set
+    /// rather than building. See the field's own note for why this is counted
+    /// separately from [`Ground::columns_built`] rather than added to it.
+    #[must_use]
+    pub fn columns_resident(&self) -> u32 {
+        self.resident_columns
     }
 
     /// The state at a cell, from the edits if one has touched it and from the
@@ -172,8 +218,19 @@ impl Solidity for Ground<'_> {
                 if !self.built.iter().flatten().any(|(at, _)| *at == pos) {
                     match world.template(pos) {
                         Column::Shared(chunk) => lent = Some(chunk),
-                        Column::Built(chunk) => {
+                        // The server is keeping this one. A refcount, not a
+                        // build — and holding the handle here means the
+                        // residency may retire its own entry mid-walk without
+                        // this session losing the column under its feet.
+                        Column::Resident(chunk) => {
                             self.built[self.next] = Some((pos, chunk));
+                            self.next = (self.next + 1) % CACHED_COLUMNS;
+                            self.resident_columns += 1;
+                        }
+                        // Nobody is keeping it, so this session pays for it,
+                        // exactly as every column used to be paid for.
+                        Column::Built(chunk) => {
+                            self.built[self.next] = Some((pos, std::sync::Arc::new(chunk)));
                             self.next = (self.next + 1) % CACHED_COLUMNS;
                             self.built_columns += 1;
                         }
@@ -186,7 +243,7 @@ impl Solidity for Ground<'_> {
                         .iter()
                         .flatten()
                         .find(|(at, _)| *at == pos)
-                        .map(|(_, chunk)| chunk)
+                        .map(|(_, chunk)| chunk.as_ref())
                     {
                         Some(chunk) => chunk,
                         // Unreachable: the column was either lent or built
