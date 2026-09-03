@@ -135,7 +135,8 @@ pub enum RosterChange {
     ///
     /// Carries the difference rather than the whole set because
     /// `minecraft:set_equipment` charges per entry — a set of six with one
-    /// helmet in it is sixteen bytes where the one changed slot is six — and
+    /// helmet in it is a seventeen-byte body where the one changed slot is
+    /// seven — and
     /// because everybody who can receive this has already been told the rest.
     /// One event for however many slots moved at once, so a player swapping a
     /// full set of armour costs each viewer one packet and not four.
@@ -304,9 +305,9 @@ impl Roster {
                 return;
             };
             let mut changed: Vec<EquipmentChange> = Vec::new();
-            for slot in 0..EQUIPMENT_SLOTS {
-                if player.equipment[slot] != now[slot] {
-                    changed.push((slot as u8, now[slot].clone()));
+            for (slot, stack) in now.iter().enumerate().take(EQUIPMENT_SLOTS) {
+                if &player.equipment[slot] != stack {
+                    changed.push((slot as u8, stack.clone()));
                 }
             }
             if changed.is_empty() {
@@ -532,7 +533,10 @@ mod tests {
 
         roster.equipped(wearer.player.entity_id, wearing(&[2, 3, 4, 5]));
 
-        assert_eq!(equipment_changes(&mut watcher.listener), vec![vec![2, 3, 4, 5]]);
+        assert_eq!(
+            equipment_changes(&mut watcher.listener),
+            vec![vec![2, 3, 4, 5]]
+        );
     }
 
     #[test]

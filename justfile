@@ -95,3 +95,17 @@ drops port="25565":
 
 collide port="25565":
     cd tools/bot && node collide.js {{port}}
+
+# What one player can see of another player's armour and hand.
+#
+#   just equipment 25565                    record from a running server
+#   node equipment.js <port> --out a.json   the same, naming the file
+#   node equipment.js --compare vanilla.json dust.json
+#
+# Three bots: one dresses, one watches, and one joins after everything has
+# already happened. The third is the point — a server that sends equipment only
+# on change looks perfect to the watcher and leaves the latecomer looking at a
+# naked player forever. Outside `verify` for the same reason `bot` is, and the
+# comparison against a real 1.21.1 server is what decision record 0029 is.
+equipment port="25565":
+    cd tools/bot && node equipment.js {{port}}

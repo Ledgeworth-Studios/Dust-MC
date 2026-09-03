@@ -99,6 +99,57 @@ of getting a confident wrong answer:
   prediction stands uncorrected and the player sees a block on their head.
   `--predict` sends that prediction and requires the contradiction.
 
+## The equipment differential
+
+`equipment.js` asks a different question again: not what the server told the
+player who acted, but what it told **everybody else**. It is the only script
+here that needs more than one bot, because `minecraft:set_equipment` is the one
+packet a server sends to every viewer *except* the player it is about.
+
+```
+node equipment.js 25565 --out dust.json
+node equipment.js 25703 --out vanilla.json    # a real 1.21.1 server
+node equipment.js --compare vanilla.json dust.json
+```
+
+Three bots. A **wearer** who dresses, a **watcher** who was already here, and a
+**latecomer** who joins once the wearer is fully dressed and then watches
+nothing happen. The latecomer is the point: a server that sends equipment only
+when it changes looks perfect to the watcher and leaves the latecomer staring
+at a naked player forever, which is what "everybody is bare-headed until they
+each happen to change a slot" looks like from the inside.
+
+Every step records **how many packets arrived and how many entries were in
+them**, not just the resulting picture. Half the steps are steps where saying
+nothing is the right answer — a stack dropped into the middle of the inventory
+changes no equipment slot — and a recording that held only the picture would
+call a server that broadcasts all six slots on every click identical to one
+that broadcasts none. The counts are what make "said nothing" a measurement.
+They also answer the batching question without anybody having to reason about
+it: three pieces of armour is either one packet of three entries or three
+packets of one, and the recording says which.
+
+It is 14 of 15 against a real 1.21.1 server, and the fifteenth is named in the
+script: Minecraft coalesces equipment per tick and Dust broadcasts per
+container change, so three creative writes inside one tick leave as three
+packets rather than one. The entries and the picture agree; only the packet
+count differs, and a difference in any other field on any other step still
+fails. Decision record 0029 is this script's output.
+
+Two edits to the server were used to watch it fail. Dropping the on-sight send
+took it to 13 of 15 on the latecomer's step alone; broadcasting the whole
+six-slot set on every container change took it to **1 of 15**, including both
+of the steps whose right answer is silence.
+
+**One trap, paid for here.** A packet listener attached in a `spawn` handler is
+attached too late. A join burst arrives in one TCP read and node runs every
+packet handler for that read synchronously, while the microtask a `spawn`
+listener resolves runs after all of them — so a listener attached on spawn
+misses everything the server said in the same breath as the position packet,
+which is exactly where the equipment of everybody already here is sent. The
+first run of this script reported a latecomer seeing nothing, and that reading
+was the instrument. `spawned()` now attaches at construction.
+
 ## Running it
 
 ```
