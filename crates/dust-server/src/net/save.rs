@@ -96,6 +96,47 @@ pub struct SavedStack {
     pub components: Option<String>,
 }
 
+/// One furnace, as it is written down.
+///
+/// **Ticks, not a wall-clock deadline.** A furnace with 900 ticks of coal left
+/// is written as 900 and comes back as 900, so a server that was off for a
+/// week comes back to the furnace the player left rather than to a cold one
+/// with a stack of ash. That is vanilla's behaviour and it is the one a player
+/// can reason about; the alternative — advancing a furnace over the downtime —
+/// would be a server where logging in gives you free smelting, or takes your
+/// fuel, depending on which way the arithmetic went.
+///
+/// The fire is written as its **block name** for the same reason
+/// [`SavedBlock`] is: `minecraft:blast_furnace` means the same thing in every
+/// version and a discriminant does not.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedFurnace {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    /// `minecraft:furnace`, `minecraft:blast_furnace` or `minecraft:smoker`.
+    pub fire: String,
+    /// Only the slots that hold something: 0 the input, 1 the fuel, 2 the
+    /// output.
+    #[serde(default)]
+    pub slots: Vec<SavedStack>,
+    /// Ticks of fuel left.
+    #[serde(default)]
+    pub lit: u16,
+    /// What the fuel now burning was worth.
+    #[serde(default)]
+    pub lit_total: u16,
+    /// Ticks the current item has cooked for.
+    #[serde(default)]
+    pub cooking: u16,
+    /// Ticks the current item takes.
+    #[serde(default)]
+    pub total: u16,
+    /// Experience banked and not yet collected.
+    #[serde(default)]
+    pub experience: f32,
+}
+
 /// Where a player was when they left, and what they were carrying.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedPlayer {
@@ -112,6 +153,10 @@ pub struct SavedPlayer {
     /// Which hotbar slot was in hand, `0..9`.
     #[serde(default)]
     pub selected: u8,
+    /// Total experience points. Absent in a file written before there was
+    /// anything to earn any from, which means none.
+    #[serde(default)]
+    pub experience: u32,
 }
 
 /// The whole file.
@@ -124,6 +169,10 @@ pub struct Save {
     pub blocks: Vec<SavedBlock>,
     #[serde(default)]
     pub players: Vec<SavedPlayer>,
+    /// Every furnace that holds anything. Absent in a version 2 file, which
+    /// is a world from before furnaces existed and therefore had none.
+    #[serde(default)]
+    pub furnaces: Vec<SavedFurnace>,
     /// Which Minecraft version's component encoding the `components` fields
     /// are written in, or absent when no stack in the file has any.
     ///
@@ -146,7 +195,8 @@ pub struct Save {
 
 /// The version this build writes and is willing to read.
 ///
-/// Bumped to 2 when player inventories joined the file. A version 1 file still
+/// Bumped to 2 when player inventories joined the file, and to 3 when
+/// furnaces did. A version 1 file still
 /// loads — the new fields default to an empty inventory, which is exactly what
 /// a save written before there were any means — and it is only the other
 /// direction that is refused.
@@ -156,7 +206,10 @@ pub struct Save {
 /// a version 2 reader meeting a version 2 file that has them would ignore keys
 /// it does not know, which is the one case this reasoning does not cover and
 /// is why the encoding version is written in the file rather than inferred.
-pub const SAVE_VERSION: u32 = 2;
+/// Bumped to 3 when furnaces joined the file, on the same argument: a version
+/// 2 file has no `furnaces` key, defaults to none, and that is exactly what a
+/// world written before there were any means.
+pub const SAVE_VERSION: u32 = 3;
 
 /// The file's name inside the world directory.
 pub const SAVE_FILE: &str = "dust-edits.json";
@@ -342,6 +395,10 @@ pub type SharedInventories = std::sync::Arc<std::sync::Mutex<Inventories>>;
 pub struct Carried {
     pub slots: crate::net::inventory::Slots,
     pub selected: u8,
+    /// Total experience points. **Points, not levels**: levels are a function
+    /// of points and the function is not linear, so storing the level would
+    /// round away the progress bar every time a player logged out.
+    pub experience: u32,
 }
 
 /// What each player was carrying, read out of a save.
@@ -366,7 +423,7 @@ pub fn inventories(save: &Save) -> (Inventories, Vec<String>, usize) {
         let Some(id) = parse_id(&player.id) else {
             continue;
         };
-        if player.inventory.is_empty() && player.selected == 0 {
+        if player.inventory.is_empty() && player.selected == 0 && player.experience == 0 {
             continue;
         }
         let mut slots: crate::net::inventory::Slots = std::array::from_fn(|_| None);
@@ -411,6 +468,7 @@ pub fn inventories(save: &Save) -> (Inventories, Vec<String>, usize) {
             Carried {
                 slots,
                 selected: player.selected,
+                experience: player.experience,
             },
         );
     }
@@ -441,12 +499,134 @@ pub fn stacks_of(carried: &Carried) -> Vec<SavedStack> {
 /// `None` rather than always the version, so that a world nobody has put a
 /// named item in stays a file with no component key in it at all.
 #[must_use]
-pub fn components_version(players: &[SavedPlayer]) -> Option<&'static str> {
-    players
+pub fn components_version(
+    players: &[SavedPlayer],
+    furnaces: &[SavedFurnace],
+) -> Option<&'static str> {
+    let in_players = players
         .iter()
         .flat_map(|player| player.inventory.iter())
-        .any(|stack| stack.components.is_some())
-        .then_some(dust_registry::generated::registries::DATA_VERSION)
+        .any(|stack| stack.components.is_some());
+    // A furnace's slots carry components too — a renamed pickaxe used as fuel
+    // is a real thing a player can do — and a save that stamped the version
+    // only from the players' halves would write component bytes with nothing
+    // saying which version they are.
+    let in_furnaces = furnaces
+        .iter()
+        .flat_map(|furnace| furnace.slots.iter())
+        .any(|stack| stack.components.is_some());
+    (in_players || in_furnaces).then_some(dust_registry::generated::registries::DATA_VERSION)
+}
+
+/// Write down one furnace.
+#[must_use]
+pub fn saved_furnace(at: Position, furnace: &crate::net::furnaces::Furnace) -> SavedFurnace {
+    SavedFurnace {
+        x: at.x,
+        y: at.y,
+        z: at.z,
+        fire: furnace.fire.block().to_owned(),
+        slots: furnace
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, stack)| {
+                let stack = stack.as_ref()?;
+                Some(SavedStack {
+                    slot: index as u8,
+                    item: stack.item.name().to_owned(),
+                    count: stack.count,
+                    components: stack.components.to_hex(),
+                })
+            })
+            .collect(),
+        lit: furnace.lit,
+        lit_total: furnace.lit_total,
+        cooking: furnace.cooking,
+        total: furnace.total,
+        experience: furnace.experience,
+    }
+}
+
+/// Read the furnaces back.
+///
+/// Returns what was read, the item names this build does not have and the
+/// component patches it would not vouch for — the same three answers
+/// [`inventories`] gives, for the same reasons.
+///
+/// A furnace whose `fire` names a block this build has no fire for is dropped
+/// and named. That is a furnace's contents lost, and it is still the right
+/// answer: the alternative is guessing which fire it was, and a smoker
+/// restored as a blast furnace would cook the wrong things at the wrong speed
+/// for ever.
+#[must_use]
+pub fn furnaces(
+    save: &Save,
+) -> (
+    Vec<(Position, crate::net::furnaces::Furnace)>,
+    Vec<String>,
+    usize,
+) {
+    let mut out = Vec::new();
+    let mut unknown = Vec::new();
+    let mut dropped_components = 0usize;
+    let components_readable = save
+        .components
+        .as_deref()
+        .is_some_and(|version| version == dust_registry::generated::registries::DATA_VERSION);
+    for saved in &save.furnaces {
+        let Some(fire) = dust_sim::cooking::Fire::from_block(&saved.fire) else {
+            if !unknown.contains(&saved.fire) {
+                unknown.push(saved.fire.clone());
+            }
+            continue;
+        };
+        let mut furnace = crate::net::furnaces::Furnace::new(fire);
+        furnace.lit = saved.lit;
+        furnace.lit_total = saved.lit_total;
+        furnace.cooking = saved.cooking;
+        furnace.total = saved.total;
+        furnace.experience = if saved.experience.is_finite() && saved.experience >= 0.0 {
+            saved.experience
+        } else {
+            0.0
+        };
+        for stack in &saved.slots {
+            let index = usize::from(stack.slot);
+            if index >= crate::net::furnaces::SLOTS || stack.count == 0 {
+                continue;
+            }
+            let Some(item) = dust_registry::Item::from_name(&stack.item) else {
+                if !unknown.contains(&stack.item) {
+                    unknown.push(stack.item.clone());
+                }
+                continue;
+            };
+            let components = match stack.components.as_deref() {
+                None => dust_protocol::components::ComponentPatch::EMPTY,
+                Some(hex) if components_readable => {
+                    match dust_protocol::components::ComponentPatch::from_hex(hex) {
+                        Ok(patch) => patch,
+                        Err(_) => {
+                            dropped_components += 1;
+                            dust_protocol::components::ComponentPatch::EMPTY
+                        }
+                    }
+                }
+                Some(_) => {
+                    dropped_components += 1;
+                    dust_protocol::components::ComponentPatch::EMPTY
+                }
+            };
+            furnace.slots[index] = Some(crate::net::inventory::Stack::with_components(
+                item,
+                stack.count,
+                components,
+            ));
+        }
+        out.push((Position::new(saved.x, saved.y, saved.z), furnace));
+    }
+    (out, unknown, dropped_components)
 }
 
 /// Read a hyphenated profile id back into its bytes.
@@ -510,6 +690,7 @@ mod tests {
         let dir = temp_dir("roundtrip");
         let save = Save {
             version: SAVE_VERSION,
+            furnaces: Vec::new(),
             components: None,
             blocks: vec![SavedBlock {
                 x: -1,
@@ -537,6 +718,7 @@ mod tests {
                     },
                 ],
                 selected: 4,
+                experience: 0,
             }],
         };
         store(&dir, &save).expect("written");
@@ -598,6 +780,7 @@ mod tests {
         // changed version needs to know which item their players lost.
         let save = Save {
             version: SAVE_VERSION,
+            furnaces: Vec::new(),
             components: None,
             blocks: Vec::new(),
             players: vec![SavedPlayer {
@@ -620,6 +803,7 @@ mod tests {
                     },
                 ],
                 selected: 0,
+                experience: 0,
             }],
         };
         let (carried, unknown, _) = inventories(&save);
@@ -635,6 +819,7 @@ mod tests {
         let dir = temp_dir("future");
         let save = Save {
             version: SAVE_VERSION + 1,
+            furnaces: Vec::new(),
             components: None,
             ..Save::default()
         };
@@ -694,6 +879,7 @@ mod tests {
         let dir = temp_dir("atomic");
         let good = Save {
             version: SAVE_VERSION,
+            furnaces: Vec::new(),
             components: None,
             blocks: vec![SavedBlock {
                 x: 7,
@@ -728,6 +914,7 @@ mod tests {
     fn one_player(stack: SavedStack, components: Option<&str>) -> Save {
         Save {
             version: SAVE_VERSION,
+            furnaces: Vec::new(),
             components: components.map(ToOwned::to_owned),
             blocks: Vec::new(),
             players: vec![SavedPlayer {
@@ -737,6 +924,7 @@ mod tests {
                 z: 0.0,
                 inventory: vec![stack],
                 selected: 0,
+                experience: 0,
             }],
         }
     }
@@ -758,7 +946,11 @@ mod tests {
         );
         let mut slots: crate::net::inventory::Slots = std::array::from_fn(|_| None);
         slots[9] = Some(stack.clone());
-        let carried = Carried { slots, selected: 0 };
+        let carried = Carried {
+            slots,
+            selected: 0,
+            experience: 0,
+        };
         let written = stacks_of(&carried);
         assert_eq!(written[0].components, worn(431).to_hex());
 
@@ -848,11 +1040,13 @@ mod tests {
                 components: None,
             }],
             selected: 0,
+            experience: 0,
         }];
-        assert_eq!(components_version(&plain), None);
+        assert_eq!(components_version(&plain, &[]), None);
         let dir = temp_dir("plain");
         let save = Save {
             version: SAVE_VERSION,
+            furnaces: Vec::new(),
             components: None,
             blocks: Vec::new(),
             players: plain,

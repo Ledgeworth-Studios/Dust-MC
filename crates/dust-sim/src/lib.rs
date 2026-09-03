@@ -2,8 +2,9 @@
 //!
 //! Entities, physics, inventory, redstone, fluids, AI and combat will live
 //! here. What is here today is [`placement`]: which *state* a block takes when
-//! a player puts it down; [`drops`]: what breaking one yields; and
-//! [`crafting`]: what a grid of items makes.
+//! a player puts it down; [`drops`]: what breaking one yields;
+//! [`crafting`]: what a grid of items makes; and [`cooking`]: what a fire turns
+//! one item into.
 //!
 //! Nothing in this crate knows about a socket or a save file. It takes what a
 //! click said and answers with a block state, which is what lets it be tested
@@ -16,11 +17,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cooking;
 pub mod crafting;
 pub mod drops;
 pub mod mining;
 pub mod placement;
 
+pub use cooking::{Cooked, Cooking, Fire};
 pub use crafting::{Recipe, Recipes};
 pub use drops::{compile, Break, Drop, Rng, Table, Tables, Tool};
 pub use mining::{tool_is_correct, Digger, Progress};

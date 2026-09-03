@@ -95,6 +95,7 @@ use std::sync::{Arc, OnceLock};
 
 use dust_protocol::components::ComponentPatch;
 use dust_protocol::types::Slot;
+use dust_registry::placement::ItemBlocks;
 use dust_registry::tags::{self, TagRegistry};
 use dust_registry::Item;
 use dust_sim::crafting::Recipes;
@@ -170,9 +171,34 @@ pub const TABLE_GRID_END: usize = 55;
 pub const TABLE_OUTPUT: usize = 55;
 /// How wide a crafting table's grid is.
 pub const TABLE_WIDTH: usize = 3;
-/// Every slot this container stores: the player's forty-six and the ten a
-/// crafting table adds while one is open.
-pub const STORAGE: usize = 56;
+/// A furnace's three slots, `56..=58` in this container's *storage*.
+///
+/// **A mirror, not the furnace.** The furnace's items live in the world, in
+/// `net::furnaces`, because they go on existing when every player logs out and
+/// they go on smelting while nobody is watching. What is here is one session's
+/// copy of them, refreshed from the world at the top of every click and
+/// written back at the bottom of it, under the same lock — see
+/// [`Inventory::with_furnace`].
+///
+/// Keeping them here rather than in a menu of their own is the same argument
+/// [`TABLE_GRID_START`] makes: it is what lets one implementation of the seven
+/// click modes serve a third window, and the modes are at 101 of 101 against a
+/// real server because there is one of them.
+pub const FURNACE_START: usize = 56;
+/// The furnace's input, the slot the fire cooks.
+pub const FURNACE_INPUT: usize = 56;
+/// The furnace's fuel.
+pub const FURNACE_FUEL: usize = 57;
+/// The furnace's output. Takes nothing and gives what the fire made.
+pub const FURNACE_OUTPUT: usize = 58;
+/// One past the furnace's slots.
+pub const FURNACE_END: usize = 59;
+
+/// Every slot this container stores: the player's forty-six, the ten a
+/// crafting table adds, and the three a furnace does.
+///
+/// Under 64, and that is load-bearing: [`Changed`] is a `u64` bitmask.
+pub const STORAGE: usize = 59;
 
 /// The slot number a click outside the window carries.
 pub const OUTSIDE: i16 = -999;
@@ -349,12 +375,27 @@ fn slot_limit(index: usize, item: Item) -> u8 {
 /// The offhand really is unrestricted: a real server accepts a stack of nine
 /// cobblestone into slot 45, which is measured in `tools/bot/clicks.js` and is
 /// not a guess about what looks sensible.
-fn may_place(index: usize, item: Item) -> bool {
-    if index == CRAFTING_OUTPUT || index == TABLE_OUTPUT {
+fn may_place(index: usize, item: Item, fuel: Option<&ItemBlocks>) -> bool {
+    if index == CRAFTING_OUTPUT || index == TABLE_OUTPUT || index == FURNACE_OUTPUT {
         return false;
     }
     if (ARMOUR_START..ARMOUR_END).contains(&index) {
         return worn_in(item) == Some(index);
+    }
+    // `FurnaceFuelSlot.mayPlace`: something that burns, or a bucket. The
+    // bucket is there because a lava bucket burns and leaves an empty one
+    // behind, and a player must be able to take that empty one back out and
+    // put a full one in without the slot arguing.
+    //
+    // A server whose table has no `burn` column does **not** refuse
+    // everything: it has no opinion, and a fuel slot that took nothing would
+    // be a furnace that cannot be lit at all. See `ItemBlocks::has_burn` —
+    // "the table does not know" is not "this item does not burn".
+    if index == FURNACE_FUEL {
+        let Some(fuel) = fuel.filter(|table| table.has_burn()) else {
+            return true;
+        };
+        return fuel.burn(item).is_some() || item.name() == "minecraft:bucket";
     }
     true
 }
@@ -373,6 +414,15 @@ type Destinations = [Option<(std::ops::Range<usize>, bool)>; 2];
 /// [`Inventory::pickup_result`] and not a write.
 fn writable(index: usize) -> bool {
     index != CRAFTING_OUTPUT && index != TABLE_OUTPUT && index < STORAGE
+}
+
+/// Whether this slot is one of a furnace's three.
+///
+/// The question a save asks, and a close: those three belong to a block, and a
+/// player who walks away from a furnace must not take its contents with them.
+#[must_use]
+pub fn is_furnace_slot(index: usize) -> bool {
+    (FURNACE_START..FURNACE_END).contains(&index)
 }
 
 /// One stack: an item, how many of it, and what makes it that one.
@@ -451,6 +501,10 @@ impl Stack {
 /// The slots of one player's container.
 pub type Slots = [Option<Stack>; SLOTS];
 
+/// How many slots a furnace's window numbers: three, then the player's
+/// twenty-seven and nine.
+pub const FURNACE_SLOT_COUNT: usize = 39;
+
 /// Which window a click names, and therefore what its slot numbers mean.
 ///
 /// A window is a *numbering*, not a container. Both of these are views onto
@@ -467,14 +521,30 @@ pub enum Window {
     /// player's main inventory and `37..=45` their hotbar. No armour and no
     /// offhand — a crafting table cannot see either.
     Table,
+    /// A furnace, a blast furnace or a smoker: `0` the input, `1` the fuel,
+    /// `2` the result, `3..=29` the player's main inventory and `30..=38`
+    /// their hotbar. **Thirty-nine slots, not forty-six** — the first window
+    /// here that is not the same size as the others, which is why
+    /// [`Window::slot_count`] exists at all.
+    ///
+    /// The three slots in front belong to the block, not the player. They are
+    /// mirrored into [`FURNACE_START`] for the duration of a click; see there.
+    Furnace,
 }
 
 impl Window {
-    /// How many slots this window numbers. Forty-six for both, and they are
-    /// not the same forty-six.
+    /// How many slots this window numbers.
+    ///
+    /// Forty-six for the player's own and a crafting table, which are not the
+    /// same forty-six; thirty-nine for a furnace, which has three slots in
+    /// front of the player's thirty-six instead of ten. A container sent at
+    /// the wrong length is a screen whose last row is somewhere else.
     #[must_use]
     pub fn slot_count(self) -> usize {
-        SLOTS
+        match self {
+            Self::Player | Self::Table => SLOTS,
+            Self::Furnace => FURNACE_SLOT_COUNT,
+        }
     }
 
     /// The storage index a wire slot number reaches, or `None` for a number
@@ -488,6 +558,14 @@ impl Window {
                 1..=9 => TABLE_GRID_START + slot - 1,
                 10..=36 => MAIN_START + slot - 10,
                 37..=45 => HOTBAR_START + slot - 37,
+                _ => return None,
+            }),
+            Self::Furnace => Some(match slot {
+                0 => FURNACE_INPUT,
+                1 => FURNACE_FUEL,
+                2 => FURNACE_OUTPUT,
+                3..=29 => MAIN_START + slot - 3,
+                30..=38 => HOTBAR_START + slot - 30,
                 _ => return None,
             }),
         }
@@ -506,18 +584,43 @@ impl Window {
                 HOTBAR_START..=44 => storage - HOTBAR_START + 37,
                 _ => return None,
             }),
+            Self::Furnace => Some(match storage {
+                FURNACE_INPUT => 0,
+                FURNACE_FUEL => 1,
+                FURNACE_OUTPUT => 2,
+                MAIN_START..=35 => storage - MAIN_START + 3,
+                HOTBAR_START..=44 => storage - HOTBAR_START + 30,
+                _ => return None,
+            }),
         }
     }
 
-    /// The output slot this window's grid fills, and the grid that fills it.
-    fn crafting(self) -> (usize, std::ops::Range<usize>, usize) {
+    /// The output slot this window's grid fills, and the grid that fills it —
+    /// or `None` for a window with no grid.
+    ///
+    /// An `Option` and not a sentinel pair. A furnace has an output slot and
+    /// it is emphatically not a crafting output: nothing about the three items
+    /// in front of a player says what comes out, the fire does, and a window
+    /// that answered here would have its result recomputed to *nothing* on the
+    /// first click that moved the input.
+    fn crafting(self) -> Option<(usize, std::ops::Range<usize>, usize)> {
         match self {
-            Self::Player => (
+            Self::Player => Some((
                 CRAFTING_OUTPUT,
                 CRAFTING_START..CRAFTING_END,
                 CRAFTING_WIDTH,
-            ),
-            Self::Table => (TABLE_OUTPUT, TABLE_GRID_START..TABLE_GRID_END, TABLE_WIDTH),
+            )),
+            Self::Table => Some((TABLE_OUTPUT, TABLE_GRID_START..TABLE_GRID_END, TABLE_WIDTH)),
+            Self::Furnace => None,
+        }
+    }
+
+    /// The output slot a click on it takes from, grid or fire.
+    fn output(self) -> usize {
+        match self {
+            Self::Player => CRAFTING_OUTPUT,
+            Self::Table => TABLE_OUTPUT,
+            Self::Furnace => FURNACE_OUTPUT,
         }
     }
 }
@@ -560,6 +663,15 @@ impl Changed {
     #[must_use]
     pub fn is_empty(self) -> bool {
         self.slots == 0 && !self.cursor
+    }
+
+    /// Both of these changes, as one.
+    #[must_use]
+    pub fn and(self, other: Self) -> Self {
+        Self {
+            slots: self.slots | other.slots,
+            cursor: self.cursor || other.cursor,
+        }
     }
 
     /// The slots that moved, in ascending order.
@@ -626,6 +738,19 @@ pub struct Inventory {
     /// read as "no recipe matched", because the two would look the same to
     /// every caller and one of them is a misconfiguration.
     recipes: Option<Arc<Recipes>>,
+    /// What the four fires cook, for the one question a shift-click asks: does
+    /// the open furnace's fire cook this? Shared, like the recipes.
+    cooking: Option<Arc<dust_sim::cooking::Cooking>>,
+    /// Which fire the open furnace is, if one is open. Set on the open and
+    /// cleared on the close, because a blast furnace and a smoker read
+    /// different tables and a shift-click has to ask the right one.
+    fire: Option<dust_sim::cooking::Fire>,
+    /// The item table, for the one question a slot asks of it: does this burn?
+    ///
+    /// Shared with every other session for the same reason the recipes are.
+    /// `None` is a server with no `[data] path`, and a fuel slot then takes
+    /// anything rather than nothing — see [`may_place`].
+    fuel: Option<Arc<ItemBlocks>>,
 }
 
 impl Default for Inventory {
@@ -637,6 +762,9 @@ impl Default for Inventory {
             drag: Drag::default(),
             state_id: 0,
             recipes: None,
+            cooking: None,
+            fire: None,
+            fuel: None,
         }
     }
 }
@@ -659,6 +787,76 @@ impl Inventory {
     ///
     /// Called once per login. The recipes outlive every session, so this is an
     /// `Arc` clone and not a copy of 887 recipes.
+    /// The same container, able to tell fuel from everything else.
+    ///
+    /// Called once per login beside [`Inventory::crafting_with`], and an `Arc`
+    /// clone for the same reason.
+    #[must_use]
+    pub fn burning_with(
+        mut self,
+        fuel: Arc<ItemBlocks>,
+        cooking: Arc<dust_sim::cooking::Cooking>,
+    ) -> Self {
+        self.fuel = Some(fuel);
+        self.cooking = Some(cooking);
+        self
+    }
+
+    /// Which fire the open furnace is, if one is open.
+    #[must_use]
+    pub fn fire(&self) -> Option<dust_sim::cooking::Fire> {
+        self.fire
+    }
+
+    /// Which fire the open furnace is. `None` closes one.
+    pub fn at_fire(&mut self, fire: Option<dust_sim::cooking::Fire>) {
+        self.fire = fire;
+    }
+
+    /// Copy a furnace's three slots in, marking what a watching client would
+    /// see move.
+    ///
+    /// Called at the **top** of every click on a furnace window, under the
+    /// furnace world's lock. The mirror is stale between clicks — the fire
+    /// goes on working — and refreshing it here is what stops a click acting
+    /// on a picture of a furnace that has since produced an ingot. A click
+    /// that then overwrote the slots from a stale mirror would delete it.
+    pub fn mirror_furnace(&mut self, slots: &[Option<Stack>]) -> Changed {
+        let mut changed = Changed::default();
+        for (offset, stack) in slots.iter().take(FURNACE_END - FURNACE_START).enumerate() {
+            let index = FURNACE_START + offset;
+            if self.slots[index] != *stack {
+                self.slots[index] = stack.clone();
+                changed.mark(index);
+            }
+        }
+        changed
+    }
+
+    /// The three slots as the mirror now holds them, to be written back.
+    #[must_use]
+    pub fn furnace_slots(&self) -> [Option<Stack>; 3] {
+        [
+            self.slots[FURNACE_INPUT].clone(),
+            self.slots[FURNACE_FUEL].clone(),
+            self.slots[FURNACE_OUTPUT].clone(),
+        ]
+    }
+
+    /// Forget the mirror, so nothing of one furnace is carried to the next.
+    ///
+    /// Not a cosmetic tidy: the mirror slots are storage indices like any
+    /// other, and a shift-click aimed at `MAIN_START..HOTBAR_END` cannot reach
+    /// them — but [`Inventory::give`] walks a range and a future one might.
+    /// Leaving a stack of somebody else's iron in a slot no window can see is
+    /// the kind of thing that turns up as a duplication bug a year later.
+    pub fn clear_furnace_mirror(&mut self) {
+        for index in FURNACE_START..FURNACE_END {
+            self.slots[index] = None;
+        }
+        self.fire = None;
+    }
+
     #[must_use]
     pub fn crafting_with(mut self, recipes: Arc<Recipes>) -> Self {
         self.recipes = Some(recipes);
@@ -881,7 +1079,9 @@ impl Inventory {
         // 2x2 keeps whatever was in it while a table is open, and a click that
         // somehow moved it has to leave its output right.
         for window in [Window::Player, Window::Table] {
-            let (_, grid, _) = window.crafting();
+            let Some((_, grid, _)) = window.crafting() else {
+                continue;
+            };
             if grid.clone().any(|slot| changed.has(slot)) {
                 self.refresh_output(window, &mut changed);
             }
@@ -898,7 +1098,9 @@ impl Inventory {
         let Some(recipes) = self.recipes.as_ref() else {
             return;
         };
-        let (output, grid, width) = window.crafting();
+        let Some((output, grid, width)) = window.crafting() else {
+            return;
+        };
         // Nine at most, and a 2x2 uses the first four. A fixed array rather
         // than a `Vec`, because this runs on every click that moves a grid
         // slot and a lookup that allocated would allocate per keystroke.
@@ -927,7 +1129,9 @@ impl Inventory {
     /// which is the one failure crafting must not have. See decision record
     /// 0031.
     fn take_result(&mut self, window: Window, changed: &mut Changed) {
-        let (_, grid, _) = window.crafting();
+        let Some((_, grid, _)) = window.crafting() else {
+            return;
+        };
         for index in grid {
             let Some(mut stack) = self.slots[index].clone() else {
                 continue;
@@ -969,7 +1173,13 @@ impl Inventory {
             changed.mark_cursor();
             self.give(stack, &mut changed);
         }
-        let (output, grid, _) = window.crafting();
+        // A furnace's three slots are not the player's and are not given
+        // back. They belong to the block, they go on smelting after the
+        // screen shuts, and a close that emptied them into the player's
+        // pockets would be a furnace that could never be left alone.
+        let Some((output, grid, _)) = window.crafting() else {
+            return changed;
+        };
         for index in grid {
             if let Some(stack) = self.slots[index].take() {
                 changed.mark(index);
@@ -1099,7 +1309,7 @@ impl Inventory {
         let Some(index) = named else {
             return;
         };
-        if index == window.crafting().0 {
+        if index == window.output() {
             self.pickup_result(window, button, changed);
             return;
         }
@@ -1133,7 +1343,7 @@ impl Inventory {
         if !(0..=1).contains(&button) {
             return;
         }
-        let Some(made) = self.slots[window.crafting().0].clone() else {
+        let Some(made) = self.slots[window.output()].clone() else {
             return;
         };
         match self.cursor.clone() {
@@ -1170,7 +1380,7 @@ impl Inventory {
             // A slot that will not take this item at all does nothing, which is
             // what a real server does with cobblestone aimed at a helmet slot.
             (Some(mut held), None) => {
-                if !may_place(index, held.item) {
+                if !may_place(index, held.item, self.fuel.as_deref()) {
                     return;
                 }
                 let moved = held.count.min(limit);
@@ -1183,7 +1393,7 @@ impl Inventory {
             (Some(mut held), Some(mut there))
                 if held.stacks_with(&there)
                     && there.count < limit
-                    && may_place(index, held.item) =>
+                    && may_place(index, held.item, self.fuel.as_deref()) =>
             {
                 let moved = held.count.min(limit - there.count);
                 there.count += moved;
@@ -1195,7 +1405,7 @@ impl Inventory {
             // Swap, if the slot will take what is on the cursor and the whole
             // of it fits.
             (Some(held), Some(there)) => {
-                if !may_place(index, held.item) || held.count > limit {
+                if !may_place(index, held.item, self.fuel.as_deref()) || held.count > limit {
                     return;
                 }
                 self.slots[index] = Some(held);
@@ -1219,7 +1429,7 @@ impl Inventory {
             }
             // Hand full, slot empty or the same item with room: put one down.
             (Some(mut held), None) => {
-                if !may_place(index, held.item) {
+                if !may_place(index, held.item, self.fuel.as_deref()) {
                     return;
                 }
                 held.count -= 1;
@@ -1229,7 +1439,7 @@ impl Inventory {
             (Some(mut held), Some(mut there))
                 if held.stacks_with(&there)
                     && there.count < slot_limit(index, held.item)
-                    && may_place(index, held.item) =>
+                    && may_place(index, held.item, self.fuel.as_deref()) =>
             {
                 held.count -= 1;
                 there.count += 1;
@@ -1237,7 +1447,9 @@ impl Inventory {
                 self.cursor = (held.count > 0).then_some(held);
             }
             (Some(held), Some(there)) => {
-                if !may_place(index, held.item) || held.count > slot_limit(index, held.item) {
+                if !may_place(index, held.item, self.fuel.as_deref())
+                    || held.count > slot_limit(index, held.item)
+                {
                     return;
                 }
                 self.slots[index] = Some(held);
@@ -1265,7 +1477,7 @@ impl Inventory {
         let Some(index) = named else {
             return;
         };
-        if index == window.crafting().0 {
+        if index == window.output() {
             self.quick_move_result(window, changed);
             return;
         }
@@ -1328,7 +1540,7 @@ impl Inventory {
     /// [`quick_move`]: Inventory::quick_move
     fn quick_move_result(&mut self, window: Window, changed: &mut Changed) {
         loop {
-            let Some(made) = self.slots[window.crafting().0].clone() else {
+            let Some(made) = self.slots[window.output()].clone() else {
                 return;
             };
             // Tried against a copy first. `move_to` mutates what it is given
@@ -1411,7 +1623,59 @@ impl Inventory {
                     ]
                 }
             }
+            // `AbstractFurnaceMenu.quickMoveStack`, arm for arm, and the
+            // order is the one a player feels. Out of any of the three
+            // furnace slots, into the player's half. Out of the player's
+            // half: the input if the fire cooks it, else the fuel slot if it
+            // burns, and only if it is neither does the stack shuffle between
+            // the hotbar and the inventory.
+            //
+            // Which way round matters for one common item: a **log** both
+            // smelts (to charcoal) and burns. Vanilla tries the input first,
+            // so shift-clicking logs at a furnace fills the input, and a
+            // player who wanted them as fuel drags them. Trying fuel first
+            // would put every log a player owns under the fire.
+            Window::Furnace => {
+                if is_furnace_slot(index) {
+                    return [Some((MAIN_START..HOTBAR_END, false)), None];
+                }
+                let item = self.slots[index].as_ref().map(|stack| stack.item);
+                let smeltable = item.is_some_and(|item| self.cooks(item));
+                let burns = item.is_some_and(|item| self.burns(item));
+                if smeltable {
+                    return [Some((FURNACE_INPUT..FURNACE_INPUT + 1, false)), None];
+                }
+                if burns {
+                    return [Some((FURNACE_FUEL..FURNACE_FUEL + 1, false)), None];
+                }
+                if (MAIN_START..MAIN_END).contains(&index) {
+                    [Some((HOTBAR_START..HOTBAR_END, false)), None]
+                } else {
+                    [Some((MAIN_START..MAIN_END, false)), None]
+                }
+            }
         }
+    }
+
+    /// Whether the open furnace's fire cooks this item.
+    ///
+    /// `false` on a server with no recipes, which is the same answer it gives
+    /// for an item nothing cooks — and here the two really are the same
+    /// answer, because a shift-click has to go *somewhere* and a server with
+    /// no data has no reason to prefer the input.
+    fn cooks(&self, item: Item) -> bool {
+        self.cooking
+            .as_ref()
+            .zip(self.fire)
+            .is_some_and(|(cooking, fire)| cooking.find(fire, item).is_some())
+    }
+
+    /// Whether this item burns. See [`may_place`] for what a table with no
+    /// `burn` column means.
+    fn burns(&self, item: Item) -> bool {
+        self.fuel
+            .as_ref()
+            .is_some_and(|table| table.burn(item).is_some())
     }
 
     /// `InventoryMenu.quickMoveStack`, which is the arm the player's own
@@ -1461,7 +1725,7 @@ impl Inventory {
         let Some(index) = named else {
             return;
         };
-        if index == window.crafting().0 {
+        if index == window.output() {
             let Some(made) = self.slots[index].clone() else {
                 return;
             };
@@ -1489,7 +1753,7 @@ impl Inventory {
             }
             return;
         };
-        if !may_place(index, coming.item) {
+        if !may_place(index, coming.item, self.fuel.as_deref()) {
             return;
         }
         let limit = slot_limit(index, coming.item);
@@ -1552,7 +1816,7 @@ impl Inventory {
         let Some(index) = named else {
             return;
         };
-        if index == window.crafting().0 && (0..=1).contains(&button) {
+        if index == window.output() && (0..=1).contains(&button) {
             if self.slots[index].is_none() {
                 return;
             }
@@ -1623,7 +1887,7 @@ impl Inventory {
                     self.drag.reset();
                     return;
                 };
-                let fits = may_place(index, held.item)
+                let fits = may_place(index, held.item, self.fuel.as_deref())
                     && match self.slots[index].as_ref() {
                         None => true,
                         Some(there) => {
@@ -1830,7 +2094,7 @@ impl Inventory {
             return;
         }
         for index in (0..steps).map(at) {
-            if self.slots[index].is_some() || !may_place(index, stack.item) {
+            if self.slots[index].is_some() || !may_place(index, stack.item, self.fuel.as_deref()) {
                 continue;
             }
             let moved = stack.count.min(slot_limit(index, stack.item));
@@ -2905,14 +3169,14 @@ mod tests {
         assert_eq!(worn_in(item("minecraft:carved_pumpkin")), Some(ARMOUR_HEAD));
         assert_eq!(worn_in(stone()), None);
 
-        assert!(may_place(ARMOUR_HEAD, helmet()));
-        assert!(!may_place(ARMOUR_HEAD, boots()));
-        assert!(!may_place(ARMOUR_FEET, helmet()));
-        assert!(!may_place(ARMOUR_HEAD, stone()));
+        assert!(may_place(ARMOUR_HEAD, helmet(), None));
+        assert!(!may_place(ARMOUR_HEAD, boots(), None));
+        assert!(!may_place(ARMOUR_FEET, helmet(), None));
+        assert!(!may_place(ARMOUR_HEAD, stone(), None));
         // The offhand and the inventory take anything, the output nothing.
-        assert!(may_place(OFFHAND, stone()));
-        assert!(may_place(MAIN_START, helmet()));
-        assert!(!may_place(CRAFTING_OUTPUT, stone()));
+        assert!(may_place(OFFHAND, stone(), None));
+        assert!(may_place(MAIN_START, helmet(), None));
+        assert!(!may_place(CRAFTING_OUTPUT, stone(), None));
     }
 
     #[test]

@@ -443,6 +443,9 @@ pub struct Server {
     /// roster, and inserted into the tick loop by phase 4 because that is
     /// where ticking happens. The slot is what lets those be different phases.
     item_ticker: Option<Box<dyn crate::participant::TickParticipant>>,
+    /// The furnaces' ticker, stashed for the same reason: it needs the world,
+    /// which the bind phase builds, and it runs in the tick phase.
+    furnace_ticker: Option<Box<dyn crate::participant::TickParticipant>>,
 }
 
 /// What the teardown has to write out.
@@ -450,6 +453,7 @@ struct Saveable {
     world: crate::net::SharedWorld,
     positions: crate::net::save::SharedPositions,
     inventories: crate::net::save::SharedInventories,
+    furnaces: std::sync::Arc<crate::net::furnaces::Furnaces>,
     world_dir: PathBuf,
 }
 
@@ -489,6 +493,7 @@ impl Server {
             listener: None,
             saveable: None,
             item_ticker: None,
+            furnace_ticker: None,
         }
     }
 
@@ -577,6 +582,9 @@ impl Server {
             &tasks::WorkCharger::from_option(self.options.virtual_work_clock.clone()),
         );
         if let Some(ticker) = self.item_ticker.take() {
+            participants.insert(ticker);
+        }
+        if let Some(ticker) = self.furnace_ticker.take() {
             participants.insert(ticker);
         }
         for extra in std::mem::take(&mut self.options.extra_tasks) {
@@ -1006,18 +1014,35 @@ impl Server {
         }
         let drops = std::sync::Arc::new(drops);
 
-        // And the fourth: what a grid of items makes. Same directory, same
-        // argument, decision record 0031.
-        let (recipes, recipes_report) = match data_path.as_deref() {
-            None => (dust_sim::crafting::Recipes::default(), None),
+        // And the fourth: what a grid of items makes, and what a fire turns
+        // one item into. Same directory, same argument, decision record 0033.
+        let (recipes, cooking, recipes_report) = match data_path.as_deref() {
+            None => (
+                dust_sim::crafting::Recipes::default(),
+                dust_sim::cooking::Cooking::new(),
+                None,
+            ),
             Some(path) => {
-                let (recipes, report) = crate::registries::recipes::beside(path);
-                (recipes, Some(report))
+                let (recipes, cooking, report) = crate::registries::recipes::beside(path);
+                (recipes, cooking, Some(report))
             }
         };
         match &recipes_report {
             Some(report) if report.files > 0 => {
-                self.options.logger.info("dust::data", report.summary())
+                self.options.logger.info("dust::data", report.summary());
+                // Per fire and not just a total. Three of the four are read
+                // from different files and any one of them can be empty while
+                // the others are full — a smoker with no recipes and a furnace
+                // with seventy is a server where half the food does not cook,
+                // and one number could not say so.
+                let per_fire = crate::registries::recipes::per_fire(&cooking)
+                    .into_iter()
+                    .map(|(fire, pairs)| format!("{} {pairs}", fire.block()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.options
+                    .logger
+                    .info("dust::data", format!("cooking pairs: {per_fire}"));
             }
             _ => self.options.logger.info(
                 "dust::data",
@@ -1025,6 +1050,7 @@ impl Server {
             ),
         }
         let recipes = std::sync::Arc::new(recipes);
+        let cooking = std::sync::Arc::new(cooking);
         let items: std::sync::Arc<crate::net::items::ItemWorld> = std::sync::Arc::default();
 
         let opacity = crate::net::world::opacity_of(palette.air, constants.as_ref());
@@ -1171,6 +1197,7 @@ impl Server {
         let world_dir = self.options.world_dir.clone();
         let positions: crate::net::save::SharedPositions = std::sync::Arc::default();
         let inventories: crate::net::save::SharedInventories = std::sync::Arc::default();
+        let furnaces = std::sync::Arc::new(crate::net::furnaces::Furnaces::new());
         match crate::net::save::load(&world_dir) {
             Ok(Some(saved)) => {
                 let (blocks, unknown) = crate::net::save::resolve(&saved.blocks);
@@ -1193,6 +1220,31 @@ impl Server {
                         saved.players.len()
                     ),
                 );
+                let (saved_furnaces, unknown_fires, furnace_components) =
+                    crate::net::save::furnaces(&saved);
+                let restored_furnaces =
+                    furnaces.restore(saved_furnaces, Some(&cooking), item_blocks.as_deref());
+                if restored_furnaces > 0 {
+                    self.options.logger.info(
+                        "dust::server",
+                        format!(
+                            "restored {restored_furnaces} furnace(s), {} of them alight",
+                            furnaces.active()
+                        ),
+                    );
+                }
+                if !unknown_fires.is_empty() {
+                    self.options.logger.warn(
+                        "dust::server",
+                        format!(
+                            "the save names {} furnace(s) whose block or items this build has \
+                             no entry for, and they were dropped: {}",
+                            unknown_fires.len(),
+                            unknown_fires.join(", ")
+                        ),
+                    );
+                }
+                let dropped_components = dropped_components + furnace_components;
                 if dropped_components > 0 {
                     // Named rather than swallowed: the stacks came back and
                     // their names, enchantments and contents did not, and a
@@ -1321,6 +1373,8 @@ impl Server {
             items: std::sync::Arc::clone(&items),
             drops: std::sync::Arc::clone(&drops),
             recipes: std::sync::Arc::clone(&recipes),
+            cooking: std::sync::Arc::clone(&cooking),
+            furnaces: std::sync::Arc::clone(&furnaces),
             item_entity_type: crate::net::play::item_entity_type().ok_or_else(|| {
                 fail("the generated entity table has no minecraft:item".to_owned())
             })?,
@@ -1328,6 +1382,12 @@ impl Server {
 
         // Built here because it needs the world and the roster, both of which
         // are phase 3's; inserted into the tick loop by phase 4.
+        self.furnace_ticker = Some(Box::new(crate::net::furnaces::FurnaceTicker::new(
+            std::sync::Arc::clone(&furnaces),
+            std::sync::Arc::clone(&world),
+            Some(std::sync::Arc::clone(&cooking)),
+            ctx.item_blocks.clone(),
+        )));
         self.item_ticker = Some(Box::new(crate::net::items::ItemTicker::new(
             std::sync::Arc::clone(&items),
             std::sync::Arc::clone(&world),
@@ -1370,6 +1430,7 @@ impl Server {
             world: std::sync::Arc::clone(&world),
             positions: std::sync::Arc::clone(&positions),
             inventories: std::sync::Arc::clone(&inventories),
+            furnaces: std::sync::Arc::clone(&furnaces),
             world_dir,
         });
         Ok(())
@@ -1514,6 +1575,7 @@ impl Server {
                         .map(crate::net::save::stacks_of)
                         .unwrap_or_default(),
                     selected: carried.get(id).map_or(0, |c| c.selected),
+                    experience: carried.get(id).map_or(0, |c| c.experience),
                 })
                 .collect();
             // Ordered, so two saves of one world are the same file.
@@ -1521,18 +1583,33 @@ impl Server {
             players
         };
 
+        // Snapshotted here rather than streamed, and it is safe to: this runs
+        // in the `WorldDirs` teardown arm, which is after the listener is
+        // released and after the tick loop has stopped, so nothing can be
+        // mutating a furnace while it is written.
+        let furnaces: Vec<crate::net::save::SavedFurnace> = saveable
+            .furnaces
+            .snapshot()
+            .into_iter()
+            .map(|(at, furnace)| crate::net::save::saved_furnace(at, &furnace))
+            .collect();
+
         let stacks: usize = players.iter().map(|p| p.inventory.len()).sum();
+        let burning = furnaces.iter().filter(|f| f.lit > 0).count();
         let counts = format!(
-            "{} block change(s), {} player position(s) and {stacks} carried stack(s)",
+            "{} block change(s), {} player position(s), {stacks} carried stack(s) and \
+             {} furnace(s), {burning} of them alight",
             blocks.len(),
-            players.len()
+            players.len(),
+            furnaces.len()
         );
         let save = crate::net::save::Save {
             version: crate::net::save::SAVE_VERSION,
             blocks,
-            components: crate::net::save::components_version(&players)
+            components: crate::net::save::components_version(&players, &furnaces)
                 .map(std::borrow::ToOwned::to_owned),
             players,
+            furnaces,
         };
         match crate::net::save::store(&saveable.world_dir, &save) {
             Ok(()) => format!("saved {counts}"),
