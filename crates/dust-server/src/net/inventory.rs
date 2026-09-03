@@ -21,11 +21,11 @@
 //! 45        offhand
 //! ```
 //!
-//! The five crafting slots are stored rather than skipped. Nothing here crafts,
-//! so the output slot never fills on its own — but a player can *put* something
-//! in the grid, and a container that dropped those four slots would make items
-//! disappear into a hole with vanilla's own numbering on it. Storing them costs
-//! twenty bytes and removes a class of bug that only shows up as lost items.
+//! The five crafting slots are the 2x2 grid a player carries with them, and
+//! slot 0 is what it makes. The recipes are the operator's own files, read at
+//! boot by `registries::recipes` and matched by [`dust_sim::crafting`]; an
+//! [`Inventory`] built without them behaves exactly as this container did
+//! before crafting existed, with an output slot that never fills.
 //!
 //! # Counts, and where the number comes from
 //!
@@ -91,18 +91,22 @@
 //! world yet, so Q destroys rather than throws. Stated here because a player
 //! finds that out by losing something.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use dust_protocol::components::ComponentPatch;
 use dust_protocol::types::Slot;
 use dust_registry::tags::{self, TagRegistry};
 use dust_registry::Item;
+use dust_sim::crafting::Recipes;
 
 /// How many slots a player's own container has. Vanilla's `0..=45`.
 pub const SLOTS: usize = 46;
 
-/// The crafting output. Never filled by this server, and never writable by a
-/// client — vanilla refuses a creative write here too.
+/// The crafting output.
+///
+/// Not a normal slot in either direction. Nothing may be *put* here — vanilla
+/// refuses a creative write and a click alike — and what is taken *out* is
+/// paid for with the grid: see [`Inventory::take_result`].
 pub const CRAFTING_OUTPUT: usize = 0;
 
 /// The 2x2 crafting grid, `1..=4`.
@@ -110,6 +114,11 @@ pub const CRAFTING_START: usize = 1;
 /// One past the crafting grid, so that `CRAFTING_START..CRAFTING_END` is a
 /// range rather than an arithmetic exercise at each call site.
 pub const CRAFTING_END: usize = 5;
+
+/// How wide the player's own grid is. Slots `1..=4` are a 2x2 read row-major,
+/// which is the order `CraftingContainer` numbers them and therefore the order
+/// a pattern must be laid against.
+pub const CRAFTING_WIDTH: usize = 2;
 
 /// Armour, `5..=8`: head, chest, legs, feet.
 pub const ARMOUR_START: usize = 5;
@@ -502,6 +511,16 @@ pub struct Inventory {
     /// alone: a click carrying a stale one was made against a window that has
     /// since moved.
     state_id: i32,
+    /// What this player's 2x2 grid can make. Shared with every other session:
+    /// it is read-only after boot and one `Arc` clone per login is the whole
+    /// per-player cost.
+    ///
+    /// `None` is a server with no `[data] path`, and it is not an error — it
+    /// is the server this was before crafting, with a grid that stores and an
+    /// output that never fills. A recipe table that was absent must not be
+    /// read as "no recipe matched", because the two would look the same to
+    /// every caller and one of them is a misconfiguration.
+    recipes: Option<Arc<Recipes>>,
 }
 
 impl Default for Inventory {
@@ -512,6 +531,7 @@ impl Default for Inventory {
             selected: 0,
             drag: Drag::default(),
             state_id: 0,
+            recipes: None,
         }
     }
 }
@@ -525,6 +545,20 @@ impl Inventory {
             selected: usize::from(selected).min(HOTBAR_SLOTS - 1),
             ..Self::default()
         }
+    }
+
+    /// The same container, able to craft.
+    ///
+    /// Called once per login. The recipes outlive every session, so this is an
+    /// `Arc` clone and not a copy of 887 recipes.
+    #[must_use]
+    pub fn crafting_with(mut self, recipes: Arc<Recipes>) -> Self {
+        self.recipes = Some(recipes);
+        // A restored container can have something already in its grid: a
+        // player who logged out mid-craft comes back to the output they left,
+        // rather than to an empty slot that fills only once they touch it.
+        self.refresh_output(&mut Changed::default());
+        self
     }
 
     /// Every slot, in vanilla's numbering. Borrowed, never copied: this is read
@@ -625,31 +659,35 @@ impl Inventory {
     ///   [`Item::max_stack_size`] earns its place: sixty-four buckets in one
     ///   slot is not something a client should be able to ask for, and the
     ///   number that says so is per-item and Minecraft's.
-    pub fn set_creative(&mut self, slot: i16, item: &Slot) -> Result<Option<usize>, usize> {
+    pub fn set_creative(&mut self, slot: i16, item: &Slot) -> Result<Changed, usize> {
+        let mut changed = Changed::default();
         if slot == -1 {
             // Thrown out of the creative menu. Nothing to report: the client
             // has already forgotten it.
-            return Ok(None);
+            return Ok(changed);
         }
         let Ok(index) = usize::try_from(slot) else {
-            return Ok(None);
+            return Ok(changed);
         };
         if !(CRAFTING_START..SLOTS).contains(&index) {
-            return Ok(None);
+            return Ok(changed);
         }
         match decode(item) {
-            Decoded::Empty => {
-                self.slots[index] = None;
-                Ok(Some(index))
-            }
-            Decoded::Stack(stack) => {
-                self.slots[index] = Some(stack);
-                Ok(Some(index))
-            }
+            Decoded::Empty => self.slots[index] = None,
+            Decoded::Stack(stack) => self.slots[index] = Some(stack),
             // Refused, and the slot is left as it was. The client believes it
             // put something there, so the caller has to say otherwise.
-            Decoded::TooMany | Decoded::UnknownItem => Err(index),
+            Decoded::TooMany | Decoded::UnknownItem => return Err(index),
         }
+        changed.mark(index);
+        // A creative write lands in the grid as readily as anywhere else, and
+        // the output has to follow it. The client wrote the slot it named and
+        // already draws that one; slot 0 it did not write, so the caller sends
+        // that one back.
+        if (CRAFTING_START..CRAFTING_END).contains(&index) {
+            self.refresh_output(&mut changed);
+        }
+        Ok(changed)
     }
 
     /// Replay a `Click Container` over this state.
@@ -681,7 +719,77 @@ impl Inventory {
             ClickMode::QuickCraft => self.quick_craft(slot, button, &mut changed),
             ClickMode::PickupAll => self.pickup_all(button, &mut changed),
         }
+        // The output is a function of the grid, so it is recomputed whenever
+        // the grid moved and never otherwise. A player arranging ingredients
+        // makes one lookup per click that touches a grid slot, and none at all
+        // for the other forty-one slots — which is the difference between an
+        // index and a scan of every recipe on every click.
+        if (CRAFTING_START..CRAFTING_END).any(|slot| changed.has(slot)) {
+            self.refresh_output(&mut changed);
+        }
         changed
+    }
+
+    /// Put in slot 0 whatever the grid now makes, and say if that moved.
+    ///
+    /// A container with no recipes leaves the slot alone rather than emptying
+    /// it: it has no opinion, and clearing a slot it cannot fill would be a
+    /// server with no data path deleting whatever a save had put there.
+    fn refresh_output(&mut self, changed: &mut Changed) {
+        let Some(recipes) = self.recipes.as_ref() else {
+            return;
+        };
+        let mut cells = [None; CRAFTING_END - CRAFTING_START];
+        for (cell, slot) in cells.iter_mut().zip(CRAFTING_START..CRAFTING_END) {
+            *cell = self.slots[slot].as_ref().map(|stack| stack.item);
+        }
+        let height = cells.len() / CRAFTING_WIDTH;
+        let made = recipes
+            .find(CRAFTING_WIDTH, height, &cells)
+            .map(|recipe| {
+                let (item, count) = recipe.result();
+                Stack::new(item, count)
+            });
+        if self.slots[CRAFTING_OUTPUT] != made {
+            self.slots[CRAFTING_OUTPUT] = made;
+            changed.mark(CRAFTING_OUTPUT);
+        }
+    }
+
+    /// Pay for one craft: one item out of every occupied grid slot, and
+    /// whatever those items leave behind put back.
+    ///
+    /// Called only once the result has already been handed to the player, so
+    /// there is no path on which the grid is spent and nothing comes back —
+    /// which is the one failure crafting must not have. See decision record
+    /// 0031.
+    fn take_result(&mut self, changed: &mut Changed) {
+        for index in CRAFTING_START..CRAFTING_END {
+            let Some(mut stack) = self.slots[index].clone() else {
+                continue;
+            };
+            let left = dust_sim::crafting::remainder(stack.item);
+            stack.count -= 1;
+            self.slots[index] = (stack.count > 0).then_some(stack.clone());
+            changed.mark(index);
+            // A bucket comes back. Minecraft puts it in the slot the milk
+            // bucket came out of when that slot is now empty, merges it when
+            // the slot holds the same thing, and otherwise gives it to the
+            // player — and giving it to the player is the direction that
+            // cannot lose it.
+            let Some(left) = left.map(|item| Stack::new(item, 1)) else {
+                continue;
+            };
+            match self.slots[index].clone() {
+                None => self.slots[index] = Some(left),
+                Some(mut there) if there.stacks_with(&left) && !there.is_full() => {
+                    there.count += 1;
+                    self.slots[index] = Some(there);
+                }
+                Some(_) => self.give(left, changed),
+            }
+        }
+        self.refresh_output(changed);
     }
 
     /// What a player's window close does to what they were holding.
@@ -702,6 +810,14 @@ impl Inventory {
                 changed.mark(index);
                 self.give(stack, &mut changed);
             }
+        }
+        // The output is what the grid makes, and the grid is now empty. It is
+        // cleared rather than given to the player: it was never crafted, it
+        // was only ever a picture of what *would* be, and handing it over
+        // would be a free item for every player who opened their inventory,
+        // put a log in and closed it again.
+        if self.slots[CRAFTING_OUTPUT].take().is_some() {
+            changed.mark(CRAFTING_OUTPUT);
         }
         changed
     }
@@ -754,6 +870,10 @@ impl Inventory {
             }
             return;
         }
+        if slot == CRAFTING_OUTPUT as i16 {
+            self.pickup_result(button, changed);
+            return;
+        }
         let Some(index) = self.writable(slot) else {
             return;
         };
@@ -762,6 +882,48 @@ impl Inventory {
             1 => self.pickup_right(index, changed),
             _ => {}
         }
+    }
+
+    /// A click on the crafting output.
+    ///
+    /// Nothing can be put here, so the only two things a click can do is take
+    /// the result onto an empty cursor or pour it onto a cursor already
+    /// holding the same thing. Both take the **whole** result and pay for it
+    /// once.
+    ///
+    /// Left and right do the same thing, and that is a decision rather than an
+    /// omission. Vanilla's `AbstractContainerMenu.doClick` computes
+    /// `(count + 1) / 2` for a right click before it reaches the result slot,
+    /// and the ingredients are spent by `ResultSlot.onTake` whatever that
+    /// number came out as — so a right click on four planks made from one log
+    /// hands the player two planks and destroys the other two. This server
+    /// hands over four. Priority 1: a click that silently deletes half a craft
+    /// is the single worst thing an inventory can do to a player, and no
+    /// player has ever right-clicked the output *wanting* half.
+    fn pickup_result(&mut self, button: i8, changed: &mut Changed) {
+        if !(0..=1).contains(&button) {
+            return;
+        }
+        let Some(made) = self.slots[CRAFTING_OUTPUT].clone() else {
+            return;
+        };
+        match self.cursor.clone() {
+            None => self.cursor = Some(made),
+            Some(mut held) => {
+                if !held.stacks_with(&made) || held.count + made.count > held.item.max_stack_size()
+                {
+                    // No room for the whole result. Nothing happens rather
+                    // than part of it happening: a craft that spent the grid
+                    // and delivered less than it made would be the loss this
+                    // whole path exists to avoid.
+                    return;
+                }
+                held.count += made.count;
+                self.cursor = Some(held);
+            }
+        }
+        changed.mark_cursor();
+        self.take_result(changed);
     }
 
     fn pickup_left(&mut self, index: usize, changed: &mut Changed) {
@@ -877,6 +1039,10 @@ impl Inventory {
         if index >= SLOTS {
             return;
         }
+        if index == CRAFTING_OUTPUT {
+            self.quick_move_result(changed);
+            return;
+        }
         loop {
             let Some(mut stack) = self.slots[index].clone() else {
                 return;
@@ -899,6 +1065,76 @@ impl Inventory {
             }
             self.slots[index] = Some(stack);
         }
+    }
+
+    /// Shift-click on the crafting output: craft until the inputs run out.
+    ///
+    /// This is the same loop [`quick_move`] runs and the same reason it is a
+    /// loop, but the destination is not what changes between passes — the
+    /// *source* is. Each pass spends the grid, the grid makes the result
+    /// again, and the pass after that finds a full output slot. A stack of
+    /// sixty-four logs shift-clicked once is sixty-four crafts and 256 planks,
+    /// which is the single most-used interaction in the game.
+    ///
+    /// It stops on the first pass whose result does not fit **whole**, and
+    /// that pass is not performed. Vanilla's `moveItemStackTo` returns true
+    /// when it moved *any* of the stack, spends the grid anyway, and the
+    /// remainder is destroyed; a player shift-clicking with two free slots
+    /// left watches ingredients turn into nothing. Priority 1: stopping one
+    /// craft early leaves the ingredients in the grid where the player can see
+    /// them.
+    ///
+    /// The bound is the grid, not a constant: every pass removes one item from
+    /// every occupied grid slot, so a 2x2 holding four full stacks is at most
+    /// sixty-four passes and there is no way to write a recipe that does not
+    /// shrink its own inputs.
+    ///
+    /// [`quick_move`]: Inventory::quick_move
+    fn quick_move_result(&mut self, changed: &mut Changed) {
+        loop {
+            let Some(made) = self.slots[CRAFTING_OUTPUT].clone() else {
+                return;
+            };
+            // Tried against a copy first. `move_to` mutates what it is given
+            // and leaves behind what did not fit, and there is no way to put
+            // that back into the inventory it came from without knowing which
+            // slots it touched — so the question "does all of it fit" is asked
+            // before anything moves.
+            if !self.room_for(&made) {
+                return;
+            }
+            let mut stack = made;
+            // Reversed, which is `InventoryMenu.quickMoveStack`'s own
+            // `moveItemStackTo(stack, 9, 45, true)` for slot 0 and only for
+            // slot 0: a crafted stack fills the hotbar from the right before
+            // it touches the main inventory, and a player who has crafted
+            // planks expects them under their hand.
+            self.move_to_reversed(MAIN_START..HOTBAR_END, &mut stack, changed);
+            debug_assert_eq!(stack.count, 0, "room_for said the whole stack fits");
+            self.take_result(changed);
+        }
+    }
+
+    /// Whether `MAIN_START..HOTBAR_END` can take the whole of this stack.
+    ///
+    /// Counts rather than moves: partial stacks of the same item take what
+    /// they have room for, and empty slots take a stack each.
+    fn room_for(&self, stack: &Stack) -> bool {
+        let mut left = u32::from(stack.count);
+        for index in MAIN_START..HOTBAR_END {
+            let limit = u32::from(slot_limit(index, stack.item));
+            left = left.saturating_sub(match self.slots[index].as_ref() {
+                None => limit,
+                Some(there) if there.stacks_with(stack) => {
+                    limit.saturating_sub(u32::from(there.count))
+                }
+                Some(_) => 0,
+            });
+            if left == 0 {
+                return true;
+            }
+        }
+        false
     }
 
     /// Where one pass of a shift-click sends what is in this slot.
@@ -940,14 +1176,32 @@ impl Inventory {
     /// there swaps. A real server does exactly that, and a server that swapped
     /// anyway is a player wearing a block.
     fn swap(&mut self, slot: i16, button: i8, changed: &mut Changed) {
-        let Some(index) = self.writable(slot) else {
-            return;
-        };
+        let named = usize::try_from(slot).ok().filter(|index| *index < SLOTS);
         let other = if button == SWAP_OFFHAND_BUTTON {
             OFFHAND
         } else if (0..HOTBAR_SLOTS as i8).contains(&button) {
             HOTBAR_START + button as usize
         } else {
+            return;
+        };
+        // A number key over the crafting output takes the result, and only
+        // into a slot that is empty — there is nothing to swap it *with*,
+        // because nothing may be put into the output. Vanilla's `doClick`
+        // reaches the same place by asking `mayPlace` of the hotbar's stack
+        // and finding it false.
+        if named == Some(CRAFTING_OUTPUT) {
+            let Some(made) = self.slots[CRAFTING_OUTPUT].clone() else {
+                return;
+            };
+            if self.slots[other].is_some() {
+                return;
+            }
+            self.slots[other] = Some(made);
+            changed.mark(other);
+            self.take_result(changed);
+            return;
+        }
+        let Some(index) = self.writable(slot) else {
             return;
         };
         if other == index {
@@ -1221,8 +1475,37 @@ impl Inventory {
     /// the second asks [`may_place`]. Neither matters for a range inside the
     /// inventory; both matter for the one-slot range an armour move uses.
     fn move_to(&mut self, range: std::ops::Range<usize>, stack: &mut Stack, changed: &mut Changed) {
+        self.move_into(range, stack, changed, false);
+    }
+
+    /// The same, from the far end. Vanilla's `reverse` flag, and slot 0's
+    /// shift-click is the one caller that sets it — see [`quick_move_result`].
+    ///
+    /// [`quick_move_result`]: Inventory::quick_move_result
+    fn move_to_reversed(
+        &mut self,
+        range: std::ops::Range<usize>,
+        stack: &mut Stack,
+        changed: &mut Changed,
+    ) {
+        self.move_into(range, stack, changed, true);
+    }
+
+    fn move_into(
+        &mut self,
+        range: std::ops::Range<usize>,
+        stack: &mut Stack,
+        changed: &mut Changed,
+        reverse: bool,
+    ) {
+        // Arithmetic rather than a reversed iterator, because both halves want
+        // the same order and collecting one would be an allocation on every
+        // shift-click.
+        let (start, end) = (range.start, range.end);
+        let at = |step: usize| if reverse { end - 1 - step } else { start + step };
+        let steps = end.saturating_sub(start);
         if stack.item.max_stack_size() > 1 {
-            for index in range.clone() {
+            for index in (0..steps).map(at) {
                 if stack.count == 0 {
                     return;
                 }
@@ -1243,7 +1526,7 @@ impl Inventory {
         if stack.count == 0 {
             return;
         }
-        for index in range {
+        for index in (0..steps).map(at) {
             if self.slots[index].is_some() || !may_place(index, stack.item) {
                 continue;
             }
@@ -1499,11 +1782,11 @@ mod tests {
         // 36 is hotbar slot 0 and 44 is slot 8; 5 is the helmet and 45 the
         // offhand. All four are slots the old hotbar dropped on the floor.
         let mut inventory = Inventory::default();
-        assert_eq!(inventory.set_creative(36, &wire(stone(), 1)), Ok(Some(36)));
+        assert!(inventory.set_creative(36, &wire(stone(), 1)).unwrap().has(36));
         assert_eq!(inventory.held(), Some(stone()), "slot 0 is selected");
-        assert_eq!(inventory.set_creative(44, &wire(dirt(), 5)), Ok(Some(44)));
-        assert_eq!(inventory.set_creative(9, &wire(dirt(), 64)), Ok(Some(9)));
-        assert_eq!(inventory.set_creative(45, &wire(bucket(), 1)), Ok(Some(45)));
+        assert!(inventory.set_creative(44, &wire(dirt(), 5)).unwrap().has(44));
+        assert!(inventory.set_creative(9, &wire(dirt(), 64)).unwrap().has(9));
+        assert!(inventory.set_creative(45, &wire(bucket(), 1)).unwrap().has(45));
         assert_eq!(inventory.slot(9).map(|s| s.count), Some(64));
         assert_eq!(inventory.slot(45).map(|s| s.item), Some(bucket()));
         assert!(inventory.select(8));
@@ -1520,11 +1803,8 @@ mod tests {
         assert_eq!(inventory.set_creative(37, &wire(stone(), 65)), Err(37));
         assert_eq!(inventory.slot(37).cloned(), None);
         // And the ones that are fine stay fine.
-        assert_eq!(inventory.set_creative(38, &wire(stone(), 64)), Ok(Some(38)));
-        assert_eq!(
-            inventory.set_creative(39, &wire(item("minecraft:ender_pearl"), 16)),
-            Ok(Some(39))
-        );
+        assert!(inventory.set_creative(38, &wire(stone(), 64)).unwrap().has(38));
+        assert!(inventory.set_creative(39, &wire(item("minecraft:ender_pearl"), 16)).unwrap().has(39));
         assert_eq!(
             inventory.set_creative(40, &wire(item("minecraft:ender_pearl"), 17)),
             Err(40)
@@ -1534,12 +1814,12 @@ mod tests {
     #[test]
     fn the_crafting_output_is_not_writable_and_neither_is_a_slot_off_the_end() {
         let mut inventory = Inventory::default();
-        assert_eq!(inventory.set_creative(0, &wire(stone(), 1)), Ok(None));
-        assert_eq!(inventory.set_creative(46, &wire(stone(), 1)), Ok(None));
-        assert_eq!(inventory.set_creative(-2, &wire(stone(), 1)), Ok(None));
+        assert!(inventory.set_creative(0, &wire(stone(), 1)).unwrap().is_empty());
+        assert!(inventory.set_creative(46, &wire(stone(), 1)).unwrap().is_empty());
+        assert!(inventory.set_creative(-2, &wire(stone(), 1)).unwrap().is_empty());
         // -1 is the creative menu's "throw this away", which is a real
         // instruction and not a refusal.
-        assert_eq!(inventory.set_creative(-1, &wire(stone(), 1)), Ok(None));
+        assert!(inventory.set_creative(-1, &wire(stone(), 1)).unwrap().is_empty());
         assert!(inventory.slots().iter().all(Option::is_none));
     }
 
@@ -1563,7 +1843,7 @@ mod tests {
     #[test]
     fn a_selection_outside_the_hotbar_leaves_the_one_in_hand_alone() {
         let mut inventory = Inventory::default();
-        assert_eq!(inventory.set_creative(36, &wire(stone(), 1)), Ok(Some(36)));
+        assert!(inventory.set_creative(36, &wire(stone(), 1)).unwrap().has(36));
         assert!(!inventory.select(9));
         assert!(!inventory.select(-1));
         assert_eq!(inventory.held(), Some(stone()));
@@ -2257,10 +2537,10 @@ mod tests {
             item_id: item("minecraft:stone").protocol_id() as i32,
             components: named(),
         };
-        assert_eq!(
-            inventory.set_creative(MAIN_START as i16, &sent),
-            Ok(Some(MAIN_START))
-        );
+        assert!(inventory
+            .set_creative(MAIN_START as i16, &sent)
+            .unwrap()
+            .has(MAIN_START));
         assert_eq!(
             inventory.slot(MAIN_START).map(|s| s.components.clone()),
             Some(named())

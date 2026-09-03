@@ -167,6 +167,11 @@ pub struct SessionContext {
     /// a guess is a survival game that gives you the wrong thing, and there is
     /// no way to tell from inside the world that it was a guess.
     pub drops: Arc<dust_sim::drops::Tables>,
+    /// What a grid of items makes. Read at boot out of the operator's own
+    /// recipe files and never written again, so every session shares one copy.
+    /// Empty when there is no `[data] path`, and an empty table crafts
+    /// nothing rather than crafting wrongly.
+    pub recipes: Arc<dust_sim::crafting::Recipes>,
     /// Minecraft's own per-state constants, if the operator put a table beside
     /// their data.
     ///
@@ -912,7 +917,8 @@ where
         .expect("the inventory map is never poisoned")
         .get(&profile_id)
         .map(|carried| Inventory::restored(carried.slots.clone(), carried.selected))
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .crafting_with(Arc::clone(&ctx.recipes));
 
     // And told to the client, all forty-six slots at once. This is the one
     // place the whole container goes out: a join has nothing to compare
@@ -1632,15 +1638,22 @@ where
                     // other, and both land in the same container.
                     Ok(play::serverbound::Packet::SetCreativeModeSlot(set)) => {
                         match inventory.set_creative(set.slot, &set.item) {
-                            Ok(Some(index)) => {
+                            Ok(changed) if !changed.is_empty() => {
                                 record_inventory(ctx, profile_id, me.entity_id, &inventory);
-                                // Not echoed back. The client wrote the slot
-                                // itself and already draws it; a set-slot here
-                                // would be a packet per creative-menu click
-                                // that changes nothing on screen.
-                                let _ = index;
+                                // The slot the client named is not echoed
+                                // back: it wrote that one itself and already
+                                // draws it, and a set-slot here would be a
+                                // packet per creative-menu click that changes
+                                // nothing on screen. The crafting output is
+                                // the exception — a write into the grid moves
+                                // a slot the client did not touch.
+                                for index in changed.iter() {
+                                    if index != usize::try_from(set.slot).unwrap_or(usize::MAX) {
+                                        send_slot(conn, ctx, &mut inventory, index).await?;
+                                    }
+                                }
                             }
-                            Ok(None) => {}
+                            Ok(_) => {}
                             // Refused — a count above the item's own maximum,
                             // or an item this build has no entry for. The
                             // client believes it put something there, so it has
