@@ -139,6 +139,30 @@ pub fn position_packet(
     }
 }
 
+/// Put a player back where the server believes they are.
+///
+/// The same packet the join sends, with one difference that matters to whoever
+/// is holding the mouse: the two rotation bits are marked **relative** and sent
+/// as zero, so the position moves and the view does not. An absolute rotation
+/// here would snap a corrected player's head to whatever yaw the server last
+/// heard about, which is a second, unrelated jolt on top of the one the
+/// correction is for — and the server's copy of where they were looking is
+/// always at least a packet out of date.
+///
+/// A teleport rather than a message, because a message is not a correction: the
+/// client honours this by moving, and answers it with the teleport id.
+pub fn correction(at: (f64, f64, f64), teleport_id: i32) -> play::clientbound::PlayerPosition {
+    play::clientbound::PlayerPosition {
+        x: at.0,
+        y: at.1,
+        z: at.2,
+        yaw: 0.0,
+        pitch: 0.0,
+        flags: TeleportFlags(TeleportFlags::YAW | TeleportFlags::PITCH),
+        teleport_id: VarInt(teleport_id),
+    }
+}
+
 /// Encode one column into a chunk packet.
 /// `pos` is passed rather than read off the chunk, because the chunk may be a
 /// template shared by every column in the world — see `world::FlatWorld`. A

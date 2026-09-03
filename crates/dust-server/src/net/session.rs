@@ -107,6 +107,14 @@ pub struct SessionContext {
     /// for the reason that crate's own documentation gives: a rule that can
     /// only be run from inside a session can only be tested by running one.
     pub reach: dust_guard::Reach,
+    /// How far a player may move in one tick before the server stops believing
+    /// them.
+    ///
+    /// In `dust_guard` for the same reason the reach limit is, and measured
+    /// rather than chosen: `tools/bot/movement.js` counts what a real client's
+    /// movement packets actually contain, and decision record 0012 says what it
+    /// found and what the number is set to because of it.
+    pub speed: dust_guard::SpeedLimit,
     /// The furthest this server will stream, in columns.
     ///
     /// A ceiling and not the answer: a client asks for a distance of its own
@@ -789,6 +797,18 @@ where
     W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut position = start;
+    // Where the server believes this player is, as opposed to where their last
+    // packet said. Until this existed they were the same thing, and the README
+    // said so in its "Not yet" list.
+    let mut movement = dust_guard::Movement::new(ctx.speed, start);
+    // When the last movement packet was judged. A movement budget has to be
+    // per *tick* and not per packet, or a connection that stalls and then
+    // delivers fourteen queued packets at once refuses thirteen of them.
+    let mut last_move = std::time::Instant::now();
+    // Teleport ids this session has issued. The join used the first one; every
+    // correction takes the next, so a client's acknowledgement names which
+    // teleport it is answering.
+    let mut last_teleport_id = FIRST_TELEPORT_ID;
     // Recorded once on arrival too, so a player who joins and never moves is
     // still somewhere the next boot knows about.
     ctx.positions
@@ -1062,19 +1082,77 @@ where
                     // fourth carries only a rotation, and a player turning on
                     // the spot has not changed which columns they can see.
                     Ok(play::serverbound::Packet::MovePlayerPos(m)) => {
-                        position = (m.x, m.y, m.z);
-                        record(ctx, profile_id, position);
-                        ctx.roster
-                            .moved(me.entity_id, m.x, m.y, m.z, me.yaw, me.pitch);
-                        moved(conn, ctx, &mut view, m.x, m.z).await?;
+                        let ticks = ticks_since(&mut last_move);
+                        match movement.claimed((m.x, m.y, m.z), ticks) {
+                            dust_guard::Claim::Accepted => {
+                                position = movement.at();
+                                record(ctx, profile_id, position);
+                                ctx.roster.moved(
+                                    me.entity_id,
+                                    position.0,
+                                    position.1,
+                                    position.2,
+                                    me.yaw,
+                                    me.pitch,
+                                );
+                                moved(conn, ctx, &mut view, position.0, position.2).await?;
+                            }
+                            dust_guard::Claim::Ignored => {}
+                            dust_guard::Claim::Refused(why) => {
+                                put_back(
+                                    conn,
+                                    ctx,
+                                    &mut movement,
+                                    &mut last_teleport_id,
+                                    (m.x, m.y, m.z),
+                                    why,
+                                )
+                                .await?;
+                            }
+                        }
                     }
                     Ok(play::serverbound::Packet::MovePlayerPosRot(m)) => {
-                        position = (m.x, m.y, m.z);
+                        // The rotation is kept whatever happens to the
+                        // position. A player who is refused for moving too far
+                        // was still looking somewhere, and a placement reads
+                        // that; refusing a look because a position was wrong
+                        // would leave the two out of step for no gain.
                         rotation = (m.yaw, m.pitch);
-                        record(ctx, profile_id, position);
-                        ctx.roster
-                            .moved(me.entity_id, m.x, m.y, m.z, m.yaw, m.pitch);
-                        moved(conn, ctx, &mut view, m.x, m.z).await?;
+                        let ticks = ticks_since(&mut last_move);
+                        match movement.claimed((m.x, m.y, m.z), ticks) {
+                            dust_guard::Claim::Accepted => {
+                                position = movement.at();
+                                record(ctx, profile_id, position);
+                                ctx.roster.moved(
+                                    me.entity_id,
+                                    position.0,
+                                    position.1,
+                                    position.2,
+                                    m.yaw,
+                                    m.pitch,
+                                );
+                                moved(conn, ctx, &mut view, position.0, position.2).await?;
+                            }
+                            dust_guard::Claim::Ignored => {}
+                            dust_guard::Claim::Refused(why) => {
+                                put_back(
+                                    conn,
+                                    ctx,
+                                    &mut movement,
+                                    &mut last_teleport_id,
+                                    (m.x, m.y, m.z),
+                                    why,
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                    // A client answering a teleport. Most of these are about
+                    // nothing — every client acknowledges the one that placed
+                    // it on join — and the one that is not is what ends the
+                    // silence after a correction.
+                    Ok(play::serverbound::Packet::TeleportConfirm(confirm)) => {
+                        movement.confirmed(confirm.teleport_id.0);
                     }
                     // An arm swing. Sent on every click, hit and miss
                     // alike, and it is the only thing that makes another
@@ -1253,14 +1331,84 @@ where
     }
 }
 
+/// Ticks since the last movement packet was judged, and reset the clock.
+///
+/// Wall time rather than a tick counter, because a session has no tick counter
+/// and adding one to reach this number would tie the packet path to the game
+/// loop for no gain: what the budget is about is how long the player had, and
+/// that is what a clock measures. `Instant::now` is a vDSO read on every
+/// platform this runs on, which is the cheapest thing in this function.
+///
+/// The cap is a thousand ticks and it is not the real bound — `dust_guard`
+/// clamps this to its own maximum and owns that number. This one exists only so
+/// that a session resumed after a laptop was shut for an hour produces a `u32`
+/// rather than a wrap.
+fn ticks_since(last: &mut std::time::Instant) -> u32 {
+    let now = std::time::Instant::now();
+    let millis = now.duration_since(*last).as_millis();
+    *last = now;
+    (millis / 50).min(1_000) as u32
+}
+
+/// Refuse a claimed position and teleport the player back to the last one the
+/// server believed.
+///
+/// A correction and not a log line: the client honours a `player_position` by
+/// moving, which is the whole difference between a server that notices a cheat
+/// and one that stops it. Until the client acknowledges the teleport id, its
+/// movement packets are ignored rather than refused — see
+/// [`dust_guard::Claim::Ignored`] for why answering each of them with another
+/// teleport is how a correction becomes a loop.
+///
+/// The log line is per correction and not per packet for the same reason.
+async fn put_back<W>(
+    conn: &mut Conn<W>,
+    ctx: &SessionContext,
+    movement: &mut dust_guard::Movement,
+    last_teleport_id: &mut i32,
+    claimed: (f64, f64, f64),
+    why: dust_guard::Refusal,
+) -> Result<(), SessionError>
+where
+    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    *last_teleport_id = last_teleport_id.wrapping_add(1);
+    let back = movement.correct(*last_teleport_id);
+    let reason = match why {
+        dust_guard::Refusal::NotFinite => "a coordinate that is not a number".to_owned(),
+        dust_guard::Refusal::OutOfWorld => "a position outside every world".to_owned(),
+        dust_guard::Refusal::TooFast {
+            moved_squared,
+            allowed_squared,
+        } => format!(
+            "{:.1} blocks in the time for {:.1}",
+            moved_squared.sqrt(),
+            allowed_squared.sqrt()
+        ),
+    };
+    ctx.logger.warn(
+        "dust::net",
+        format!(
+            "a player claimed {:.1}, {:.1}, {:.1} — {reason}; put back to {:.1}, {:.1}, {:.1}",
+            claimed.0, claimed.1, claimed.2, back.0, back.1, back.2
+        ),
+    );
+    send_play(
+        conn,
+        play_mod::correction(back, *last_teleport_id),
+        ctx.version,
+    )
+    .await
+}
+
 /// Stream whatever a move to `(x, z)` requires.
 ///
 /// Called for every position packet, which arrive twenty times a second, and
 /// almost all of them land in the column the player was already in — so the
 /// common path is one comparison inside [`View::move_to`] and no packets at
-/// all. The position is trusted as sent: nothing here validates movement, and
-/// an anti-cheat that did would live between this and the world rather than
-/// inside it.
+/// all. Only reached for a position `dust_guard::Movement` accepted — a
+/// refused one streams nothing, because the columns a player who is not there
+/// can see are not columns anybody needs.
 async fn moved<W>(
     conn: &mut Conn<W>,
     ctx: &SessionContext,
@@ -1322,10 +1470,11 @@ fn held_block(
 
 /// Whether a player at `feet` may act on the block at `location`.
 ///
-/// The position is the one their last movement packet claimed, which this
-/// server trusts as sent — so this refuses acting far from a position the
-/// player is honestly at, and not a client that lies about where it is. That
-/// is the cheat the README names: breaking bedrock from across the map.
+/// The position is the last one `dust_guard::Movement` accepted, which is
+/// where the player could have walked to and not merely where they said they
+/// were. Between the two checks the cheat the README names is closed from both
+/// ends: this refuses acting far from where the player is, and the movement
+/// check refuses being somewhere they could not have got to.
 ///
 /// The eye height is a standing player's. Dust does not track a pose, so a
 /// crouching player is measured 0.35 too high; `[server] interaction_range`'s

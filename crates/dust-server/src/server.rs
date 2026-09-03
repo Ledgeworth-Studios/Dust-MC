@@ -732,6 +732,7 @@ impl Server {
         let online_mode = config.server.online_mode;
         let view_distance = config.server.view_distance;
         let reach = dust_guard::Reach::new(config.server.interaction_range);
+        let speed = dust_guard::SpeedLimit::new(config.server.movement_speed_limit);
         let data_path = config.data.path.clone();
 
         let fail = |message: String| -> ServerError {
@@ -1057,6 +1058,7 @@ impl Server {
             world_spawn,
             view_distance,
             reach,
+            speed,
             overworld_dimension_type: overworld,
             blocks: crate::net::PlaceableBlocks {
                 air: palette.air,

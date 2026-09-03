@@ -105,10 +105,21 @@ the block, and the check lives in `dust-guard` rather than in the session
 because a rule that can only be run from inside a session can only be tested by
 running one.
 
+And a player is where they say they are, or they are put back. A movement
+packet claiming a position further than `[server] movement_speed_limit` — ten
+blocks a tick, which is what vanilla allows — is answered with a teleport to
+the last position the server believed, not with a log line. The limit was
+measured rather than chosen: `just movement` counts what a real client's
+packets contain, and over 1,217 of them covering walking, sprinting,
+sprint-jumping, creative flight, a 300-block free fall and a walk through a
+700 ms network stall, the largest single tick was 3.58 blocks. Decision record
+0012 has the table and says what it declined.
+
 **Not yet**, and each of these is stated where the code for it would go: no
-physics, block updates, drops or tool checks, and nothing that validates
-*movement*, so the position a reach is measured from is whatever the client
-last claimed; no inventory beyond the nine hotbar slots a
+physics, block updates, drops or tool checks; **no collision**, so movement is
+checked for speed and for being a number and not against the blocks it passed
+through, and a client may still walk into a wall so long as it walks at a
+walking pace; no inventory beyond the nine hotbar slots a
 creative client writes, so nothing is stored and nothing is carried between
 sessions; **no neighbour rules**, so a fence does not connect to what it touches,
 a rail does not bend and a stair does not become a corner — sixty-one of the

@@ -390,6 +390,34 @@ mod tests {
     }
 
     #[test]
+    fn a_speed_limit_that_would_correct_a_falling_player_is_named_as_an_error() {
+        // A player who steps off a cliff accelerates to 3.92 blocks a tick and
+        // stays there. Anything under that is a server that teleports people
+        // back for falling, which is worse than no movement check at all.
+        for bad in ["0.0", "1.0", "3.9", "nan"] {
+            let err = DustConfig::from_toml_and_env(
+                &format!("[server]\nmovement_speed_limit = {bad}\n"),
+                "test",
+                [],
+            )
+            .expect_err("a limit that argues with gravity is a configuration error");
+            assert!(
+                err.to_string().contains("movement_speed_limit"),
+                "{bad}: {err}"
+            );
+        }
+        // Turning the check off is a thing an operator may legitimately want,
+        // and `inf` is how they say it rather than a magic zero.
+        let off =
+            DustConfig::from_toml_and_env("[server]\nmovement_speed_limit = inf\n", "test", [])
+                .expect("inf turns the check off");
+        assert!(off.server.movement_speed_limit.is_infinite());
+        // And the default is not near the bound it just refused.
+        let config = DustConfig::from_toml_and_env("", "test", []).expect("the defaults load");
+        assert!(config.server.movement_speed_limit >= 10.0);
+    }
+
+    #[test]
     fn a_reach_that_would_refuse_ordinary_play_is_named_as_an_error() {
         // Under 1.63 a player cannot break the ground they are standing on,
         // and under 5 they lose reach a vanilla client legitimately has. The
