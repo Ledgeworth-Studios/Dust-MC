@@ -38,6 +38,50 @@ as an unstalled walk — the packets bunch, the steps do not. A validator that
 charges a movement budget by the clock refuses an honest client for arriving
 early, and this is where that would show up.
 
+## The click differential
+
+`clicks.js` is a third idea again: it does not check the server and it does not
+watch the client. It **records**, so that the same recording can be taken from
+Minecraft's own server and the two diffed.
+
+```
+node clicks.js 25603 --out dust.json          # a running Dust server
+node clicks.js 25703 --out vanilla.json       # a real 1.21.1 server, same script
+node clicks.js --compare vanilla.json dust.json
+node clicks.js 25603 --predict                # the one thing the diff cannot see
+```
+
+A hundred clicks over a seeded container, one snapshot of every slot per click.
+The comparison is the measurement; a recording on its own is not a result, which
+is why nothing in the first two commands asserts anything.
+
+**It is the reason decision record 0016 exists.** The first version of the
+script reached only the ordinary inventory and reported 58 of 58 — a number
+about the fifty-eight situations it reached, not about the container. Twenty-five
+more clicks over the armour slots, the offhand and the crafting grid took it to
+60 of 83, and eighteen more seeded with a wearable that stacks to 64 took the
+repaired 83 of 83 back to 84 of 101. It is now 101 of 101.
+
+Three things had to be learned to make the recording honest, and each is a way
+of getting a confident wrong answer:
+
+- **Claim nothing.** `window_click` carries the client's own prediction and a
+  server only corrects what the prediction got wrong, so every click here claims
+  "nothing changed and my hand is empty". That makes both servers tell us
+  everything they changed, which is what makes two recordings comparable.
+- **Read the raw packets.** mineflayer drops `set_slot` for window -1 — its
+  handler resolves a window by id, finds none, and returns — so the cursor is
+  invisible through `bot.inventory` and a drag read that way looks like it moved
+  nothing. (Decision record 0013 hit the same wall from the other side with
+  window -2.) The window id also arrives as 255 rather than -1, because
+  minecraft-data types that field unsigned on 1.21.1.
+- **`--predict` exists because the diff cannot see everything.** Since every
+  click claims nothing changed, a click the server *refuses* is one where both
+  ends already agree and no packet is needed — two servers that both send
+  nothing are two recordings that agree, at 101 of 101, while a real client's
+  prediction stands uncorrected and the player sees a block on their head.
+  `--predict` sends that prediction and requires the contradiction.
+
 ## Running it
 
 ```

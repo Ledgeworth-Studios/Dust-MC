@@ -62,17 +62,33 @@
 //! [`Inventory::click`] is `Click Container`'s seven modes replayed over this
 //! state. It is a real specification and it is followed rather than guessed at:
 //! left and right click, shift-click, the number keys and F, creative clone,
-//! Q and control-Q, the three drags, and double-click-to-collect. The one thing
-//! it does not do is **auto-equip armour on shift-click**, because which slot a
-//! helmet goes in is `Item.getEquipmentSlot()` in Java and is in no report — it
-//! is the next column `dust-items.tsv` needs. Every other way of filling an
-//! armour slot works, including dragging one there.
+//! Q and control-Q, the three drags, and double-click-to-collect.
+//!
+//! # What a slot will accept
+//!
+//! Forty-four of the forty-six slots take any item. The crafting output takes
+//! none, and the four armour slots take only what is worn *in that slot* —
+//! which is why [`worn_in`] exists and why it is built out of Mojang's item
+//! tags rather than written down. That one rule reaches five of the seven
+//! modes: a left click, a right click, a shift-click, a number key and a drag
+//! all consult it, and the drag consults it when a slot *joins* the drag
+//! rather than at the end, because the share each slot receives is divided by
+//! how many slots joined.
+//!
+//! All of it was measured. `tools/bot/clicks.js` replays eighty-two clicks
+//! against this server and against a real 1.21.1 server and diffs the two
+//! recordings; the armour, offhand and crafting-grid clicks are the last
+//! twenty-five of them, and they are what said this paragraph was wrong before
+//! it was written. Decision record 0016 has the counts.
 //!
 //! Dropping is real and the item is *gone*: there are no item entities in the
 //! world yet, so Q destroys rather than throws. Stated here because a player
 //! finds that out by losing something.
 
+use std::sync::OnceLock;
+
 use dust_protocol::types::Slot;
+use dust_registry::tags::{self, TagRegistry};
 use dust_registry::Item;
 
 /// How many slots a player's own container has. Vanilla's `0..=45`.
@@ -92,6 +108,16 @@ pub const CRAFTING_END: usize = 5;
 pub const ARMOUR_START: usize = 5;
 /// One past the armour.
 pub const ARMOUR_END: usize = 9;
+
+/// The four armour slots by name, because `ARMOUR_START + 2` at a call site is
+/// a place to be wrong by one and the mistake looks like a client bug.
+pub const ARMOUR_HEAD: usize = 5;
+/// The chest slot, which is also where an elytra goes.
+pub const ARMOUR_CHEST: usize = 6;
+/// The leggings slot.
+pub const ARMOUR_LEGS: usize = 7;
+/// The boots slot.
+pub const ARMOUR_FEET: usize = 8;
 
 /// The main inventory, `9..=35`.
 pub const MAIN_START: usize = 9;
@@ -123,6 +149,134 @@ pub const OUTSIDE: i16 = -999;
 /// end of that numbering.
 const SWAP_OFFHAND_BUTTON: i8 = 40;
 
+/// Where an item is *worn*, as a slot number in this container's numbering, or
+/// `None` for the overwhelming majority of items that are worn nowhere.
+///
+/// This is the table [`Inventory::click`]'s armour rules are missing without,
+/// and it is the reason the header used to say shift-click does not equip.
+/// Java answers the same question with `Mob.getEquipmentSlotForItem`, which
+/// walks a class hierarchy — `ArmorItem` knows its own type, `ShieldItem` is
+/// hard-wired to the offhand — and a class hierarchy is not in any report. The
+/// item report does not help either: on 1.21.1 every armour piece's
+/// `minecraft:attribute_modifiers` is an **empty list**, so the report can say
+/// how much damage a helmet absorbs nowhere and which slot it goes in nowhere.
+/// The `minecraft:equippable` component that would answer this outright is
+/// 1.21.2 and later.
+///
+/// What does answer it, on this version, is Mojang's own item tags, which
+/// arrive through the same extraction as everything else:
+///
+/// | tag | slot |
+/// |---|---|
+/// | `minecraft:head_armor` | head |
+/// | `minecraft:chest_armor` | chest |
+/// | `minecraft:leg_armor` | legs |
+/// | `minecraft:foot_armor` | feet |
+/// | `minecraft:skulls` | head |
+///
+/// That is 32 of the 34 items a player can wear. The last two —
+/// `minecraft:elytra` on the chest and `minecraft:carved_pumpkin` on the head —
+/// are in no tag that names a slot, so they are named here, as is
+/// `minecraft:shield`, which goes in the offhand.
+///
+/// **Names written down are names that can go stale, so they are guarded
+/// rather than trusted.** `minecraft:enchantable/equippable` is vanilla's own
+/// list of everything that is worn: the four armour tags, the skulls, the
+/// elytra and the carved pumpkin, 34 items in all.
+/// `every_wearable_item_has_a_slot_to_be_worn_in` walks that tag and fails on
+/// any member this table places nowhere — so a version that adds a wearable
+/// stops the build on the row where it happened, rather than shipping an item
+/// a player cannot put on. The shield is not in that tag, because a shield is
+/// held rather than worn, and is checked by name on its own.
+///
+/// # Cost
+///
+/// One byte per item, 1,333 of them, built once on the first click of the
+/// server's life and read as an array index afterwards. The alternative — a
+/// tag lookup per click — is five binary searches over a 514-row table on a
+/// path a player hits several times a second.
+fn worn_in(item: Item) -> Option<usize> {
+    static WORN: OnceLock<Box<[u8]>> = OnceLock::new();
+    let table = WORN.get_or_init(build_worn_table);
+    // `CRAFTING_OUTPUT` is slot 0 and nothing is worn there, so zero is free to
+    // mean "worn nowhere" and the table needs no `Option` per row.
+    match table.get(item.protocol_id() as usize).copied() {
+        None | Some(0) => None,
+        Some(slot) => Some(slot as usize),
+    }
+}
+
+/// The tags that name a slot, and which slot each names.
+const WORN_BY_TAG: [(&str, usize); 5] = [
+    ("minecraft:head_armor", ARMOUR_START),
+    ("minecraft:chest_armor", ARMOUR_START + 1),
+    ("minecraft:leg_armor", ARMOUR_START + 2),
+    ("minecraft:foot_armor", ARMOUR_START + 3),
+    ("minecraft:skulls", ARMOUR_START),
+];
+
+/// The three 1.21.1 leaves no tag for. See [`worn_in`].
+const WORN_BY_NAME: [(&str, usize); 3] = [
+    ("minecraft:elytra", ARMOUR_START + 1),
+    ("minecraft:carved_pumpkin", ARMOUR_START),
+    ("minecraft:shield", OFFHAND),
+];
+
+fn build_worn_table() -> Box<[u8]> {
+    let mut table = vec![0u8; Item::registry().entry_count()];
+    let mut put = |name: &str, slot: usize| {
+        if let Some(item) = Item::from_name(name) {
+            table[item.protocol_id() as usize] = slot as u8;
+        }
+    };
+    for (tag, slot) in WORN_BY_TAG {
+        let Some(def) = tags::from_id(TagRegistry::Item, tag) else {
+            continue;
+        };
+        for member in def.members {
+            put(member, slot);
+        }
+    }
+    for (name, slot) in WORN_BY_NAME {
+        put(name, slot);
+    }
+    table.into_boxed_slice()
+}
+
+/// The most of `item` one slot will hold.
+///
+/// Vanilla's `Slot.getMaxStackSize(ItemStack)`, which is the item's own maximum
+/// everywhere in this container except the four armour slots, where `ArmorSlot`
+/// returns 1. That is not a formality: `minecraft:player_head` stacks to 64 and
+/// is worn on the head, so a player left-clicking a stack of sixty-four heads
+/// onto the helmet slot puts **one** there and keeps sixty-three on the cursor.
+/// A container that used the item's number would swallow the stack.
+fn slot_limit(index: usize, item: Item) -> u8 {
+    if (ARMOUR_START..ARMOUR_END).contains(&index) {
+        1
+    } else {
+        item.max_stack_size()
+    }
+}
+
+/// Whether a click may put `item` in this slot — vanilla's `Slot.mayPlace`.
+///
+/// Three answers, and the middle one is the whole point of [`worn_in`]: the
+/// crafting output takes nothing, an armour slot takes only what is worn in
+/// *that* slot, and everything else — the offhand included — takes anything.
+/// The offhand really is unrestricted: a real server accepts a stack of nine
+/// cobblestone into slot 45, which is measured in `tools/bot/clicks.js` and is
+/// not a guess about what looks sensible.
+fn may_place(index: usize, item: Item) -> bool {
+    if index == CRAFTING_OUTPUT {
+        return false;
+    }
+    if (ARMOUR_START..ARMOUR_END).contains(&index) {
+        return worn_in(item) == Some(index);
+    }
+    true
+}
+
 /// One stack: an item and how many of it.
 ///
 /// The count is never zero — an empty slot is `None`, not a stack of nothing —
@@ -145,11 +299,10 @@ impl Stack {
         }
     }
 
-    /// How many more of this item the stack could hold.
-    fn room(self) -> u8 {
-        self.item.max_stack_size().saturating_sub(self.count)
-    }
-
+    /// Whether the stack is at the item's own maximum. Not the same question
+    /// as whether the *slot* it is in is full — see [`slot_limit`] — and the
+    /// two callers left are the double-click gather, which is about the cursor
+    /// and about stacks it will not break open.
     fn is_full(self) -> bool {
         self.count >= self.item.max_stack_size()
     }
@@ -443,10 +596,7 @@ impl Inventory {
         // The hotbar is filled after the main inventory, matching vanilla's
         // `moveItemStackTo(stack, 9, 45, false)`: a player who closes a window
         // does not want their hand's contents replaced.
-        if self.merge_into(MAIN_START..HOTBAR_END, &mut left, changed) {
-            return;
-        }
-        self.fill_empty(MAIN_START..HOTBAR_END, &mut left, changed);
+        self.move_to(MAIN_START..HOTBAR_END, &mut left, changed);
     }
 
     // -- the seven modes ---------------------------------------------------
@@ -480,29 +630,50 @@ impl Inventory {
     }
 
     fn pickup_left(&mut self, index: usize, changed: &mut Changed) {
+        let limit = self
+            .cursor
+            .map_or(u8::MAX, |held| slot_limit(index, held.item));
         match (self.cursor, self.slots[index]) {
             // Hand empty, slot full: take it all.
             (None, Some(stack)) => {
                 self.cursor = Some(stack);
                 self.slots[index] = None;
             }
-            // Hand full, slot empty: put it all down.
-            (Some(stack), None) => {
-                self.slots[index] = Some(stack);
-                self.cursor = None;
+            // Hand full, slot empty: put down as much as the slot will hold.
+            // A slot that will not take this item at all does nothing, which is
+            // what a real server does with cobblestone aimed at a helmet slot.
+            (Some(mut held), None) => {
+                if !may_place(index, held.item) {
+                    return;
+                }
+                let moved = held.count.min(limit);
+                held.count -= moved;
+                self.slots[index] = Some(Stack {
+                    item: held.item,
+                    count: moved,
+                });
+                self.cursor = (held.count > 0).then_some(held);
             }
-            // Both full, same item: pour the hand into the slot up to the
-            // item's own maximum and keep the rest.
-            (Some(mut held), Some(mut there)) if held.item == there.item && !there.is_full() => {
-                let moved = held.count.min(there.room());
+            // Both full, same item: pour the hand into the slot up to what the
+            // slot will hold and keep the rest.
+            (Some(mut held), Some(mut there))
+                if held.item == there.item
+                    && there.count < limit
+                    && may_place(index, held.item) =>
+            {
+                let moved = held.count.min(limit - there.count);
                 there.count += moved;
                 held.count -= moved;
                 self.slots[index] = Some(there);
                 self.cursor = (held.count > 0).then_some(held);
             }
             // Both full, different items — or the same item with no room.
-            // Swap.
+            // Swap, if the slot will take what is on the cursor and the whole
+            // of it fits.
             (Some(held), Some(there)) => {
+                if !may_place(index, held.item) || held.count > limit {
+                    return;
+                }
                 self.slots[index] = Some(held);
                 self.cursor = Some(there);
             }
@@ -527,6 +698,9 @@ impl Inventory {
             }
             // Hand full, slot empty or the same item with room: put one down.
             (Some(mut held), None) => {
+                if !may_place(index, held.item) {
+                    return;
+                }
                 held.count -= 1;
                 self.slots[index] = Some(Stack {
                     item: held.item,
@@ -534,13 +708,20 @@ impl Inventory {
                 });
                 self.cursor = (held.count > 0).then_some(held);
             }
-            (Some(mut held), Some(mut there)) if held.item == there.item && !there.is_full() => {
+            (Some(mut held), Some(mut there))
+                if held.item == there.item
+                    && there.count < slot_limit(index, held.item)
+                    && may_place(index, held.item) =>
+            {
                 held.count -= 1;
                 there.count += 1;
                 self.slots[index] = Some(there);
                 self.cursor = (held.count > 0).then_some(held);
             }
             (Some(held), Some(there)) => {
+                if !may_place(index, held.item) || held.count > slot_limit(index, held.item) {
+                    return;
+                }
                 self.slots[index] = Some(held);
                 self.cursor = Some(there);
             }
@@ -550,15 +731,18 @@ impl Inventory {
         changed.mark_cursor();
     }
 
-    /// Shift-click: send the stack to the other half of the container.
+    /// Shift-click: send the stack where a real client sends it.
     ///
-    /// Vanilla's `InventoryMenu.quickMoveStack`, minus the armour rules — see
-    /// this module's header for why those need a table nobody has extracted
-    /// yet. The destinations that remain are exactly vanilla's:
-    ///
-    /// - the crafting slots and the armour slots empty into the inventory,
-    /// - the main inventory goes to the hotbar,
-    /// - the hotbar goes to the main inventory.
+    /// Vanilla's `AbstractContainerMenu.clicked` does not call
+    /// `quickMoveStack` once. It calls it **in a loop**, until a call moves
+    /// nothing or the slot no longer holds the same item, and that loop is not
+    /// a detail — it is the only reason shift-clicking a stack of nine player
+    /// heads works. The first pass sees an empty head slot and moves one head
+    /// there, because an armour slot holds one. The second pass sees the head
+    /// slot occupied, takes a different arm entirely, and sends the other eight
+    /// to the hotbar. A single pass leaves eight heads sitting in the slot the
+    /// player shift-clicked, which is what this did until a real server was
+    /// asked.
     fn quick_move(&mut self, slot: i16, changed: &mut Changed) {
         let Ok(index) = usize::try_from(slot) else {
             return;
@@ -566,35 +750,68 @@ impl Inventory {
         if index >= SLOTS {
             return;
         }
-        let Some(mut stack) = self.slots[index] else {
-            return;
-        };
-        let destination = if (MAIN_START..MAIN_END).contains(&index) {
+        loop {
+            let Some(mut stack) = self.slots[index] else {
+                return;
+            };
+            let destination = self.quick_move_destination(index, stack.item);
+            self.slots[index] = None;
+            let before = stack.count;
+            self.move_to(destination, &mut stack, changed);
+            if stack.count == before {
+                // Nowhere for any of it to go. Vanilla leaves the slot alone
+                // and so does this: a shift-click that moves nothing must not
+                // report a change, or the client redraws a slot that did not
+                // move.
+                self.slots[index] = Some(stack);
+                return;
+            }
+            changed.mark(index);
+            if stack.count == 0 {
+                return;
+            }
+            self.slots[index] = Some(stack);
+        }
+    }
+
+    /// Where one pass of a shift-click sends what is in this slot.
+    ///
+    /// Vanilla's `InventoryMenu.quickMoveStack`, arm for arm and in its order,
+    /// because the order *is* the rule: the equipment arms sit between the
+    /// container's two halves, so a helmet in the main inventory goes to the
+    /// head — but a helmet already **in** an armour slot comes off, and a
+    /// helmet with a helmet already on the head goes to the hotbar like any
+    /// other item.
+    ///
+    /// - the crafting output, the crafting grid and the armour empty into the
+    ///   inventory as a whole,
+    /// - an item that is worn, whose slot is empty, is put on,
+    /// - the main inventory goes to the hotbar,
+    /// - the hotbar goes to the main inventory,
+    /// - anything else — the offhand — goes to the inventory as a whole.
+    fn quick_move_destination(&self, index: usize, item: Item) -> std::ops::Range<usize> {
+        if index < ARMOUR_END {
+            return MAIN_START..HOTBAR_END;
+        }
+        if let Some(to) = worn_in(item).filter(|&to| self.slots[to].is_none()) {
+            return to..to + 1;
+        }
+        if (MAIN_START..MAIN_END).contains(&index) {
             HOTBAR_START..HOTBAR_END
         } else if (HOTBAR_START..HOTBAR_END).contains(&index) {
             MAIN_START..MAIN_END
         } else {
-            // The crafting slots, the armour slots and the offhand all empty
-            // into the inventory as a whole.
             MAIN_START..HOTBAR_END
-        };
-        self.slots[index] = None;
-        let before = stack.count;
-        if !self.merge_into(destination.clone(), &mut stack, changed) {
-            self.fill_empty(destination, &mut stack, changed);
         }
-        if stack.count == before {
-            // Nowhere for any of it to go. Vanilla leaves the slot alone and
-            // so does this: a shift-click that moves nothing must not report a
-            // change, or the client redraws a slot that did not move.
-            self.slots[index] = Some(stack);
-            return;
-        }
-        self.slots[index] = (stack.count > 0).then_some(stack);
-        changed.mark(index);
     }
 
     /// A number key or F: swap this slot with a hotbar slot or the offhand.
+    ///
+    /// The named slot has an opinion and the hotbar slot does not, so only one
+    /// direction is checked: pressing 1 over the helmet slot with cobblestone
+    /// in hotbar slot 0 does nothing at all, and pressing it with a helmet
+    /// there swaps. A real server does exactly that, and a server that swapped
+    /// anyway is a player wearing a block.
     fn swap(&mut self, slot: i16, button: i8, changed: &mut Changed) {
         let Some(index) = self.writable(slot) else {
             return;
@@ -609,9 +826,42 @@ impl Inventory {
         if other == index {
             return;
         }
-        self.slots.swap(index, other);
+        let Some(mut coming) = self.slots[other] else {
+            // Nothing coming in: this is a take, and every slot here may be
+            // taken from.
+            if self.slots[index].is_some() {
+                self.slots.swap(index, other);
+                changed.mark(index);
+                changed.mark(other);
+            }
+            return;
+        };
+        if !may_place(index, coming.item) {
+            return;
+        }
+        let limit = slot_limit(index, coming.item);
+        if coming.count <= limit {
+            self.slots.swap(index, other);
+            changed.mark(index);
+            changed.mark(other);
+            return;
+        }
+        // More than the slot holds — a stack of skulls aimed at the head. The
+        // slot takes what it holds, the rest stays in the hotbar, and whatever
+        // was in the slot goes back into the inventory rather than being
+        // deleted to make room.
+        let going = self.slots[index].take();
+        coming.count -= limit;
+        self.slots[other] = Some(coming);
+        self.slots[index] = Some(Stack {
+            item: coming.item,
+            count: limit,
+        });
         changed.mark(index);
         changed.mark(other);
+        if let Some(going) = going {
+            self.give(going, changed);
+        }
     }
 
     /// Creative middle-click: a full stack of whatever is there.
@@ -688,17 +938,24 @@ impl Inventory {
                     return;
                 };
                 // A slot only joins the drag if the cursor's item could go
-                // there: empty, or the same item with room. Vanilla checks the
-                // same thing, and it matters because the share each slot gets
-                // is computed from how many slots there are.
+                // there: the slot will take that item, and it is empty or the
+                // same item with room. Vanilla checks both at *this* step and
+                // not at the end, which is load-bearing — the share each slot
+                // gets is `count / slots.len()`, so a slot that is filtered on
+                // the way in makes the others' share larger. Dragging twenty-one
+                // cobblestone across the chest slot and one ordinary slot puts
+                // all twenty-one in the ordinary slot on a real server, not ten.
                 let Some(held) = self.cursor else {
                     self.drag.reset();
                     return;
                 };
-                let fits = match self.slots[index] {
-                    None => true,
-                    Some(there) => there.item == held.item && !there.is_full(),
-                };
+                let fits = may_place(index, held.item)
+                    && match self.slots[index] {
+                        None => true,
+                        Some(there) => {
+                            there.item == held.item && there.count < slot_limit(index, held.item)
+                        }
+                    };
                 if fits {
                     self.drag.add(index);
                 }
@@ -722,14 +979,13 @@ impl Inventory {
         if self.drag.count == 0 {
             return;
         }
-        let max = held.item.max_stack_size();
         // Left drag splits what is on the cursor evenly and keeps the
         // remainder; right drag puts one in each; middle drag is creative and
         // fills each slot without spending anything.
         let share = match kind {
             0 => held.count / self.drag.count,
             1 => 1,
-            _ => max,
+            _ => held.item.max_stack_size(),
         };
         if share == 0 {
             return;
@@ -740,7 +996,7 @@ impl Inventory {
                 continue;
             }
             let existing = self.slots[index].map_or(0, |s| s.count);
-            let want = share.min(max.saturating_sub(existing));
+            let want = share.min(slot_limit(index, held.item).saturating_sub(existing));
             if want == 0 {
                 continue;
             }
@@ -830,54 +1086,54 @@ impl Inventory {
         (index != CRAFTING_OUTPUT && index < SLOTS).then_some(index)
     }
 
-    /// Pour `stack` into partial stacks of the same item in `range`. Returns
-    /// whether it all fitted.
-    fn merge_into(
-        &mut self,
-        range: std::ops::Range<usize>,
-        stack: &mut Stack,
-        changed: &mut Changed,
-    ) -> bool {
-        for index in range {
-            let Some(mut there) = self.slots[index] else {
-                continue;
-            };
-            if there.item != stack.item || there.is_full() {
-                continue;
-            }
-            let moved = stack.count.min(there.room());
-            there.count += moved;
-            stack.count -= moved;
-            self.slots[index] = Some(there);
-            changed.mark(index);
-            if stack.count == 0 {
-                return true;
+    /// Vanilla's `AbstractContainerMenu.moveItemStackTo`, which is what every
+    /// shift-click and every put-it-back is made of.
+    ///
+    /// Two passes and they are not the same pass. The first pours into partial
+    /// stacks of the same item, so a shift-clicked stack tops up what is
+    /// already there rather than opening a new slot beside it. The second puts
+    /// what is left into **one** empty slot and stops — vanilla breaks out of
+    /// that loop, and since no slot here holds more than a stack there is never
+    /// anything left over to want a second one.
+    ///
+    /// Both passes ask [`slot_limit`] rather than the item's own maximum, and
+    /// the second asks [`may_place`]. Neither matters for a range inside the
+    /// inventory; both matter for the one-slot range an armour move uses.
+    fn move_to(&mut self, range: std::ops::Range<usize>, stack: &mut Stack, changed: &mut Changed) {
+        if stack.item.max_stack_size() > 1 {
+            for index in range.clone() {
+                if stack.count == 0 {
+                    return;
+                }
+                let Some(mut there) = self.slots[index] else {
+                    continue;
+                };
+                let limit = slot_limit(index, stack.item);
+                if there.item != stack.item || there.count >= limit {
+                    continue;
+                }
+                let moved = stack.count.min(limit - there.count);
+                there.count += moved;
+                stack.count -= moved;
+                self.slots[index] = Some(there);
+                changed.mark(index);
             }
         }
-        stack.count == 0
-    }
-
-    /// Put whatever is left of `stack` into the first empty slots in `range`.
-    fn fill_empty(
-        &mut self,
-        range: std::ops::Range<usize>,
-        stack: &mut Stack,
-        changed: &mut Changed,
-    ) {
+        if stack.count == 0 {
+            return;
+        }
         for index in range {
-            if stack.count == 0 {
-                return;
-            }
-            if self.slots[index].is_some() {
+            if self.slots[index].is_some() || !may_place(index, stack.item) {
                 continue;
             }
-            let moved = stack.count.min(stack.item.max_stack_size());
+            let moved = stack.count.min(slot_limit(index, stack.item));
             self.slots[index] = Some(Stack {
                 item: stack.item,
                 count: moved,
             });
             stack.count -= moved;
             changed.mark(index);
+            return;
         }
     }
 }
@@ -1001,6 +1257,20 @@ mod tests {
     /// wrong and the generated one does not.
     fn bucket() -> Item {
         item("minecraft:water_bucket")
+    }
+
+    fn helmet() -> Item {
+        item("minecraft:iron_helmet")
+    }
+
+    fn boots() -> Item {
+        item("minecraft:iron_boots")
+    }
+
+    /// Worn on the head and stacks to 64, which is the only combination in the
+    /// game where an armour slot's own limit of one is visible.
+    fn head() -> Item {
+        item("minecraft:player_head")
     }
 
     fn wire(item: Item, count: i32) -> Slot {
@@ -1366,5 +1636,197 @@ mod tests {
         }
         assert_eq!(to_wire(None), Slot::Empty);
         assert_eq!(from_wire(&Slot::Empty), None);
+    }
+
+    #[test]
+    fn every_wearable_item_has_a_slot_to_be_worn_in() {
+        // `minecraft:enchantable/equippable` is vanilla's own list of the 34
+        // things a player wears, and this table places 32 of them from four
+        // slot-naming tags and the other two by name. A version that adds a
+        // wearable — or renames one of those two — fails here rather than
+        // shipping an item that cannot be put on.
+        let wearable = dust_registry::tags::wire(TagRegistry::Item)
+            .expect("the item tags resolve")
+            .into_iter()
+            .find(|tag| tag.id == "minecraft:enchantable/equippable")
+            .expect("1.21.1 has that tag");
+        let mut placed_nowhere = Vec::new();
+        for id in &wearable.entries {
+            let item = Item::from_protocol_id(*id).expect("a tag member is an item");
+            if worn_in(item).is_none() {
+                placed_nowhere.push(item.name());
+            }
+        }
+        assert!(
+            placed_nowhere.is_empty(),
+            "these are worn somewhere and this table says nowhere: {placed_nowhere:?}"
+        );
+        assert_eq!(wearable.entries.len(), 34, "the wearables on 1.21.1");
+        // The shield is not worn and so is not in that tag; it is the one
+        // offhand answer and nothing else guards it.
+        assert_eq!(worn_in(item("minecraft:shield")), Some(OFFHAND));
+    }
+
+    #[test]
+    fn the_four_armour_slots_take_only_what_is_worn_in_them() {
+        assert_eq!(worn_in(helmet()), Some(ARMOUR_HEAD));
+        assert_eq!(worn_in(boots()), Some(ARMOUR_FEET));
+        assert_eq!(worn_in(item("minecraft:elytra")), Some(ARMOUR_CHEST));
+        assert_eq!(worn_in(item("minecraft:carved_pumpkin")), Some(ARMOUR_HEAD));
+        assert_eq!(worn_in(stone()), None);
+
+        assert!(may_place(ARMOUR_HEAD, helmet()));
+        assert!(!may_place(ARMOUR_HEAD, boots()));
+        assert!(!may_place(ARMOUR_FEET, helmet()));
+        assert!(!may_place(ARMOUR_HEAD, stone()));
+        // The offhand and the inventory take anything, the output nothing.
+        assert!(may_place(OFFHAND, stone()));
+        assert!(may_place(MAIN_START, helmet()));
+        assert!(!may_place(CRAFTING_OUTPUT, stone()));
+    }
+
+    #[test]
+    fn a_left_click_cannot_put_a_block_on_a_players_head() {
+        let mut inventory = with(&[(MAIN_START, stone(), 9)]);
+        inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
+        let changed = inventory.click(ClickMode::Pickup, ARMOUR_HEAD as i16, 0);
+        assert!(changed.is_empty(), "a refused click changes nothing");
+        assert_eq!(inventory.slot(ARMOUR_HEAD), None);
+        assert_eq!(inventory.cursor(), Some(Stack::new(stone(), 9)));
+
+        // Boots into the helmet slot are refused for the same reason, and the
+        // helmet slot takes the helmet.
+        inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
+        let mut inventory = with(&[(MAIN_START, boots(), 1), (MAIN_START + 1, helmet(), 1)]);
+        inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
+        assert!(inventory
+            .click(ClickMode::Pickup, ARMOUR_HEAD as i16, 0)
+            .is_empty());
+        inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
+        inventory.click(ClickMode::Pickup, (MAIN_START + 1) as i16, 0);
+        inventory.click(ClickMode::Pickup, ARMOUR_HEAD as i16, 0);
+        assert_eq!(inventory.slot(ARMOUR_HEAD), Some(Stack::new(helmet(), 1)));
+    }
+
+    #[test]
+    fn shift_click_puts_armour_on_and_takes_it_off_again() {
+        let mut inventory = with(&[(MAIN_START, helmet(), 1)]);
+        inventory.click(ClickMode::QuickMove, MAIN_START as i16, 0);
+        assert_eq!(inventory.slot(ARMOUR_HEAD), Some(Stack::new(helmet(), 1)));
+        assert_eq!(inventory.slot(MAIN_START), None);
+
+        // Off again, and into the inventory rather than back onto the head.
+        inventory.click(ClickMode::QuickMove, ARMOUR_HEAD as i16, 0);
+        assert_eq!(inventory.slot(ARMOUR_HEAD), None);
+        assert_eq!(inventory.slot(MAIN_START), Some(Stack::new(helmet(), 1)));
+    }
+
+    #[test]
+    fn a_second_helmet_goes_to_the_hotbar_because_the_head_is_taken() {
+        let mut inventory = with(&[
+            (ARMOUR_HEAD, helmet(), 1),
+            (MAIN_START, item("minecraft:golden_helmet"), 1),
+        ]);
+        inventory.click(ClickMode::QuickMove, MAIN_START as i16, 0);
+        assert_eq!(inventory.slot(ARMOUR_HEAD), Some(Stack::new(helmet(), 1)));
+        assert_eq!(
+            inventory.slot(HOTBAR_START),
+            Some(Stack::new(item("minecraft:golden_helmet"), 1))
+        );
+    }
+
+    #[test]
+    fn a_shield_shift_clicks_into_the_offhand_unless_it_is_taken() {
+        let shield = item("minecraft:shield");
+        let mut inventory = with(&[(MAIN_START, shield, 1)]);
+        inventory.click(ClickMode::QuickMove, MAIN_START as i16, 0);
+        assert_eq!(inventory.slot(OFFHAND), Some(Stack::new(shield, 1)));
+
+        let mut inventory = with(&[(MAIN_START, shield, 1), (OFFHAND, stone(), 1)]);
+        inventory.click(ClickMode::QuickMove, MAIN_START as i16, 0);
+        assert_eq!(inventory.slot(OFFHAND), Some(Stack::new(stone(), 1)));
+        assert_eq!(inventory.slot(HOTBAR_START), Some(Stack::new(shield, 1)));
+    }
+
+    #[test]
+    fn the_offhand_and_the_crafting_grid_empty_into_the_inventory() {
+        let mut inventory = with(&[(OFFHAND, stone(), 9), (CRAFTING_START, stone(), 4)]);
+        inventory.click(ClickMode::QuickMove, OFFHAND as i16, 0);
+        assert_eq!(inventory.slot(MAIN_START), Some(Stack::new(stone(), 9)));
+        inventory.click(ClickMode::QuickMove, CRAFTING_START as i16, 0);
+        assert_eq!(inventory.slot(MAIN_START), Some(Stack::new(stone(), 13)));
+        assert_eq!(inventory.slot(CRAFTING_START), None);
+    }
+
+    #[test]
+    fn a_number_key_over_an_armour_slot_obeys_the_slot_and_not_the_key() {
+        let mut inventory = with(&[
+            (ARMOUR_HEAD, helmet(), 1),
+            (HOTBAR_START, stone(), 6),
+            (HOTBAR_START + 1, item("minecraft:golden_helmet"), 1),
+        ]);
+        let changed = inventory.click(ClickMode::Swap, ARMOUR_HEAD as i16, 0);
+        assert!(changed.is_empty(), "a block cannot be swapped onto a head");
+        assert_eq!(inventory.slot(ARMOUR_HEAD), Some(Stack::new(helmet(), 1)));
+
+        inventory.click(ClickMode::Swap, ARMOUR_HEAD as i16, 1);
+        assert_eq!(
+            inventory.slot(ARMOUR_HEAD),
+            Some(Stack::new(item("minecraft:golden_helmet"), 1))
+        );
+        assert_eq!(
+            inventory.slot(HOTBAR_START + 1),
+            Some(Stack::new(helmet(), 1))
+        );
+    }
+
+    #[test]
+    fn an_armour_slot_holds_one_of_something_that_stacks_to_sixty_four() {
+        // A player head is worn and stacks to 64. `ArmorSlot.getMaxStackSize`
+        // is 1, so one goes on and the rest stays on the cursor.
+        assert_eq!(head().max_stack_size(), 64);
+        let mut inventory = with(&[(MAIN_START, head(), 9)]);
+        inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
+        inventory.click(ClickMode::Pickup, ARMOUR_HEAD as i16, 0);
+        assert_eq!(inventory.slot(ARMOUR_HEAD), Some(Stack::new(head(), 1)));
+        assert_eq!(inventory.cursor(), Some(Stack::new(head(), 8)));
+
+        // And a shift-click puts one on the head and then keeps going: the
+        // second pass finds the head slot occupied, takes the ordinary arm and
+        // sends the other eight to the hotbar. Measured against a real server;
+        // a single pass leaves them in the slot that was clicked.
+        let mut inventory = with(&[(MAIN_START, head(), 9)]);
+        inventory.click(ClickMode::QuickMove, MAIN_START as i16, 0);
+        assert_eq!(inventory.slot(ARMOUR_HEAD), Some(Stack::new(head(), 1)));
+        assert_eq!(inventory.slot(MAIN_START), None);
+        assert_eq!(inventory.slot(HOTBAR_START), Some(Stack::new(head(), 8)));
+    }
+
+    #[test]
+    fn a_drag_skips_the_slot_that_will_not_take_it_and_the_rest_share_more() {
+        // Twenty-one cobblestone dragged across the chest slot and one
+        // ordinary slot. The chest slot never joins the drag, so the share is
+        // 21/1 and not 21/2 — measured against a real server.
+        let mut inventory = with(&[(MAIN_START, stone(), 21)]);
+        inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
+        inventory.click(ClickMode::QuickCraft, OUTSIDE, 0);
+        inventory.click(ClickMode::QuickCraft, ARMOUR_CHEST as i16, 1);
+        inventory.click(ClickMode::QuickCraft, (MAIN_START + 8) as i16, 1);
+        inventory.click(ClickMode::QuickCraft, OUTSIDE, 2);
+        assert_eq!(inventory.slot(ARMOUR_CHEST), None);
+        assert_eq!(
+            inventory.slot(MAIN_START + 8),
+            Some(Stack::new(stone(), 21))
+        );
+        assert_eq!(inventory.cursor(), None);
+    }
+
+    #[test]
+    fn a_block_goes_in_the_offhand_because_the_offhand_takes_anything() {
+        let mut inventory = with(&[(MAIN_START, stone(), 9), (OFFHAND, dirt(), 2)]);
+        inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
+        inventory.click(ClickMode::Pickup, OFFHAND as i16, 0);
+        assert_eq!(inventory.slot(OFFHAND), Some(Stack::new(stone(), 9)));
+        assert_eq!(inventory.cursor(), Some(Stack::new(dirt(), 2)));
     }
 }
