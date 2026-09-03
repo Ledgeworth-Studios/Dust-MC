@@ -439,6 +439,10 @@ pub struct Server {
     /// The world and the player positions, kept so the teardown can write them
     /// down. `None` until phase 3 builds them.
     saveable: Option<Saveable>,
+    /// Item physics, built by phase 3 because it needs the world and the
+    /// roster, and inserted into the tick loop by phase 4 because that is
+    /// where ticking happens. The slot is what lets those be different phases.
+    item_ticker: Option<Box<dyn crate::participant::TickParticipant>>,
 }
 
 /// What the teardown has to write out.
@@ -477,6 +481,7 @@ impl Server {
             tracker: Arc::new(ThreadTracker::default()),
             listener: None,
             saveable: None,
+            item_ticker: None,
         }
     }
 
@@ -564,6 +569,9 @@ impl Server {
             &config,
             &tasks::WorkCharger::from_option(self.options.virtual_work_clock.clone()),
         );
+        if let Some(ticker) = self.item_ticker.take() {
+            participants.insert(ticker);
+        }
         for extra in std::mem::take(&mut self.options.extra_tasks) {
             participants.insert(extra);
         }
@@ -919,6 +927,31 @@ impl Server {
         }
         let item_blocks = item_blocks.map(std::sync::Arc::new);
 
+        // The third thing read out of `[data] path`, and the only one that is
+        // Minecraft's own file rather than a table extracted from its jar:
+        // what a broken block yields. See `registries::drops`.
+        let (drops, drops_report) = match data_path.as_deref() {
+            None => (dust_sim::drops::Tables::default(), None),
+            Some(path) => {
+                let (tables, report) = crate::registries::drops::beside(path);
+                (tables, Some(report))
+            }
+        };
+        match &drops_report {
+            Some(report) if report.files > 0 => {
+                self.options.logger.info("dust::data", report.summary())
+            }
+            // Said once and spelled out, like the two tables above it: the
+            // consequence is that mining gives nothing, which is the whole
+            // survival game, and an operator should not have to guess why.
+            _ => self.options.logger.info(
+                "dust::data",
+                "no loot tables under [data] path, so a broken block drops nothing".to_owned(),
+            ),
+        }
+        let drops = std::sync::Arc::new(drops);
+        let items: std::sync::Arc<crate::net::items::ItemWorld> = std::sync::Arc::default();
+
         let opacity = crate::net::world::opacity_of(palette.air, constants.as_ref());
         // Shared rather than moved: the world lights and heightmaps with this
         // table, and a session reads the sound a placed block makes out of the
@@ -1117,10 +1150,24 @@ impl Server {
                 fail("the generated entity table has no minecraft:player".to_owned())
             })?,
             counters: std::sync::Arc::clone(&counters),
-            constants,
+            constants: constants.clone(),
             item_blocks,
             registry_contents,
+            items: std::sync::Arc::clone(&items),
+            drops: std::sync::Arc::clone(&drops),
+            item_entity_type: crate::net::play::item_entity_type().ok_or_else(|| {
+                fail("the generated entity table has no minecraft:item".to_owned())
+            })?,
         });
+
+        // Built here because it needs the world and the roster, both of which
+        // are phase 3's; inserted into the tick loop by phase 4.
+        self.item_ticker = Some(Box::new(crate::net::items::ItemTicker::new(
+            std::sync::Arc::clone(&items),
+            std::sync::Arc::clone(&world),
+            std::sync::Arc::clone(&roster),
+            constants,
+        )));
 
         let handle = listener
             .serve(ctx, counters, self.options.logger.clone())

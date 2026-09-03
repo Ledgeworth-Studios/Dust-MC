@@ -599,6 +599,16 @@ pub fn player_entity_type() -> Option<i32> {
         .and_then(|t| i32::try_from(t.protocol_id()).ok())
 }
 
+/// `minecraft:item`'s id in the entity-type registry.
+///
+/// Resolved at boot for the same reason the player's is: the id is a position
+/// in a generated table, and a constant here would be a second answer to a
+/// question that table already answers.
+pub fn item_entity_type() -> Option<i32> {
+    dust_registry::EntityType::from_name("minecraft:item")
+        .and_then(|t| i32::try_from(t.protocol_id()).ok())
+}
+
 // ---------------------------------------------------------------------------
 // The rest of what a joining client is told
 // ---------------------------------------------------------------------------

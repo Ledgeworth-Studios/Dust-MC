@@ -267,6 +267,32 @@ impl Roster {
         let _ = self.changes.send(RosterChange::Said { entity_id, text });
     }
 
+    /// One entity id, for something that is not a player.
+    ///
+    /// The roster owns the allocator because the roster is what is in the
+    /// world, and because an item entity and a player sharing an id is a
+    /// client drawing one on top of the other. Two allocators would be two
+    /// counters that have to be told about each other; one is one number.
+    pub fn claim_entity_id(&self) -> i32 {
+        self.next_entity_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Where everybody is, into a buffer the caller keeps.
+    ///
+    /// Fills rather than returns because this is called twenty times a second
+    /// by the item tick, and [`Roster::snapshot`] clones a `String` per player
+    /// to answer a question that is three floats.
+    pub fn positions_into(&self, out: &mut Vec<(f64, f64, f64)>) {
+        out.clear();
+        out.extend(
+            self.players
+                .lock()
+                .expect("the roster is never poisoned")
+                .values()
+                .map(|player| (player.x, player.y, player.z)),
+        );
+    }
+
     /// Everyone here, for rebuilding a session that fell behind.
     pub fn snapshot(&self) -> Vec<Player> {
         self.players

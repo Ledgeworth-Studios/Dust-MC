@@ -153,6 +153,20 @@ pub struct SessionContext {
     pub roster: super::players::SharedRoster,
     /// `minecraft:player`'s id in the entity-type registry, resolved at boot.
     pub player_entity_type: i32,
+    /// `minecraft:item`'s id in the same table.
+    pub item_entity_type: i32,
+    /// Every item lying on the ground, and the channel their comings and
+    /// goings travel on.
+    pub items: Arc<super::items::ItemWorld>,
+    /// What a broken block yields, compiled from the operator's own loot
+    /// tables at boot.
+    ///
+    /// An empty set is the ordinary state of a server without a `[data] path`,
+    /// and it means breaking a block drops nothing rather than dropping a
+    /// guess. Which of those a player would rather have is not a close call:
+    /// a guess is a survival game that gives you the wrong thing, and there is
+    /// no way to tell from inside the world that it was a guess.
+    pub drops: Arc<dust_sim::drops::Tables>,
     /// Minecraft's own per-state constants, if the operator put a table beside
     /// their data.
     ///
@@ -876,6 +890,37 @@ where
     )
     .await?;
 
+    // Every item lying in the world from now on. Subscribed *before* the
+    // items already there are sent, for the reason the edit channel is: an
+    // item that appears in the window between the two is better sent twice
+    // than not at all, because a client told about an entity it already has
+    // replaces it and a client never told has a drop it cannot see.
+    let mut item_changes = ctx.items.subscribe();
+    if !ctx.items.is_empty() {
+        let mut already = Vec::new();
+        ctx.items
+            .visible_from(position, f64::from(view.radius() * 16), &mut already);
+        for change in &already {
+            relay_item(conn, ctx, change).await?;
+        }
+    }
+    // Picking things up is asked at the tick rate rather than on every
+    // movement packet: a client sends those faster than the world moves, and a
+    // player walking over a stack does not need to be told twice in one tick
+    // that they have it. The atomic read at the top of the arm is what makes
+    // this free on a server with nothing on the floor.
+    let mut pickups = tokio::time::interval(PICKUP_PERIOD);
+    let mut collected: Vec<(dust_registry::Item, u8)> = Vec::new();
+
+    // The stream every break's loot roll comes out of. Seeded from the
+    // player's entity id and the moment they joined, so two players mining at
+    // once do not get the same sequence of leaves and saplings and so a
+    // restart does not repeat one.
+    let mut drop_seed = (me.entity_id as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos() as u64);
+
     let mut next_id: i64 = 1;
     // `interval`'s first tick fires immediately, and that is kept rather than
     // skipped: one keep-alive right after the chunks proves the round trip
@@ -925,6 +970,65 @@ where
                 )
                 .await?;
                 next_id = next_id.wrapping_add(1);
+            }
+            _ = pickups.tick() => {
+                if !ctx.items.is_empty() {
+                    collected.clear();
+                    ctx.items.claim_near(me.entity_id, position, &mut collected);
+                    for (item, count) in collected.drain(..) {
+                        let (changed, left) = inventory
+                            .collect(super::inventory::Stack::new(item, count));
+                        for index in 0..super::inventory::SLOTS {
+                            if changed.has(index) {
+                                send_slot(conn, ctx, &mut inventory, index).await?;
+                            }
+                        }
+                        // A full inventory puts it straight back on the floor
+                        // where the player is standing, so nothing is deleted
+                        // and they can see what would not fit.
+                        if let Some(over) = left {
+                            ctx.items.pop(
+                                &ctx.roster,
+                                dust_protocol::types::Position {
+                                    x: position.0.floor() as i32,
+                                    y: position.1.floor() as i32,
+                                    z: position.2.floor() as i32,
+                                },
+                                over.item,
+                                over.count,
+                                me.entity_id as u64,
+                            );
+                        }
+                    }
+                }
+            }
+            change = item_changes.recv() => {
+                match change {
+                    Ok(change) => {
+                        let (x, z) = change.at();
+                        if view.holds(view::column_of(x, z)) {
+                            relay_item(conn, ctx, &change).await?;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        // Unlike a missed block change, a missed item change
+                        // cannot be repaired by resending a column: entities
+                        // are not in the chunk packet. The honest repair is to
+                        // say so; the visible cost is an item the player walks
+                        // through, and it is picked up anyway because pickup
+                        // is decided by the server and not by what was drawn.
+                        ctx.logger.warn(
+                            "dust::net",
+                            format!("{} missed {missed} item change(s)", me.name),
+                        );
+                    }
+                    // The world is going away, and a closed broadcast
+                    // receiver is ready for ever after. Ending the session is
+                    // what the edit channel does for the same reason: the
+                    // alternative is a `select!` arm that resolves instantly
+                    // on every pass and spins a core.
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                }
             }
             edit = edits.recv() => {
                 match edit {
@@ -1339,12 +1443,43 @@ where
                         if matches!(action.status, StartDigging | FinishDigging)
                             && within_reach(ctx, position, movement.pose(), action.location)
                         {
+                            // Read before the break, because after it the
+                            // cell is air and a loot table asks what *was*
+                            // there. The two cells above and below come with
+                            // it: two tables read them, and both are a
+                            // double-tall plant deciding which half of itself
+                            // is the one that drops.
+                            let previous = ctx.world.block_at(action.location);
+                            let neighbours = [
+                                (-1i8, ctx.world.block_at(below(action.location))),
+                                (1i8, ctx.world.block_at(above(action.location))),
+                            ];
                             // Through `break_block` and not `set_block`: the
                             // other players are shown the block breaking, and
                             // the particles and the sound come from what was
                             // there rather than from the air left behind.
-                            ctx.world
+                            //
+                            // **The return value is the whole of the
+                            // difference between a break that yielded nothing
+                            // and a break that never happened.** They leave
+                            // the same air behind and look identical from
+                            // outside; only this says which it was, and a
+                            // refused break that dropped a stone would be a
+                            // duplication bug nobody could see.
+                            let broke = ctx.world
                                 .break_block(action.location, ctx.blocks.air, me.entity_id);
+                            if broke {
+                                drop_seed = drop_seed.wrapping_mul(6_364_136_223_846_793_005)
+                                    .wrapping_add(1_442_695_040_888_963_407);
+                                spill(
+                                    ctx,
+                                    action.location,
+                                    previous,
+                                    &neighbours,
+                                    inventory.held(),
+                                    drop_seed,
+                                );
+                            }
                         }
                         // The sequence number is acknowledged whatever
                         // happened. The client predicted the change locally
@@ -2148,6 +2283,161 @@ where
             }
         }
     }
+}
+
+/// How often a session asks whether its player is standing on anything.
+///
+/// One tick. A player walks 0.28 blocks in one, and the pickup reach is 1.4,
+/// so nothing can be walked past between two asks.
+const PICKUP_PERIOD: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The cell above one.
+fn above(position: dust_protocol::types::Position) -> dust_protocol::types::Position {
+    dust_protocol::types::Position {
+        y: position.y.saturating_add(1),
+        ..position
+    }
+}
+
+/// The cell below one.
+fn below(position: dust_protocol::types::Position) -> dust_protocol::types::Position {
+    dust_protocol::types::Position {
+        y: position.y.saturating_sub(1),
+        ..position
+    }
+}
+
+/// Roll a broken block's loot table and put what came out on the ground.
+///
+/// Called only when the break actually changed the world. Everything it needs
+/// is read before the break, because after it the cell is air.
+///
+/// **The count is split into stacks here and not in `dust-sim`**, because only
+/// this layer knows what a stack is: a loot table's `set_count` of eight and a
+/// fortune-multiplied ore are both one number that has nothing to do with the
+/// sixty-four a chest slot holds.
+fn spill(
+    ctx: &SessionContext,
+    at: dust_protocol::types::Position,
+    previous: u32,
+    neighbours: &[(i8, u32)],
+    held: Option<dust_registry::Item>,
+    seed: u64,
+) {
+    let Some(state) = dust_registry::BlockState::from_id(previous) else {
+        return;
+    };
+    let Some(table) = ctx.drops.table(state.block()) else {
+        // No table for this block, which is not "drops nothing" — see
+        // `dust_sim::drops::Tables::table`. Nothing is dropped either way, and
+        // the difference is why this branch is written down rather than being
+        // the same `return` as an empty roll.
+        return;
+    };
+    let around: Vec<(i8, dust_registry::BlockState)> = neighbours
+        .iter()
+        .filter_map(|(offset, state)| {
+            dust_registry::BlockState::from_id(*state).map(|state| (*offset, state))
+        })
+        .collect();
+    let context = dust_sim::drops::Break {
+        state,
+        tool: dust_sim::drops::Tool {
+            item: held,
+            // A stack carries no data components yet, so it carries no
+            // enchantments and every silk-touch and fortune branch in every
+            // table takes its unenchanted side. That is a gap in the stack and
+            // not in the table: the day a stack knows, this line is where it
+            // starts working.
+            enchantments: &[],
+        },
+        broken_by_entity: true,
+        neighbours: &around,
+    };
+    let mut rolled = Vec::new();
+    let mut rng = dust_sim::drops::Rng::from_seed(seed);
+    table.roll(&context, &mut rng, &mut rolled);
+    for drop in rolled {
+        let limit = u32::from(drop.item.max_stack_size().max(1));
+        let mut left = drop.count;
+        while left > 0 {
+            let taken = left.min(limit);
+            left -= taken;
+            ctx.items.pop(
+                &ctx.roster,
+                at,
+                drop.item,
+                u8::try_from(taken).unwrap_or(u8::MAX),
+                seed ^ u64::from(left),
+            );
+        }
+    }
+}
+
+/// Put one item change on the wire.
+///
+/// A spawn is two packets and not one: `AddEntity` says an item entity is
+/// there and `SetEntityData` says which item, and an item entity without the
+/// second renders as nothing at all.
+async fn relay_item<W>(
+    conn: &mut Conn<W>,
+    ctx: &SessionContext,
+    change: &super::items::ItemChange,
+) -> Result<(), SessionError>
+where
+    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    use super::items::ItemChange;
+    match change {
+        ItemChange::Spawned {
+            id, item, count, ..
+        } => {
+            if let Some(packet) = super::items::spawn(change, ctx.item_entity_type) {
+                send_play(conn, packet, ctx.version).await?;
+            }
+            send_play(
+                conn,
+                super::items::contents(*id, *item, *count),
+                ctx.version,
+            )
+            .await?;
+        }
+        ItemChange::Settled { id, x, y, z } => {
+            send_play(
+                conn,
+                play::clientbound::TeleportEntity {
+                    entity_id: VarInt(*id),
+                    x: *x,
+                    y: *y,
+                    z: *z,
+                    yaw: dust_protocol::types::Angle::from_degrees(0.0),
+                    pitch: dust_protocol::types::Angle::from_degrees(0.0),
+                    on_ground: true,
+                },
+                ctx.version,
+            )
+            .await?;
+        }
+        ItemChange::Collected { id, by, count, .. } => {
+            // The animation first and the removal second. The other order is
+            // an item that vanishes and then is told to fly somewhere.
+            send_play(
+                conn,
+                play::clientbound::TakeItemEntity {
+                    collected_entity_id: VarInt(*id),
+                    collector_entity_id: VarInt(*by),
+                    pickup_item_count: VarInt(i32::from(*count)),
+                },
+                ctx.version,
+            )
+            .await?;
+            send_play(conn, super::play::despawn(*id), ctx.version).await?;
+        }
+        ItemChange::Removed { id, .. } => {
+            send_play(conn, super::play::despawn(*id), ctx.version).await?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -195,24 +195,49 @@ something agree exactly. Decision record
 [0018](docs/decisions/0018-what-a-placed-block-reads-from-the-cell-it-lands-in.md)
 has the counts and says what it declined.
 
+**Breaking a block gives you the block.** What it yields is not a rule — it is
+`loot_table/blocks/<block>.json`, in the data pack the operator already
+produces for `[data] path`, compiled at boot and rolled per break: stone yields
+cobblestone, wheat yields wheat at age seven and seeds otherwise, an ore yields
+a variable count, leaves usually yield nothing. All 982 of vanilla 1.21.1's
+block tables compile with one entry refused. Against a real 1.21.1 server
+breaking fifty blocks in survival, `cargo xtask harness drops` scores 44 of 46
+rows where what Minecraft dropped is something Dust drops; both misses are the
+same missing thing, and it is named below. What comes out is an **item
+entity** — the first entity Dust has — which pops out of the centre of the
+broken block, falls, merges with its twin, can be walked over to collect, and
+despawns after five minutes. A thousand of them beside a player cost 110
+microseconds of a 50-millisecond tick, and a thousand with nobody near cost
+616 nanoseconds. Decision records
+[0022](docs/decisions/0022-what-a-broken-block-yields.md) and
+[0023](docs/decisions/0023-what-shape-an-entity-has.md) are the accounts.
+
 **Not yet**, and each of these is stated where the code for it would go: no
-physics, block updates, drops or tool checks, so a player is stopped from
+physics or block updates, so a player is stopped from
 entering a block and never pushed out of one; **no chunk residency**, so a
 movement check on a world read from region files rebuilds a column out of a
 region file every time a walking player leaves the four they carry, and costs
 8.8 microseconds a packet instead of 0.4 — decision record
 [0020](docs/decisions/0020-what-a-movement-check-really-costs-on-a-saved-world.md)
-has the counts; **no water on the movement path**,
+has the counts, and the same missing cache is what makes a *falling item* on
+such a world cost 558 microseconds a tick against 38 on a flat one; **no water
+on the movement path**,
 so a player who says they are sprinting and airborne is measured at their feet
 rather than at their full height, because they might be swimming and no client
 ever says so — decision record
 [0019](docs/decisions/0019-how-tall-a-player-is.md) says what that costs and why
-it is the direction to be wrong in; **no item entities**, so a dropped stack is destroyed rather than
-thrown, and nothing can be picked up off the ground; no crafting, so the grid is
+it is the direction to be wrong in; **no tool check**, so breaking stone with a
+bare hand yields cobblestone where Minecraft yields nothing — that and the
+sixty wall blocks whose loot table is another block's are the same missing
+oracle column, and they are the two disagreements the drops survey found;
+**Q still destroys a stack rather than throwing it**, and item entities are not
+saved, so a restart clears the floor; no crafting, so the grid is
 five slots that store and never combine; **no data components on a stack**, so a
 renamed block or an enchanted tool is stored and given back as the plain item,
-and shift-clicking a helmet moves it rather than wearing it — that last one
-needs one more column of `dust-items.tsv`, and 0013 says which; no
+shift-clicking a helmet moves it rather than wearing it, every silk-touch and
+fortune branch of every loot table takes its unenchanted side, and a broken
+chest drops a chest without its contents — that first one needs one more column
+of `dust-items.tsv`, and 0013 says which; no
 **redstone wire** and no **scaffolding distance**, which are the last two
 neighbour rules of the sixty-one decision record
 [0014](docs/decisions/0014-what-a-block-reads-from-the-cell-next-door.md)

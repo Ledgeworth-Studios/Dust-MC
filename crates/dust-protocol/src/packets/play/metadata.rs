@@ -19,9 +19,16 @@
 //!
 //! What is modelled is chosen by what a server sends in ordinary play: the
 //! numeric and text types, positions and directions, the optional wrappers,
-//! NBT, villager data, pose. What is not — item stacks (the Slot seam),
-//! particles, and the registry-backed inline variants — is refused by name,
-//! and each refusal says what finishing it requires.
+//! NBT, villager data, pose, and — since item entities — the item stack. What
+//! is not — particles and the registry-backed inline variants — is refused by
+//! name, and each refusal says what finishing it requires.
+//!
+//! The Slot seam opened for the reason the rest of this list did: something
+//! sends it. An item entity's index-8 metadata *is* an item stack, so an item
+//! lying on the ground is invisible without it. What travels is what
+//! [`crate::types::Slot`] can already say — a count, an item id, and the
+//! components stripped from that item's defaults — which is exactly what a
+//! stack with no data components on it has to say.
 //!
 //! # The terminator
 //!
@@ -32,7 +39,9 @@
 //! place to put it.
 
 use crate::nbt::Nbt;
-use crate::types::{Decode, Encode, Identifier, Position, ProtocolString, Uuid, VarInt, VarLong};
+use crate::types::{
+    Decode, Encode, Identifier, Position, ProtocolString, Slot, Uuid, VarInt, VarLong,
+};
 use crate::wire::{DecodeError, EncodeError, WireRead, WireWrite};
 use crate::{text::Component, ProtocolVersion};
 
@@ -49,6 +58,9 @@ pub enum MetadataValue {
     String(ProtocolString),
     TextComponent(Component),
     OptionalTextComponent(Option<Component>),
+    /// An item stack — what an item entity is holding, and what a player's
+    /// equipment slots carry.
+    Slot(Slot),
     Boolean(bool),
     /// Pitch, yaw and roll in degrees, exactly as sent and never normalised.
     Rotations(f32, f32, f32),
@@ -132,6 +144,7 @@ impl MetadataValue {
             Self::String(_) => 4,
             Self::TextComponent(_) => 5,
             Self::OptionalTextComponent(_) => 6,
+            Self::Slot(_) => 7,
             Self::Boolean(_) => 8,
             Self::Rotations(..) => 9,
             Self::BlockPosition(_) => 10,
@@ -170,6 +183,7 @@ impl MetadataValue {
             4 => ProtocolString::decode(input, version).map(Self::String),
             5 => Component::decode(input, version).map(Self::TextComponent),
             6 => Option::<Component>::decode(input, version).map(Self::OptionalTextComponent),
+            7 => Slot::decode(input, version).map(Self::Slot),
             8 => input.read_bool().map(Self::Boolean),
             9 => Ok(Self::Rotations(
                 input.read_f32()?,
@@ -237,7 +251,6 @@ impl MetadataValue {
 /// about everything still outside it.
 fn refusal_why(serializer: i32) -> &'static str {
     match serializer {
-        7 => "an item stack needs component layouts, which no report extracts yet",
         17 | 18 => "particle options have no length and their layouts live outside any report",
         23 | 26 => {
             "wolf and painting variants may be inline definitions, which are outside \
@@ -265,6 +278,7 @@ impl Encode for MetadataValue {
             Self::String(value) => return value.encode(out, version),
             Self::TextComponent(value) => return value.encode(out, version),
             Self::OptionalTextComponent(value) => return value.encode(out, version),
+            Self::Slot(value) => return value.encode(out, version),
             Self::Boolean(value) => out.write_bool(*value),
             Self::Rotations(x, y, z) | Self::Vector(x, y, z) => {
                 out.write_f32(*x);

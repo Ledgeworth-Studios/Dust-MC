@@ -81,6 +81,12 @@ impl View {
     /// this is one line: a shrinking view forgets what fell outside it and a
     /// growing one sends what came in, and neither is a special case.
     ///
+    /// How far this view reaches, in columns.
+    #[must_use]
+    pub fn radius(&self) -> i32 {
+        self.radius
+    }
+
     /// Clamped like [`View::with_radius`], for the same reason.
     pub fn set_radius(&mut self, radius: u32) {
         self.radius = i32::try_from(radius.clamp(1, 32)).expect("clamped to 1..=32");

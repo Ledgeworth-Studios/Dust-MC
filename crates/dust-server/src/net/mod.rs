@@ -45,6 +45,7 @@ pub mod configure;
 pub mod edits;
 pub mod favicon;
 pub mod inventory;
+pub mod items;
 pub mod level;
 pub mod listen;
 pub mod play;

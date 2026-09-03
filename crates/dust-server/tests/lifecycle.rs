@@ -269,9 +269,21 @@ fn boot_ticks_simulated_ctrl_c_and_shutdown_follow_the_documented_order() {
 
     // Configuration reached the registry: the two config-gated placeholders
     // and the injected participant all ran, in priority order.
+    //
+    // `items` is between the probe and the counter and is not a placeholder —
+    // it is the item entities' physics, and it is the first real work the tick
+    // loop was given. A tick that reported the list without it would be one
+    // where nothing dropped on the ground ever moved, which is why the list is
+    // spelled out here rather than counted.
     assert_eq!(
         report.participants,
-        vec!["status-probe", "counter", "jvm-placeholder", "ore-workload"]
+        vec![
+            "status-probe",
+            "items",
+            "counter",
+            "jvm-placeholder",
+            "ore-workload"
+        ]
     );
 }
 

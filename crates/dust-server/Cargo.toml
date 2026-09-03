@@ -71,3 +71,7 @@ flate2.workspace = true
 [[bench]]
 name = "movement"
 harness = false
+
+[[bench]]
+name = "items"
+harness = false

@@ -409,6 +409,56 @@ fence and sign that would waterlog. Nothing here goes more than one cell out
 either, so a rail's rise to a rail a block higher and a scaffolding's distance
 to the ground are both out of reach of these scenes.
 
+## Asking Minecraft what a broken block yields
+
+`drops.js` is the fourth survey here and the first about **entities**. It reads
+item entities off the raw packet stream — `spawn_entity` for the entity and
+`entity_metadata` for the stack it holds — rather than off `bot.entities`,
+which is prismarine's reading of the same bytes plus its own opinions.
+
+```
+node drops.js 25565 --check                    the gate, against Dust
+node drops.js 25565 stone,dirt,oak_leaves      what came out, as TSV
+
+mkfifo /tmp/mc-console
+( tail -f /tmp/mc-console | java -jar server.jar nogui > /tmp/mc.log 2>&1 & )
+DUST_SERVER_CONSOLE=/tmp/mc-console \
+  node drops.js 25701 blocks.txt --survival    the measurement, against vanilla
+```
+
+**`--survival` is not a convenience.** A creative player's break drops nothing
+in Minecraft, so a survey run in creative would record an empty answer for
+every block and call it a measurement. The survival arena is built from the
+console: peaceful, no random ticks so a crop cannot grow between the `setblock`
+and the dig, haste so the digging is not what is being timed, and a floor at a
+**stated height** rather than around wherever the bot landed — the first run of
+this against a world an earlier survey had dug through put the bot at y = -60,
+built its floor inside deepslate and hung on the first block it could not
+reach. Where the arena is has to be a decision and not an observation.
+
+**A break that yielded nothing and a break that never happened leave the same
+air behind**, and most of the interesting blocks — leaves, grass, snow —
+legitimately yield nothing. So the target cell is read before *and* after, and
+a row only says `NOTHING` when the block was there first and is air afterwards.
+A cell that never held it is `NO SUCH BLOCK`; one that still holds it is `NOT
+BROKEN`. Four outcomes, not one — and the fourth caught something on the first
+run: `minecraft:ice` reads back as `water`, because it melted rather than being
+broken, and a survey with one outcome would have filed that as "ice drops
+nothing".
+
+The control is `minecraft:stone` with a netherite pickaxe, which has to give
+exactly one cobblestone; a run where it does not stops before printing a single
+answer.
+
+`cargo xtask harness drops --answers <file>` scores `dust_sim::drops` against
+the result. A drop is a *distribution*, so a row agrees when the observed drop
+is one Dust can produce over two thousand rolls, and disagrees when Dust never
+produces it — and then the worklist prints what Dust produces instead, because
+Dust dropping something Minecraft never could is invisible to a survey that saw
+one break. Fifty blocks, 44 of 46 scorable rows agreeing, and both misses the
+same missing thing: `minecraft:snow` and `minecraft:cobweb` need a shovel and
+shears, and Dust has no tool check.
+
 ## The long one
 
 ```

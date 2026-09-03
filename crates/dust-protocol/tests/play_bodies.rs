@@ -136,6 +136,22 @@ fn metadata_offsets_distinguish_absent_from_zero() {
     assert_eq!(writer.as_bytes(), &[15, 10]);
     let back = MetadataValue::read(15, &mut Reader::new(&[10]), v()).expect("decodes");
     assert_eq!(back, block_state);
+
+    // Serializer 7, the item stack, which was on the refusal list until item
+    // entities needed it: an item entity's index-8 metadata *is* a stack, and
+    // an item entity without it renders as nothing at all. Round-tripped like
+    // every other modelled one — a count, an item id, no added components and
+    // no removed ones, which is what a stack with no data components says.
+    let stack = MetadataValue::Slot(dust_protocol::types::Slot::Present {
+        count: 3,
+        item_id: 42,
+        removed_components: Vec::new(),
+    });
+    let mut writer = Writer::new();
+    stack.encode(&mut writer, v()).expect("encodes");
+    assert_eq!(writer.as_bytes(), &[7, 3, 42, 0, 0]);
+    let back = MetadataValue::read(7, &mut Reader::new(&[3, 42, 0, 0]), v()).expect("decodes");
+    assert_eq!(back, stack);
 }
 
 #[test]
@@ -144,13 +160,12 @@ fn unknown_metadata_serializers_are_refused_by_id_and_never_guessed_at() {
     // serializer names its reason; an unmodelled id says why no guess is
     // possible. Neither may panic, default, or skip.
     for (serializer, payload) in [
-        (7i32, &[][..]), // item stack: the Slot seam
-        (17, &[0][..]),  // particle: options have no length
-        (18, &[][..]),   // particles
-        (23, &[0][..]),  // wolf variant, inline form
-        (26, &[0][..]),  // painting variant, inline form
-        (31, &[0][..]),  // not modelled at all on this version
-        (-3, &[][..]),   // hostile id
+        (17i32, &[0][..]), // particle: options have no length
+        (18, &[][..]),     // particles
+        (23, &[0][..]),    // wolf variant, inline form
+        (26, &[0][..]),    // painting variant, inline form
+        (31, &[0][..]),    // not modelled at all on this version
+        (-3, &[][..]),     // hostile id
     ] {
         let bytes = one_entry(0, serializer, payload);
         match MetadataEntries::decode(&mut Reader::new(&bytes), v()) {
