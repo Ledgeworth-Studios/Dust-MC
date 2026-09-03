@@ -54,7 +54,7 @@ use dust_registry::BlockConstants;
 use dust_world::chunk::Chunk;
 use dust_world::coords::ChunkPos;
 
-use super::edits::EditedWorld;
+use super::edits::{EditedWorld, Edits};
 use super::source::Column;
 
 /// The name of the column in `dust-constants.tsv` that says which block states
@@ -111,11 +111,16 @@ impl<'a> Ground<'a> {
     /// The state at a cell, from the edits if one has touched it and from the
     /// column as generated otherwise.
     ///
-    /// The caller has already resolved the column, which is the expensive part;
-    /// this is the per-cell remainder.
-    fn state_at(&self, chunk: &Chunk, x: i32, y: i32, z: i32) -> u32 {
-        if let Some(state) = self.world.edited_block_at(Position { x, y, z }) {
-            return state;
+    /// The caller has already resolved the column and taken the edit map's
+    /// read lock, which are the two expensive parts; this is the per-cell
+    /// remainder. It used to take that lock itself, once per cell, which for
+    /// one movement packet was up to twelve acquisitions of the same lock —
+    /// see [`super::edits::EditedWorld::edits_now`].
+    fn state_at(edits: &Edits<'_>, chunk: &Chunk, x: i32, y: i32, z: i32) -> u32 {
+        if !edits.is_empty() {
+            if let Some(state) = edits.at(Position { x, y, z }) {
+                return state;
+            }
         }
         chunk.get_block((x & 15) as u32, y, (z & 15) as u32)
     }
@@ -138,6 +143,10 @@ impl Solidity for Ground<'_> {
         // ones below it and a lent column can be read while the cache is being
         // written.
         let world = self.world;
+        // Once for the whole box, rather than once for each of its cells. The
+        // guard is held for the length of this call, so an edit lands either
+        // side of the box and never in the middle of it.
+        let edits = world.edits_now();
         for cx in (lo.0 >> 4)..=(hi.0 >> 4) {
             for cz in (lo.2 >> 4)..=(hi.2 >> 4) {
                 let pos = ChunkPos::new(cx, cz);
@@ -174,7 +183,7 @@ impl Solidity for Ground<'_> {
                 for y in low..=high {
                     for z in lo.2.max(cz * 16)..=hi.2.min(cz * 16 + 15) {
                         for x in lo.0.max(cx * 16)..=hi.0.min(cx * 16 + 15) {
-                            let state = self.state_at(chunk, x, y, z);
+                            let state = Self::state_at(&edits, chunk, x, y, z);
                             if self.constants.is_set(self.solid, state) {
                                 return Some((x, y, z));
                             }
