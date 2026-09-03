@@ -231,6 +231,32 @@ impl Source {
         built
     }
 
+    /// The server's resident set, for a caller that keeps a claim on it —
+    /// `net::residency::Residence` for a session and
+    /// `net::residency::ColumnClaim` for the item entities.
+    ///
+    /// `None` on a flat world, which lends one template column to every
+    /// position and has nothing to keep. A claim on `None` does nothing and
+    /// that is the right nothing: there is no column to hold.
+    #[must_use]
+    pub fn residency(&self) -> Option<Arc<Residency>> {
+        match self {
+            Self::Flat(_) => None,
+            Self::Anvil(world) => Some(Arc::clone(&world.residency)),
+        }
+    }
+
+    /// Where a claim sends the columns it has just taken, to be built off the
+    /// caller's own thread. `None` where the world builds nothing or its
+    /// warming thread would not start.
+    #[must_use]
+    pub fn warming(&self) -> Option<std::sync::mpsc::Sender<Vec<ChunkPos>>> {
+        match self {
+            Self::Flat(_) => None,
+            Self::Anvil(world) => world.wanted.clone(),
+        }
+    }
+
     /// How many columns the server is keeping. Zero on a flat world.
     #[must_use]
     pub fn resident_columns(&self) -> usize {

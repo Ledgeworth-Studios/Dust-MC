@@ -612,7 +612,7 @@ where
     // it, and the nine columns it builds are nine of the first twenty-five the
     // stream below is about to send — so the stream finds them resident and
     // the warm costs the join nothing it was not already paying.
-    let mut residence = super::residency::Residence::new(ctx.world.clone());
+    let mut residence = super::residency::Residence::new(ctx.world.residency());
     if residence.move_to(centre) {
         ctx.world.warm(centre);
     }

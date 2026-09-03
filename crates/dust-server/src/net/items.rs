@@ -737,7 +737,7 @@ impl ItemTicker {
     ) -> Self {
         Self {
             items,
-            claim: super::residency::ColumnClaim::new(std::sync::Arc::clone(&world)),
+            claim: super::residency::ColumnClaim::new(world.residency(), world.warming()),
             world,
             roster,
             constants,

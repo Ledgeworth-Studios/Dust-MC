@@ -357,7 +357,10 @@ impl Residency {
 /// A residency that leaks nine columns per crashed session is the memory leak
 /// this whole module exists to not be.
 pub struct Residence {
-    world: super::edits::SharedWorld,
+    /// The server's resident set, or `None` for a world that keeps nothing —
+    /// a flat world lends one template column to every position, so there is
+    /// nothing for a claim to be a claim on.
+    residency: Option<Arc<Residency>>,
     /// The column this player was last known to be standing in, or `None` for
     /// a session that has not been placed yet.
     centre: Option<ChunkPos>,
@@ -373,9 +376,9 @@ impl std::fmt::Debug for Residence {
 
 impl Residence {
     #[must_use]
-    pub fn new(world: super::edits::SharedWorld) -> Self {
+    pub fn new(residency: Option<Arc<Residency>>) -> Self {
         Self {
-            world,
+            residency,
             centre: None,
         }
     }
@@ -396,9 +399,13 @@ impl Residence {
         if self.centre == Some(centre) {
             return false;
         }
-        self.world.hold(centre);
+        let Some(residency) = &self.residency else {
+            self.centre = Some(centre);
+            return true;
+        };
+        residency.hold(centre);
         if let Some(previous) = self.centre.replace(centre) {
-            self.world.release(previous);
+            residency.release(previous);
         }
         true
     }
@@ -406,8 +413,8 @@ impl Residence {
 
 impl Drop for Residence {
     fn drop(&mut self) {
-        if let Some(centre) = self.centre {
-            self.world.release(centre);
+        if let (Some(residency), Some(centre)) = (&self.residency, self.centre) {
+            residency.release(centre);
         }
     }
 }
@@ -429,7 +436,10 @@ impl Drop for Residence {
 /// takes the additions before it drops the removals so a column in both is
 /// never retired and rebuilt, and gives the whole thing up when it is dropped.
 pub struct ColumnClaim {
-    world: super::edits::SharedWorld,
+    residency: Option<Arc<Residency>>,
+    /// Where a newly claimed column goes to be built, off this thread. See
+    /// [`super::source::Source::want`].
+    warm: Option<std::sync::mpsc::Sender<Vec<ChunkPos>>>,
     held: Vec<ChunkPos>,
 }
 
@@ -443,9 +453,13 @@ impl std::fmt::Debug for ColumnClaim {
 
 impl ColumnClaim {
     #[must_use]
-    pub fn new(world: super::edits::SharedWorld) -> Self {
+    pub fn new(
+        residency: Option<Arc<Residency>>,
+        warm: Option<std::sync::mpsc::Sender<Vec<ChunkPos>>>,
+    ) -> Self {
         Self {
-            world,
+            residency,
+            warm,
             held: Vec::new(),
         }
     }
@@ -461,6 +475,7 @@ impl ColumnClaim {
     pub fn set(&mut self, wanted: &mut Vec<ChunkPos>) {
         wanted.sort_unstable_by_key(|pos| (pos.x, pos.z));
         wanted.dedup();
+        let Some(residency) = &self.residency else { return };
         if self.held == *wanted {
             return;
         }
@@ -475,19 +490,25 @@ impl ColumnClaim {
             .filter(|pos| !wanted.contains(pos))
             .copied()
             .collect();
-        self.world.hold_columns(&added);
-        self.world.release_columns(&dropped);
+        residency.hold_columns(&added);
+        residency.release_columns(&dropped);
         self.held.clear();
         self.held.extend_from_slice(wanted);
         if !added.is_empty() {
-            self.world.want(added);
+            if let Some(warm) = &self.warm {
+                // Fails only while the world is being dropped, and there is
+                // nothing to warm for a world that is going away.
+                let _ = warm.send(added);
+            }
         }
     }
 }
 
 impl Drop for ColumnClaim {
     fn drop(&mut self) {
-        self.world.release_columns(&self.held);
+        if let Some(residency) = &self.residency {
+            residency.release_columns(&self.held);
+        }
     }
 }
 
@@ -560,6 +581,78 @@ mod tests {
         assert!(residency.resident(at(1, 0)).is_some());
         let columns = residency.columns.read().expect("not poisoned");
         assert_eq!(columns[&(1, 0)].holders, 1);
+    }
+
+    /// The order [`Residence::move_to`] takes its two steps in, checked by the
+    /// one thing that can see the difference.
+    ///
+    /// Six of the nine columns are in both rings when a player steps across a
+    /// boundary. Releasing the old ring first drops those six to zero holders
+    /// for an instant — and `release` is where the retired tier is emptied, so
+    /// a server already over [`RETIRED_CAP`] throws away the column the player
+    /// is standing on and rebuilds it. Holding first means they never reach
+    /// zero.
+    ///
+    /// This is why the check has to push the map over the cap first: below it
+    /// a retired column is kept, and the wrong order is invisible.
+    #[test]
+    fn a_step_across_a_boundary_does_not_drop_the_columns_it_keeps() {
+        let residency = Arc::new(Residency::new());
+        for x in 0..(RETIRED_CAP as i32) {
+            residency.hold(at(x * 4, 100));
+            residency.release(at(x * 4, 100));
+        }
+        let mut player = Residence::new(Some(Arc::clone(&residency)));
+        assert!(player.move_to(at(0, 0)));
+        assert!(residency.fill(at(1, 0), a_column()));
+        // A step from column 0 to column 1. (1, 0) is in both rings, and the
+        // player is now standing on it.
+        assert!(player.move_to(at(1, 0)));
+        assert!(
+            residency.resident(at(1, 0)).is_some(),
+            "the column under the player was retired while they stepped onto it"
+        );
+    }
+
+    /// A session that ends any way at all gives its ring back.
+    #[test]
+    fn a_session_that_ends_gives_its_ring_back() {
+        let residency = Arc::new(Residency::new());
+        {
+            let mut player = Residence::new(Some(Arc::clone(&residency)));
+            player.move_to(at(0, 0));
+            let held = residency.columns.read().expect("not poisoned");
+            assert_eq!(held.values().filter(|c| c.holders > 0).count(), 9);
+        }
+        let held = residency.columns.read().expect("not poisoned");
+        assert_eq!(
+            held.values().filter(|c| c.holders > 0).count(),
+            0,
+            "nine columns outlived the session that claimed them"
+        );
+    }
+
+    /// The item world's claim follows its items and is given up with them.
+    #[test]
+    fn a_claim_follows_what_it_is_asked_for_and_ends_with_it() {
+        let residency = Arc::new(Residency::new());
+        {
+            let mut claim = ColumnClaim::new(Some(Arc::clone(&residency)), None);
+            claim.set(&mut vec![at(0, 0), at(1, 0), at(0, 0)]);
+            assert_eq!(residency.len(), 2, "the duplicate was claimed twice");
+            // The items moved on. What is still wanted keeps its holder; what
+            // is not loses it.
+            claim.set(&mut vec![at(1, 0), at(2, 0)]);
+            let held = residency.columns.read().expect("not poisoned");
+            assert_eq!(held[&(0, 0)].holders, 0);
+            assert_eq!(held[&(1, 0)].holders, 1, "a column wanted twice running");
+            assert_eq!(held[&(2, 0)].holders, 1);
+        }
+        let held = residency.columns.read().expect("not poisoned");
+        assert!(
+            held.values().all(|c| c.holders == 0),
+            "the items despawned and their columns stayed claimed"
+        );
     }
 
     #[test]

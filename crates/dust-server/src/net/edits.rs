@@ -411,6 +411,20 @@ impl EditedWorld {
         self.generated.warm_columns(columns)
     }
 
+    /// The server's resident set and the channel its builds go down, for a
+    /// caller that keeps a claim on them. See
+    /// [`super::source::Source::residency`].
+    #[must_use]
+    pub fn residency(&self) -> Option<Arc<super::residency::Residency>> {
+        self.generated.residency()
+    }
+
+    /// See [`super::source::Source::warming`].
+    #[must_use]
+    pub fn warming(&self) -> Option<std::sync::mpsc::Sender<Vec<ChunkPos>>> {
+        self.generated.warming()
+    }
+
     /// How many columns the server is keeping resident, across all players.
     #[must_use]
     pub fn resident_columns(&self) -> usize {
