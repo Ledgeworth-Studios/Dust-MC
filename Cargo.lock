@@ -383,6 +383,7 @@ name = "dust-sim"
 version = "0.0.0"
 dependencies = [
  "dust-registry",
+ "serde_json",
 ]
 
 [[package]]

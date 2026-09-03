@@ -10,6 +10,9 @@ authors.workspace = true
 [dependencies]
 # The block table: which properties a block has and what they may be.
 dust-registry.workspace = true
+# Loot tables are JSON files in the operator's own data. `drops` reads them;
+# nothing here writes any, and no JSON type appears in a public signature.
+serde_json.workspace = true
 
 [lints]
 workspace = true
