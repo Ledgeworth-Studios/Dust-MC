@@ -147,6 +147,19 @@ with a third-party client: set slots, leave, come back, look. Decision record
 [0013](docs/decisions/0013-where-a-players-inventory-lives.md) says what the
 record does and does not promise.
 
+And a slot that has an opinion keeps it. An armour slot takes only what is worn
+in that slot and holds one of it, the crafting output takes nothing, and the
+offhand takes anything — so a shift-clicked chestplate goes on the chest, a
+shield goes to the offhand, and cobblestone aimed at a helmet slot does nothing
+at all. Which slot an item is worn in comes from Mojang's own item tags, with
+the two items no tag places named in the source and guarded by a third tag that
+fails the build if a version adds a wearable. `tools/bot/clicks.js` replays a
+hundred clicks against Dust and against a real 1.21.1 server and diffs the two
+recordings: **101 of 101 snapshots agree**, up from 60 of 83 when the armour
+clicks were first asked. Decision record
+[0016](docs/decisions/0016-which-slot-an-item-is-worn-in.md) has the table and
+what a helmet still does not do.
+
 And a fence connects to what it touches, whichever way the wall was built. A
 fence, a wall, a glass pane and a stair take their shape from the six cells
 around them — when they are placed, and again whenever anything beside them is

@@ -79,7 +79,7 @@
 //! against this server and against a real 1.21.1 server and diffs the two
 //! recordings; the armour, offhand and crafting-grid clicks are the last
 //! twenty-five of them, and they are what said this paragraph was wrong before
-//! it was written. Decision record 0014 has the counts.
+//! it was written. Decision record 0016 has the counts.
 //!
 //! Dropping is real and the item is *gone*: there are no item entities in the
 //! world yet, so Q destroys rather than throws. Stated here because a player
