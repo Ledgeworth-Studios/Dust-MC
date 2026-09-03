@@ -43,6 +43,7 @@
 
 pub mod commands;
 pub mod constants;
+pub mod enchantments;
 pub mod flat;
 pub mod fluids;
 pub mod generated;

@@ -150,6 +150,45 @@ impl ComponentPatch {
         self.as_wire_bytes().len()
     }
 
+    /// The payload bytes of the component called `name`, if this patch sets it.
+    ///
+    /// `None` for a patch that does not set it — including one that *removes*
+    /// it, which is a different fact and one no caller here needs: a removal
+    /// says "use the item's default", and the default for every component this
+    /// is asked about is nothing.
+    ///
+    /// The patch is stored in type-id order and the ids are the run-time
+    /// registry's, so the walk is by name rather than by a number this build
+    /// could hold. It costs one pass over a patch that is almost always empty
+    /// and, when it is not, almost always one or two entries; the alternative
+    /// is decoding every component of every stack on the chance somebody asks.
+    ///
+    /// Returns `None` rather than an error when the bytes cannot be walked.
+    /// They came through [`ComponentPatch::read`], which walked them once
+    /// already, so an unwalkable patch here is impossible — and a caller
+    /// asking "is this pickaxe enchanted" has no better answer to give a
+    /// player than "no".
+    #[must_use]
+    pub fn component(&self, name: &str) -> Option<&[u8]> {
+        let bytes = self.0.as_ref()?;
+        let mut cursor = Cursor::new(bytes);
+        let added = cursor.count("added components").ok()?;
+        // The removed count, skipped: removals come after every addition, so
+        // nothing here has to read them.
+        cursor.count("removed components").ok()?;
+        for _ in 0..added {
+            let id = cursor.var_int().ok()?;
+            let found = type_name(id)?;
+            let start = cursor.at;
+            let len = measure_at(found, &cursor.bytes[start..], 0).ok()?;
+            cursor.skip(len).ok()?;
+            if found == name {
+                return Some(&cursor.bytes[start..start + len]);
+            }
+        }
+        None
+    }
+
     /// The patch as lowercase hex, or `None` when it is empty.
     ///
     /// Used by the save file, which writes it beside the item's name.

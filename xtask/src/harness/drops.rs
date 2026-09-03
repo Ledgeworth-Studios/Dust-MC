@@ -44,6 +44,11 @@ const ROLLS: u32 = 2_000;
 pub struct Options {
     pub answers: PathBuf,
     pub tables: Option<PathBuf>,
+    /// Score every row as though the tool were unenchanted, which is the
+    /// negative control for the enchantment seam: every silk-touch and
+    /// fortune branch then takes its other side, and a scorer that still
+    /// agrees is not reading the column it says it reads.
+    pub without_enchantments: bool,
     pub verbose: bool,
 }
 
@@ -72,6 +77,9 @@ struct Answer {
     tool: Option<Item>,
     /// The tool as the survey spelled it, for the worklist.
     held: String,
+    /// What was on it, as `(name, level)`. Empty for a plain tool, which is
+    /// almost every row.
+    enchantments: Vec<(String, u32)>,
     outcome: Outcome,
 }
 
@@ -186,7 +194,20 @@ pub fn run(options: &Options) -> std::process::ExitCode {
         };
         let requires_tool =
             needs_tool.is_some_and(|(table, flag)| table.is_set(flag, block.default_state().id()));
-        let seen = distribution(table, block, answer.tool, requires_tool, ROLLS);
+        let enchantments: Vec<(&str, u32)> = answer
+            .enchantments
+            .iter()
+            .filter(|_| !options.without_enchantments)
+            .map(|(name, level)| (name.as_str(), *level))
+            .collect();
+        let seen = distribution(
+            table,
+            block,
+            answer.tool,
+            &enchantments,
+            requires_tool,
+            ROLLS,
+        );
         let times = seen.get(&wanted).copied().unwrap_or(0);
         if times > 0 {
             agreed += 1;
@@ -249,15 +270,17 @@ fn distribution(
     table: &drops::Table,
     block: Block,
     held: Option<Item>,
+    enchantments: &[(&str, u32)],
     requires_tool: bool,
     rolls: u32,
 ) -> BTreeMap<String, u32> {
-    // Whatever the survey held, including nothing. A stack carries no data
-    // components yet, so `enchantments` is empty here for the same reason it
-    // is empty in the server — see decision record 0022.
+    // Whatever the survey held, including nothing and including what was on
+    // it. The tool column may name enchantments — `netherite_pickaxe@fortune:3`
+    // — and a scorer that dropped them would compare a fortune run against the
+    // unenchanted branch and call every extra ore a disagreement.
     let tool = Tool {
         item: held,
-        enchantments: &[],
+        enchantments,
     };
     let context = Break {
         state: block.default_state(),
@@ -361,6 +384,32 @@ fn default_tables() -> Option<PathBuf> {
     path.is_dir().then_some(path)
 }
 
+/// Split `netherite_pickaxe@fortune:3+efficiency:5` into the item and what is
+/// on it.
+///
+/// The same spelling `tools/bot/drops.js --tool` takes, so one column in a
+/// survey file means one thing on both sides of the comparison. A plain tool
+/// has no `@` and produces an empty list, which is almost every row.
+fn split_tool(spelling: &str) -> (&str, Vec<(String, u32)>) {
+    let Some((item, rest)) = spelling.split_once('@') else {
+        return (spelling, Vec::new());
+    };
+    let enchantments = rest
+        .split('+')
+        .filter(|pair| !pair.is_empty())
+        .filter_map(|pair| {
+            let (name, level) = pair.rsplit_once(':')?;
+            let name = if name.contains(':') {
+                name.to_owned()
+            } else {
+                format!("minecraft:{name}")
+            };
+            Some((name, level.parse::<u32>().ok()?))
+        })
+        .collect();
+    (item, enchantments)
+}
+
 fn read_answers(path: &Path) -> Result<Vec<Answer>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| {
         format!(
@@ -393,18 +442,23 @@ fn read_answers(path: &Path) -> Result<Vec<Answer>, String> {
         // have a great deal to say about, and reading it as "no answer" would
         // silently drop every row that is about it.
         let held = fields[1].to_owned();
-        let tool = if held == "-" {
+        // `item@enchantment:level+enchantment:level`, which is what
+        // `tools/bot/drops.js --tool` writes when it puts an enchanted tool in
+        // the hand. Split before the item is resolved, because
+        // `netherite_pickaxe@fortune:3` is not an item name.
+        let (spelling, enchantments) = split_tool(&held);
+        let tool = if spelling == "-" {
             None
         } else {
-            let namespaced = if held.contains(':') {
-                held.clone()
+            let namespaced = if spelling.contains(':') {
+                spelling.to_owned()
             } else {
-                format!("minecraft:{held}")
+                format!("minecraft:{spelling}")
             };
             let item = Item::from_name(&namespaced);
             if item.is_none() {
                 return Err(format!(
-                    "line {}: `{held}` is not an item on this version, so the survey \
+                    "line {}: `{spelling}` is not an item on this version, so the survey \
                      was run against a different one",
                     index + 1
                 ));
@@ -415,6 +469,7 @@ fn read_answers(path: &Path) -> Result<Vec<Answer>, String> {
             block: fields[0].to_owned(),
             tool,
             held,
+            enchantments,
             outcome,
         });
     }
@@ -427,6 +482,7 @@ fn read_answers(path: &Path) -> Result<Vec<Answer>, String> {
 pub fn parse(args: &[String]) -> Result<Options, String> {
     let mut answers = None;
     let mut tables = None;
+    let mut without_enchantments = false;
     let mut verbose = false;
     let mut index = 0;
     while index < args.len() {
@@ -434,6 +490,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
         index += 1;
         match flag {
             "--verbose" => verbose = true,
+            "--without-enchantments" => without_enchantments = true,
             "--answers" | "--tables" => {
                 let value = args
                     .get(index)
@@ -455,6 +512,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
     Ok(Options {
         answers: answers.ok_or("harness drops needs --answers <file>")?,
         tables,
+        without_enchantments,
         verbose,
     })
 }

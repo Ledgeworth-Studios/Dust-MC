@@ -196,17 +196,51 @@ function watchItems (b) {
   }
 }
 
-function creativeSlot (b, slot, name) {
-  const known = b.registry.itemsByName[name.replace('minecraft:', '')]
+/// Split a tool spelling into its item and its enchantments.
+///
+/// `minecraft:diamond_pickaxe@fortune:3` is a diamond pickaxe with fortune III;
+/// `@silk_touch:1+efficiency:5` puts two on one tool. The spelling exists
+/// because **an enchanted tool is a different tool**, and a survey that could
+/// only name items could not ask the one question every ore table turns on.
+/// It goes into `/give`'s component syntax against a real server and into a
+/// `set_creative_slot` component against Dust, so one column in the output
+/// means one thing on both sides.
+function splitTool (spelling) {
+  const at = spelling.indexOf('@')
+  if (at < 0) return { item: spelling, enchantments: [] }
+  const item = spelling.slice(0, at)
+  const enchantments = spelling.slice(at + 1).split('+').filter(Boolean).map(pair => {
+    const [name, level] = pair.split(':')
+    return { name: name.includes(':') ? name : 'minecraft:' + name, level: Number(level || 1) }
+  })
+  return { item, enchantments }
+}
+
+function creativeSlot (b, slot, spelling) {
+  const { item, enchantments } = splitTool(spelling)
+  const known = b.registry.itemsByName[item.replace('minecraft:', '')]
   if (!known) return false
+  // The enchantment id is the registry's, which is the same number the server
+  // reads it back as. Taken from mineflayer's own copy rather than counted
+  // here: a survey that numbered the registry itself would be checking its own
+  // arithmetic against the server's.
+  const pairs = []
+  for (const e of enchantments) {
+    const found = b.registry.enchantmentsByName[e.name.replace('minecraft:', '')]
+    if (!found) return false
+    pairs.push({ id: found.id, level: e.level })
+  }
+  const components = pairs.length
+    ? [{ type: 'enchantments', data: { enchantments: pairs, showTooltip: true } }]
+    : []
   b._client.write('set_creative_slot', {
     slot,
     item: {
       itemCount: 1,
       itemId: known.id,
-      addedComponentCount: 0,
+      addedComponentCount: components.length,
       removedComponentCount: 0,
-      components: [],
+      components,
       removeComponents: []
     }
   })
@@ -633,6 +667,78 @@ async function gateRun () {
     fromWall.length === 1 && fromWall[0].item === 'minecraft:oak_sign',
     fromWall.map(e => `${e.item}*${e.count}`).join(',') || 'nothing')
 
+  // 9. **Silk touch changes what comes out.** Stone with a plain pickaxe is
+  // cobblestone and with silk touch it is stone, and those are two different
+  // items rather than two counts of one — the deterministic half of the
+  // enchantment seam, and the one a wrong answer cannot hide in.
+  //
+  // Both halves are asserted in the same breath. A server that read the
+  // component and a server that ignored it both produce *an* item, and a
+  // check that only looked for stone would pass on a server whose every drop
+  // was silk-touched.
+  // Raw start-and-stop rather than `bot.dig`, for every row from here down:
+  // prismarine-item throws on a 1.21.1 enchanted stack and mineflayer touches
+  // it to time the break. The packets are what a client sends and they work in
+  // both game modes.
+  let gateSeq = 900
+  const rawDig = async () => {
+    const outcome = await timedDig(b, at, 0, gateSeq)
+    gateSeq += 2
+    return outcome
+  }
+  const plainStone = await put('minecraft:stone')
+  await hand('minecraft:netherite_pickaxe')
+  mark = items.mark()
+  await rawDig()
+  await wait(SETTLE_MS)
+  const plainDrop = items.since(mark).filter(e => e.item)
+  await put('minecraft:stone')
+  await hand('minecraft:netherite_pickaxe@silk_touch:1')
+  mark = items.mark()
+  await rawDig()
+  await wait(SETTLE_MS)
+  const silked = items.since(mark).filter(e => e.item)
+  check('silk touch gives stone where a plain pickaxe gives cobblestone',
+    Boolean(plainStone) &&
+      plainDrop.length === 1 && plainDrop[0].item === 'minecraft:cobblestone' &&
+      silked.length === 1 && silked[0].item === 'minecraft:stone',
+    `plain ${plainDrop.map(e => e.item).join(',') || 'nothing'}, ` +
+      `silk ${silked.map(e => e.item).join(',') || 'nothing'}`)
+
+  // 10. **Fortune changes how many.** A distribution and not a number, so it
+  // is asked over enough breaks to see the tail: an unenchanted pickaxe on
+  // coal ore gives exactly one coal every time, and fortune III gives 1 to 4.
+  // The check is that the plain runs are all ones and the enchanted runs are
+  // not — twelve of each, so a fortune that quietly did nothing would have to
+  // roll a one twelve times running, which is one chance in sixteen million.
+  const ROUNDS = 12
+  async function coalRun (tool) {
+    const counts = []
+    for (let i = 0; i < ROUNDS; i++) {
+      const ore = await put('minecraft:coal_ore')
+      // **The tool goes in the hand after the block goes down, every round.**
+      // `put` selects the hotbar slot holding the block so it can place it,
+      // and a run that armed the pickaxe once before the loop broke every ore
+      // with an ore in its hand — which is the wrong tool for a block that
+      // wants one, so all twelve rounds read zero and the row failed for a
+      // reason that had nothing to do with fortune.
+      await hand(tool)
+      if (!ore || ore.name !== 'coal_ore') { counts.push(-1); continue }
+      const before = items.mark()
+      await rawDig()
+      await wait(SETTLE_MS)
+      const out = items.since(before).filter(e => e.item === 'minecraft:coal')
+      counts.push(out.reduce((n, e) => n + e.count, 0))
+    }
+    return counts
+  }
+  const plainCoal = await coalRun('minecraft:netherite_pickaxe')
+  const luckyCoal = await coalRun('minecraft:netherite_pickaxe@fortune:3')
+  const plainAllOnes = plainCoal.length === ROUNDS && plainCoal.every(n => n === 1)
+  const luckyMax = Math.max(...luckyCoal)
+  check('fortune III on coal ore drops more than one, and a plain pickaxe never does',
+    plainAllOnes && luckyCoal.every(n => n >= 1 && n <= 4) && luckyMax > 1,
+    `plain ${plainCoal.join('')}, fortune ${luckyCoal.join('')}`)
 
   b.quit()
   const failed = results.filter(r => !r.ok).length
@@ -703,20 +809,37 @@ async function main () {
   // the first tool in hand and every row after it is about the wrong tool.
   async function hold (which) {
     if (!survival) return true
+    const { item, enchantments } = splitTool(which)
     say(`clear Digger`)
     await wait(250)
     if (which !== BARE) {
-      say(`give Digger ${which}`)
+      // 1.21.1's component syntax. The `levels:` wrapper is required on this
+      // version and is the whole of what a wrong spelling costs: the server
+      // answers "Failed to parse", `/clear` has already run, and every row
+      // after it is about a bare hand wearing a tool's name in the output.
+      // The name check below is what catches that.
+      const levels = enchantments
+        .map(e => `"${e.name}":${e.level}`)
+        .join(',')
+      const spelt = enchantments.length
+        ? `${item}[minecraft:enchantments={levels:{${levels}}}]`
+        : item
+      say(`give Digger ${spelt}`)
       await wait(300)
     }
     b._client.write('held_item_slot', { slotId: 0 })
     await wait(250)
     if (which === BARE) return true
     const held = b.inventory.slots[36]
-    return Boolean(held) && held.name === which.replace('minecraft:', '')
+    return Boolean(held) && held.name === item.replace('minecraft:', '')
   }
 
   const rows = []
+  // The dig sequence for the raw-packet path. A client numbers its own
+  // predictions and the server echoes the number back; reusing one is not
+  // fatal here, but a monotonic count is what a real client does and it costs
+  // an integer.
+  let digSequence = 1
   const pairs = []
   for (const which of tools) {
     for (const block of blocks) pairs.push([block, which])
@@ -797,13 +920,30 @@ async function main () {
     }
     const mark = items.mark()
     let dug = true
-    try {
-      await Promise.race([
-        b.dig(before),
-        wait(DIG_TIMEOUT_MS).then(() => { throw new Error('dig timed out') })
-      ])
-    } catch (e) {
-      dug = false
+    // **`bot.dig` cannot hold an enchanted tool.** prismarine-item's `enchants`
+    // getter throws `enchantments is not iterable` on a 1.21.1 stack carrying
+    // the component, and mineflayer reaches it while working out how long the
+    // break should take — so every enchanted row of the first run of this read
+    // REFUSED, which is a library failure wearing a server's clothes. The raw
+    // packets do not ask prismarine anything: a start and a stop, which is
+    // what a client sends and what `timedDig` already proved arms a vanilla
+    // server's own count.
+    if (splitTool(tool).enchantments.length > 0) {
+      const outcome = await timedDig(b, at, 0, digSequence)
+      digSequence += 2
+      dug = outcome.ms !== null
+    } else {
+      try {
+        await Promise.race([
+          b.dig(before),
+          wait(DIG_TIMEOUT_MS).then(() => { throw new Error('dig timed out') })
+        ])
+      } catch (e) {
+        dug = false
+        if (process.env.DUST_BOT_VERBOSE) {
+          console.error(`  dig failed on ${block} with ${tool}: ${e.message}`)
+        }
+      }
     }
     await wait(SETTLE_MS)
 

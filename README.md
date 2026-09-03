@@ -350,10 +350,11 @@ whenever they close it; no **furnace, blast furnace,
 smoker, campfire, stonecutter or smithing table**, which is 389 of the 1,290
 recipe files an operator's data pack ships and is a different shape from a
 crafting grid — a furnace has a fuel slot and a burn timer, not a pattern; a
-stack now carries its data
-components, but **nothing in the world reads them**, so every silk-touch and
-fortune branch of every loot table takes its unenchanted side and a broken chest
-drops a chest without its contents; **armour protects from nothing**, since there is no
+stack carries its data components and a break now reads its
+**enchantments** — silk touch, fortune and efficiency all work, scored 27/27
+against a real 1.21.1 server and 15/27 with the component withheld — but
+**nothing else in the world reads a component**, so a broken chest still drops
+a chest without its contents; **armour protects from nothing**, since there is no
 damage to protect from yet; no
 **redstone wire** and no **scaffolding distance**, which are the last two
 neighbour rules of the sixty-one decision record

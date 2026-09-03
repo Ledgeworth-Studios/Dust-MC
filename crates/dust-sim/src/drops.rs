@@ -80,15 +80,23 @@ pub struct Drop {
 /// handful long, and a `HashMap` allocated per break to answer it twice would
 /// cost more than the scan it replaced.
 ///
-/// **Today the server passes an empty slice**, because a stack carries no data
-/// components yet and so carries no enchantments. That is a gap in the item
-/// stack and not in this module: the day a stack knows it is silk-touched,
-/// every silk-touch branch in every table starts working, with no change here.
+/// **The server reads this off the held stack**, which it could not do for the
+/// life of these tables — every silk-touch and fortune branch was compiled and
+/// unreachable, and a player mining ore with a fortune pickaxe got one drop.
+/// The day the stack knew, every one of those branches started working with no
+/// change here at all. Decision record 0028 has the 27 rows a real 1.21.1
+/// server was measured giving and the 12 that go wrong when this is emptied.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Tool<'a> {
     /// The item in the breaking hand, or `None` for a bare hand.
     pub item: Option<Item>,
     /// `(enchantment id, level)`, ids spelled `minecraft:silk_touch`.
+    ///
+    /// Filled from the held stack's `minecraft:enchantments` component; see
+    /// `dust_registry::enchantments`. It was empty for the life of the drop
+    /// tables and every silk-touch and fortune branch took its unenchanted
+    /// side; decision record 0028 has the 27 rows a real server was measured
+    /// giving, and the 12 of them that go wrong when this is emptied again.
     pub enchantments: &'a [(&'a str, u32)],
 }
 

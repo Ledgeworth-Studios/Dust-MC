@@ -728,9 +728,17 @@ impl Inventory {
     /// The item in the selected hotbar slot, if there is one.
     #[must_use]
     pub fn held(&self) -> Option<Item> {
-        self.slots[HOTBAR_START + self.selected]
-            .as_ref()
-            .map(|stack| stack.item)
+        self.held_stack().map(|stack| stack.item)
+    }
+
+    /// The whole stack in the selected hotbar slot, components and all.
+    ///
+    /// Borrowed, for the reason [`Inventory::slot`] is: what a break asks of
+    /// this is whether the tool is enchanted, and that answer lives in an
+    /// `Arc` nobody should touch the refcount of to read one byte.
+    #[must_use]
+    pub fn held_stack(&self) -> Option<&Stack> {
+        self.slots[HOTBAR_START + self.selected].as_ref()
     }
 
     /// What everybody else can see of this inventory.

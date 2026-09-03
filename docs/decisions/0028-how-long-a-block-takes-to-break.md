@@ -44,9 +44,10 @@ hand) and **not on the ground** (`÷ 5`). Three are not:
   it makes an underwater player mine at their dry speed, which the allowance
   absorbs in the player's favour.
 
-Efficiency is written and reachable but always zero today, because nothing
-decodes `minecraft:enchantments` out of a stack's component bytes yet. It is
-the same seam decision record 0027 named for silk touch and fortune.
+Efficiency reads off the held stack. That took a decoder — see
+*Reading an enchantment* below — and it is the largest single number a player
+can change about a break: efficiency V takes a diamond pickaxe from speed 8 to
+34, which is stone in 2 ticks rather than 6.
 
 ## What client and server do when they disagree — the two thresholds
 
@@ -192,14 +193,67 @@ a chunk lookup on the tick loop of every mining player for an answer already
 known. The delayed-destroy check is one `Option` test on the tick that already
 runs for pickups.
 
+## Reading an enchantment, which unlocked three things at once
+
+A stack has carried its data components since the item-component work landed,
+and nothing could say what was in them. Three rules waited on the same missing
+step: efficiency here, and silk touch and fortune in every loot table, all
+compiled and all unreachable. **A player mining ore with a fortune pickaxe got
+one drop.**
+
+The step is small and the reason it looked large is worth writing down. The
+component carries `(registry id, level)`, and a registry id means nothing
+without the registry — and decision record 0009 says Dust does not *serve*
+`minecraft:enchantment`, which reads like a blocker. It is not. The **names**
+in the order that assigns their ids have been in `dust_registry::synced` since
+the registry sync landed: 42 of them, captured off a real server and checked
+against that capture by a test. Serving a registry and naming a number against
+it are different things, and decision record 0007's line — a name is a fact
+about the protocol, a value is Mojang's content — is what separates them. So:
+`ComponentPatch::component(name)` walks the patch,
+`dust_registry::enchantments::parse` turns the payload into `(name, level)`,
+and an unenchanted stack produces an empty `Vec`, which allocates nothing.
+
+### What a real server was measured dropping, with three tools
+
+Nine blocks, a plain netherite pickaxe, the same with silk touch, and the same
+with fortune III. `cargo xtask harness drops`:
+
+```text
+  27/27 rows agree                             (100.0%)
+  15/27 with --without-enchantments             (55.6%)
+```
+
+The twelve that break are the point: silk touch stops giving stone, cobblestone
+comes back instead, and fortune III's `coal*2`, `redstone*7`, `diamond*2` and
+`lapis_lazuli*12` all become answers Dust never produces. **Read the fifteen
+too.** Six of them are enchanted rows that agree anyway, because what the
+unenchanted branch gives is inside the enchanted distribution's support —
+fortune on gravel is still flint, fortune III on glowstone still caps at four.
+A control that only reported a rate would have called that a 56% pass; it is
+44% of the rows disagreeing and the rest declining to answer.
+
+`node drops.js <port> --check` gained two rows for the same seam, and both
+assert a contradiction rather than a presence: silk touch gives `stone` where a
+plain pickaxe gives `cobblestone`, and over twelve breaks each a plain pickaxe
+gives coal `111111111111` where fortune III gives `421114123114`. A fortune
+that quietly did nothing would have to roll a one twelve times running.
+
+### `bot.dig` cannot hold an enchanted tool
+
+prismarine-item's `enchants` getter throws `enchantments is not iterable` on a
+1.21.1 stack carrying the component, and mineflayer reaches it while working
+out how long a break should take. Every enchanted row of the first survey read
+`REFUSED`, which is a library failure wearing a server's clothes. The enchanted
+rows now send the raw start and stop instead — the same two packets the timing
+survey above uses, which ask prismarine nothing.
+
 ## What is still wrong
 
-- **Efficiency is always zero**, and so are silk touch and fortune. All three
-  wait on the same thing: a decoder for `minecraft:enchantments` in a stack's
-  component bytes. A player mining ore with a fortune pickaxe still gets one
-  drop.
 - **No haste, no mining fatigue, no underwater penalty**, each for the reason
   stated above.
+- **Nothing but a break reads a component.** A broken chest still drops a chest
+  without its contents.
 - **The 20 measured rows are 5 blocks and 4 tools.** They cover both divisors,
   a bare hand, three tool speeds and a block that requires a tool — but they do
   not cover hardness 0, unbreakable, or a block whose properties vary. Those

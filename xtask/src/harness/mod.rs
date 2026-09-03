@@ -160,15 +160,18 @@ outside the repository (override with DUST_HARNESS_CACHE).
       reading what it says it reads. A gate: exit 1 on any disagreement.
       Decision record 0028 is why this exists.
 
-  drops --answers <file> [--tables <[data] path>] [--verbose]
+  drops --answers <file> [--tables <[data] path>] [--without-enchantments] [--verbose]
       Score what Dust says a broken block yields against the answers
       `tools/bot/drops.js --survival` asked of a real Minecraft server in
       survival mode -- survival because a creative player's break drops
       nothing. A drop is a distribution, so a row agrees when the observed
       drop is one Dust can produce, over two thousand rolls; it disagrees when
       Dust never produces it, and then the worklist prints what Dust does
-      produce instead. A measurement and not a gate: exit 0 unless the run
-      failed. Decision record 0022 is why this exists.
+      produce instead. The tool column may name enchantments --
+      `netherite_pickaxe@fortune:3` -- and `--without-enchantments` scores
+      every row as though it did not, which is the negative control for that
+      half. A measurement and not a gate: exit 0 unless the run failed.
+      Decision records 0022 and 0028 are why this exists.
 
   worldgen --version <v> [--seed <n>] [--radius <r>] [--at <x>,<z>]...
       Read a world Minecraft generated, build the same chunks with Dust's own
