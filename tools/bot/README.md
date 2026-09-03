@@ -112,6 +112,45 @@ of getting a confident wrong answer:
   prediction stands uncorrected and the player sees a block on their head.
   `--predict` sends that prediction and requires the contradiction.
 
+## The crafting differential
+
+`crafting.js` asks what the container became after each step of a player
+crafting, and diffs that against a real 1.21.1 server. Same shape as
+`clicks.js` — record, do not assert — because the crafting output is the one
+slot in the container that fills by itself, refuses everything a player puts
+in it, and moves slots nobody clicked.
+
+```
+node crafting.js 25603 --out dust.json
+node crafting.js 25703 --out vanilla.json     # a real 1.21.1 server
+node crafting.js --compare vanilla.json dust.json
+node crafting.js 25603 --refuse               # what the diff cannot see
+```
+
+Twenty-eight steps and three recipe shapes reachable from the seed, on purpose:
+a log into planks (shapeless, one ingredient), four planks into a crafting
+table (shaped, filling the grid), and four honey bottles into a honey block —
+which is the only vanilla 2x2 recipe whose ingredients leave something behind,
+and a script made only of planks could not tell a server that gives the four
+glass bottles back from one that eats them.
+
+**28 of 29 snapshots agree.** The one that does not is step 28, and it is
+deliberate: with sixty-two planks in the last free slot, a real server moves
+the two planks that fit, spends the log and destroys the other two, while Dust
+refuses the craft. That step exists because step 26 — a result that fits
+*nowhere* — cannot see the difference: both servers answer it by doing nothing,
+which the diff calls agreement. A row that separates "does not fit" from "does
+not fit whole" had to be written on purpose.
+
+`--refuse` is the same argument as `clicks.js --predict`. Every click in the
+recording claims nothing changed, so a click the server refuses is a click both
+ends already agree about and neither server sends a packet. `--refuse` claims
+what a real client draws — the cobblestone it dropped into the output, and an
+empty hand — and requires both to be taken back. 6 of 6 on a real server, 6 of
+6 on Dust, and 3 of 6 when Dust is rebuilt without the output's own pickup
+path, which is what says the check can fail. Decision record 0033 is this
+script's output.
+
 ## The equipment differential
 
 `equipment.js` asks a different question again: not what the server told the

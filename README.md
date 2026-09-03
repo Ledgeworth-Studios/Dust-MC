@@ -197,6 +197,27 @@ Dust broadcasts per change, named in the script and declined in decision record
 [0029](docs/decisions/0029-what-other-players-see-you-wearing.md), which also
 says what this costs with ten players in view of each other and with a hundred.
 
+**And a grid of items makes something.** The 2x2 a player carries crafts: put a
+log in it and four planks appear in the output, take them and the log is spent,
+shift-click and it crafts until the grid runs out. The recipes are the
+operator's own data pack, read out of `[data] path` at boot the same way the
+loot tables are — **887 of the 1,290 files vanilla ships are made in a grid,
+all 887 compile and none is refused**, 389 want a furnace or a stonecutter and
+14 are Java classes rather than described recipes. A lookup runs on every click
+that moves a grid slot, so the recipes are indexed by ingredient item: 2,713
+pairs, about 36 kB, 128 ms to build at boot and **35 ns a lookup**. A honey
+bottle gives its glass bottle back. `tools/bot/crafting.js` records what the
+container became after each of twenty-eight steps against Dust and against a
+real 1.21.1 server and diffs them: **28 of 29 snapshots agree**, and the one
+that does not is a shift-click whose result only half fits — where a real
+server moves what it can, spends the ingredients and destroys the rest, and
+Dust refuses the craft. `--refuse` is the other half, because a recording of
+two servers that both stay silent agrees: it tells the lie a real client tells
+about the output slot and requires the contradiction, at **6 of 6** on both.
+Decision record
+[0033](docs/decisions/0033-what-a-grid-of-items-makes.md) has the counts, the
+three deliberate differences, and what the 3x3 still needs.
+
 And a fence connects to what it touches, whichever way the wall was built. A
 fence, a wall, a glass pane and a stair take their shape from the six cells
 around them — when they are placed, and again whenever anything beside them is
@@ -282,8 +303,11 @@ says creative and a creative client sends a start and never a stop; decision
 record [0028](docs/decisions/0028-how-long-a-block-takes-to-break.md) has the
 rule, what a real server was measured doing, and the two things it waits on;
 **Q still destroys a stack rather than throwing it**, and item entities are not
-saved, so a restart clears the floor; no crafting, so the grid is
-five slots that store and never combine; a stack now carries its data
+saved, so a restart clears the floor; **no crafting table**, so the 2x2 a
+player carries crafts and every three-wide recipe — a pickaxe, a bed, a chest,
+bread — has nowhere to be made, because a 3x3 needs a window the server opens
+on a right-click and this container is built around the player's own
+forty-six; a stack now carries its data
 components, but **nothing in the world reads them**, so every silk-touch and
 fortune branch of every loot table takes its unenchanted side and a broken chest
 drops a chest without its contents; **armour protects from nothing**, since there is no

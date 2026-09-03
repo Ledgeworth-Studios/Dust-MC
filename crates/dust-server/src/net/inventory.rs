@@ -822,10 +822,19 @@ impl Inventory {
 
     /// Take a stack up off the ground.
     ///
-    /// The same placement [`Inventory::closed`] uses — partial stacks first,
-    /// then the main inventory, then the hotbar — because it is the placement
-    /// vanilla uses and a player has forty hours of habit about where a picked
-    /// up stack lands.
+    /// The same placement [`Inventory::closed`] uses, and it is vanilla's
+    /// `Inventory.add`: the slot in hand first, then the offhand, then the
+    /// rest of the hotbar, then the main inventory — and an empty slot is
+    /// taken from the hotbar before the inventory.
+    ///
+    /// Measured, and it was wrong before. This container filled the main
+    /// inventory first, on the reasoning that a player does not want their
+    /// hand replaced; a real 1.21.1 server closing a window with a log in the
+    /// crafting grid puts that log in the **first hotbar slot**, and
+    /// `tools/bot/crafting.js` reports the row. Priority 1: where a picked-up
+    /// stack lands is forty hours of muscle memory and a server that puts it
+    /// somewhere else is a server that feels wrong without being able to say
+    /// why.
     ///
     /// Returns what did **not** fit. A full inventory is a real state and the
     /// item stays on the ground for it; deleting the overflow would be a
@@ -833,19 +842,64 @@ impl Inventory {
     pub fn collect(&mut self, stack: Stack) -> (Changed, Option<Stack>) {
         let mut changed = Changed::default();
         let mut left = stack;
-        self.move_to(MAIN_START..HOTBAR_END, &mut left, &mut changed);
+        self.place(&mut left, &mut changed);
         (changed, (left.count > 0).then_some(left))
     }
 
-    /// Put a stack into the main inventory and hotbar, merging into partial
-    /// stacks first. Whatever does not fit is dropped, which is the only
-    /// caller-visible loss and only happens with a full inventory.
+    /// Put a stack where a player would be given one. Whatever does not fit is
+    /// dropped, which is the only caller-visible loss and only happens with a
+    /// full inventory.
     fn give(&mut self, stack: Stack, changed: &mut Changed) {
         let mut left = stack;
-        // The hotbar is filled after the main inventory, matching vanilla's
-        // `moveItemStackTo(stack, 9, 45, false)`: a player who closes a window
-        // does not want their hand's contents replaced.
-        self.move_to(MAIN_START..HOTBAR_END, &mut left, changed);
+        self.place(&mut left, changed);
+    }
+
+    /// Vanilla's `Inventory.add`, which is two searches and not one range.
+    ///
+    /// `getSlotWithRemainingSpace` looks for a partial stack of the same thing
+    /// in the slot in hand, then the offhand, then the hotbar, then the main
+    /// inventory. `getFreeSlot` then looks for an empty one, and it scans only
+    /// the thirty-six — **the offhand is never chosen for an empty slot**,
+    /// which is why the two searches are written out rather than sharing one
+    /// order.
+    fn place(&mut self, stack: &mut Stack, changed: &mut Changed) {
+        if stack.item.max_stack_size() > 1 {
+            let selected = HOTBAR_START + self.selected;
+            let order = [selected, OFFHAND]
+                .into_iter()
+                .chain(HOTBAR_START..HOTBAR_END)
+                .chain(MAIN_START..MAIN_END);
+            for index in order {
+                if stack.count == 0 {
+                    return;
+                }
+                let Some(mut there) = self.slots[index].clone() else {
+                    continue;
+                };
+                let limit = slot_limit(index, stack.item);
+                if !there.stacks_with(stack) || there.count >= limit {
+                    continue;
+                }
+                let moved = stack.count.min(limit - there.count);
+                there.count += moved;
+                stack.count -= moved;
+                self.slots[index] = Some(there);
+                changed.mark(index);
+            }
+        }
+        if stack.count == 0 {
+            return;
+        }
+        for index in (HOTBAR_START..HOTBAR_END).chain(MAIN_START..MAIN_END) {
+            if self.slots[index].is_some() {
+                continue;
+            }
+            let moved = stack.count.min(slot_limit(index, stack.item));
+            self.slots[index] = Some(stack.of(moved));
+            stack.count -= moved;
+            changed.mark(index);
+            return;
+        }
     }
 
     // -- the seven modes ---------------------------------------------------
@@ -1267,6 +1321,21 @@ impl Inventory {
         if self.cursor.is_some() {
             // Vanilla ignores a throw while something is on the cursor — that
             // gesture is the outside-click drop instead.
+            return;
+        }
+        // Q over the crafting output crafts once and throws what it made away.
+        // Measured, not guessed: a real 1.21.1 server takes a log out of the
+        // grid for both Q and control-Q, one craft each, and this container
+        // matches it. What reaches the floor differs between the two buttons
+        // on a real server and reaches no floor at all here, which is what
+        // every other Q in this file already does.
+        if slot == CRAFTING_OUTPUT as i16 && (0..=1).contains(&button) {
+            if self.slots[CRAFTING_OUTPUT].is_none() {
+                return;
+            }
+            self.slots[CRAFTING_OUTPUT] = None;
+            changed.mark(CRAFTING_OUTPUT);
+            self.take_result(changed);
             return;
         }
         let Some(index) = self.writable(slot) else {
@@ -2039,9 +2108,9 @@ mod tests {
         inventory.closed();
         assert_eq!(inventory.slot(CRAFTING_OUTPUT), None);
         assert_eq!(
-            inventory.slot(MAIN_START).cloned(),
+            inventory.slot(HOTBAR_START).cloned(),
             Some(Stack::new(log(), 1)),
-            "the log went back to the player"
+            "the log went back into the hand, which is where a real server puts it"
         );
     }
 
