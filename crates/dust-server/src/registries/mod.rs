@@ -35,6 +35,7 @@
 pub mod constants;
 pub mod convert;
 pub mod drops;
+pub mod recipes;
 pub mod schema;
 pub mod source;
 

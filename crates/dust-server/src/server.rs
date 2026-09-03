@@ -1005,6 +1005,26 @@ impl Server {
             ),
         }
         let drops = std::sync::Arc::new(drops);
+
+        // And the fourth: what a grid of items makes. Same directory, same
+        // argument, decision record 0031.
+        let (recipes, recipes_report) = match data_path.as_deref() {
+            None => (dust_sim::crafting::Recipes::default(), None),
+            Some(path) => {
+                let (recipes, report) = crate::registries::recipes::beside(path);
+                (recipes, Some(report))
+            }
+        };
+        match &recipes_report {
+            Some(report) if report.files > 0 => {
+                self.options.logger.info("dust::data", report.summary())
+            }
+            _ => self.options.logger.info(
+                "dust::data",
+                "no recipes under [data] path, so nothing crafts".to_owned(),
+            ),
+        }
+        let recipes = std::sync::Arc::new(recipes);
         let items: std::sync::Arc<crate::net::items::ItemWorld> = std::sync::Arc::default();
 
         let opacity = crate::net::world::opacity_of(palette.air, constants.as_ref());
@@ -1297,6 +1317,7 @@ impl Server {
             registry_contents,
             items: std::sync::Arc::clone(&items),
             drops: std::sync::Arc::clone(&drops),
+            recipes: std::sync::Arc::clone(&recipes),
             item_entity_type: crate::net::play::item_entity_type().ok_or_else(|| {
                 fail("the generated entity table has no minecraft:item".to_owned())
             })?,
