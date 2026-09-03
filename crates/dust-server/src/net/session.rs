@@ -1154,7 +1154,7 @@ where
                                 dig.at,
                                 previous,
                                 &neighbours,
-                                inventory.held(),
+                                inventory.held_stack(),
                                 drop_seed,
                             );
                         }
@@ -1703,7 +1703,7 @@ where
                                 let progress = break_progress(
                                     ctx,
                                     state,
-                                    inventory.held(),
+                                    inventory.held_stack(),
                                     posture.on_ground,
                                 );
                                 if progress.instant() {
@@ -1791,7 +1791,7 @@ where
                                     action.location,
                                     previous,
                                     &neighbours,
-                                    inventory.held(),
+                                    inventory.held_stack(),
                                     drop_seed,
                                 );
                             }
@@ -2892,9 +2892,10 @@ struct Digging {
 fn break_progress(
     ctx: &SessionContext,
     state: u32,
-    held: Option<dust_registry::Item>,
+    held: Option<&super::inventory::Stack>,
     on_ground: bool,
 ) -> dust_sim::mining::Progress {
+    let item = held.map(|stack| stack.item);
     let Some(constants) = ctx.constants.as_deref() else {
         return dust_sim::mining::Progress::of(0.0, &dust_sim::mining::Digger::bare());
     };
@@ -2905,14 +2906,16 @@ fn break_progress(
         return dust_sim::mining::Progress::of(0.0, &dust_sim::mining::Digger::bare());
     };
     let digger = dust_sim::mining::Digger {
-        speed: dust_registry::mining::speed(held, block),
-        // A stack carries its components as bytes and nothing decodes
-        // `minecraft:enchantments` out of them yet, so every efficiency
-        // branch takes its unenchanted side. That is a gap in the stack and
-        // not in the rule: the day a stack knows, this line is where it
-        // starts working, and it is the same seam `spill` names for silk
-        // touch and fortune.
-        efficiency: 0,
+        speed: dust_registry::mining::speed(item, block),
+        // Off the stack in the hand. Efficiency V on a diamond pickaxe takes
+        // its speed from 8 to 34, which is stone in 2 ticks rather than 6 —
+        // the largest single number a player can change about a break, and it
+        // was the one thing in this rule that could not be reached before an
+        // enchantment had a name.
+        efficiency: dust_registry::enchantments::level(
+            &held_enchantments(held),
+            "minecraft:efficiency",
+        ),
         // **Both facts, composed — and this is the line a real server was
         // measured correcting.** The drops verdict alone says a bare hand is
         // wrong for dirt, and Minecraft says it is right: a block that asks
@@ -2926,11 +2929,22 @@ fn break_progress(
                 // `spill` takes of the same absent column.
                 None => false,
             },
-            dust_registry::mining::correct_for_drops(held, block),
+            dust_registry::mining::correct_for_drops(item, block),
         ),
         on_ground,
     };
     dust_sim::mining::Progress::of(hardness, &digger)
+}
+
+/// The `(name, level)` pairs on the stack in the player's hand.
+///
+/// One place rather than two, because the loot roll and the break timer ask
+/// the same question of the same stack and a server that read the patch twice
+/// per break would be walking the same bytes for the same answer.
+fn held_enchantments(held: Option<&super::inventory::Stack>) -> Vec<(&'static str, u32)> {
+    held.and_then(|stack| stack.components.component("minecraft:enchantments"))
+        .map(dust_registry::enchantments::parse)
+        .unwrap_or_default()
 }
 
 fn spill(
@@ -2938,7 +2952,7 @@ fn spill(
     at: dust_protocol::types::Position,
     previous: u32,
     neighbours: &[(i8, u32)],
-    held: Option<dust_registry::Item>,
+    held: Option<&super::inventory::Stack>,
     seed: u64,
 ) {
     let Some(state) = dust_registry::BlockState::from_id(previous) else {
@@ -2957,6 +2971,7 @@ fn spill(
             dust_registry::BlockState::from_id(*state).map(|state| (*offset, state))
         })
         .collect();
+    let enchantments = held_enchantments(held);
     let context = dust_sim::drops::Break {
         state,
         // Whether this state yields anything to the wrong tool. Read off the
@@ -2970,13 +2985,15 @@ fn spill(
             _ => false,
         },
         tool: dust_sim::drops::Tool {
-            item: held,
-            // A stack carries no data components yet, so it carries no
-            // enchantments and every silk-touch and fortune branch in every
-            // table takes its unenchanted side. That is a gap in the stack and
-            // not in the table: the day a stack knows, this line is where it
-            // starts working.
-            enchantments: &[],
+            item: held.map(|stack| stack.item),
+            // **Read from the stack the player is actually holding.** Every
+            // silk-touch and fortune branch of every table has been compiled
+            // and unreachable since the tables landed; this is the line that
+            // reaches them. An unenchanted stack — which is almost every stack
+            // — produces an empty `Vec`, and an empty `Vec` allocates nothing,
+            // so the ordinary break pays one walk of a patch that is usually
+            // absent.
+            enchantments: &enchantments,
         },
         broken_by_entity: true,
         neighbours: &around,

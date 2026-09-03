@@ -599,6 +599,22 @@ one break. Fifty blocks, 44 of 46 scorable rows agreeing, and both misses the
 same missing thing: `minecraft:snow` and `minecraft:cobweb` need a shovel and
 shears, and Dust has no tool check.
 
+### An enchanted tool
+
+`--tool` takes `netherite_pickaxe@fortune:3`, and `@silk_touch:1+efficiency:5`
+puts two on one tool. **An enchanted tool is a different tool**, and a survey
+that could only name items could not ask the question every ore table turns on.
+The spelling goes into `/give`'s component syntax against a real server and
+into a `set_creative_slot` component against Dust, so one column means one
+thing on both sides — and `cargo xtask harness drops` reads the same spelling,
+with `--without-enchantments` as its negative control.
+
+**`bot.dig` cannot hold one.** prismarine-item's `enchants` getter throws
+`enchantments is not iterable` on a 1.21.1 stack carrying the component, and
+mineflayer reaches it while timing the break, so every enchanted row of the
+first run read `REFUSED` — a library failure wearing a server's clothes. The
+enchanted rows send the raw start and stop instead.
+
 ### And how long a break takes
 
 The same script, with `--times`, times the server rather than reading what came
