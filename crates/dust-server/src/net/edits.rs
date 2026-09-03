@@ -406,6 +406,11 @@ impl EditedWorld {
         self.generated.warm(centre)
     }
 
+    /// The same, on this thread, for a named set of columns.
+    pub fn warm_columns(&self, columns: &[ChunkPos]) -> u32 {
+        self.generated.warm_columns(columns)
+    }
+
     /// How many columns the server is keeping resident, across all players.
     #[must_use]
     pub fn resident_columns(&self) -> usize {

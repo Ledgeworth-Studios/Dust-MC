@@ -9,14 +9,22 @@
 //! builds in a 432-block walk. That is two things at once and only one of them
 //! is a number:
 //!
-//! - **A player feels it.** 0.9 ms of file read, decompress, NBT parse and
-//!   light pass happens on the session's own task, between a movement packet
-//!   arriving and the reply going out. Walking into new terrain hitches, and a
-//!   hundred players walking into new terrain at once is a server that stops
-//!   answering.
-//! - **It is paid per player.** [`super::collide::Ground`] keeps four built
-//!   columns *per session*, so two players standing in the same place hold two
-//!   copies of the same megabyte.
+//! - **A player feels it.** A file read, a decompress, an NBT parse and a light
+//!   pass happen on the session's own task, between a movement packet arriving
+//!   and the reply going out. Measured on a cold world: **2.25 ms a column**,
+//!   and a single movement packet at the worst moment took **11.28 ms**.
+//!   Walking into new terrain hitches, and a hundred players walking into new
+//!   terrain at once is a server that stops answering.
+//! - **It is paid per holder, not per column.** [`super::collide::Ground`]
+//!   keeps four built columns *per session*, so two players standing in the
+//!   same place hold two copies of the same column — and
+//!   `net::items::ItemTicker` builds a fresh `Ground` inside **every tick**,
+//!   whose cache dies with it: a single falling item over region files cost
+//!   **555,197 ns a tick** against 38 on a flat world.
+//!
+//! The second of those is why this is not a bigger per-session cache. A cache
+//! belongs to a caller; residency belongs to the server, and there are two
+//! callers on two different kinds of thread.
 //!
 //! # What this is instead
 //!
@@ -26,7 +34,23 @@
 //!
 //! # Who owns a column, and when it is dropped
 //!
-//! A session **holds** the [`RESIDENT_RADIUS`] ring around the column it is
+//! Two kinds of holder, because there are two access patterns and one of them
+//! is not a ring around anybody:
+//!
+//! - **A player is a moving window.** [`Residence`] holds the
+//!   [`RESIDENT_RADIUS`] ring around the column a session is standing in and
+//!   slides it as they walk.
+//! - **Falling items are a static set.** [`ColumnClaim`] holds whatever columns
+//!   `net::items::footprint_into` names — the columns the drops that are still
+//!   in the air will read *next* tick — and gives them up as they land. A
+//!   settled item never asks the world anything, so a heap lying on the floor
+//!   holds nothing at all.
+//!
+//! Both are refcounts on the same column, which is the point: two players and a
+//! bouncing pile of cobblestone over one column keep one copy of it between
+//! them.
+//!
+//! A session **holds** the ring around the column it is
 //! standing in — nine columns — and releases them when it moves or ends. A
 //! column with at least one holder is never dropped. Nine and not the view's
 //! several hundred, because this is what the *movement check* needs and it is
@@ -40,10 +64,11 @@
 //! over the two columns that were already resident; they have to walk the
 //! width of a column — sixteen blocks, 1.6 seconds even at the speed limit
 //! `dust_guard::SpeedLimit` allows and about 3.7 at a walk — before they can
-//! touch one of the new ones. Five builds is 4.5 ms. **The margin is about
-//! three hundred to one, and it is bounded by the speed limit rather than by a
-//! lock**: the only way to reach a column that is not yet built is to move
-//! faster than the server will believe, which is separately refused.
+//! touch one of the new ones. Warming a whole cold ring of nine is **20.3 ms,
+//! measured**. **The margin is about eighty to one, and it is bounded by the
+//! speed limit rather than by a lock**: the only way to reach a column that is
+//! not yet built is to move faster than the server will believe, which is
+//! separately refused.
 //!
 //! A column that loses its last holder is **retired rather than dropped**, and
 //! the retired ones go wholesale when there are more than [`RETIRED_CAP`] of
@@ -55,12 +80,26 @@
 //!
 //! # What it costs
 //!
-//! Nine columns a player, shared, and zero on a flat world, which lends one
-//! template column to every position and has nothing to be resident. Against
-//! the four built columns *per session* that [`super::collide::Ground`] holds
-//! today, this is fewer columns per player and they stop being per player at
-//! all: ten players in one place hold nine columns between them rather than
-//! forty.
+//! **A column of a real world is 111 KB, measured** — `benches/movement.rs`
+//! counts the heap under 256 of them — and not the megabyte three modules'
+//! documentation has claimed for the life of the project. So:
+//!
+//! | | before, 4 a session | after, 9 shared |
+//! | --- | --- | --- |
+//! | 1 player | 0.4 MB | 1.0 MB |
+//! | 10 players together | 4.4 MB | 1.0 MB |
+//! | 10 players apart | 4.4 MB | 10 MB + 7 MB retired |
+//! | 100 players apart | 44 MB | 100 MB + 7 MB retired |
+//!
+//! **This is more memory, not less, for players who are spread out**, and the
+//! honest reading is that the efficiency case was nine times weaker than it
+//! looked before anybody measured a column. What justifies it is the first
+//! priority and not the second: 11.28 ms in one movement packet, and 555,197 ns
+//! a tick for one falling item. The retired tier is a flat 7 MB for the whole
+//! server, not per player.
+//!
+//! Zero of all of it on a flat world, which lends one template column to every
+//! position and has nothing to be resident.
 //!
 //! # Thread safety, and what "serialised" means here
 //!

@@ -212,8 +212,14 @@ impl Source {
     /// [`Source::want`].
     pub fn warm(&self, centre: ChunkPos) -> u32 {
         let Self::Anvil(world) = self else { return 0 };
+        self.warm_columns(&world.residency.cold(centre))
+    }
+
+    /// The same, for a named set of columns rather than a ring.
+    pub fn warm_columns(&self, columns: &[ChunkPos]) -> u32 {
+        let Self::Anvil(world) = self else { return 0 };
         let mut built = 0;
-        for pos in world.residency.cold(centre) {
+        for pos in world.residency.cold_columns(columns) {
             // Built with no lock held, then offered. A player who walked away
             // in the meantime, or another thread that got there first, means
             // the column is dropped here rather than kept — see

@@ -484,15 +484,24 @@ fn near_any(entity: &ItemEntity, players: &[(f64, f64, f64)]) -> bool {
     })
 }
 
-/// Which columns the items that will tick this tick are standing in.
+/// Which columns the items that will **ask the world a question** this tick are
+/// standing in.
 ///
 /// The set `net::residency::ColumnClaim` keeps for the item world, and the
 /// reason it is a set of columns rather than a ring around anybody: an item is
-/// simulated from up to [`TICK_RADIUS`] away — four chunks — so a heap of
-/// cobblestone can be ticking in a column no player's own ring covers, and it
-/// would rebuild that column out of the region file twenty times a second
-/// forever. Bounded twice over: nothing outside `TICK_RADIUS` of a player is in
-/// it at all, and the whole thing goes when the items despawn.
+/// simulated from up to [`TICK_RADIUS`] away — four chunks — so a falling drop
+/// can be in a column no player's own ring covers, and it would rebuild that
+/// column out of the region file twenty times a second for as long as it fell.
+///
+/// **Settled items are not in it, and that is the whole of the memory
+/// argument.** `step` returns on the first line for an item that has landed, so
+/// a heap of cobblestone lying on the floor never touches the world at all —
+/// measured, in `benches/items.rs`: a hundred settled items over region files
+/// cost 4,068 ns a tick with the server keeping columns and 4,068 without,
+/// because neither of them reads one. Claiming columns for them would be a
+/// megabyte apiece held for the five minutes until they despawn, bought for
+/// nothing. What is claimed is the second or two between a block breaking and
+/// its drops coming to rest, and it is given up the moment they do.
 ///
 /// Appended to a buffer the caller reuses, and not deduplicated here — the
 /// claim sorts and dedups, and a thousand items in one column would otherwise
@@ -505,15 +514,27 @@ pub fn footprint_into(items: &ItemWorld, players: &[(f64, f64, f64)], out: &mut 
         .expect("the item world is never poisoned");
     let mut last: Option<ChunkPos> = None;
     for entity in entities.iter() {
-        if !near_any(entity, players) {
+        if entity.settled || !near_any(entity, players) {
             continue;
         }
+        // **Where it will be, not where it is.** `step` moves the item and then
+        // reads the cell under the position it moved to, so the column this
+        // tick reads is the one at `x + vx`. Claiming the column the item is
+        // standing in instead is right for every item that does not cross a
+        // boundary and wrong for exactly the ones that do — and an item is
+        // given a random horizontal push when it pops, so crossing is what
+        // they spend their first second doing.
+        //
+        // Measured, a hundred falling items over region files: **2,020,855 ns
+        // a tick claiming `x`, 4,875 claiming what is read.** It looked like a
+        // margin was needed and it was an off-by-one-tick.
+        //
         // Items are stored in the order they were dropped and a heap of them
         // shares a column, so remembering the last one answers almost every
         // entity without touching the vector.
         let pos = ChunkPos::new(
-            (entity.x.floor() as i32) >> 4,
-            (entity.z.floor() as i32) >> 4,
+            ((entity.x + entity.vx).floor() as i32) >> 4,
+            ((entity.z + entity.vz).floor() as i32) >> 4,
         );
         if last != Some(pos) {
             out.push(pos);

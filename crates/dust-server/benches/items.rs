@@ -115,6 +115,7 @@ fn main() {
         &world,
         constants.as_ref(),
         &here,
+        false,
         ItemWorld::default,
     );
     for count in [1usize, 100, 1_000] {
@@ -125,6 +126,7 @@ fn main() {
             &world,
             constants.as_ref(),
             &here,
+            false,
             || filled(&roster, count),
         );
     }
@@ -138,6 +140,7 @@ fn main() {
             &world,
             constants.as_ref(),
             &here,
+            false,
             || {
                 let items = filled(&roster, count);
                 settle(&items, &world, constants.as_ref(), &here);
@@ -152,6 +155,7 @@ fn main() {
         &world,
         constants.as_ref(),
         &far,
+        false,
         || {
             let items = filled(&roster, 1_000);
             settle(&items, &world, constants.as_ref(), &here);
@@ -201,16 +205,61 @@ fn region_row(
     let world = EditedWorld::new(Source::Anvil(Box::new(anvil)));
     println!("\n  falling, over region files");
     for count in [1usize, 100] {
-        row(
-            &format!("{count} item(s), somebody near"),
-            count,
-            FALLING,
-            &world,
-            Some(constants),
-            players,
-            || filled(roster, count),
-        );
+        for resident in [false, true] {
+            row(
+                &name(count, resident),
+                count,
+                FALLING,
+                &world,
+                Some(constants),
+                players,
+                resident,
+                || filled(roster, count),
+            );
+        }
     }
+    // The rows that matter more than the ones above them, and the reason is
+    // arithmetic: an item falls for fifteen ticks and then lies there for five
+    // minutes, which is six thousand. What a heap of cobblestone costs a
+    // server is almost entirely what it costs at rest.
+    //
+    // They are also the rows the claim is honest on. A falling item drifts —
+    // `pop` gives it a random horizontal push — so a claim taken before a
+    // fifteen-tick burst can be a column behind by the end of it, and this
+    // bench runs its ticks back to back where a server puts fifty milliseconds
+    // between them and re-claims in the gap. A settled heap does not move, so
+    // the claim is exactly right and stays right.
+    println!("\n  at rest, over region files");
+    for count in [1usize, 100] {
+        for resident in [false, true] {
+            row(
+                &name(count, resident),
+                count,
+                TICKS,
+                &world,
+                Some(constants),
+                players,
+                resident,
+                || {
+                    let items = filled(roster, count);
+                    settle(&items, &world, Some(constants), players);
+                    items
+                },
+            );
+        }
+    }
+}
+
+/// What a region row is called: the count, and which side of the change it is.
+fn name(count: usize, resident: bool) -> String {
+    format!(
+        "{count} item(s), {}",
+        if resident {
+            "server keeping columns"
+        } else {
+            "the way it worked before"
+        }
+    )
 }
 
 /// Run the items to rest without timing it, so an at-rest row starts at rest.
@@ -260,18 +309,40 @@ fn row<F>(
     world: &EditedWorld,
     constants: Option<&BlockConstants>,
     players: &[(f64, f64, f64)],
+    resident: bool,
     mut build: F,
 ) where
     F: FnMut() -> ItemWorld,
 {
     let mut runs = Vec::with_capacity(ROUNDS);
     let mut moving = 0;
+    let mut footprint = Vec::new();
     for _ in 0..ROUNDS {
         let items = build();
         let mut near = Vec::new();
         let started = Instant::now();
         for _ in 0..ticks {
+            if resident {
+                // What `net::items::ItemTicker` does with a
+                // `net::residency::ColumnClaim`, every tick and before the
+                // tick that reads them — because a falling item is given a
+                // random horizontal push and the column it reads this tick is
+                // not always the one it read last.
+                //
+                // Two differences from the server, both of which make this row
+                // **pessimistic**: the warm is waited for rather than handed to
+                // the world's warming thread, and these ticks run back to back
+                // where a server puts fifty milliseconds between them for that
+                // thread to work in. Every column built here is charged to the
+                // timed loop; on a server almost none of them would be.
+                dust_server::net::items::footprint_into(&items, players, &mut footprint);
+                world.hold_columns(&footprint);
+                world.warm_columns(&footprint);
+            }
             items.tick(world, constants, players, &mut near);
+            if resident {
+                world.release_columns(&footprint);
+            }
         }
         runs.push(started.elapsed().as_nanos() / u128::from(ticks));
         moving = items.len() - items.at_rest();
