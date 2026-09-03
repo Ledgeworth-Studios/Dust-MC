@@ -521,13 +521,13 @@ mod tests {
                         slot: 9,
                         item: "minecraft:cobblestone".to_owned(),
                         count: 17,
-                            components: None,
+                        components: None,
                     },
                     SavedStack {
                         slot: 45,
                         item: "minecraft:bucket".to_owned(),
                         count: 1,
-                            components: None,
+                        components: None,
                     },
                 ],
                 selected: 4,
@@ -604,13 +604,13 @@ mod tests {
                         slot: 9,
                         item: "minecraft:cobblestone".to_owned(),
                         count: 3,
-                            components: None,
+                        components: None,
                     },
                     SavedStack {
                         slot: 10,
                         item: "minecraft:unobtainium".to_owned(),
                         count: 1,
-                            components: None,
+                        components: None,
                     },
                 ],
                 selected: 0,
@@ -702,5 +702,157 @@ mod tests {
             .expect("a torn temporary");
         let back = load(&dir).expect("read").expect("present");
         assert_eq!(back.blocks[0].x, 7, "the previous save is intact");
+    }
+
+    /// A patch from the operator's own registry, as `net::inventory` builds
+    /// them. Nothing here writes a component number down.
+    fn worn(amount: i32) -> dust_protocol::components::ComponentPatch {
+        crate::net::inventory::install_component_types();
+        let id = dust_registry::Registry::from_name("minecraft:data_component_type")
+            .and_then(|r| r.entry_id("minecraft:damage"))
+            .expect("in the registry") as i32;
+        let mut bytes = Vec::new();
+        dust_protocol::varint::write_var_int(1, &mut bytes);
+        dust_protocol::varint::write_var_int(0, &mut bytes);
+        dust_protocol::varint::write_var_int(id, &mut bytes);
+        dust_protocol::varint::write_var_int(amount, &mut bytes);
+        dust_protocol::components::ComponentPatch::from_wire_bytes(&bytes).expect("walks")
+    }
+
+    fn one_player(stack: SavedStack, components: Option<&str>) -> Save {
+        Save {
+            version: SAVE_VERSION,
+            components: components.map(ToOwned::to_owned),
+            blocks: Vec::new(),
+            players: vec![SavedPlayer {
+                id: "f3d28cb0-7225-3cb1-baeb-2dadd2be89ae".to_owned(),
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                inventory: vec![stack],
+                selected: 0,
+            }],
+        }
+    }
+
+    fn slot_nine(save: &Save) -> (Option<crate::net::inventory::Stack>, usize) {
+        let (carried, _, dropped) = inventories(save);
+        let id = parse_id("f3d28cb0-7225-3cb1-baeb-2dadd2be89ae").expect("an id");
+        let mine = carried.get(&id).expect("present");
+        (mine.slots[9].clone(), dropped)
+    }
+
+    #[test]
+    fn a_worn_tool_comes_back_worn() {
+        let dir = temp_dir("components");
+        let stack = crate::net::inventory::Stack::with_components(
+            dust_registry::Item::from_name("minecraft:diamond_pickaxe").expect("an item"),
+            1,
+            worn(431),
+        );
+        let mut slots: crate::net::inventory::Slots = std::array::from_fn(|_| None);
+        slots[9] = Some(stack.clone());
+        let carried = Carried { slots, selected: 0 };
+        let written = stacks_of(&carried);
+        assert_eq!(written[0].components, worn(431).to_hex());
+
+        let save = one_player(
+            written.into_iter().next().expect("one"),
+            Some(components_version_of_this_build()),
+        );
+        store(&dir, &save).expect("written");
+        let back = load(&dir).expect("read").expect("present");
+        let (slot, dropped) = slot_nine(&back);
+        assert_eq!(slot, Some(stack), "the components have to survive the file");
+        assert_eq!(dropped, 0);
+    }
+
+    /// The version this build's component bytes belong to.
+    fn components_version_of_this_build() -> &'static str {
+        dust_registry::generated::registries::DATA_VERSION
+    }
+
+    #[test]
+    fn components_written_for_another_version_are_dropped_and_counted() {
+        // The trap this is here for: the same eleven bytes are an enchantment
+        // in one version's registry and a food value in the next, because the
+        // type ids are positions in a table Minecraft regenerates. Reading them
+        // anyway would hand the player a different item and call it theirs.
+        let save = one_player(
+            SavedStack {
+                slot: 9,
+                item: "minecraft:diamond_pickaxe".to_owned(),
+                count: 1,
+                components: worn(431).to_hex(),
+            },
+            Some("1.99.9"),
+        );
+        let (slot, dropped) = slot_nine(&save);
+        assert_eq!(dropped, 1);
+        let slot = slot.expect("the item itself still comes back");
+        assert!(slot.components.is_empty());
+        assert_eq!(slot.count, 1);
+    }
+
+    #[test]
+    fn components_with_no_version_beside_them_are_dropped_and_counted() {
+        // A hand-edited file, or one from a Dust that wrote components without
+        // saying which version they were. Neither is a file to guess at.
+        let save = one_player(
+            SavedStack {
+                slot: 9,
+                item: "minecraft:diamond_pickaxe".to_owned(),
+                count: 1,
+                components: worn(431).to_hex(),
+            },
+            None,
+        );
+        let (slot, dropped) = slot_nine(&save);
+        assert_eq!(dropped, 1);
+        assert!(slot.expect("still there").components.is_empty());
+    }
+
+    #[test]
+    fn hex_that_is_not_a_patch_loses_the_components_and_not_the_item() {
+        let save = one_player(
+            SavedStack {
+                slot: 9,
+                item: "minecraft:diamond_pickaxe".to_owned(),
+                count: 1,
+                components: Some("ffffff".to_owned()),
+            },
+            Some(components_version_of_this_build()),
+        );
+        let (slot, dropped) = slot_nine(&save);
+        assert_eq!(dropped, 1);
+        assert!(slot.expect("still there").components.is_empty());
+    }
+
+    #[test]
+    fn a_world_nobody_named_anything_in_writes_no_component_key_at_all() {
+        let plain = vec![SavedPlayer {
+            id: "f3d28cb0-7225-3cb1-baeb-2dadd2be89ae".to_owned(),
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            inventory: vec![SavedStack {
+                slot: 9,
+                item: "minecraft:cobblestone".to_owned(),
+                count: 3,
+                components: None,
+            }],
+            selected: 0,
+        }];
+        assert_eq!(components_version(&plain), None);
+        let dir = temp_dir("plain");
+        let save = Save {
+            version: SAVE_VERSION,
+            components: None,
+            blocks: Vec::new(),
+            players: plain,
+        };
+        store(&dir, &save).expect("written");
+        let text = std::fs::read_to_string(path_in(&dir)).expect("read");
+        assert!(!text.contains("components"), "{text}");
     }
 }

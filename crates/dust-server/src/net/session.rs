@@ -2082,8 +2082,9 @@ where
             .changed_slots
             .iter()
             .find(|slot| usize::try_from(slot.number) == Ok(index));
-        let agrees = claimed
-            .is_some_and(|slot| super::inventory::from_wire(&slot.item).as_ref() == inventory.slot(index));
+        let agrees = claimed.is_some_and(|slot| {
+            super::inventory::from_wire(&slot.item).as_ref() == inventory.slot(index)
+        });
         if !agrees {
             send_slot(conn, ctx, inventory, index).await?;
         }

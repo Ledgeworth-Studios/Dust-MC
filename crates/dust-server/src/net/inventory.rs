@@ -1285,10 +1285,8 @@ fn components_of(slot: &Slot) -> Option<ComponentPatch> {
 pub fn install_component_types() {
     fn name_of(id: i32) -> Option<&'static str> {
         static REGISTRY: OnceLock<Option<dust_registry::Registry>> = OnceLock::new();
-        let registry =
-            (*REGISTRY.get_or_init(|| {
-                dust_registry::Registry::from_name("minecraft:data_component_type")
-            }))?;
+        let registry = (*REGISTRY
+            .get_or_init(|| dust_registry::Registry::from_name("minecraft:data_component_type")))?;
         registry.entry_name(u32::try_from(id).ok()?)
     }
     dust_protocol::components::install_type_names(name_of);
@@ -1324,6 +1322,34 @@ pub fn from_wire(slot: &Slot) -> Option<Stack> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A patch that sets one component, with the id the operator's own
+    /// registry gave it. Nothing here writes a component number down.
+    fn patch(component: &str, payload: &[u8]) -> ComponentPatch {
+        install_component_types();
+        let id = dust_registry::Registry::from_name("minecraft:data_component_type")
+            .and_then(|registry| registry.entry_id(component))
+            .expect("the extracted registry has that component type") as i32;
+        let mut bytes = Vec::new();
+        dust_protocol::varint::write_var_int(1, &mut bytes);
+        dust_protocol::varint::write_var_int(0, &mut bytes);
+        dust_protocol::varint::write_var_int(id, &mut bytes);
+        bytes.extend_from_slice(payload);
+        ComponentPatch::from_wire_bytes(&bytes).expect("a patch this build can walk")
+    }
+
+    /// `minecraft:damage`, which is one VarInt and is what a used tool carries.
+    fn worn(amount: i32) -> ComponentPatch {
+        let mut payload = Vec::new();
+        dust_protocol::varint::write_var_int(amount, &mut payload);
+        patch("minecraft:damage", &payload)
+    }
+
+    /// `minecraft:custom_name`, which is one network-NBT value. An empty
+    /// compound stands in for the text: this is about identity, not rendering.
+    fn named() -> ComponentPatch {
+        patch("minecraft:custom_name", &[10, 0])
+    }
 
     fn item(name: &str) -> Item {
         Item::from_name(name).expect("this build has that item")
@@ -1575,7 +1601,10 @@ mod tests {
 
         inventory.click(ClickMode::Swap, 9, SWAP_OFFHAND_BUTTON);
         assert_eq!(inventory.slot(9).cloned(), None);
-        assert_eq!(inventory.slot(OFFHAND).cloned(), Some(Stack::new(dirt(), 2)));
+        assert_eq!(
+            inventory.slot(OFFHAND).cloned(),
+            Some(Stack::new(dirt(), 2))
+        );
     }
 
     #[test]
@@ -1583,7 +1612,11 @@ mod tests {
         let mut inventory = with(&[(9, stone(), 1), (10, bucket(), 1)]);
         inventory.click(ClickMode::Clone, 9, 2);
         assert_eq!(inventory.cursor().cloned(), Some(Stack::new(stone(), 64)));
-        assert_eq!(inventory.slot(9).cloned(), Some(Stack::new(stone(), 1)), "unchanged");
+        assert_eq!(
+            inventory.slot(9).cloned(),
+            Some(Stack::new(stone(), 1)),
+            "unchanged"
+        );
 
         // And the number is the item's, not 64.
         let mut inventory = with(&[(10, bucket(), 1)]);
@@ -1793,20 +1826,29 @@ mod tests {
         inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
         inventory.click(ClickMode::Pickup, (MAIN_START + 1) as i16, 0);
         inventory.click(ClickMode::Pickup, ARMOUR_HEAD as i16, 0);
-        assert_eq!(inventory.slot(ARMOUR_HEAD).cloned(), Some(Stack::new(helmet(), 1)));
+        assert_eq!(
+            inventory.slot(ARMOUR_HEAD).cloned(),
+            Some(Stack::new(helmet(), 1))
+        );
     }
 
     #[test]
     fn shift_click_puts_armour_on_and_takes_it_off_again() {
         let mut inventory = with(&[(MAIN_START, helmet(), 1)]);
         inventory.click(ClickMode::QuickMove, MAIN_START as i16, 0);
-        assert_eq!(inventory.slot(ARMOUR_HEAD).cloned(), Some(Stack::new(helmet(), 1)));
+        assert_eq!(
+            inventory.slot(ARMOUR_HEAD).cloned(),
+            Some(Stack::new(helmet(), 1))
+        );
         assert_eq!(inventory.slot(MAIN_START).cloned(), None);
 
         // Off again, and into the inventory rather than back onto the head.
         inventory.click(ClickMode::QuickMove, ARMOUR_HEAD as i16, 0);
         assert_eq!(inventory.slot(ARMOUR_HEAD).cloned(), None);
-        assert_eq!(inventory.slot(MAIN_START).cloned(), Some(Stack::new(helmet(), 1)));
+        assert_eq!(
+            inventory.slot(MAIN_START).cloned(),
+            Some(Stack::new(helmet(), 1))
+        );
     }
 
     #[test]
@@ -1816,7 +1858,10 @@ mod tests {
             (MAIN_START, item("minecraft:golden_helmet"), 1),
         ]);
         inventory.click(ClickMode::QuickMove, MAIN_START as i16, 0);
-        assert_eq!(inventory.slot(ARMOUR_HEAD).cloned(), Some(Stack::new(helmet(), 1)));
+        assert_eq!(
+            inventory.slot(ARMOUR_HEAD).cloned(),
+            Some(Stack::new(helmet(), 1))
+        );
         assert_eq!(
             inventory.slot(HOTBAR_START).cloned(),
             Some(Stack::new(item("minecraft:golden_helmet"), 1))
@@ -1828,21 +1873,36 @@ mod tests {
         let shield = item("minecraft:shield");
         let mut inventory = with(&[(MAIN_START, shield, 1)]);
         inventory.click(ClickMode::QuickMove, MAIN_START as i16, 0);
-        assert_eq!(inventory.slot(OFFHAND).cloned(), Some(Stack::new(shield, 1)));
+        assert_eq!(
+            inventory.slot(OFFHAND).cloned(),
+            Some(Stack::new(shield, 1))
+        );
 
         let mut inventory = with(&[(MAIN_START, shield, 1), (OFFHAND, stone(), 1)]);
         inventory.click(ClickMode::QuickMove, MAIN_START as i16, 0);
-        assert_eq!(inventory.slot(OFFHAND).cloned(), Some(Stack::new(stone(), 1)));
-        assert_eq!(inventory.slot(HOTBAR_START).cloned(), Some(Stack::new(shield, 1)));
+        assert_eq!(
+            inventory.slot(OFFHAND).cloned(),
+            Some(Stack::new(stone(), 1))
+        );
+        assert_eq!(
+            inventory.slot(HOTBAR_START).cloned(),
+            Some(Stack::new(shield, 1))
+        );
     }
 
     #[test]
     fn the_offhand_and_the_crafting_grid_empty_into_the_inventory() {
         let mut inventory = with(&[(OFFHAND, stone(), 9), (CRAFTING_START, stone(), 4)]);
         inventory.click(ClickMode::QuickMove, OFFHAND as i16, 0);
-        assert_eq!(inventory.slot(MAIN_START).cloned(), Some(Stack::new(stone(), 9)));
+        assert_eq!(
+            inventory.slot(MAIN_START).cloned(),
+            Some(Stack::new(stone(), 9))
+        );
         inventory.click(ClickMode::QuickMove, CRAFTING_START as i16, 0);
-        assert_eq!(inventory.slot(MAIN_START).cloned(), Some(Stack::new(stone(), 13)));
+        assert_eq!(
+            inventory.slot(MAIN_START).cloned(),
+            Some(Stack::new(stone(), 13))
+        );
         assert_eq!(inventory.slot(CRAFTING_START).cloned(), None);
     }
 
@@ -1855,7 +1915,10 @@ mod tests {
         ]);
         let changed = inventory.click(ClickMode::Swap, ARMOUR_HEAD as i16, 0);
         assert!(changed.is_empty(), "a block cannot be swapped onto a head");
-        assert_eq!(inventory.slot(ARMOUR_HEAD).cloned(), Some(Stack::new(helmet(), 1)));
+        assert_eq!(
+            inventory.slot(ARMOUR_HEAD).cloned(),
+            Some(Stack::new(helmet(), 1))
+        );
 
         inventory.click(ClickMode::Swap, ARMOUR_HEAD as i16, 1);
         assert_eq!(
@@ -1876,7 +1939,10 @@ mod tests {
         let mut inventory = with(&[(MAIN_START, head(), 9)]);
         inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
         inventory.click(ClickMode::Pickup, ARMOUR_HEAD as i16, 0);
-        assert_eq!(inventory.slot(ARMOUR_HEAD).cloned(), Some(Stack::new(head(), 1)));
+        assert_eq!(
+            inventory.slot(ARMOUR_HEAD).cloned(),
+            Some(Stack::new(head(), 1))
+        );
         assert_eq!(inventory.cursor().cloned(), Some(Stack::new(head(), 8)));
 
         // And a shift-click puts one on the head and then keeps going: the
@@ -1885,9 +1951,15 @@ mod tests {
         // a single pass leaves them in the slot that was clicked.
         let mut inventory = with(&[(MAIN_START, head(), 9)]);
         inventory.click(ClickMode::QuickMove, MAIN_START as i16, 0);
-        assert_eq!(inventory.slot(ARMOUR_HEAD).cloned(), Some(Stack::new(head(), 1)));
+        assert_eq!(
+            inventory.slot(ARMOUR_HEAD).cloned(),
+            Some(Stack::new(head(), 1))
+        );
         assert_eq!(inventory.slot(MAIN_START).cloned(), None);
-        assert_eq!(inventory.slot(HOTBAR_START).cloned(), Some(Stack::new(head(), 8)));
+        assert_eq!(
+            inventory.slot(HOTBAR_START).cloned(),
+            Some(Stack::new(head(), 8))
+        );
     }
 
     #[test]
@@ -1914,7 +1986,152 @@ mod tests {
         let mut inventory = with(&[(MAIN_START, stone(), 9), (OFFHAND, dirt(), 2)]);
         inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
         inventory.click(ClickMode::Pickup, OFFHAND as i16, 0);
-        assert_eq!(inventory.slot(OFFHAND).cloned(), Some(Stack::new(stone(), 9)));
+        assert_eq!(
+            inventory.slot(OFFHAND).cloned(),
+            Some(Stack::new(stone(), 9))
+        );
         assert_eq!(inventory.cursor().cloned(), Some(Stack::new(dirt(), 2)));
+    }
+    fn stone_with(components: ComponentPatch, count: u8) -> Stack {
+        Stack::with_components(item("minecraft:stone"), count, components)
+    }
+
+    #[test]
+    fn a_left_click_pours_one_stack_into_another_only_when_the_components_match() {
+        // The whole point of this module's change, from the player's side: a
+        // named stack poured onto a plain one would take the name off both.
+        let mut inventory = Inventory::default();
+        inventory.slots[MAIN_START] = Some(stone_with(named(), 16));
+        inventory.cursor = Some(stone_with(named(), 16));
+        inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
+        assert_eq!(
+            inventory.slot(MAIN_START).map(|s| s.count),
+            Some(32),
+            "two stacks with the same components must merge"
+        );
+        assert_eq!(inventory.cursor(), None);
+
+        let mut inventory = Inventory::default();
+        inventory.slots[MAIN_START] = Some(stone_with(named(), 16));
+        inventory.cursor = Some(stone_with(ComponentPatch::EMPTY, 16));
+        inventory.click(ClickMode::Pickup, MAIN_START as i16, 0);
+        // A swap, which is what vanilla does with two stacks that are not the
+        // same thing. Not a merge, and not a refusal.
+        assert_eq!(inventory.slot(MAIN_START).map(|s| s.count), Some(16));
+        assert_eq!(
+            inventory.slot(MAIN_START).map(|s| s.components.clone()),
+            Some(ComponentPatch::EMPTY)
+        );
+        assert_eq!(
+            inventory.cursor().map(|s| s.components.clone()),
+            Some(named())
+        );
+    }
+
+    #[test]
+    fn a_shift_click_finds_the_stack_that_matches_and_not_the_one_that_does_not() {
+        let mut inventory = Inventory::default();
+        // Two partial stacks of stone in the hotbar: one worn, one plain. A
+        // shift-clicked worn stack must top up the worn one and leave the
+        // plain one alone, even though the plain one comes first.
+        inventory.slots[HOTBAR_START] = Some(stone_with(ComponentPatch::EMPTY, 60));
+        inventory.slots[HOTBAR_START + 1] = Some(stone_with(worn(3), 60));
+        inventory.slots[MAIN_START] = Some(stone_with(worn(3), 8));
+        inventory.click(ClickMode::QuickMove, MAIN_START as i16, 0);
+        assert_eq!(inventory.slot(HOTBAR_START).map(|s| s.count), Some(60));
+        assert_eq!(inventory.slot(HOTBAR_START + 1).map(|s| s.count), Some(64));
+        // The four that did not fit took an empty slot rather than the plain
+        // stack sitting in front of it.
+        assert_eq!(inventory.slot(HOTBAR_START + 2).map(|s| s.count), Some(4));
+        assert_eq!(inventory.slot(MAIN_START), None);
+    }
+
+    #[test]
+    fn a_double_click_gathers_the_ones_that_are_the_same_thing() {
+        let mut inventory = Inventory {
+            cursor: Some(stone_with(worn(3), 1)),
+            ..Inventory::default()
+        };
+        inventory.slots[MAIN_START] = Some(stone_with(worn(3), 10));
+        inventory.slots[MAIN_START + 1] = Some(stone_with(ComponentPatch::EMPTY, 10));
+        inventory.slots[MAIN_START + 2] = Some(stone_with(worn(9), 10));
+        inventory.click(ClickMode::PickupAll, MAIN_START as i16, 0);
+        assert_eq!(inventory.cursor().map(|s| s.count), Some(11));
+        assert_eq!(inventory.slot(MAIN_START), None);
+        assert_eq!(inventory.slot(MAIN_START + 1).map(|s| s.count), Some(10));
+        assert_eq!(inventory.slot(MAIN_START + 2).map(|s| s.count), Some(10));
+    }
+
+    #[test]
+    fn a_drag_skips_a_slot_holding_the_same_item_with_different_components() {
+        // The drag decides at the moment a slot joins, and the share is divided
+        // by how many joined — so a slot filtered here makes the others' share
+        // larger rather than losing its own.
+        let mut inventory = Inventory {
+            cursor: Some(stone_with(named(), 20)),
+            ..Inventory::default()
+        };
+        inventory.slots[MAIN_START] = Some(stone_with(ComponentPatch::EMPTY, 1));
+        inventory.click(ClickMode::QuickCraft, OUTSIDE, 0);
+        inventory.click(ClickMode::QuickCraft, MAIN_START as i16, 1);
+        inventory.click(ClickMode::QuickCraft, (MAIN_START + 1) as i16, 1);
+        inventory.click(ClickMode::QuickCraft, OUTSIDE, 2);
+        assert_eq!(inventory.slot(MAIN_START).map(|s| s.count), Some(1));
+        assert_eq!(inventory.slot(MAIN_START + 1).map(|s| s.count), Some(20));
+    }
+
+    #[test]
+    fn a_middle_click_copies_the_components_the_way_vanilla_copies_the_stack() {
+        let mut inventory = Inventory::default();
+        inventory.slots[MAIN_START] = Some(stone_with(named(), 1));
+        inventory.click(ClickMode::Clone, MAIN_START as i16, 0);
+        assert_eq!(inventory.cursor().map(|s| s.count), Some(64));
+        assert_eq!(
+            inventory.cursor().map(|s| s.components.clone()),
+            Some(named())
+        );
+    }
+
+    #[test]
+    fn a_named_stack_survives_the_wire_and_comes_back_the_same_stack() {
+        let stack = stone_with(named(), 3);
+        let wire = to_wire(Some(&stack));
+        assert_eq!(from_wire(&wire), Some(stack));
+    }
+
+    #[test]
+    fn a_creative_write_keeps_the_components_the_client_sent() {
+        install_component_types();
+        let mut inventory = Inventory::default();
+        let sent = Slot::Present {
+            count: 1,
+            item_id: item("minecraft:stone").protocol_id() as i32,
+            components: named(),
+        };
+        assert_eq!(
+            inventory.set_creative(MAIN_START as i16, &sent),
+            Ok(Some(MAIN_START))
+        );
+        assert_eq!(
+            inventory.slot(MAIN_START).map(|s| s.components.clone()),
+            Some(named())
+        );
+    }
+
+    #[test]
+    fn the_boot_path_installs_the_component_registry() {
+        // Without this the whole feature is inert: `dust-protocol` refuses
+        // every component by number, and it would do it quietly, one packet at
+        // a time, on a server that looked like it was working.
+        install_component_types();
+        assert!(dust_protocol::components::type_names_installed());
+        assert_eq!(
+            dust_protocol::components::type_name(
+                dust_registry::Registry::from_name("minecraft:data_component_type")
+                    .and_then(|r| r.entry_id("minecraft:custom_name"))
+                    .expect("in the registry") as i32
+            ),
+            Some("minecraft:custom_name")
+        );
     }
 }

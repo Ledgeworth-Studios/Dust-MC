@@ -210,7 +210,9 @@ impl ComponentPatch {
         let mut cursor = Cursor::new(bytes);
         let patch = Self::read(&mut cursor)?;
         if cursor.left() != 0 {
-            return Err(DecodeError::TrailingBytes { left: cursor.left() });
+            return Err(DecodeError::TrailingBytes {
+                left: cursor.left(),
+            });
         }
         Ok(patch)
     }
@@ -367,8 +369,15 @@ fn measure_at(name: &str, bytes: &[u8], depth: u32) -> Result<usize, DecodeError
         | "intangible_projectile" => c.nbt()?,
 
         // A single VarInt.
-        "max_stack_size" | "max_damage" | "damage" | "rarity" | "custom_model_data"
-        | "repair_cost" | "map_id" | "map_post_processing" | "ominous_bottle_amplifier"
+        "max_stack_size"
+        | "max_damage"
+        | "damage"
+        | "rarity"
+        | "custom_model_data"
+        | "repair_cost"
+        | "map_id"
+        | "map_post_processing"
+        | "ominous_bottle_amplifier"
         | "base_color" => {
             c.var_int()?;
         }
@@ -680,10 +689,8 @@ impl<'a> Cursor<'a> {
     /// this allocate or loop past the buffer before the first read fails.
     fn count(&mut self, field: &'static str) -> Result<usize, DecodeError> {
         let value = self.var_int()?;
-        let count = usize::try_from(value).map_err(|_| DecodeError::NegativeLength {
-            field,
-            value,
-        })?;
+        let count =
+            usize::try_from(value).map_err(|_| DecodeError::NegativeLength { field, value })?;
         if count > self.left() {
             return Err(DecodeError::UnexpectedEnd {
                 wanted: count,
@@ -800,5 +807,314 @@ impl<'a> Cursor<'a> {
             self.var_int()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A network-NBT empty compound: TAG_Compound then TAG_End.
+    const EMPTY_COMPOUND: &[u8] = &[10, 0];
+
+    fn var(value: i32) -> Vec<u8> {
+        let mut out = Vec::new();
+        varint::write_var_int(value, &mut out);
+        out
+    }
+
+    fn text(value: &str) -> Vec<u8> {
+        let mut out = var(value.len() as i32);
+        out.extend_from_slice(value.as_bytes());
+        out
+    }
+
+    /// Glue byte strings together, so a layout reads like the layout.
+    fn bytes(parts: &[&[u8]]) -> Vec<u8> {
+        parts.concat()
+    }
+
+    /// Every layout is asked the same question: given these bytes and one more
+    /// byte after them that must not be touched, how long is the component?
+    ///
+    /// The trailing byte is the point. A walker that ran past the end would be
+    /// caught by the length, but a walker that stops *early* would not — so
+    /// the expected length is stated and the sentinel proves the walker did
+    /// not simply consume everything it was given.
+    #[track_caller]
+    fn walks(name: &str, body: &[u8]) {
+        let mut with_sentinel = body.to_vec();
+        with_sentinel.push(0xAB);
+        match measure(name, &with_sentinel) {
+            Ok(len) => assert_eq!(len, body.len(), "{name} walked the wrong number of bytes"),
+            Err(e) => panic!("{name} did not walk: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn the_simple_shapes_walk_exactly_as_far_as_they_go() {
+        walks("minecraft:damage", &var(431));
+        walks("minecraft:repair_cost", &var(0));
+        walks("minecraft:unbreakable", &[1]);
+        walks("minecraft:enchantment_glint_override", &[0]);
+        walks("minecraft:map_color", &[0, 1, 2, 3]);
+        walks(
+            "minecraft:note_block_sound",
+            &text("minecraft:block.note_block.harp"),
+        );
+        walks("minecraft:custom_data", EMPTY_COMPOUND);
+        walks("minecraft:custom_name", EMPTY_COMPOUND);
+    }
+
+    #[test]
+    fn a_component_whose_whole_value_is_its_presence_is_zero_bytes_long() {
+        // The trap this is here for: four component types have no payload at
+        // all, and a walker that read even one byte for them would put every
+        // later component one byte out.
+        for name in [
+            "minecraft:hide_tooltip",
+            "minecraft:hide_additional_tooltip",
+            "minecraft:creative_slot_lock",
+            "minecraft:fire_resistant",
+        ] {
+            assert_eq!(measure(name, &[0xAB, 0xCD]), Ok(0), "{name}");
+        }
+    }
+
+    #[test]
+    fn an_enchantment_list_walks_its_pairs_and_its_tooltip_flag() {
+        // Two enchantments and the show-in-tooltip byte.
+        walks(
+            "minecraft:enchantments",
+            &bytes(&[&var(2), &var(9), &var(5), &var(12), &var(1), &[1]]),
+        );
+        walks("minecraft:stored_enchantments", &bytes(&[&var(0), &[0]]));
+    }
+
+    #[test]
+    fn lore_is_a_count_and_that_many_whole_nbt_values() {
+        walks(
+            "minecraft:lore",
+            &bytes(&[&var(3), EMPTY_COMPOUND, EMPTY_COMPOUND, EMPTY_COMPOUND]),
+        );
+    }
+
+    #[test]
+    fn a_holder_is_an_id_or_the_thing_itself() {
+        // A banner layer naming a registered pattern: id + 1, then the colour.
+        walks(
+            "minecraft:banner_patterns",
+            &bytes(&[&var(1), &var(8), &var(3)]),
+        );
+        // The same layer with the pattern written out inline: a zero, then the
+        // asset id and the translation key.
+        walks(
+            "minecraft:banner_patterns",
+            &bytes(&[
+                &var(1),
+                &var(0),
+                &text("minecraft:block/base"),
+                &text("block.minecraft.banner.base"),
+                &var(3),
+            ]),
+        );
+    }
+
+    #[test]
+    fn a_holder_set_is_a_tag_name_or_a_count_of_ids() {
+        // A tool rule whose blocks are a tag: the leading zero means a name.
+        walks(
+            "minecraft:tool",
+            &bytes(&[
+                &var(1),
+                &var(0),
+                &text("minecraft:mineable/pickaxe"),
+                &[1],
+                &[0x3F, 0x80, 0, 0],
+                &[1],
+                &[1],
+                &[0x3F, 0x80, 0, 0],
+                &var(1),
+            ]),
+        );
+        // The same rule listing three block ids: three plus one, then three ids.
+        walks(
+            "minecraft:tool",
+            &bytes(&[
+                &var(1),
+                &var(4),
+                &var(1),
+                &var(2),
+                &var(3),
+                &[0],
+                &[0],
+                &[0x3F, 0x80, 0, 0],
+                &var(1),
+            ]),
+        );
+    }
+
+    #[test]
+    fn a_container_component_walks_the_stacks_inside_it_and_their_components() {
+        // A shulker box holding one named stack. The inner stack's own patch is
+        // walked by the same table, which is the recursion this needs to get
+        // right — an inner component skipped by the wrong length would put the
+        // *outer* component's end in the wrong place.
+        install_test_types();
+        let inner = bytes(&[
+            &var(1),              // count
+            &var(42),             // item id
+            &var(1),              // one added component
+            &var(0),              // no removals
+            &var(CUSTOM_NAME_ID), // custom_name
+            EMPTY_COMPOUND,
+        ]);
+        walks("minecraft:container", &bytes(&[&var(2), &inner, &var(0)]));
+    }
+
+    #[test]
+    fn an_effect_that_hides_another_effect_walks_both() {
+        // `hiddenEffect` is an optional *further* effect and the recursion is
+        // real; a walker that read the option flag and stopped would be short
+        // by a whole effect.
+        let inner = bytes(&[&var(0), &var(200), &[0, 1, 1], &[0]]);
+        let outer = bytes(&[&var(1), &var(600), &[0, 1, 1], &[1], &inner]);
+        walks(
+            "minecraft:potion_contents",
+            &bytes(&[&[0], &[0], &var(1), &var(3), &outer, &[0]]),
+        );
+    }
+
+    #[test]
+    fn a_component_type_this_build_has_no_layout_for_is_refused_by_name() {
+        assert!(matches!(
+            measure("minecraft:not_a_component", &[1, 2, 3]),
+            Err(DecodeError::Unsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn a_length_that_runs_past_the_buffer_is_refused_rather_than_wrapping() {
+        // A lore list claiming a thousand lines in six bytes. The count is
+        // bounded by what is left before anything is read, so this fails as a
+        // short buffer rather than looping a thousand times.
+        assert!(measure("minecraft:lore", &bytes(&[&var(1000), EMPTY_COMPOUND])).is_err());
+        assert!(measure("minecraft:lore", &bytes(&[&var(-1)])).is_err());
+    }
+
+    // -- the patch ---------------------------------------------------------
+
+    /// `custom_name`'s id in 1.21.1. Only ever used to *install a stub*, which
+    /// is why writing it here is not a second copy of the registry: the number
+    /// this test uses does not have to be Minecraft's, only consistent.
+    const CUSTOM_NAME_ID: i32 = 5;
+    const DAMAGE_ID: i32 = 3;
+
+    fn install_test_types() {
+        fn stub(id: i32) -> Option<&'static str> {
+            match id {
+                CUSTOM_NAME_ID => Some("minecraft:custom_name"),
+                DAMAGE_ID => Some("minecraft:damage"),
+                _ => None,
+            }
+        }
+        install_type_names(stub);
+    }
+
+    #[test]
+    fn an_empty_patch_costs_nothing_and_is_two_zero_bytes_on_the_wire() {
+        let patch = ComponentPatch::EMPTY;
+        assert!(patch.is_empty());
+        assert_eq!(patch.as_wire_bytes(), &[0, 0]);
+        assert_eq!(patch.to_hex(), None);
+    }
+
+    #[test]
+    fn two_patches_that_arrived_in_different_orders_are_one_patch() {
+        install_test_types();
+        let one = ComponentPatch::from_wire_bytes(&bytes(&[
+            &var(2),
+            &var(0),
+            &var(CUSTOM_NAME_ID),
+            EMPTY_COMPOUND,
+            &var(DAMAGE_ID),
+            &var(7),
+        ]))
+        .expect("walks");
+        let other = ComponentPatch::from_wire_bytes(&bytes(&[
+            &var(2),
+            &var(0),
+            &var(DAMAGE_ID),
+            &var(7),
+            &var(CUSTOM_NAME_ID),
+            EMPTY_COMPOUND,
+        ]))
+        .expect("walks");
+        assert_eq!(
+            one, other,
+            "the same components in two orders must compare equal"
+        );
+        assert_eq!(one.as_wire_bytes(), other.as_wire_bytes());
+    }
+
+    #[test]
+    fn two_patches_that_differ_in_one_component_are_two_patches() {
+        install_test_types();
+        let worn =
+            ComponentPatch::from_wire_bytes(&bytes(&[&var(1), &var(0), &var(DAMAGE_ID), &var(7)]))
+                .expect("walks");
+        let fresh =
+            ComponentPatch::from_wire_bytes(&bytes(&[&var(1), &var(0), &var(DAMAGE_ID), &var(8)]))
+                .expect("walks");
+        assert_ne!(worn, fresh);
+        assert_ne!(worn, ComponentPatch::EMPTY);
+    }
+
+    #[test]
+    fn a_patch_that_names_one_type_twice_is_refused() {
+        install_test_types();
+        let twice = bytes(&[
+            &var(2),
+            &var(0),
+            &var(DAMAGE_ID),
+            &var(7),
+            &var(DAMAGE_ID),
+            &var(8),
+        ]);
+        assert!(ComponentPatch::from_wire_bytes(&twice).is_err());
+    }
+
+    #[test]
+    fn a_patch_that_both_sets_and_removes_one_type_is_refused() {
+        install_test_types();
+        let both = bytes(&[&var(1), &var(1), &var(DAMAGE_ID), &var(7), &var(DAMAGE_ID)]);
+        assert!(ComponentPatch::from_wire_bytes(&both).is_err());
+    }
+
+    #[test]
+    fn removals_need_no_layout_and_survive_the_hex_the_save_writes() {
+        let patch = ComponentPatch::removing(&[9, 3, 3]);
+        let hex = patch.to_hex().expect("not empty");
+        assert_eq!(ComponentPatch::from_hex(&hex).expect("reads back"), patch);
+        // Sorted and deduplicated: no additions, two removals, 3 then 9.
+        assert_eq!(patch.as_wire_bytes(), &[0, 2, 3, 9]);
+    }
+
+    #[test]
+    fn hex_that_is_not_a_patch_is_refused_rather_than_becoming_one() {
+        assert!(ComponentPatch::from_hex("0").is_err());
+        assert!(ComponentPatch::from_hex("zz").is_err());
+        // Well-formed hex, but it claims a component and then ends.
+        assert!(ComponentPatch::from_hex("0100").is_err());
+    }
+
+    #[test]
+    fn a_patch_with_bytes_left_over_is_refused() {
+        install_test_types();
+        let trailing = bytes(&[&var(1), &var(0), &var(DAMAGE_ID), &var(7), &[0xFF]]);
+        assert!(matches!(
+            ComponentPatch::from_wire_bytes(&trailing),
+            Err(DecodeError::TrailingBytes { .. })
+        ));
     }
 }

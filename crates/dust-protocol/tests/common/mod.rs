@@ -1060,7 +1060,9 @@ fn play_frames(out: &mut Vec<Frame>) {
                             icon: Slot::Present {
                                 count: 1,
                                 item_id: 42,
-                                components: dust_protocol::components::ComponentPatch::removing(&[7]),
+                                components: dust_protocol::components::ComponentPatch::removing(&[
+                                    7
+                                ]),
                             },
                             frame: FrameType::Task,
                             flags: AdvancementDisplay::SHOW_TOAST,
