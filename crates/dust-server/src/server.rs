@@ -751,6 +751,7 @@ impl Server {
         let speed = dust_guard::SpeedLimit::new(config.server.movement_speed_limit);
         let collision = config.server.movement_collision;
         let data_path = config.data.path.clone();
+        let configured_seed = config.worldgen.seed;
 
         let fail = |message: String| -> ServerError {
             ServerError::NetworkBind {
@@ -1024,8 +1025,65 @@ impl Server {
         // directory is checked here — a world whose spawn this server cannot
         // read is one it would silently serve from the origin instead.
         let mut world_spawn = None;
+        // The generator, if the operator's own data can build one. A world
+        // file supplies its own seed; a server with no world file takes the
+        // one its configuration names.
+        //
+        // A seed is read from `level.dat` rather than configured for a saved
+        // world because the columns off the edge of a disc have to continue
+        // the world that is there. Generating them from a different seed would
+        // put a cliff where the file ends, which is a wrong answer that looks
+        // like a right one — worse than the plain that ran on before, which at
+        // least says out loud that it is not the world.
+        let world_directory = std::path::PathBuf::from(&world_source);
+        let seed = if world_source.is_empty() {
+            Some(configured_seed)
+        } else {
+            crate::net::level::seed_beside(&world_directory)
+        };
+        let generated = match (seed, data_path.as_deref()) {
+            (Some(seed), Some(path)) => crate::net::generated::beside(
+                std::path::Path::new(path),
+                seed,
+                flat.clone(),
+                opacity.clone(),
+                plains,
+                biomes.entries.len() as u32,
+                constants.clone(),
+            )
+            .map_err(fail)?
+            .map(|(world, report)| (world, report, seed)),
+            _ => None,
+        };
+        match &generated {
+            Some((_, report, seed)) => self
+                .options
+                .logger
+                .info("dust::worldgen", report.summary(*seed)),
+            None if data_path.is_none() => self.options.logger.info(
+                "dust::worldgen",
+                "no [data] path, so every column is the flat world: bedrock, three                  rows of dirt and grass at y -60"
+                    .to_owned(),
+            ),
+            None if seed.is_none() => self.options.logger.info(
+                "dust::worldgen",
+                format!(
+                    "no seed in the level.dat beside {world_source}, so a column that                      world does not contain is the flat world rather than the terrain                      its seed would have generated"
+                ),
+            ),
+            None => self.options.logger.info(
+                "dust::worldgen",
+                format!(
+                    "no {} under [data] path, so every column is the flat world;                      `cargo xtask extract --only worldgen` writes it",
+                    dust_gen::biome::FILE
+                ),
+            ),
+        }
         let source = if world_source.is_empty() {
-            crate::net::source::Source::Flat(Box::new(flat))
+            match generated {
+                Some((world, _, _)) => crate::net::source::Source::Generated(Box::new(world)),
+                None => crate::net::source::Source::Flat(Box::new(flat)),
+            }
         } else {
             let directory = std::path::PathBuf::from(&world_source);
             if !crate::net::source::AnvilWorld::is_region_directory(&directory) {
@@ -1057,13 +1115,22 @@ impl Server {
                     ),
                 },
             );
-            crate::net::source::Source::Anvil(Box::new(crate::net::source::AnvilWorld::new(
-                directory,
-                names,
-                flat,
-                opacity,
-                constants.clone(),
-            )))
+            crate::net::source::Source::Anvil(Box::new(match generated {
+                Some((world, _, _)) => crate::net::source::AnvilWorld::generating(
+                    directory,
+                    names,
+                    world,
+                    opacity,
+                    constants.clone(),
+                ),
+                None => crate::net::source::AnvilWorld::new(
+                    directory,
+                    names,
+                    flat,
+                    opacity,
+                    constants.clone(),
+                ),
+            }))
         };
 
         // The constants go into the world as well as into the session: the

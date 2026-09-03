@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 ctrlc.workspace = true
 dust-config.workspace = true
+dust-gen.workspace = true
 # The rules a client's claim is checked against; see src/net/session.rs.
 dust-guard.workspace = true
 # The game's rules about which state a placed block takes; see src/net/session.rs.

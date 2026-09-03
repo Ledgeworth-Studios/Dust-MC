@@ -51,6 +51,9 @@ The embedded JVM that runs plugin bytecode.
 
 World generation: the engine, and Dust's knobs over it.
 
+| Setting | Type | Default | When | Meaning |
+| --- | --- | --- | --- | --- |
+| `seed` | `i64` | `0` | restart | The seed a generated world is built from.  Only used when there is no world to read a seed out of: a server with `[server] world_source` set takes the seed from that world's own `level.dat`, because generating the columns off its edge from a different one would put a cliff where the disc ends.  The default is zero rather than a random number. Two servers started from the same configuration should serve the same world, and an operator who wants a different one should be able to say which. |
 
 ## `[worldgen.ores]`
 

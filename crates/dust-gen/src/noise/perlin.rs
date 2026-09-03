@@ -269,6 +269,49 @@ impl PerlinNoise {
         noise
     }
 
+    /// The stack `old_blended_noise` draws, which is not the stack every
+    /// other noise draws.
+    ///
+    /// Two differences, both of them contract rather than detail. The octaves
+    /// come **straight off one stream in reverse index order** rather than each
+    /// from its own `octave_<n>` hash, so the three stacks a blended noise
+    /// holds are three consecutive stretches of one sequence and the order they
+    /// are built in is part of the answer. And the amplitudes are not read from
+    /// a noise-parameters file at all: `octaves` is a closed range ending at 0
+    /// and every amplitude in it is 1.
+    pub fn create_legacy_for_blended_noise(random: &mut Xoroshiro, lowest_octave: i32) -> Self {
+        debug_assert!(lowest_octave < 0, "the range is -n..=0");
+        let count = (-lowest_octave + 1) as usize;
+        let mut levels: Vec<Option<ImprovedNoise>> = (0..count).map(|_| None).collect();
+        // `-firstOctave` is the index of octave zero, which is the last slot,
+        // and it is drawn first. The rest are drawn walking *down* from it.
+        let top = count - 1;
+        levels[top] = Some(ImprovedNoise::new(random));
+        for index in (0..top).rev() {
+            levels[index] = Some(ImprovedNoise::new(random));
+        }
+        let lowest_freq_input_factor = 2f64.powi(lowest_octave);
+        let lowest_freq_value_factor =
+            2f64.powi(count as i32 - 1) / (2f64.powi(count as i32) - 1.0);
+        let mut noise = Self {
+            levels,
+            amplitudes: vec![1.0; count],
+            lowest_freq_input_factor,
+            lowest_freq_value_factor,
+            max_value: 0.0,
+        };
+        noise.max_value = noise.edge_value(2.0);
+        noise
+    }
+
+    /// The octave a blended noise asks for by number, which counts from the
+    /// **top** of the stack: octave 0 is the last slot, the one drawn first.
+    pub fn octave(&self, index: usize) -> Option<&ImprovedNoise> {
+        self.levels
+            .get(self.levels.len().checked_sub(index + 1)?)?
+            .as_ref()
+    }
+
     fn edge_value(&self, edge: f64) -> f64 {
         let mut total = 0.0;
         let mut value_factor = self.lowest_freq_value_factor;
@@ -311,7 +354,7 @@ impl PerlinNoise {
 /// enough out, the fractional part stops carrying information. This is
 /// Minecraft's fold and it is part of the answer, not a guard: a world at
 /// x = 50,000,000 is the world this wrap produces.
-fn wrap(value: f64) -> f64 {
+pub(super) fn wrap(value: f64) -> f64 {
     value - lfloor(value / 3.3554432E7 + 0.5) as f64 * 3.3554432E7
 }
 

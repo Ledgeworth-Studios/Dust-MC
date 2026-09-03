@@ -52,6 +52,50 @@ pub struct WorldSpawn {
 /// The file name Minecraft gives a world's own record of itself.
 const LEVEL_DAT: &str = "level.dat";
 
+/// The seed of the world whose region directory this is.
+///
+/// `None` when there is no `level.dat`, when it cannot be read, or when it
+/// does not carry a seed — all three of which are the same answer to the
+/// caller, and none of them an error.
+///
+/// **That is deliberately softer than [`spawn_beside`], and the difference is
+/// what each one is for.** A spawn point that exists and is ignored puts every
+/// player in the wrong place in a world that is otherwise right, so an
+/// unreadable one stops the server. A seed is only ever used to generate the
+/// columns *off the edge* of the world file; not having one costs a plain
+/// there instead of terrain, which is what Dust served everywhere until this
+/// existed. Refusing to start over it would be refusing to serve a world this
+/// server can serve.
+pub fn seed_beside(region_directory: &Path) -> Option<i64> {
+    let world_directory = region_directory.parent()?;
+    let bytes = std::fs::read(world_directory.join(LEVEL_DAT)).ok()?;
+    read_seed(&bytes)
+}
+
+/// The seed inside a `level.dat`'s bytes, compressed or not.
+fn read_seed(bytes: &[u8]) -> Option<i64> {
+    let plain = dust_nbt::compression::decompress_detected(bytes, LEVEL_DAT_LIMIT).ok()?;
+    let document = dust_nbt::read::from_bytes(&plain).ok()?;
+    let dust_nbt::Tag::Compound(root) = &document.tag else {
+        return None;
+    };
+    let dust_nbt::Tag::Compound(data) = root.get("Data")? else {
+        return None;
+    };
+    // 1.16 moved it here from `Data.RandomSeed`, and both spellings are read:
+    // an operator with an older save is serving an older world, not a broken
+    // one.
+    if let Some(dust_nbt::Tag::Compound(settings)) = data.get("WorldGenSettings") {
+        if let Some(dust_nbt::Tag::Long(seed)) = settings.get("seed") {
+            return Some(*seed);
+        }
+    }
+    match data.get("RandomSeed") {
+        Some(dust_nbt::Tag::Long(seed)) => Some(*seed),
+        _ => None,
+    }
+}
+
 /// Read the spawn point of the world whose region directory this is.
 ///
 /// `Ok(None)` when there is no `level.dat` beside the directory. `Err` when
@@ -173,6 +217,39 @@ mod tests {
         data.insert("SpawnY", Tag::Int(67));
         data.insert("SpawnZ", Tag::Int(z));
         data
+    }
+
+    #[test]
+    fn the_seed_comes_out_of_either_place_a_world_has_kept_it() {
+        // 1.16 moved the seed from `Data.RandomSeed` into
+        // `Data.WorldGenSettings.seed`, and a server is asked to serve both.
+        let mut modern = spawn_of(0, 0);
+        let mut settings = Compound::new();
+        settings.insert("seed", Tag::Long(-4172144997902289642));
+        modern.insert("WorldGenSettings", Tag::Compound(settings));
+        assert_eq!(read_seed(&level_dat(modern)), Some(-4172144997902289642));
+
+        let mut ancient = spawn_of(0, 0);
+        ancient.insert("RandomSeed", Tag::Long(7));
+        assert_eq!(read_seed(&level_dat(ancient)), Some(7));
+    }
+
+    #[test]
+    fn a_world_file_with_no_seed_in_it_is_not_an_error() {
+        // Softer than the spawn read on purpose, and this is the test that
+        // says so: a missing seed costs a plain off the edge of the disc,
+        // which is what Dust served everywhere before there was a generator.
+        // A missing spawn point puts every player in the wrong place in a
+        // world that is otherwise right, and that one refuses to start.
+        assert_eq!(read_seed(&level_dat(spawn_of(0, 0))), None);
+        assert_eq!(read_seed(b"not a world file at all"), None);
+        assert!(read_spawn(b"not a world file at all").is_err());
+    }
+
+    #[test]
+    fn there_is_no_seed_beside_a_directory_with_no_world_file() {
+        let dir = temp_dir("no-seed");
+        assert_eq!(seed_beside(&dir.join("region")), None);
     }
 
     #[test]

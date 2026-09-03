@@ -405,18 +405,36 @@ impl BiomeSource {
 
     /// A sampler holding this thread's scratch space.
     pub fn sampler(&self) -> Sampler<'_> {
-        Sampler {
-            source: self,
-            evaluator: Evaluator::new(&self.climate.graph),
-        }
+        Sampler::over(&self.climate.graph, self.climate.roots, &self.parameters)
     }
 }
 
-/// One thread's view of a [`BiomeSource`].
+/// One thread's view of a biome source.
+///
+/// It holds the parameter list and the six climate roots rather than a whole
+/// [`BiomeSource`], so a caller that compiled the climate half as part of a
+/// larger router can sample biomes off *that* graph instead of building a
+/// second copy of twenty-five noise tables.
 #[derive(Debug, Clone)]
 pub struct Sampler<'a> {
-    source: &'a BiomeSource,
+    parameters: &'a BiomeParameters,
+    roots: [usize; 6],
     evaluator: Evaluator<'a>,
+}
+
+impl<'a> Sampler<'a> {
+    /// A sampler over a graph the caller already has.
+    pub fn over(
+        graph: &'a crate::noise::density::Graph,
+        roots: [usize; 6],
+        parameters: &'a BiomeParameters,
+    ) -> Self {
+        Self {
+            parameters,
+            roots,
+            evaluator: Evaluator::new(graph),
+        }
+    }
 }
 
 impl Sampler<'_> {
@@ -426,7 +444,7 @@ impl Sampler<'_> {
     pub fn climate(&mut self, quart_x: i32, quart_y: i32, quart_z: i32) -> [i64; 6] {
         let mut raw = [0.0f64; 6];
         self.evaluator.compute_all(
-            &self.source.climate.roots,
+            &self.roots,
             quart_x << 2,
             quart_y << 2,
             quart_z << 2,
@@ -441,10 +459,7 @@ impl Sampler<'_> {
     /// The biome at a cell, in quart coordinates.
     pub fn biome(&mut self, quart_x: i32, quart_y: i32, quart_z: i32) -> Option<u32> {
         let point = self.climate(quart_x, quart_y, quart_z);
-        self.source
-            .parameters
-            .nearest(&point)
-            .map(|region| region.id)
+        self.parameters.nearest(&point).map(|region| region.id)
     }
 }
 

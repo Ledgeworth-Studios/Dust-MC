@@ -25,6 +25,7 @@
 //! twice is computed once. Both are exact — every node here is a pure function
 //! of the point — so neither can change an answer, only the time it takes.
 
+use super::blended::BlendedNoise;
 use super::perlin::NormalNoise;
 
 /// One node of a compiled density-function graph.
@@ -44,10 +45,56 @@ pub enum Node {
     /// so the graph still says what vanilla's said.
     BlendAlpha,
     BlendOffset,
-    /// `cache_once` and `interpolated`: markers with no effect at a point.
+    /// `cache_once`: a marker with no effect at a point.
     Passthrough(usize),
-    /// `flat_cache` and `cache_2d`: markers that promise y-independence.
+    /// `cache_2d`: a memo on the block column. Exact — the argument is a
+    /// function of x and z alone.
     ColumnCache(usize),
+    /// `flat_cache`: **not** the same node as `cache_2d`, and the difference
+    /// is an answer and not a speed.
+    ///
+    /// Vanilla's `FlatCache` fills a table over the chunk's *quart* grid at
+    /// y = 0 and every block in a 4x4 column reads the same entry. So the
+    /// value at x = 5 is the value computed at x = 4. A memo keyed on the
+    /// exact block column would be a different generator — smoother, and not
+    /// Minecraft's.
+    FlatCache(usize),
+    /// `interpolated`: computed at the corners of a 4x8x4 cell and lerped
+    /// inside it. The terrain's shape *is* this interpolation; a version that
+    /// evaluated the argument at every block would be a different world.
+    ///
+    /// The payload is a slot in [`Graph::interpolated`], which holds the
+    /// argument; the node itself carries no argument index, so nothing can
+    /// evaluate one by accident at a position that is not a corner.
+    Interpolated(usize),
+    Clamp {
+        argument: usize,
+        min: f64,
+        max: f64,
+    },
+    Square(usize),
+    Cube(usize),
+    HalfNegative(usize),
+    QuarterNegative(usize),
+    Squeeze(usize),
+    /// Only one branch is evaluated, which is why a cave function can name a
+    /// hundred nodes and cost none of them above the surface.
+    RangeChoice {
+        input: usize,
+        min_inclusive: f64,
+        max_exclusive: f64,
+        in_range: usize,
+        out_of_range: usize,
+    },
+    /// `weird_scaled_sampler`: a noise whose *scale* is chosen by another
+    /// function, in four or five steps.
+    WeirdScaledSampler {
+        input: usize,
+        noise: usize,
+        rarity: Rarity,
+    },
+    /// `old_blended_noise`, indexed into the graph's blended noises.
+    Blended(usize),
     /// `shift_a`: the offset noise sampled at (x, 0, z).
     ShiftA(usize),
     /// `shift_b`: the offset noise sampled at (z, x, 0). Not a typo — that
@@ -99,12 +146,59 @@ pub struct Spline {
     pub points: Vec<SplinePoint>,
 }
 
+/// The two step functions `weird_scaled_sampler` picks a scale with.
+///
+/// Named after the data pack's own spelling rather than after what they do,
+/// because what they do is a table with no rule in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rarity {
+    Type1,
+    Type2,
+}
+
+impl Rarity {
+    /// The scale this mapper gives a value. Steps, not a curve.
+    pub fn scale(self, value: f64) -> f64 {
+        match self {
+            Self::Type1 => {
+                if value < -0.5 {
+                    0.75
+                } else if value < 0.0 {
+                    1.0
+                } else if value < 0.5 {
+                    1.5
+                } else {
+                    2.0
+                }
+            }
+            Self::Type2 => {
+                if value < -0.75 {
+                    0.5
+                } else if value < -0.5 {
+                    0.75
+                } else if value < 0.5 {
+                    1.0
+                } else if value < 0.75 {
+                    2.0
+                } else {
+                    3.0
+                }
+            }
+        }
+    }
+}
+
 /// A compiled graph, its splines, and the noises it names.
 #[derive(Debug, Clone)]
 pub struct Graph {
     pub nodes: Vec<Node>,
     pub splines: Vec<Spline>,
     pub noises: Vec<NormalNoise>,
+    /// One entry per `old_blended_noise` in the graph.
+    pub blended: Vec<BlendedNoise>,
+    /// One entry per `interpolated` node: the argument it samples at cell
+    /// corners. The index into this is the slot the node carries.
+    pub interpolated: Vec<usize>,
 }
 
 /// A graph plus the scratch space one thread needs to evaluate it.
@@ -122,6 +216,24 @@ pub struct Evaluator<'a> {
     column_stamp: Vec<u64>,
     column_generation: u64,
     column: (i32, i32),
+    flat_memo: Vec<f64>,
+    flat_stamp: Vec<u64>,
+    flat_generation: u64,
+    quart: (i32, i32),
+    /// One stamp counter for all three memos, so a stamp is unique across the
+    /// evaluator's life. That is what lets a nested evaluation at another
+    /// position borrow the memos and hand them back untouched: the outer
+    /// point's entries keep their own stamp and the inner point's can never
+    /// collide with it.
+    stamps: u64,
+    /// The current value of each `interpolated` node, one slot each.
+    lattice: Vec<f64>,
+    /// The interval each `interpolated` node is confined to over the whole of
+    /// the cell now being filled.
+    lattice_bounds: Vec<(f64, f64)>,
+    bounds_memo: Vec<(f64, f64)>,
+    bounds_stamp: Vec<u64>,
+    bounds_generation: u64,
 }
 
 impl<'a> Evaluator<'a> {
@@ -130,13 +242,239 @@ impl<'a> Evaluator<'a> {
         Self {
             graph,
             point_memo: vec![0.0; size],
-            point_stamp: vec![0; size],
+            // Never zero: the stamp counter starts at zero and only ever
+            // counts up, so an unwritten slot cannot match a live generation.
+            // A zero-initialised stamp beside a zero-initialised generation is
+            // a memo that answers before it has been filled.
+            point_stamp: vec![u64::MAX; size],
             point_generation: 0,
             column_memo: vec![0.0; size],
-            column_stamp: vec![0; size],
+            column_stamp: vec![u64::MAX; size],
             column_generation: 0,
             column: (i32::MIN, i32::MIN),
+            flat_memo: vec![0.0; size],
+            flat_stamp: vec![u64::MAX; size],
+            flat_generation: 0,
+            quart: (i32::MIN, i32::MIN),
+            stamps: 0,
+            lattice: vec![0.0; graph.interpolated.len()],
+            lattice_bounds: vec![(f64::NEG_INFINITY, f64::INFINITY); graph.interpolated.len()],
+            bounds_memo: vec![(0.0, 0.0); size],
+            bounds_stamp: vec![u64::MAX; size],
+            bounds_generation: 0,
         }
+    }
+
+    /// The value of one `interpolated` node's argument at a lattice corner.
+    ///
+    /// This is the only way to reach that argument, and it is deliberately not
+    /// `compute`: everywhere else the node answers with whatever
+    /// [`Self::set_interpolated`] last put in its slot, which is the lerp
+    /// inside the cell.
+    pub fn corner(&mut self, slot: usize, x: i32, y: i32, z: i32) -> f64 {
+        let argument = self.graph.interpolated[slot];
+        self.elsewhere(x, z, |evaluator| evaluator.eval(argument, x, y, z))
+    }
+
+    /// Put a slot's value for the block about to be asked for.
+    pub fn set_interpolated(&mut self, slot: usize, value: f64) {
+        self.lattice[slot] = value;
+    }
+
+    /// Say which cell is being filled, by handing over every interpolated
+    /// node's eight corners.
+    ///
+    /// A trilinear interpolation is a convex combination of its corners, so
+    /// the smallest and the largest of the eight bound the node over the whole
+    /// cell — exactly, with nothing assumed.
+    pub fn enter_cell(&mut self, corners: impl Fn(usize) -> [f64; 8]) {
+        for slot in 0..self.lattice_bounds.len() {
+            let eight = corners(slot);
+            let mut low = eight[0];
+            let mut high = eight[0];
+            for value in &eight[1..] {
+                low = low.min(*value);
+                high = high.max(*value);
+            }
+            self.lattice_bounds[slot] = (low, high);
+        }
+        self.stamps += 1;
+        self.bounds_generation = self.stamps;
+    }
+
+    /// The interval `root` is confined to anywhere in the cell
+    /// [`Self::enter_cell`] named.
+    ///
+    /// **This can only ever be wider than the truth.** Every arm below is the
+    /// interval arithmetic for its node, and every node whose value depends on
+    /// the position inside the cell — a noise, a spline, the old blended noise
+    /// — answers with the widest interval it could ever take anywhere, or with
+    /// an infinite one where that is not known. A caller may therefore act on
+    /// `high <= 0` or `low > 0` and cannot act on anything else.
+    ///
+    /// The walk stops at an `interpolated` node, which is why it is cheap: the
+    /// noise under it is bounded by the eight corners that were sampled
+    /// anyway, and the forty octaves below that are never reached.
+    pub fn cell_bounds(&mut self, root: usize) -> (f64, f64) {
+        if self.bounds_stamp[root] == self.bounds_generation {
+            return self.bounds_memo[root];
+        }
+        let value = self.bounds_uncached(root);
+        self.bounds_stamp[root] = self.bounds_generation;
+        self.bounds_memo[root] = value;
+        value
+    }
+
+    fn bounds_uncached(&mut self, index: usize) -> (f64, f64) {
+        let unknown = (f64::NEG_INFINITY, f64::INFINITY);
+        match self.graph.nodes[index] {
+            Node::Constant(value) => (value, value),
+            Node::Interpolated(slot) => self.lattice_bounds[slot],
+            Node::Passthrough(a) | Node::ColumnCache(a) | Node::FlatCache(a) => self.cell_bounds(a),
+            Node::Abs(a) => {
+                let (low, high) = self.cell_bounds(a);
+                if low >= 0.0 {
+                    (low, high)
+                } else if high <= 0.0 {
+                    (-high, -low)
+                } else {
+                    (0.0, (-low).max(high))
+                }
+            }
+            Node::Add(a, b) => {
+                let (al, ah) = self.cell_bounds(a);
+                let (bl, bh) = self.cell_bounds(b);
+                (al + bl, ah + bh)
+            }
+            Node::Mul(a, b) => {
+                let (al, ah) = self.cell_bounds(a);
+                let (bl, bh) = self.cell_bounds(b);
+                let corners = [al * bl, al * bh, ah * bl, ah * bh];
+                if corners.iter().any(|value| value.is_nan()) {
+                    unknown
+                } else {
+                    corners
+                        .iter()
+                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), v| {
+                            (l.min(*v), h.max(*v))
+                        })
+                }
+            }
+            Node::Min(a, b) => {
+                let (al, ah) = self.cell_bounds(a);
+                let (bl, bh) = self.cell_bounds(b);
+                (al.min(bl), ah.min(bh))
+            }
+            Node::Max(a, b) => {
+                let (al, ah) = self.cell_bounds(a);
+                let (bl, bh) = self.cell_bounds(b);
+                (al.max(bl), ah.max(bh))
+            }
+            Node::BlendAlpha => (1.0, 1.0),
+            Node::BlendOffset => (0.0, 0.0),
+            Node::Clamp { argument, min, max } => {
+                let (low, high) = self.cell_bounds(argument);
+                (low.clamp(min, max), high.clamp(min, max))
+            }
+            Node::Square(a) => {
+                let (low, high) = self.cell_bounds(a);
+                let ends = [low * low, high * high];
+                if low <= 0.0 && high >= 0.0 {
+                    (0.0, ends[0].max(ends[1]))
+                } else {
+                    (ends[0].min(ends[1]), ends[0].max(ends[1]))
+                }
+            }
+            // Cubing and both negative-halving rules are increasing, so the
+            // ends stay the ends.
+            Node::Cube(a) => {
+                let (low, high) = self.cell_bounds(a);
+                (low * low * low, high * high * high)
+            }
+            Node::HalfNegative(a) => {
+                let half = |value: f64| if value > 0.0 { value } else { value * 0.5 };
+                let (low, high) = self.cell_bounds(a);
+                (half(low), half(high))
+            }
+            Node::QuarterNegative(a) => {
+                let quarter = |value: f64| if value > 0.0 { value } else { value * 0.25 };
+                let (low, high) = self.cell_bounds(a);
+                (quarter(low), quarter(high))
+            }
+            Node::Squeeze(a) => {
+                let squeeze = |value: f64| {
+                    let clamped = value.clamp(-1.0, 1.0);
+                    clamped / 2.0 - clamped * clamped * clamped / 24.0
+                };
+                let (low, high) = self.cell_bounds(a);
+                (squeeze(low), squeeze(high))
+            }
+            // Either branch may be taken somewhere in the cell, so the answer
+            // is both of them. The input is not consulted: narrowing on it
+            // would be a claim about where in the cell the branch flips.
+            Node::RangeChoice {
+                in_range,
+                out_of_range,
+                ..
+            } => {
+                let (al, ah) = self.cell_bounds(in_range);
+                let (bl, bh) = self.cell_bounds(out_of_range);
+                (al.min(bl), ah.max(bh))
+            }
+            Node::YClampedGradient {
+                from_value,
+                to_value,
+                ..
+            } => (from_value.min(to_value), from_value.max(to_value)),
+            Node::Noise { noise, .. } => {
+                let max = self.graph.noises[noise].max_value();
+                (-max, max)
+            }
+            Node::ShiftedNoise { noise, .. } => {
+                let max = self.graph.noises[noise].max_value();
+                (-max, max)
+            }
+            Node::ShiftA(noise) | Node::ShiftB(noise) => {
+                let max = self.graph.noises[noise].max_value() * 4.0;
+                (-max, max)
+            }
+            Node::WeirdScaledSampler { noise, rarity, .. } => {
+                let scale = match rarity {
+                    Rarity::Type1 => 2.0,
+                    Rarity::Type2 => 3.0,
+                };
+                (0.0, scale * self.graph.noises[noise].max_value())
+            }
+            // A spline extends linearly past its ends and the old blended
+            // noise's range is not derived here. Both sit under an
+            // `interpolated` in every dimension vanilla ships, so an infinite
+            // interval here costs nothing and claims nothing.
+            Node::Spline(_) | Node::Blended(_) => unknown,
+        }
+    }
+
+    /// Run `body` as if it were a fresh point, then give the caller's point
+    /// back.
+    ///
+    /// A flat cache reads its argument at the quart corner and y = 0, and a
+    /// lattice corner reads it at the cell corner. Both are *other points*, and
+    /// letting them write the current point's memo would answer a later node
+    /// with a value sampled somewhere else — the shape of defect this project
+    /// keeps finding, in a place a test would have to be looking for it.
+    fn elsewhere<R>(&mut self, x: i32, z: i32, body: impl FnOnce(&mut Self) -> R) -> R {
+        let point = self.point_generation;
+        let column = self.column_generation;
+        let at = self.column;
+        let flat = self.flat_generation;
+        let quart = self.quart;
+        self.start_point(x, z);
+        let value = body(self);
+        self.point_generation = point;
+        self.column_generation = column;
+        self.column = at;
+        self.flat_generation = flat;
+        self.quart = quart;
+        value
     }
 
     /// Evaluate `root` at a block position.
@@ -159,10 +497,18 @@ impl<'a> Evaluator<'a> {
     }
 
     fn start_point(&mut self, x: i32, z: i32) {
-        self.point_generation += 1;
+        self.stamps += 1;
+        self.point_generation = self.stamps;
         if self.column != (x, z) {
             self.column = (x, z);
-            self.column_generation += 1;
+            self.stamps += 1;
+            self.column_generation = self.stamps;
+        }
+        let quart = (x >> 2, z >> 2);
+        if self.quart != quart {
+            self.quart = quart;
+            self.stamps += 1;
+            self.flat_generation = self.stamps;
         }
     }
 
@@ -197,6 +543,83 @@ impl<'a> Evaluator<'a> {
             Node::BlendAlpha => 1.0,
             Node::BlendOffset => 0.0,
             Node::Passthrough(argument) => self.eval(argument, x, y, z),
+            Node::Interpolated(slot) => self.lattice[slot],
+            Node::Clamp { argument, min, max } => self.eval(argument, x, y, z).clamp(min, max),
+            Node::Square(argument) => {
+                let value = self.eval(argument, x, y, z);
+                value * value
+            }
+            Node::Cube(argument) => {
+                let value = self.eval(argument, x, y, z);
+                value * value * value
+            }
+            Node::HalfNegative(argument) => {
+                let value = self.eval(argument, x, y, z);
+                if value > 0.0 {
+                    value
+                } else {
+                    value * 0.5
+                }
+            }
+            Node::QuarterNegative(argument) => {
+                let value = self.eval(argument, x, y, z);
+                if value > 0.0 {
+                    value
+                } else {
+                    value * 0.25
+                }
+            }
+            Node::Squeeze(argument) => {
+                let value = self.eval(argument, x, y, z).clamp(-1.0, 1.0);
+                value / 2.0 - value * value * value / 24.0
+            }
+            Node::RangeChoice {
+                input,
+                min_inclusive,
+                max_exclusive,
+                in_range,
+                out_of_range,
+            } => {
+                let value = self.eval(input, x, y, z);
+                // One branch, never both. The caves under a mountain are a
+                // hundred nodes that a column above ground never touches.
+                if value >= min_inclusive && value < max_exclusive {
+                    self.eval(in_range, x, y, z)
+                } else {
+                    self.eval(out_of_range, x, y, z)
+                }
+            }
+            Node::WeirdScaledSampler {
+                input,
+                noise,
+                rarity,
+            } => {
+                let scale = rarity.scale(self.eval(input, x, y, z));
+                scale
+                    * self.graph.noises[noise]
+                        .value(
+                            f64::from(x) / scale,
+                            f64::from(y) / scale,
+                            f64::from(z) / scale,
+                        )
+                        .abs()
+            }
+            Node::Blended(noise) => self.graph.blended[noise].value(x, y, z),
+            Node::FlatCache(argument) => {
+                if self.flat_stamp[index] == self.flat_generation {
+                    return self.flat_memo[index];
+                }
+                // The quart corner, and y = 0. Vanilla fills this table before
+                // the chunk is walked and every block in the 4x4 column reads
+                // the entry; a memo on the exact column would be a smoother
+                // world than Minecraft's.
+                let qx = self.quart.0 << 2;
+                let qz = self.quart.1 << 2;
+                let value = self.elsewhere(qx, qz, |e| e.eval(argument, qx, 0, qz));
+                self.flat_stamp[index] = self.flat_generation;
+                self.flat_memo[index] = value;
+                value
+            }
             Node::ColumnCache(argument) => {
                 if self.column_stamp[index] == self.column_generation {
                     return self.column_memo[index];
@@ -356,6 +779,8 @@ mod tests {
             nodes,
             splines,
             noises: Vec::new(),
+            blended: Vec::new(),
+            interpolated: Vec::new(),
         }
     }
 

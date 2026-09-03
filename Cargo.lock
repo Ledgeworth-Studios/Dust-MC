@@ -365,6 +365,7 @@ version = "0.0.0"
 dependencies = [
  "ctrlc",
  "dust-config",
+ "dust-gen",
  "dust-guard",
  "dust-nbt",
  "dust-net",
