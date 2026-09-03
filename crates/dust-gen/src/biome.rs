@@ -99,10 +99,65 @@ impl Region {
     }
 }
 
+/// A run of consecutive rows and the smallest box holding all of them.
+///
+/// The search is a scan in table order, because the first of two equally near
+/// regions wins and the table's order is the answer. A box over a run of rows
+/// keeps that order exactly and lets the scan skip the whole run: every term of
+/// a distance is a square, so the distance to the box is a floor under the
+/// distance to any row inside it, and a floor that has already passed the best
+/// answer cannot be beaten by anything the run holds.
+///
+/// This is not a heuristic and it cannot change an answer. It is checked
+/// against the exhaustive scan over the real table, on both seeds.
+#[derive(Debug, Clone, Copy)]
+struct Run {
+    axes: [Span; 6],
+    /// The smallest offset in the run, since offset is a cost added to every
+    /// row and the smallest one is the floor for the run.
+    offset: i64,
+    start: usize,
+    end: usize,
+}
+
+/// How many rows a run holds.
+///
+/// 64, measured on 1.21.1's own 7,593-row overworld table over the same 81
+/// chunks the ladder scores: 16 and 32 rows per run come out at about 200
+/// chunk columns per second and 64 at about 290, because a smaller run pays
+/// its own box test more often than the rows it saves. Wider than 64 the boxes
+/// stop being tight enough to skip anything. See decision record 0013.
+const RUN: usize = 64;
+
+impl Run {
+    /// Whether anything in this run can still beat `best`.
+    ///
+    /// The same early exit `Region::fitness` has and for the same reason: a
+    /// total that has already passed the best cannot come back down, and most
+    /// runs are rejected on their first or second axis. With the whole floor
+    /// computed every time, the run tests were themselves the largest cost in
+    /// the search once the skipping worked.
+    fn can_beat(&self, point: &[i64; 6], best: i64) -> bool {
+        let mut total = self.offset * self.offset;
+        if total >= best {
+            return false;
+        }
+        for (axis, &value) in self.axes.iter().zip(point) {
+            let distance = axis.distance(value);
+            total += distance * distance;
+            if total >= best {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// The whole parameter list for one dimension.
 #[derive(Debug, Clone, Default)]
 pub struct BiomeParameters {
     regions: Vec<Region>,
+    runs: Vec<Run>,
 }
 
 /// What is wrong with a `dust-biomes.tsv`.
@@ -212,7 +267,34 @@ impl BiomeParameters {
         if regions.is_empty() {
             return Err(ParametersError::Empty);
         }
-        Ok(Self { regions })
+        Ok(Self::over(regions))
+    }
+
+    /// Build the skip index over a list of regions.
+    fn over(regions: Vec<Region>) -> Self {
+        let mut runs = Vec::with_capacity(regions.len().div_ceil(RUN));
+        for start in (0..regions.len()).step_by(RUN) {
+            let end = (start + RUN).min(regions.len());
+            let mut axes = [Span {
+                min: i64::MAX,
+                max: i64::MIN,
+            }; 6];
+            let mut offset = i64::MAX;
+            for region in &regions[start..end] {
+                for (slot, span) in axes.iter_mut().zip(region.axes) {
+                    slot.min = slot.min.min(span.min);
+                    slot.max = slot.max.max(span.max);
+                }
+                offset = offset.min(region.offset);
+            }
+            runs.push(Run {
+                axes,
+                offset,
+                start,
+                end,
+            });
+        }
+        Self { regions, runs }
     }
 
     pub fn len(&self) -> usize {
@@ -242,10 +324,15 @@ impl BiomeParameters {
     pub fn nearest(&self, point: &[i64; 6]) -> Option<&Region> {
         let mut best = i64::MAX;
         let mut found = None;
-        for region in &self.regions {
-            if let Some(fitness) = region.fitness(point, best) {
-                best = fitness;
-                found = Some(region);
+        for run in &self.runs {
+            if !run.can_beat(point, best) {
+                continue;
+            }
+            for region in &self.regions[run.start..run.end] {
+                if let Some(fitness) = region.fitness(point, best) {
+                    best = fitness;
+                    found = Some(region);
+                }
             }
         }
         found
@@ -446,6 +533,67 @@ mod tests {
                 .expect("a nearest")
                 .1;
             assert_eq!(pruned, exhaustive, "at {}", point[0]);
+        }
+    }
+
+    /// The skip index cannot change an answer, over a table big enough to have
+    /// one.
+    ///
+    /// The test above covers three regions, which is one run and therefore no
+    /// skipping at all. This one is 500 regions over eight runs, with spans
+    /// that overlap on every axis so that the box around a run is genuinely
+    /// wider than its rows, and it checks the answer against the exhaustive
+    /// scan the index is supposed to be indistinguishable from — the *region*
+    /// and not just its id, so a tie resolved to a different row is caught.
+    #[test]
+    fn the_skip_index_answers_exactly_what_the_whole_scan_answers() {
+        let mut rows = Vec::new();
+        for index in 0..500i64 {
+            // Spans that wander rather than tile, so a run's box is loose and
+            // the floor under it is a real floor rather than the rows again.
+            let low = (index * 37) % 20_001 - 10_000;
+            let width = (index * 911) % 4_000;
+            rows.push(format!(
+                "{}\tminecraft:b{index}\t{}\t{}\t-10000\t10000\t-10000\t10000\
+                 \t-10000\t10000\t-10000\t10000\t{}\t{}\t{}",
+                index,
+                low,
+                low + width,
+                -10_000 + (index * 53) % 20_001,
+                -10_000 + (index * 53) % 20_001 + width,
+                index % 3 * 100,
+            ));
+        }
+        let parameters = BiomeParameters::parse(&table(&rows)).expect("parsed");
+        assert_eq!(parameters.len(), 500);
+        assert!(
+            parameters.runs.len() > 1,
+            "a single run would not exercise the skipping at all"
+        );
+
+        for step in -100..=100i64 {
+            let point = [step * 137, 0, 0, 0, 0, step * -91];
+            let indexed = parameters.nearest(&point).expect("a nearest");
+            // The whole scan, in table order, with no index and no early exit.
+            let mut best = i64::MAX;
+            let mut exhaustive: Option<&Region> = None;
+            for region in parameters.regions() {
+                let mut total = region.offset * region.offset;
+                for (axis, &value) in region.axes.iter().zip(&point) {
+                    let distance = axis.distance(value);
+                    total += distance * distance;
+                }
+                if total < best {
+                    best = total;
+                    exhaustive = Some(region);
+                }
+            }
+            let exhaustive = exhaustive.expect("a nearest");
+            assert_eq!(
+                indexed.id, exhaustive.id,
+                "at {point:?}: the index picked {} and the whole scan picked {}",
+                indexed.name, exhaustive.name
+            );
         }
     }
 

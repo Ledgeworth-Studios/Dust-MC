@@ -677,12 +677,17 @@ fn build(
         // and every chunk would otherwise be given the climate at the origin.
         let base_x = vanilla.pos().x * 4;
         let base_z = vanilla.pos().z * 4;
-        for y in (height.min_y()..top).step_by(4) {
-            for z in (0..16u32).step_by(4) {
-                for x in (0..16u32).step_by(4) {
-                    let biome =
-                        biomes.biome(base_x + (x as i32 >> 2), y >> 2, base_z + (z as i32 >> 2));
-                    if let Some(biome) = biome {
+        // **Column outermost, y innermost, and that is not a style choice.**
+        // Four of the six climate functions are wrapped in a `flat_cache`,
+        // which means they do not depend on y and the sampler holds them for
+        // as long as the column does not move. Walking y on the outside moves
+        // the column on every cell and throws that away.
+        for z in (0..16u32).step_by(4) {
+            for x in (0..16u32).step_by(4) {
+                let quart_x = base_x + (x as i32 >> 2);
+                let quart_z = base_z + (z as i32 >> 2);
+                for y in (height.min_y()..top).step_by(4) {
+                    if let Some(biome) = biomes.biome(quart_x, y >> 2, quart_z) {
                         chunk.set_biome(x, y, z, biome);
                     }
                 }
