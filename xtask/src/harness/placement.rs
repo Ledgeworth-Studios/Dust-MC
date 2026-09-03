@@ -64,6 +64,11 @@ struct Answer {
     /// which varied the click and never the surroundings — see
     /// [`neighbourhood`] for what that is read as.
     before: String,
+    /// What the cell the placement landed in held **before** it, read back off
+    /// the wire a tick ahead of the click. Empty for a survey that never put
+    /// anything there, which is every run before `--into` existed and is read
+    /// as air.
+    into: String,
     /// Which of those six the placement *changed*, in the same spelling. This
     /// is the second half of a neighbour rule and the half a survey of placed
     /// states alone cannot see: a fence has to connect when the block beside it
@@ -477,6 +482,7 @@ fn dust_state_id(
         cursor_y: answer.cursor_y.parse().ok()?,
         yaw: answer.yaw,
         pitch: answer.pitch,
+        into: into(answer),
     };
     let placed = dust_sim::placement::state_for(block, click);
     let Some(solid) = solid else {
@@ -498,6 +504,24 @@ fn dust_state_id(
 /// where the fifty-five fences, walls and panes in the grid's own wrong list
 /// come from: they are wrong about the *support*, and a scorer that read those
 /// rows as "nothing was beside it" would call them all correct.
+/// What the cell the placement landed in held before it landed.
+///
+/// **Air for a row with no column, and that is a claim rather than a
+/// convenience.** Both surveys written before this one clear the volume and
+/// put back one stone support, so the cell the placement goes into really is
+/// empty in every one of their rows — a reader that guessed anything else
+/// would be scoring 10,400 rows against a cell that was never there.
+///
+/// A state this build cannot parse reads as air too, for the reason the
+/// neighbourhood reader gives: it is a version skew, and the run already
+/// counts those.
+fn into(answer: &Answer) -> BlockState {
+    if answer.into.is_empty() || answer.into == "-" {
+        return air();
+    }
+    parse_state(&answer.into).unwrap_or_else(air)
+}
+
 fn neighbourhood(answer: &Answer) -> Around {
     let mut around = Around::empty();
     if answer.before.is_empty() || answer.before == "-" {
@@ -732,6 +756,7 @@ fn parse_answers(text: &str) -> Result<Vec<Answer>, String> {
         out.push(Answer {
             before: fields.get(7).copied().unwrap_or_default().to_owned(),
             after: fields.get(8).copied().unwrap_or_default().to_owned(),
+            into: fields.get(9).copied().unwrap_or_default().to_owned(),
             item: fields[0].to_owned(),
             face: fields[1]
                 .parse::<u8>()
@@ -873,6 +898,7 @@ minecraft:allium\t1\t0\t0\t0.25\tminecraft:air\tstood
                     result: Outcome::Refused,
                     before: String::new(),
                     after: String::new(),
+                    into: String::new(),
                 },
                 &None,
                 None,

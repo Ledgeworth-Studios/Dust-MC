@@ -1313,13 +1313,13 @@ where
                     // lands at all is the same question asked of the cell it
                     // chose.
                     Ok(play::serverbound::Packet::UseItemOnBlock(use_on)) => {
-                        let state = held_block(
-                            ctx.item_blocks.as_deref(),
-                            inventory.held(),
-                            ctx.blocks.placeable,
-                            &use_on.hit,
-                            rotation,
-                        );
+                        // **Where it lands is decided before what it is**, and
+                        // that order is the whole of this change: three of the
+                        // placement rules read the cell the block is going
+                        // into — water makes it wet, snow makes it deeper, a
+                        // slab makes it double — and none of them can be asked
+                        // until the cell is known.
+                        //
                         // Reach is checked against the block that was
                         // *clicked* and not the one the placement lands in.
                         // They differ by a block, and the clicked one is the
@@ -1327,14 +1327,24 @@ where
                         // would refuse a legitimate click at the edge of range
                         // and allow one aimed back towards the player from just
                         // outside it.
+                        let holding = held_place(ctx.item_blocks.as_deref(), inventory.held());
                         let target = placement(
                             &ctx.world,
                             ctx.constants.as_deref(),
                             use_on.hit.location,
-                            use_on.hit.face,
+                            &use_on.hit,
+                            holding,
+                            rotation,
                         )
                         .filter(|_| within_reach(ctx, position, use_on.hit.location));
                         if let Some(target) = target {
+                            let state = held_block(
+                                holding,
+                                ctx.blocks.placeable,
+                                &use_on.hit,
+                                rotation,
+                                cell(&ctx.world, target),
+                            );
                             ctx.world.place_block(target, state, me.entity_id);
                         }
                         send_play(
@@ -1545,13 +1555,13 @@ where
 /// server with no `[data] path` behaving the way it always has rather than
 /// refusing right-clicks.
 fn held_block(
-    table: Option<&dust_registry::ItemBlocks>,
-    held: Option<dust_registry::Item>,
+    holding: Option<dust_registry::Block>,
     fallback: u32,
     hit: &play::serverbound::BlockHit,
     rotation: (f32, f32),
+    into: dust_registry::BlockState,
 ) -> u32 {
-    let Some(block) = table.zip(held).and_then(|(table, item)| table.places(item)) else {
+    let Some(block) = holding else {
         return fallback;
     };
     // A face the protocol does not have is one this server has no answer for;
@@ -1559,19 +1569,56 @@ fn held_block(
     // treat it as the clicked block, so the least surprising thing left is to
     // place the block's own default and let the rest of the click be as wrong
     // as it already is.
-    let Some(face) = dust_sim::placement::Face::from_protocol(hit.face) else {
+    let Some(click) = click(hit, rotation, into) else {
         return block.default_state().id();
     };
-    dust_sim::placement::state_for(
-        block,
-        dust_sim::placement::Click {
-            face,
-            cursor_y: hit.cursor_y,
-            yaw: rotation.0,
-            pitch: rotation.1,
-        },
-    )
-    .id()
+    dust_sim::placement::state_for(block, click).id()
+}
+
+/// The block a held item puts down, if there is a table to ask and an item to
+/// ask about.
+///
+/// Split out of [`held_block`] because the answer is needed *twice* and a
+/// second lookup is a second chance to disagree: once to choose where the
+/// placement lands — snow stacks and a slab doubles only under their own item
+/// — and once to choose the state that goes there.
+fn held_place(
+    table: Option<&dust_registry::ItemBlocks>,
+    held: Option<dust_registry::Item>,
+) -> Option<dust_registry::Block> {
+    table.zip(held).and_then(|(table, item)| table.places(item))
+}
+
+/// A right-click, as `dust_sim::placement` reads one.
+fn click(
+    hit: &play::serverbound::BlockHit,
+    rotation: (f32, f32),
+    into: dust_registry::BlockState,
+) -> Option<dust_sim::placement::Click> {
+    Some(dust_sim::placement::Click {
+        face: dust_sim::placement::Face::from_protocol(hit.face)?,
+        cursor_y: hit.cursor_y,
+        yaw: rotation.0,
+        pitch: rotation.1,
+        into,
+    })
+}
+
+/// What a cell holds, as a state rather than an id.
+///
+/// An id the world holds that this build has no state for is read as air. The
+/// alternative is a panic on a world saved by a different version, and the
+/// rules that read this cell all treat air as "nothing to say" — which is the
+/// right answer for a block nobody here can describe.
+fn cell(
+    world: &super::edits::EditedWorld,
+    at: dust_protocol::types::Position,
+) -> dust_registry::BlockState {
+    dust_registry::BlockState::from_id(world.block_at(at)).unwrap_or_else(|| {
+        dust_registry::Block::from_name("minecraft:air")
+            .expect("every version of the game has air")
+            .default_state()
+    })
 }
 
 /// Whether a player at `feet` may act on the block at `location`.
@@ -1617,12 +1664,14 @@ fn within_reach(
 /// # What this is not
 ///
 /// Minecraft's own answer is `canBeReplaced(state, BlockPlaceContext)`, which
-/// is this property *and* a question about what the player is holding: deep
-/// snow may only be replaced by more snow, and a slab only by its own other
-/// half. What the table carries is the no-argument property, so a placement
-/// into eight layers of snow replaces them where vanilla would refuse. Same
-/// class of gap as the default block state going down: it needs a placement
-/// context, and there is not one yet.
+/// is this property *and* a question about what the player is holding — and
+/// that second half is now asked. `dust_sim::placement::replaces_clicked` and
+/// `replaces_beside` are the two shapes of it: **deep snow may only be
+/// replaced by more snow, and a slab only by its own other half.** They are
+/// two functions rather than one because the clicked cell and the cell behind
+/// it are different questions: a bottom slab clicked on its *top* face doubles,
+/// and the same slab clicked from underneath does not — the placement goes
+/// below it instead.
 ///
 /// Nothing here validates *reach*, either — a player may still place a block
 /// from across the map, which is stated with the rest of the missing rules in
@@ -1636,9 +1685,11 @@ fn placement(
     world: &super::edits::EditedWorld,
     constants: Option<&dust_registry::BlockConstants>,
     clicked: dust_protocol::types::Position,
-    face: u8,
+    hit: &play::serverbound::BlockHit,
+    holding: Option<dust_registry::Block>,
+    rotation: (f32, f32),
 ) -> Option<dust_protocol::types::Position> {
-    let beside = offset(clicked, face);
+    let beside = offset(clicked, hit.face);
     // With nothing to ask, the old rule stands: the face, always, and never a
     // refusal. **Not `BlockConstants::replaceable`'s own default**, which
     // answers true and would send every placement into the block that was
@@ -1648,10 +1699,23 @@ fn placement(
     let Some(table) = constants.filter(|table| table.has_replaceable()) else {
         return Some(beside);
     };
-    if table.replaceable(world.block_at(clicked)) {
+    // And with no block in hand there is nothing for the item-aware half of
+    // the rule to be about, so it is the plain column on its own — exactly
+    // what this did before that half existed.
+    let (Some(block), Some(click)) = (holding, click(hit, rotation, cell(world, clicked))) else {
+        return if table.replaceable(world.block_at(clicked)) {
+            Some(clicked)
+        } else {
+            table.replaceable(world.block_at(beside)).then_some(beside)
+        };
+    };
+    let there = cell(world, clicked);
+    if dust_sim::placement::replaces_clicked(block, there, table.replaceable(there.id()), click) {
         return Some(clicked);
     }
-    table.replaceable(world.block_at(beside)).then_some(beside)
+    let past = cell(world, beside);
+    dust_sim::placement::replaces_beside(block, past, table.replaceable(past.id()))
+        .then_some(beside)
 }
 
 /// The block one step off `face` from `location`.
@@ -2067,6 +2131,42 @@ mod tests {
     ///
     /// The situation the placement rules answer most plainly, so a test about
     /// *which block* goes down is not also a test about which state.
+    /// A state id read back as a state, so a test can name the property it is
+    /// about rather than an integer.
+    trait PipeState {
+        fn pipe_state(self) -> dust_registry::BlockState;
+    }
+
+    impl PipeState for u32 {
+        fn pipe_state(self) -> dust_registry::BlockState {
+            dust_registry::BlockState::from_id(self).expect("a real state")
+        }
+    }
+
+    /// An empty cell, which is what a placement landed in before this server
+    /// asked what was already there.
+    fn nothing() -> dust_registry::BlockState {
+        dust_registry::Block::from_name("minecraft:air")
+            .expect("this build has air")
+            .default_state()
+    }
+
+    /// A click on one face of the block at the origin.
+    ///
+    /// The location is ignored — every caller passes the position it means
+    /// separately — so what this carries is the face and the cursor, which is
+    /// all the two rules under test read.
+    fn hit(face: u8, cursor_y: f32) -> play::serverbound::BlockHit {
+        play::serverbound::BlockHit {
+            location: Position { x: 0, y: 0, z: 0 },
+            face,
+            cursor_x: 0.5,
+            cursor_y,
+            cursor_z: 0.5,
+            inside_block: false,
+        }
+    }
+
     fn on_top() -> play::serverbound::BlockHit {
         play::serverbound::BlockHit {
             location: Position { x: 0, y: 0, z: 0 },
@@ -2133,7 +2233,7 @@ mod tests {
         let table = replaceable(&["minecraft:air"]);
         let ground = surface();
         assert_eq!(
-            placement(&world, Some(&table), ground, 1),
+            placement(&world, Some(&table), ground, &hit(1, 0.5), None, (0.0, 0.0)),
             Some(Position {
                 y: ground.y + 1,
                 ..ground
@@ -2155,7 +2255,7 @@ mod tests {
         };
         assert!(world.set_block(at, grass.default_state().id()));
         assert_eq!(
-            placement(&world, Some(&table), at, 1),
+            placement(&world, Some(&table), at, &hit(1, 0.5), None, (0.0, 0.0)),
             Some(at),
             "into the grass, not above it"
         );
@@ -2174,7 +2274,105 @@ mod tests {
             ..surface()
         };
         // Face 1 is up, and the cell above a buried block is more ground.
-        assert_eq!(placement(&world, Some(&table), buried, 1), None);
+        assert_eq!(
+            placement(&world, Some(&table), buried, &hit(1, 0.5), None, (0.0, 0.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_ninth_layer_of_snow_goes_on_top_of_the_drift_and_a_fourth_goes_into_it() {
+        // The item-aware half of `canBeReplaced`, which the plain column
+        // cannot express: the *same state* is replaceable by a shovel-load of
+        // anything else and not by more snow. Eight layers is a full block a
+        // player walks on, and a ninth used to flatten it back to one.
+        let world = world();
+        let snow = Block::from_name("minecraft:snow").expect("this build has snow");
+        let table = replaceable(&["minecraft:air", "minecraft:snow"]);
+        let at = Position {
+            y: surface().y + 1,
+            ..surface()
+        };
+        let deep = snow
+            .default_state()
+            .with("layers", "8")
+            .expect("snow has layers");
+        assert!(world.set_block(at, deep.id()));
+        assert_eq!(world.block_at(at), deep.id(), "the drift is really there");
+        assert_eq!(
+            placement(
+                &world,
+                Some(&table),
+                at,
+                &hit(1, 0.5),
+                Some(snow),
+                (0.0, 0.0)
+            ),
+            Some(Position { y: at.y + 1, ..at }),
+            "a ninth layer goes on top of the drift and does not flatten it"
+        );
+        // A shallower drift takes the layer instead, which is the same cell
+        // answering the opposite way to the same click.
+        let shallow = snow
+            .default_state()
+            .with("layers", "3")
+            .expect("snow has layers");
+        assert!(world.set_block(at, shallow.id()));
+        assert_eq!(
+            placement(
+                &world,
+                Some(&table),
+                at,
+                &hit(1, 0.5),
+                Some(snow),
+                (0.0, 0.0)
+            ),
+            Some(at),
+            "into the drift, which then gets a fourth layer"
+        );
+        assert_eq!(
+            held_block(Some(snow), FALLBACK, &hit(1, 0.5), (0.0, 0.0), shallow)
+                .pipe_state()
+                .property("layers"),
+            Some("4")
+        );
+    }
+
+    #[test]
+    fn a_block_placed_into_water_comes_out_waterlogged() {
+        // The wiring, end to end: the cell is read, it reaches the rule, and
+        // the state that comes back is wet. Before this, a fence post in a
+        // river replaced the water and left a dry hole in it.
+        let world = world();
+        let water = Block::from_name("minecraft:water").expect("this build has water");
+        let fence = Block::from_name("minecraft:oak_fence").expect("this build has fences");
+        let table = replaceable(&["minecraft:air", "minecraft:water"]);
+        let at = Position {
+            y: surface().y + 1,
+            ..surface()
+        };
+        assert!(world.set_block(at, water.default_state().id()));
+        let target = placement(
+            &world,
+            Some(&table),
+            at,
+            &hit(1, 0.5),
+            Some(fence),
+            (0.0, 0.0),
+        );
+        assert_eq!(target, Some(at), "into the water and not above it");
+        assert_eq!(
+            held_block(
+                Some(fence),
+                FALLBACK,
+                &hit(1, 0.5),
+                (0.0, 0.0),
+                cell(&world, at)
+            )
+            .pipe_state()
+            .property("waterlogged"),
+            Some("true")
+        );
     }
 
     #[test]
@@ -2199,7 +2397,7 @@ mod tests {
         assert!(!old.has_replaceable());
         let ground = surface();
         assert_eq!(
-            placement(&world, Some(&old), ground, 1),
+            placement(&world, Some(&old), ground, &hit(1, 0.5), None, (0.0, 0.0)),
             Some(Position {
                 y: ground.y + 1,
                 ..ground
@@ -2220,7 +2418,7 @@ mod tests {
             ..surface()
         };
         assert_eq!(
-            placement(&world, None, buried, 1),
+            placement(&world, None, buried, &hit(1, 0.5), None, (0.0, 0.0)),
             Some(Position {
                 y: buried.y + 1,
                 ..buried
@@ -2237,11 +2435,11 @@ mod tests {
         let table = table();
         let stairs = Block::from_name("minecraft:oak_stairs").expect("this build has stairs");
         let placed = held_block(
-            Some(&table),
-            Some(item("minecraft:oak_stairs")),
+            held_place(Some(&table), Some(item("minecraft:oak_stairs"))),
             FALLBACK,
             &on_top(),
             (90.0, 0.0),
+            nothing(),
         );
         assert_ne!(placed, stairs.default_state().id(), "not the default state");
         let state = dust_registry::BlockState::from_id(placed).expect("a real state");
@@ -2258,11 +2456,11 @@ mod tests {
             .id();
         assert_eq!(
             held_block(
-                Some(&table),
-                Some(item("minecraft:cobblestone")),
+                held_place(Some(&table), Some(item("minecraft:cobblestone"))),
                 FALLBACK,
                 &on_top(),
-                (0.0, 0.0)
+                (0.0, 0.0),
+                nothing()
             ),
             expected
         );
@@ -2280,11 +2478,11 @@ mod tests {
             .id();
         assert_eq!(
             held_block(
-                Some(&table),
-                Some(item("minecraft:wheat_seeds")),
+                held_place(Some(&table), Some(item("minecraft:wheat_seeds"))),
                 FALLBACK,
                 &on_top(),
-                (0.0, 0.0)
+                (0.0, 0.0),
+                nothing()
             ),
             wheat
         );
@@ -2295,16 +2493,22 @@ mod tests {
     fn an_empty_hand_and_an_item_that_places_nothing_both_fall_back() {
         let table = table();
         assert_eq!(
-            held_block(Some(&table), None, FALLBACK, &on_top(), (0.0, 0.0)),
+            held_block(
+                held_place(Some(&table), None),
+                FALLBACK,
+                &on_top(),
+                (0.0, 0.0),
+                nothing()
+            ),
             FALLBACK
         );
         assert_eq!(
             held_block(
-                Some(&table),
-                Some(item("minecraft:diamond_sword")),
+                held_place(Some(&table), Some(item("minecraft:diamond_sword"))),
                 FALLBACK,
                 &on_top(),
-                (0.0, 0.0)
+                (0.0, 0.0),
+                nothing()
             ),
             FALLBACK,
             "a sword places nothing, and nothing is the fallback and not air"
@@ -2319,11 +2523,11 @@ mod tests {
         // dropped packet.
         assert_eq!(
             held_block(
-                None,
-                Some(item("minecraft:cobblestone")),
+                held_place(None, Some(item("minecraft:cobblestone"))),
                 FALLBACK,
                 &on_top(),
-                (0.0, 0.0)
+                (0.0, 0.0),
+                nothing()
             ),
             FALLBACK
         );
