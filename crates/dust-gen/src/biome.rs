@@ -153,6 +153,81 @@ impl Run {
     }
 }
 
+/// The quart cell `BiomeManager` reads a block position's biome out of.
+///
+/// A biome is stored per 4x4x4 cell, and Minecraft does **not** simply divide:
+/// it offsets the position by two, then picks whichever of the eight
+/// surrounding cell corners wins a hash-fiddled distance. That is what makes a
+/// biome edge wobble by a block or two instead of running down a grid line, and
+/// a surface rule that asked the grid directly would put beach sand in a
+/// straight line along a coast.
+///
+/// `zoom_seed` is [`crate::noise::rng::obfuscate_seed`] of the world seed, not
+/// the world seed.
+pub fn blurred_quart(zoom_seed: i64, x: i32, y: i32, z: i32) -> (i32, i32, i32) {
+    let (bx, by, bz) = (x - 2, y - 2, z - 2);
+    let (cx, cy, cz) = (bx >> 2, by >> 2, bz >> 2);
+    let dx = f64::from(bx & 3) / 4.0;
+    let dy = f64::from(by & 3) / 4.0;
+    let dz = f64::from(bz & 3) / 4.0;
+    let mut best = 0usize;
+    let mut nearest = f64::INFINITY;
+    for corner in 0..8usize {
+        let low_x = corner & 4 == 0;
+        let low_y = corner & 2 == 0;
+        let low_z = corner & 1 == 0;
+        let distance = fiddled_distance(
+            zoom_seed,
+            if low_x { cx } else { cx + 1 },
+            if low_y { cy } else { cy + 1 },
+            if low_z { cz } else { cz + 1 },
+            if low_x { dx } else { dx - 1.0 },
+            if low_y { dy } else { dy - 1.0 },
+            if low_z { dz } else { dz - 1.0 },
+        );
+        if nearest > distance {
+            best = corner;
+            nearest = distance;
+        }
+    }
+    (
+        if best & 4 == 0 { cx } else { cx + 1 },
+        if best & 2 == 0 { cy } else { cy + 1 },
+        if best & 1 == 0 { cz } else { cz + 1 },
+    )
+}
+
+fn fiddled_distance(seed: i64, x: i32, y: i32, z: i32, dx: f64, dy: f64, dz: f64) -> f64 {
+    let mut state = seed;
+    for coordinate in [x, y, z, x, y, z] {
+        state = next_seed(state, i64::from(coordinate));
+    }
+    let first = fiddle(state);
+    state = next_seed(state, seed);
+    let second = fiddle(state);
+    state = next_seed(state, seed);
+    let third = fiddle(state);
+    square(dz + third) + square(dy + second) + square(dx + first)
+}
+
+/// `LinearCongruentialGenerator.next`, which is a hash and not a generator
+/// here: it is stepped six times over the coordinates before anything is read.
+fn next_seed(seed: i64, step: i64) -> i64 {
+    seed.wrapping_mul(
+        seed.wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407),
+    )
+    .wrapping_add(step)
+}
+
+fn fiddle(state: i64) -> f64 {
+    (f64::from((state >> 24).rem_euclid(1024) as i32) / 1024.0 - 0.5) * 0.9
+}
+
+fn square(value: f64) -> f64 {
+    value * value
+}
+
 /// The whole parameter list for one dimension.
 #[derive(Debug, Clone, Default)]
 pub struct BiomeParameters {

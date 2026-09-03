@@ -31,27 +31,42 @@ use std::path::Path;
 use crate::noise::build::{router, BuildError, NoiseSettings, Router};
 use crate::noise::density::Evaluator;
 
-/// What the noise stage puts in a cell.
+/// What a generated cell holds.
 ///
-/// Three answers and not a block state, because which block state each one is
-/// belongs to the caller's registry and not to a generator. A `u8` because a
-/// chunk's worth is ninety-six kibibytes of scratch and it is reused.
+/// Not a block state, because which block state each one is belongs to the
+/// caller's registry and not to a generator. A `u8` because a chunk's worth is
+/// ninety-six kibibytes of scratch and it is reused.
+///
+/// The noise stage answers with the first three. [`Material::Surface`] is what
+/// a surface rule claimed, and its index is into the rules' own palette —
+/// which the caller resolves once, at boot, rather than per block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
 pub enum Material {
-    Air = 0,
+    Air,
     /// The dimension's `default_block`.
-    Solid = 1,
+    Solid,
     /// The dimension's `default_fluid`, below the level the settings name.
-    Fluid = 2,
+    Fluid,
+    /// `crate::surface::Rules::palette()[index]`.
+    Surface(u8),
 }
 
 impl Material {
     pub fn from_code(code: u8) -> Self {
         match code {
+            0 => Self::Air,
             1 => Self::Solid,
             2 => Self::Fluid,
-            _ => Self::Air,
+            other => Self::Surface(other - 3),
+        }
+    }
+
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Air => 0,
+            Self::Solid => 1,
+            Self::Fluid => 2,
+            Self::Surface(index) => 3 + index,
         }
     }
 }
@@ -117,6 +132,10 @@ impl Terrain {
 
     pub fn router(&self) -> &Router {
         &self.router
+    }
+
+    pub fn router_mut(&mut self) -> &mut Router {
+        &mut self.router
     }
 
     /// How many cells a [`Filler`]'s output holds, which is 256 per world row.
@@ -249,7 +268,7 @@ impl Filler<'_> {
                                 let row = (block_y - min_y) as usize * 256;
                                 for step_z in 0..terrain.cell_width {
                                     let line = row + (lz + step_z) * 16 + lx;
-                                    out[line..line + terrain.cell_width].fill(material as u8);
+                                    out[line..line + terrain.cell_width].fill(material.code());
                                 }
                             }
                             continue;
@@ -290,7 +309,7 @@ impl Filler<'_> {
                                 let row = (block_y - min_y) as usize;
                                 out[row * 256
                                     + (block_z - base_z) as usize * 16
-                                    + (block_x - base_x) as usize] = material as u8;
+                                    + (block_x - base_x) as usize] = material.code();
                             }
                         }
                     }
@@ -383,6 +402,10 @@ fn lerp(delta: f64, start: f64, end: f64) -> f64 {
 pub struct Generator {
     terrain: Terrain,
     parameters: crate::biome::BiomeParameters,
+    /// The seed the biome blur fiddles with, which is a hash of the world seed
+    /// and not the world seed. Computed once because it is a SHA-256 and a
+    /// surface rule asks for a biome at every solid block of every column.
+    zoom_seed: i64,
 }
 
 impl Generator {
@@ -395,7 +418,25 @@ impl Generator {
         Ok(Self {
             terrain: Terrain::new(data_root, dimension, seed)?,
             parameters,
+            zoom_seed: crate::noise::rng::obfuscate_seed(seed),
         })
+    }
+
+    /// The dimension's surface rules, or `None` if its settings carry none.
+    pub fn surface(&self) -> Option<&crate::surface::Rules> {
+        self.terrain.router().surface.as_ref()
+    }
+
+    /// Point the surface rules' biome conditions at a registry's own ids.
+    ///
+    /// Separate from [`Generator::new`] because a generator is built from a
+    /// data pack and bound to a *running* registry, and the two are not the
+    /// same thing — the pack is the operator's and the ids are this build's.
+    pub fn bind_surface_biomes(&mut self, id_of: impl Fn(&str) -> Option<u32>) -> Vec<String> {
+        match self.terrain.router_mut().surface.as_mut() {
+            Some(rules) => rules.bind_biomes(id_of),
+            None => Vec::new(),
+        }
     }
 
     pub fn terrain(&self) -> &Terrain {
@@ -414,32 +455,71 @@ impl Generator {
         &mut self.parameters
     }
 
-    /// One thread's scratch: a terrain filler and a biome sampler over the one
-    /// graph.
+    /// One thread's scratch: a terrain filler, a biome sampler and a surface
+    /// painter over the one graph.
     pub fn columns(&self) -> Columns<'_> {
         let router = self.terrain.router();
         Columns {
             filler: self.terrain.filler(),
             biomes: crate::biome::Sampler::over(&router.graph, router.climate, &self.parameters),
+            painter: router.surface.as_ref().map(|rules| {
+                crate::surface::Painter::new(
+                    rules,
+                    &router.graph,
+                    &router.settings,
+                    router.initial_density,
+                )
+            }),
+            zoom_seed: self.zoom_seed,
             materials: vec![0u8; self.terrain.cells_per_chunk()],
         }
     }
 }
 
-/// The scratch one thread needs to generate columns: two evaluators over one
+/// The scratch one thread needs to generate columns: three evaluators over one
 /// shared graph, and the chunk-sized material buffer they fill.
 #[derive(Debug, Clone)]
 pub struct Columns<'a> {
     filler: Filler<'a>,
     biomes: crate::biome::Sampler<'a>,
+    painter: Option<crate::surface::Painter<'a>>,
+    zoom_seed: i64,
     materials: Vec<u8>,
 }
 
 impl<'a> Columns<'a> {
-    /// Generate one chunk's materials and hand back the buffer holding them.
+    /// Generate one chunk's materials — the noise stage and nothing past it.
+    ///
+    /// Kept beside [`Columns::surface`] rather than replaced by it, because
+    /// the ladder in `cargo xtask harness worldgen` scores the two as separate
+    /// rungs and a rung that could only be reached through the one above it
+    /// would not say what the surface rules bought.
     pub fn terrain(&mut self, chunk_x: i32, chunk_z: i32) -> &[u8] {
         self.filler.fill(chunk_x, chunk_z, &mut self.materials);
         &self.materials
+    }
+
+    /// The noise stage with the dimension's surface rules painted over it.
+    ///
+    /// The same buffer, so a caller pays for one chunk of scratch and not two.
+    pub fn surface(&mut self, chunk_x: i32, chunk_z: i32) -> &[u8] {
+        self.filler.fill(chunk_x, chunk_z, &mut self.materials);
+        if let Some(painter) = self.painter.as_mut() {
+            painter.paint(
+                chunk_x,
+                chunk_z,
+                &mut self.materials,
+                &mut self.biomes,
+                self.zoom_seed,
+            );
+        }
+        &self.materials
+    }
+
+    /// How many times the rules asked something this generator declines to
+    /// answer, and how many blocks a badlands band decided.
+    pub fn declined(&self) -> (u64, u64) {
+        self.painter.as_ref().map_or((0, 0), |p| p.declined())
     }
 
     pub fn biomes(&mut self) -> &mut crate::biome::Sampler<'a> {

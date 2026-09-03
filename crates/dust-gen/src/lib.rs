@@ -22,6 +22,7 @@ pub mod biome;
 pub mod generated;
 pub mod noise;
 pub mod ore_density;
+pub mod surface;
 pub mod terrain;
 pub mod vanilla_ores;
 pub mod worldgen;

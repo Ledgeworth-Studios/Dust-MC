@@ -102,6 +102,27 @@ impl Xoroshiro {
         (self.next_u64() >> 11) as f64 * 1.1102230246251565E-16
     }
 
+    /// Java's `nextFloat()`: 24 bits, and **an `f32` before it is anything
+    /// else**.
+    ///
+    /// The width is the whole point. `vertical_gradient` compares this against
+    /// a chance computed in `f64`, and a 53-bit draw would agree with
+    /// Minecraft about the bedrock roof almost everywhere and disagree at the
+    /// edges — the shape of wrong this project keeps finding.
+    pub fn next_f32(&mut self) -> f32 {
+        (self.next_u64() >> 40) as f32 * 5.9604645E-8
+    }
+
+    /// Java's `nextBoolean()`: the low bit of a whole draw, not a comparison.
+    pub fn next_bool(&mut self) -> bool {
+        self.next_u64() & 1 != 0
+    }
+
+    /// Java's `nextIntBetweenInclusive(min, max)`, both ends included.
+    pub fn next_i32_between_inclusive(&mut self, min: i32, max: i32) -> i32 {
+        min + self.next_i32_below(max - min + 1)
+    }
+
     /// Split off the positional factory this stream seeds.
     ///
     /// Consumes two draws, which is why the order noises are *built* in still
@@ -129,6 +150,31 @@ impl Positional {
         let (lo, hi) = seed_from_hash_of(name);
         Xoroshiro::from_parts(lo ^ self.lo, hi ^ self.hi)
     }
+
+    /// The stream belonging to a **position**, which is what a surface rule
+    /// rolls its dice from.
+    ///
+    /// Only the low word is disturbed: the high word is the factory's own, so
+    /// two factories forked from different names give different worlds at the
+    /// same block.
+    pub fn at(&self, x: i32, y: i32, z: i32) -> Xoroshiro {
+        Xoroshiro::from_parts(position_seed(x, y, z) ^ self.lo, self.hi)
+    }
+}
+
+/// `Mth.getSeed`: three coordinates folded into one word.
+///
+/// The shift is arithmetic and the multiply wraps, both deliberately — this is
+/// a hash and not an arithmetic identity.
+pub fn position_seed(x: i32, y: i32, z: i32) -> u64 {
+    let mut seed = (i64::from(x.wrapping_mul(3129871))
+        ^ (i64::from(z).wrapping_mul(116129781))
+        ^ i64::from(y)) as i64;
+    seed = seed
+        .wrapping_mul(seed)
+        .wrapping_mul(42317861)
+        .wrapping_add(seed.wrapping_mul(11));
+    (seed >> 16) as u64
 }
 
 /// Minecraft's 64-to-128-bit seed upgrade.
@@ -218,6 +264,99 @@ fn md5(message: &[u8]) -> [u8; 16] {
     out
 }
 
+/// Minecraft's "obfuscated" world seed: the first eight bytes of the SHA-256
+/// of the seed, both read little-endian.
+///
+/// It is the seed the biome blur fiddles with, and it is *not* the world seed.
+/// A blur run on the world seed itself would put biome edges in plausible but
+/// different places, which is the kind of wrong that looks right.
+pub fn obfuscate_seed(seed: i64) -> i64 {
+    let digest = sha256(&seed.to_le_bytes());
+    i64::from_le_bytes(digest[..8].try_into().expect("eight bytes"))
+}
+
+/// SHA-256, because the biome zoom seed is one.
+///
+/// Here for the same reason [`md5`] is: not a security primitive, offered as
+/// nobody's, and private to this module because the only thing that may depend
+/// on it is a number Minecraft computed the same way.
+fn sha256(message: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut state: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+
+    let mut padded = message.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&((message.len() as u64) * 8).to_be_bytes());
+
+    let mut words = [0u32; 64];
+    for block in padded.chunks_exact(64) {
+        for (index, word) in words.iter_mut().enumerate().take(16) {
+            *word = u32::from_be_bytes(
+                block[index * 4..index * 4 + 4]
+                    .try_into()
+                    .expect("four bytes"),
+            );
+        }
+        for index in 16..64 {
+            let a = words[index - 15];
+            let b = words[index - 2];
+            let s0 = a.rotate_right(7) ^ a.rotate_right(18) ^ (a >> 3);
+            let s1 = b.rotate_right(17) ^ b.rotate_right(19) ^ (b >> 10);
+            words[index] = words[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(words[index - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        for index in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choose = (e & f) ^ (!e & g);
+            let one = h
+                .wrapping_add(s1)
+                .wrapping_add(choose)
+                .wrapping_add(K[index])
+                .wrapping_add(words[index]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let two = s0.wrapping_add(majority);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(one);
+            d = c;
+            c = b;
+            b = a;
+            a = one.wrapping_add(two);
+        }
+        for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *slot = slot.wrapping_add(value);
+        }
+    }
+
+    let mut out = [0u8; 32];
+    for (chunk, word) in out.chunks_exact_mut(4).zip(state) {
+        chunk.copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,6 +425,58 @@ mod tests {
                 let drawn = random.next_i32_below(bound);
                 assert!((0..bound).contains(&drawn), "{drawn} outside 0..{bound}");
             }
+        }
+    }
+
+    #[test]
+    fn sha256_agrees_with_the_published_vectors() {
+        let hex =
+            |bytes: [u8; 32]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
+        assert_eq!(
+            hex(sha256(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex(sha256(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // Longer than one block, so the second-block path is exercised too.
+        assert_eq!(
+            hex(sha256(
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            )),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
+
+    #[test]
+    fn a_position_stream_is_a_function_of_the_position() {
+        let factory = Xoroshiro::from_seed(7).fork_positional();
+        assert_eq!(
+            factory.at(3, -5, 9).next_u64(),
+            factory.at(3, -5, 9).next_u64()
+        );
+        assert_ne!(
+            factory.at(3, -5, 9).next_u64(),
+            factory.at(3, -5, 10).next_u64()
+        );
+        // The y is folded in without being multiplied, so two positions one
+        // block apart in y are the pair most likely to collide.
+        assert_ne!(
+            factory.at(0, 0, 0).next_u64(),
+            factory.at(0, 1, 0).next_u64()
+        );
+    }
+
+    #[test]
+    fn next_float_is_twenty_four_bits_wide() {
+        let mut random = Xoroshiro::from_seed(3);
+        for _ in 0..1024 {
+            let drawn = random.next_f32();
+            assert!((0.0..1.0).contains(&drawn), "{drawn} outside 0..1");
+            // Every draw is a multiple of 2^-24. A 53-bit draw narrowed to an
+            // f32 would not be.
+            assert_eq!(drawn, (drawn * 16777216.0).round() / 16777216.0);
         }
     }
 

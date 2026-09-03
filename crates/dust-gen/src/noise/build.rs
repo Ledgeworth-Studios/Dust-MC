@@ -94,6 +94,15 @@ pub struct ClimateGraph {
     pub roots: [usize; 6],
 }
 
+/// The one positional factory a world has.
+///
+/// Every noise, every surface rule's die and every aquifer draws from this,
+/// and it is a pure function of the seed — which is why two servers with the
+/// same seed and the same data pack serve the same world.
+pub fn positional_factory(seed: i64) -> Positional {
+    Xoroshiro::from_seed(seed).fork_positional()
+}
+
 /// The shape of a dimension's noise, as its settings file states it.
 ///
 /// Not one of these numbers is written here. `cell_width` and `cell_height`
@@ -130,7 +139,14 @@ pub struct Router {
     /// `final_density`: positive is the default block, and everything else is
     /// air or fluid.
     pub final_density: usize,
+    /// `initial_density_without_jaggedness`, which a surface rule walks down
+    /// to find the coarse height of a column. `None` when the pack has none:
+    /// the condition that reads it then refuses the whole surface branch
+    /// rather than answering a guess.
+    pub initial_density: Option<usize>,
     pub settings: NoiseSettings,
+    /// The dimension's surface rules, compiled into the same graph.
+    pub surface: Option<crate::surface::Rules>,
 }
 
 /// Compile a dimension's whole noise router — climate and terrain — for one
@@ -151,13 +167,36 @@ pub fn router(root: &Path, dimension: &str, seed: i64) -> Result<Router, BuildEr
         *slot = builder.compile_route(&table, name, &settings_path)?;
     }
     let final_density = builder.compile_route(&table, "final_density", &settings_path)?;
+    // Optional because a pack may not have one, and the surface rules are the
+    // only thing that reads it.
+    let initial_density = match table.get("initial_density_without_jaggedness") {
+        Some(entry) => Some(builder.compile(&entry.clone(), &settings_path)?),
+        None => None,
+    };
     let shape = noise_settings(&settings, &settings_path)?;
+
+    // Compiled before the graph is finished, so the noises a surface rule
+    // names land in the same table the density functions' did and are read
+    // once, built once and sampled once.
+    let surface = match settings.get("surface_rule") {
+        Some(rule) => Some(crate::surface::compile(
+            rule,
+            &settings_path,
+            &shape,
+            seed,
+            |name| builder.noise(name) as u32,
+        )?),
+        None => None,
+    };
+
     let graph = builder.finish(seed)?;
     Ok(Router {
         graph,
         climate,
         final_density,
+        initial_density,
         settings: shape,
+        surface,
     })
 }
 
@@ -304,8 +343,7 @@ impl Builder {
     fn finish(self, seed: i64) -> Result<Graph, BuildError> {
         // One factory for the whole world, forked from the seed exactly once,
         // and every noise drawn from it by name.
-        let mut base = Xoroshiro::from_seed(seed);
-        let factory = base.fork_positional();
+        let factory = positional_factory(seed);
         let noises = self.build_noises(&factory)?;
         let blended = self
             .blended
