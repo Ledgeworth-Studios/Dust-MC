@@ -213,11 +213,29 @@ impl<S: RegionStore> RegionFile<S> {
             })?;
         let mut header = Header::decode(&bytes);
 
-        // Sectors the file actually holds, rounded *down*. A trailing partial
-        // sector is not a sector: a chunk that ends inside it is a chunk the
-        // file was cut through, and reading it would return whatever the last
-        // write left plus zeroes.
-        let file_sectors = length / SECTOR_BYTES as u64;
+        // Sectors the file's bytes reach into, rounded *up*.
+        //
+        // Rounded down would be the tidier rule and it is wrong against the
+        // only writer that matters: **Minecraft does not pad the last chunk it
+        // writes out to a sector boundary.** Every region file in a world
+        // vanilla generated ends mid-sector, with the final chunk's stream
+        // complete and the padding after it simply absent — measured on ten of
+        // them, where the bytes present were the declared length plus its
+        // four-byte prefix every single time.
+        //
+        // Rounding down made the last chunk of every such file `ChunkPastEnd`,
+        // and `open` refuses a file with any damage in it, so **one unpadded
+        // tail discarded all 1,024 chunks of the region** and the server served
+        // its flat fallback there instead. No test caught it because Dust's own
+        // writer pads and every test round-tripped Dust to Dust: a differential
+        // cannot catch a rule that is wrong on both sides.
+        //
+        // What is given up by rounding up is caught a layer in rather than
+        // lost: [`RegionFile::read_chunk_raw`] reads only the bytes the file
+        // holds and compares the declared stream length against those, so a
+        // file that really was cut through a chunk still fails, and fails with
+        // the byte counts rather than the sector counts.
+        let file_sectors = length.div_ceil(SECTOR_BYTES as u64);
         let mut allocator = SectorAllocator::new(file_sectors);
         let mut owners: Vec<Option<ChunkPos>> = vec![None; file_sectors as usize];
         let mut damage = Vec::new();
@@ -372,12 +390,33 @@ impl<S: RegionStore> RegionFile<S> {
             return Ok(None);
         }
 
-        let mut sectors = vec![0u8; location.sector_count as usize * SECTOR_BYTES];
+        // Only as far as the file goes. The last chunk of a region file
+        // Minecraft wrote sits in a sector that was never padded out, so the
+        // run this location describes can be a few hundred bytes shorter on
+        // disk than it is in sectors, with every byte of the stream present.
+        // `read_at` refuses a short read — correctly, it is filling a structure
+        // of known size — so the size has to be known here.
+        let length = self.store.length().map_err(|source| RegionError::Io {
+            region: self.region,
+            doing: "measuring the file",
+            source,
+        })?;
+        let at = location.first_sector as u64 * SECTOR_BYTES as u64;
+        let run = u64::from(location.sector_count) * SECTOR_BYTES as u64;
+        let held = length.saturating_sub(at).min(run) as usize;
+        if held < 5 {
+            // The file stops inside the five bytes that say how long the stream
+            // is, so there is no declared length to compare anything against.
+            // That is a short read by any other name, and it is reported as one.
+            return Err(RegionError::Io {
+                region: self.region,
+                doing: "reading a chunk's stream header",
+                source: std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+            });
+        }
+        let mut sectors = vec![0u8; held];
         self.store
-            .read_at(
-                location.first_sector as u64 * SECTOR_BYTES as u64,
-                &mut sectors,
-            )
+            .read_at(at, &mut sectors)
             .map_err(|source| RegionError::Io {
                 region: self.region,
                 doing: "reading a chunk's sectors",
