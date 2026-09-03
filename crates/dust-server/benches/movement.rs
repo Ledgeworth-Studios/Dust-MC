@@ -27,6 +27,19 @@
 //!    with the feet in the terrain and once on top of it. This is the row the
 //!    four-column cache exists for; run it with
 //!    `DUST_BENCH_REGION=<a world's region directory>`.
+//! 5. **region files, resident** — the same walk again, with the server
+//!    keeping the columns around the player the way `net/residency.rs` has it
+//!    keep them: a claim taken on the walking thread as the player crosses
+//!    into a column, and the building done on another thread that the walk
+//!    never waits for. The difference between this row and the one above it is
+//!    the whole of decision record 0021.
+//!
+//! **Every row prints what its first round did as well as the median**, and
+//! the two column counts beside it. That is not decoration. A residency row
+//! whose second round is fast because its first round filled the map is a
+//! measurement of the second round; the first-round number and `built=` — how
+//! many columns the check had to build *on its own thread* — are what say
+//! whether a player walking into terrain nobody has been in waits for a disk.
 //!
 //! **Read the two region rows as a pair and neither of them alone**, and know
 //! what the into-the-ground one is measuring. A box question stops at the
@@ -59,13 +72,81 @@
 //!   cargo bench -p dust-server --bench movement
 //! ```
 
-use std::time::Instant;
+// The allocator trait is `unsafe` to implement by nature; the wrapper below
+// forwards every call to [`System`] untouched and adds nothing but a counter,
+// which is the whole of its safety argument. The workspace's own deny stays
+// meaningful for the server; this opt-out is scoped to the bench binary, and
+// `dust-nbt/benches/allocation.rs` took it first for the same reason.
+#![allow(unsafe_code)]
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use dust_guard::{Movement, Posture, SpeedLimit};
 use dust_server::net::collide::Ground;
 use dust_server::net::edits::EditedWorld;
 use dust_server::net::source::{AnvilWorld, RegistryNames, Source};
+use dust_server::net::view::column_of;
 use dust_server::net::world::{FlatWorld, Palette};
+use dust_world::coords::ChunkPos;
+
+/// How many bytes are on the heap that have not been given back.
+static LIVE_BYTES: AtomicIsize = AtomicIsize::new(0);
+
+/// The system allocator, counting.
+///
+/// Here because "a column is about a megabyte" has been in three modules'
+/// documentation for the life of the project and nothing ever measured it, and
+/// the whole case for residency is a memory one. An exact count and not a
+/// resident-set reading: `ps` reports pages the process has taken from the
+/// operating system, and an allocator that has just freed a thousand columns
+/// hands the next thousand the same pages back — so RSS answers **zero bytes a
+/// column** for a measurement taken after any other row has run. It was tried.
+///
+/// The cost is two relaxed atomics per allocation. Every row in this file is
+/// measured through it, so the comparison the file exists to make is unaffected
+/// by it; a movement check that hits a cached column allocates nothing at all.
+struct Counting;
+
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        LIVE_BYTES.fetch_add(layout.size() as isize, Ordering::Relaxed);
+        System.alloc(layout)
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        LIVE_BYTES.fetch_sub(layout.size() as isize, Ordering::Relaxed);
+        System.dealloc(ptr, layout)
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        LIVE_BYTES.fetch_add(layout.size() as isize, Ordering::Relaxed);
+        System.alloc_zeroed(layout)
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        LIVE_BYTES.fetch_add(new_size as isize - layout.size() as isize, Ordering::Relaxed);
+        System.realloc(ptr, layout, new_size)
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
+
+/// What one round of a row did, beside how long it took.
+///
+/// Three numbers rather than one, because "how fast was it" cannot say whether
+/// the check read the world or gave up on it. `built` is columns this walk had
+/// to build on its own thread — the 0.9 ms each that D20 measured — and
+/// `resident` is columns it took out of the server's shared set instead.
+#[derive(Default, Clone, Copy)]
+struct Tally {
+    accepted: u32,
+    built: u32,
+    resident: u32,
+}
 
 /// Movement packets per row. A walking client sends twenty a second, so this
 /// is about a minute and a half of one player.
@@ -82,6 +163,12 @@ const PACKETS: u32 = 2_000;
 /// a chunk boundary every seventy-four steps, which is what the column cache is
 /// there for.
 const SPAN: f64 = 64.0;
+
+/// How many packets the paced row sends. Twenty a second, so this is fifteen
+/// seconds of one player and about four chunk boundaries — enough to answer
+/// whether the warming thread is ahead of a walk, and short enough that a
+/// bench somebody runs is not a bench somebody waits for.
+const PACED_PACKETS: u32 = 300;
 
 /// How many times each row is run. The median of five, because a single
 /// reading on a shared machine is a reading of the machine.
@@ -109,22 +196,24 @@ fn main() {
     let surface = f64::from(dust_server::net::world::SURFACE_Y + 1);
     let world = EditedWorld::new(Source::Flat(Box::new(flat)));
 
-    row("no world", || {
-        walk(
+    row("no world", || Tally {
+        accepted: walk(
             &mut Movement::new(limit(), start(surface)),
             surface,
             Posture::default(),
             |m, to| m.claimed(to, 1, &mut dust_guard::Open),
-        )
+        ),
+        ..Tally::default()
     });
     for (pose, posture) in POSES {
         row(&format!("flat, in the open, {pose}"), || {
             let mut ground =
                 Ground::of(&world, Some(&constants)).expect("the table said it was solid");
             let mut player = player(surface, posture);
-            walk(&mut player, surface, posture, |m, to| {
+            let accepted = walk(&mut player, surface, posture, |m, to| {
                 m.claimed(to, 1, &mut ground)
-            })
+            });
+            tally(accepted, &ground)
         });
     }
     // Feet one block under the surface, so every box question finds the grass
@@ -134,12 +223,13 @@ fn main() {
     let sunk = surface - 1.0;
     row("flat, into the ground", || {
         let mut ground = Ground::of(&world, Some(&constants)).expect("the table said it was solid");
-        walk(
+        let accepted = walk(
             &mut player(sunk, Posture::default()),
             sunk,
             Posture::default(),
             |m, to| m.claimed(to, 1, &mut ground),
-        )
+        );
+        tally(accepted, &ground)
     });
 
     let Some(directory) = std::env::var_os("DUST_BENCH_REGION").map(std::path::PathBuf::from)
@@ -150,19 +240,28 @@ fn main() {
         );
         return;
     };
-    let Some(names) = RegistryNames::new() else {
+    // Built more than once on purpose: the paced row at the end needs a world
+    // nobody has been near, and a residency that has already been filled by
+    // one row would answer that row's question for it.
+    let make_world = || {
+        let names = RegistryNames::new()?;
+        Some(Arc::new(EditedWorld::new(Source::Anvil(Box::new(
+            AnvilWorld::new(
+                directory.clone(),
+                names,
+                FlatWorld::new(palette, 0, 64),
+                dust_server::net::world::opacity_of(palette.air, Some(&constants)),
+                Some(std::sync::Arc::new(constants.clone())),
+            ),
+        )))))
+    };
+    // Behind an `Arc` because the residency rows below hand the same world to a
+    // warming thread, which is the shape the server has: one world, many
+    // threads asking it for columns.
+    let Some(world) = make_world() else {
         eprintln!("no synced biome registry; the region row cannot be built");
         return;
     };
-    let constants_for_world = std::sync::Arc::new(constants.clone());
-    let anvil = AnvilWorld::new(
-        directory,
-        names,
-        FlatWorld::new(palette, 0, 64),
-        dust_server::net::world::opacity_of(palette.air, Some(&constants)),
-        Some(constants_for_world),
-    );
-    let world = EditedWorld::new(Source::Anvil(Box::new(anvil)));
     // Where the terrain actually is. Probed rather than assumed, and printed,
     // because the flat fallback is what a region directory answers for a chunk
     // it does not contain — so a row that found nothing solid would be the flat
@@ -185,9 +284,10 @@ fn main() {
         row(&format!("region files, into the ground, {pose}"), || {
             let mut ground =
                 Ground::of(&world, Some(&constants)).expect("the table said it was solid");
-            walk(&mut player(y, posture), y, posture, |m, to| {
+            let accepted = walk(&mut player(y, posture), y, posture, |m, to| {
                 m.claimed(to, 1, &mut ground)
-            })
+            });
+            tally(accepted, &ground)
         });
     }
     // And the case that actually happens: a player over the terrain rather
@@ -204,9 +304,10 @@ fn main() {
         row(&format!("region files, in the open, {pose}"), || {
             let mut ground =
                 Ground::of(&world, Some(&constants)).expect("the table said it was solid");
-            walk(&mut player(air, posture), air, posture, |m, to| {
+            let accepted = walk(&mut player(air, posture), air, posture, |m, to| {
                 m.claimed(to, 1, &mut ground)
-            })
+            });
+            tally(accepted, &ground)
         });
     }
     // The number that explains the two blocks above, counted rather than
@@ -222,6 +323,269 @@ fn main() {
         ground.columns_built(),
         (f64::from(PACKETS) * 0.216) as u32,
     );
+
+    // The same walk with the server keeping the columns around the player.
+    //
+    // The warming thread stands in for the blocking pool the session task
+    // hands its builds to: the walk claims the ring as it crosses into a
+    // column, sends the centre, and carries straight on. It never waits, and
+    // whether that was enough is not an argument — it is `built=` in the row,
+    // which counts the columns the check had to build on its own thread
+    // because the warm had not got there yet.
+    let (warm, warming) = warming_thread(&world);
+    for (pose, posture) in POSES {
+        row(&format!("region files, resident, in the open, {pose}"), || {
+            let mut ground =
+                Ground::of(&world, Some(&constants)).expect("the table said it was solid");
+            let mut here: Option<ChunkPos> = None;
+            let accepted = walk(&mut player(air, posture), air, posture, |m, to| {
+                let centre = column_of(to.0, to.2);
+                if here != Some(centre) {
+                    // Exactly what `net/session.rs` does on an accepted move:
+                    // claim, hand the build to another thread, let go of the
+                    // ring behind. Nine hash lookups and a channel send.
+                    world.hold(centre);
+                    let _ = warm.send(centre);
+                    if let Some(previous) = here.replace(centre) {
+                        world.release(previous);
+                    }
+                }
+                m.claimed(to, 1, &mut ground)
+            });
+            // A session ending gives its ring up; a row that did not would
+            // hold nine more columns for every round it ran.
+            if let Some(last) = here {
+                world.release(last);
+            }
+            tally(accepted, &ground)
+        });
+    }
+    println!(
+        "  the server is keeping {} columns now that the walk has finished; \
+         every one of them is retired and none is held",
+        world.resident_columns(),
+    );
+    drop(warm);
+    let _ = warming.join();
+
+    // The two rows above are a warm residency and a player who moved faster
+    // than any client can. This is the case the change is actually about.
+    // A world each, and both cold. `warm_cost` builds the ring it times, so
+    // running the paced walk on the same world would hand it columns that were
+    // already there and answer its question for it.
+    //
+    // The centre is on the walk's own line, which is the one place the bench
+    // has probed and found terrain. That matters more than it looks: a column
+    // a region file does not contain falls back to the flat template, which is
+    // a clone and not a read — the first version of this timed a ring at
+    // (20, 20), got 0.01 ms a column against D20's 0.9, and the 90x was the
+    // fallback rather than anything to do with residency.
+    if let Some(fresh) = make_world() {
+        warm_cost(&fresh, ChunkPos::new(2, 0));
+    }
+    // The same paced walk twice, on two cold worlds: once with the server
+    // keeping columns and once the way it worked before. A mean cannot answer
+    // this and neither can a median — a stall is not felt as an average, so
+    // what both rows report is the **worst single packet**.
+    for resident in [false, true] {
+        if let Some(fresh) = make_world() {
+            paced(&fresh, &constants, air, resident);
+        }
+    }
+
+    column_bytes(&world);
+}
+
+/// One walk at the rate a client actually sends, into a world nobody has been
+/// in, timed one packet at a time.
+///
+/// The rows above cannot answer the question this change exists for. They send
+/// two thousand packets as fast as the machine will judge them, which crosses a
+/// chunk boundary every three microseconds — a player moving about a million
+/// times faster than a client can claim to — so the warming thread is behind
+/// from the first crossing and the check builds its own columns. That is a
+/// measurement of a bench, not of a server.
+///
+/// So this one sleeps. [`PACED_PACKETS`] packets at twenty a second is what a
+/// walking client sends, and the number that matters is not the mean: it is
+/// **the slowest single packet**, because a stall is not felt as an average.
+/// `built` beside it says whether the check ever had to read a region file
+/// itself.
+fn paced(
+    world: &Arc<EditedWorld>,
+    constants: &dust_registry::BlockConstants,
+    y: f64,
+    resident: bool,
+) {
+    let Some(mut ground) = Ground::of(world, Some(constants)) else {
+        return;
+    };
+    let (warm, warming) = warming_thread(world);
+    let posture = POSES[0].1;
+    let mut player = player(y, posture);
+    // The join, which claims and warms the ring before the player is let in
+    // and before any movement packet exists to wait for it — see
+    // `net/session.rs`. Timed and printed, because it is real work; it is not
+    // on the movement path, which is the whole reason it is done there.
+    //
+    // Without it the first movement packet of a session finds its own column
+    // missing and reads a region file on the spot. Measured, by leaving it
+    // out: **6.4 ms for that one packet**, which is the hitch this change is
+    // about, arriving at the worst possible moment.
+    let start = column_of(0.5, 0.5);
+    let mut here: Option<ChunkPos> = None;
+    if resident {
+        world.hold(start);
+        let joined = Instant::now();
+        let warmed = world.warm(start);
+        println!(
+            "  the join warmed {warmed} columns in {:.1} ms, before the first movement packet \
+             exists and off the movement path",
+            joined.elapsed().as_secs_f64() * 1000.0,
+        );
+        here = Some(start);
+    }
+    let mut worst = Duration::ZERO;
+    let mut total = Duration::ZERO;
+    let mut crossings = 0;
+    for i in 1..=PACED_PACKETS {
+        let along = (f64::from(i) * 0.216) % (2.0 * SPAN);
+        let x = if along <= SPAN { along } else { 2.0 * SPAN - along };
+        let to = (0.5 + x, y, 0.5);
+        // Timed around everything the session task does for one movement
+        // packet: the claim, the hand-off, and the check itself.
+        let at = Instant::now();
+        let centre = column_of(to.0, to.2);
+        if resident && here != Some(centre) {
+            world.hold(centre);
+            let _ = warm.send(centre);
+            if let Some(previous) = here.replace(centre) {
+                world.release(previous);
+            }
+            crossings += 1;
+        }
+        if player.claimed(to, 1, &mut ground) != dust_guard::Claim::Accepted {
+            player = self::player(y, posture);
+        }
+        let took = at.elapsed();
+        worst = worst.max(took);
+        total += took;
+        std::thread::sleep(Duration::from_millis(50).saturating_sub(took));
+    }
+    if let Some(last) = here {
+        world.release(last);
+    }
+    drop(warm);
+    let _ = warming.join();
+    println!(
+        "  paced at 20 packets a second, {PACED_PACKETS} packets into a world nobody had been \
+         in, {}: mean {} ns, WORST SINGLE PACKET {} ns, {} columns built on the check's own \
+         thread and {} taken from the residency ({crossings} claims)",
+        if resident {
+            "with the server keeping columns"
+        } else {
+            "the way it worked before"
+        },
+        total.as_nanos() / u128::from(PACED_PACKETS),
+        worst.as_nanos(),
+        ground.columns_built(),
+        ground.columns_resident(),
+    );
+}
+
+/// A thread that builds the columns the walk has claimed, standing in for the
+/// blocking pool a session hands its warming to.
+///
+/// One thread and not a pool, deliberately: a pool would hide a warm that could
+/// not keep up behind more threads, and the question this bench asks is whether
+/// *one* worker is ahead of a walking player.
+fn warming_thread(
+    world: &Arc<EditedWorld>,
+) -> (
+    std::sync::mpsc::Sender<ChunkPos>,
+    std::thread::JoinHandle<()>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel::<ChunkPos>();
+    let world = Arc::clone(world);
+    let handle = std::thread::spawn(move || {
+        for centre in rx {
+            world.warm(centre);
+        }
+    });
+    (tx, handle)
+}
+
+/// What one column of this world costs to keep, measured rather than repeated.
+///
+/// The columns are built once and dropped before the reading starts, so the
+/// sky-floor cache and the open region files are paid for by the first pass and
+/// what the second one adds is the chunks and nothing else. That trick works
+/// only because the counter is exact: an allocator that has just handed a
+/// thousand columns back would show a resident-set reading no growth at all.
+fn column_bytes(world: &EditedWorld) {
+    const COLUMNS: i32 = 16;
+    let build = || {
+        (0..COLUMNS)
+            .flat_map(|x| (0..COLUMNS).map(move |z| ChunkPos::new(x, z)))
+            .map(|pos| world.chunk(pos))
+            .collect::<Vec<_>>()
+    };
+    drop(build());
+    let before = LIVE_BYTES.load(Ordering::Relaxed);
+    let held = build();
+    let after = LIVE_BYTES.load(Ordering::Relaxed);
+    let count = held.len() as f64;
+    let each = (after - before) as f64 / count;
+    println!(
+        "  column size: {count} columns of this world are {} bytes on the heap, {:.0} KB each. \
+         Nine of them a player, shared, is {:.1} MB; the four a session built for itself was \
+         {:.1} MB per player and was not shared with anybody",
+        after - before,
+        each / 1024.0,
+        9.0 * each / (1024.0 * 1024.0),
+        4.0 * each / (1024.0 * 1024.0),
+    );
+    drop(held);
+}
+
+/// How long it takes to build the ring around a column nobody has been near,
+/// against how long a player takes to walk out of the one they are in.
+///
+/// The two numbers that decide whether residency works, and neither of them is
+/// a row above: the rows send packets as fast as the machine can judge them,
+/// which is a player moving about a million times faster than any client can
+/// claim to. This is the pair that says what a *real* player experiences —
+/// [`paced`] then runs one at the real rate and checks the answer.
+fn warm_cost(world: &EditedWorld, at: ChunkPos) {
+    world.hold(at);
+    let start = Instant::now();
+    let built = world.warm(at);
+    let took = start.elapsed();
+    world.release(at);
+    // A ring that built nothing, or built the flat fallback, would report a
+    // warm that costs nothing and prove only that the world is not there.
+    assert!(built > 0, "the ring at {at:?} was already resident");
+    // `dust_guard::SpeedLimit` is 10 blocks a second, which is the fastest
+    // this server will believe a walking player; a column is sixteen wide.
+    let crossing = Duration::from_secs_f64(16.0 / 10.0);
+    println!(
+        "  warming a cold ring: {built} columns in {:.1} ms, {:.2} ms each. A player crossing \
+         the column they are standing in takes {} ms at the speed limit, so the ring ahead of \
+         them is ready {:.0} times over",
+        took.as_secs_f64() * 1000.0,
+        took.as_secs_f64() * 1000.0 / f64::from(built.max(1)),
+        crossing.as_millis(),
+        crossing.as_secs_f64() / took.as_secs_f64(),
+    );
+}
+
+/// What a row read, from the `Ground` that read it.
+fn tally(accepted: u32, ground: &Ground<'_>) -> Tally {
+    Tally {
+        accepted,
+        built: ground.columns_built(),
+        resident: ground.columns_resident(),
+    }
 }
 
 /// The highest solid block in the first column of the walk that has one, or
@@ -353,22 +717,40 @@ where
     accepted
 }
 
-/// Run a workload `ROUNDS` times and print the median nanoseconds per packet.
-fn row<F: FnMut() -> u32>(name: &str, mut work: F) {
-    let name = format!("{name:<34}");
+/// Run a workload `ROUNDS` times and print the median nanoseconds per packet,
+/// the first round's, and what the first round read.
+///
+/// The first round is printed on its own because for any row that fills a
+/// cache it is the only cold one, and a median of five over a set that four of
+/// them found already warm is a number about the last four. It is also the
+/// round a real player generates: the first walk into terrain nobody has been
+/// in.
+fn row<F: FnMut() -> Tally>(name: &str, mut work: F) {
+    let name = format!("{name:<40}");
     let mut times = Vec::with_capacity(ROUNDS as usize);
-    let mut accepted = 0;
-    for _ in 0..ROUNDS {
+    let mut tally = Tally::default();
+    let mut first = 0;
+    for round in 0..ROUNDS {
         let at = Instant::now();
-        accepted = work();
-        times.push(at.elapsed().as_nanos() / u128::from(PACKETS));
+        let round_tally = work();
+        let ns = at.elapsed().as_nanos() / u128::from(PACKETS);
+        if round == 0 {
+            first = ns;
+            tally = round_tally;
+        }
+        times.push(ns);
     }
-    times.sort_unstable();
+    let mut sorted = times.clone();
+    sorted.sort_unstable();
     println!(
-        "  {name} {:>7} ns/packet   (fastest {}, slowest {}, {accepted}/{PACKETS} accepted)",
-        times[times.len() / 2],
-        times[0],
-        times[times.len() - 1],
+        "  {name} {:>7} ns/packet   (first {first}, fastest {}, slowest {}, \
+         {}/{PACKETS} accepted, first round built {} columns and shared {})",
+        sorted[sorted.len() / 2],
+        sorted[0],
+        sorted[sorted.len() - 1],
+        tally.accepted,
+        tally.built,
+        tally.resident,
     );
 }
 
