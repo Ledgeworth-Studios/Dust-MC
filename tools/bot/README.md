@@ -481,7 +481,7 @@ inventory, ignore the state id", Mojang's client honours it, and it reads like
 the right id for a correction. mineflayer's handler resolves a window by id,
 finds none, and returns — no error and no log line, on either side. Dust now
 corrects on window `0`, which is what vanilla's own synchronizer sends for a
-player's own menu and which both clients honour. See decision record 0012.
+player's own menu and which both clients honour. See decision record 0013.
 
 The cursor is still sent on window `-1`, because there is no second spelling of
 the cursor to prefer. mineflayer ignores that too and keeps its own, which is
