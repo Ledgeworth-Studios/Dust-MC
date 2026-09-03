@@ -28,7 +28,7 @@ node movement.js 25581 --check   # and assert the server corrects a liar
 
 It exists because `[server] movement_speed_limit` is a number somebody has to
 choose, and a number chosen without this one is a number that rubber-bands
-players on bad connections. Decision record 0012 is its output. The `--check`
+players on bad connections. Decision record 0017 is its output. The `--check`
 run does both halves: a bot that claims to be 707 blocks away has to be put
 back, and a bot that takes an ordinary 0.3-block step has to be left alone.
 

@@ -112,7 +112,7 @@ pub struct SessionContext {
     ///
     /// In `dust_guard` for the same reason the reach limit is, and measured
     /// rather than chosen: `tools/bot/movement.js` counts what a real client's
-    /// movement packets actually contain, and decision record 0012 says what it
+    /// movement packets actually contain, and decision record 0017 says what it
     /// found and what the number is set to because of it.
     pub speed: dust_guard::SpeedLimit,
 

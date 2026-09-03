@@ -342,7 +342,7 @@ fn watered(state: BlockState, click: Click) -> BlockState {
 /// exactly four of those made it wet. Kelp and a kelp plant hold water too and
 /// are deliberately *not* here: nothing can be placed into either, so no
 /// measurement reaches them and a line here would be one nothing checks.
-/// Decision record 0016 has the run.
+/// Decision record 0018 has the run.
 fn holds_water(state: BlockState) -> bool {
     matches!(
         state.block().name(),

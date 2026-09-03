@@ -1,4 +1,4 @@
-# D16 — What a placed block reads from the cell it lands in
+# D18 — What a placed block reads from the cell it lands in
 
 **Status:** Decided, 2026-09-03. Three rules read the target cell, one item
 carries two blocks, and both were measured against a vanilla server before
