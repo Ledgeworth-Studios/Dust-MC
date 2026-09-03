@@ -186,10 +186,7 @@ impl Report {
                 self.borrowed
             ));
         } else {
-            line.push_str(
-                ", each matched to the block of its own name because there is no \
-                 dust-blocks.tsv, so about sixty wall blocks drop nothing",
-            );
+            line.push_str(", each matched to the block of its own name");
         }
         if self.refused_entries > 0 {
             line.push_str(&format!(

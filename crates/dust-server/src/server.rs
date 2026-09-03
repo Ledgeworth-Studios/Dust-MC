@@ -839,7 +839,7 @@ impl Server {
                 "dust::data",
                 format!(
                     "block constants: Minecraft's own answers for {} block states, \
-                     {} of them emitting, {} heightmap predicate(s), {}, {}, and {}",
+                     {} of them emitting, {} heightmap predicate(s), {}, {}, {}, and {}",
                     table.len(),
                     table.emitting(),
                     table.flags().count(),
@@ -875,6 +875,23 @@ impl Server {
                         None => "no full_collision column, so nothing stops a \
                                  player walking through a wall; re-run \
                                  `cargo xtask extract --only constants` for it"
+                            .to_owned(),
+                    },
+                    // The same shape a fourth time. Without the column no
+                    // block asks for a tool, which is a server where a bare
+                    // hand gets cobblestone out of stone — visible in the
+                    // first ten seconds of play and invisible in any log that
+                    // did not say this.
+                    match table.flag("requires_tool") {
+                        Some(flag) => format!(
+                            "{} that yield nothing to the wrong tool",
+                            (0..table.len() as u32)
+                                .filter(|state| table.is_set(flag, *state))
+                                .count()
+                        ),
+                        None => "no requires_tool column, so a bare hand gets \
+                                 cobblestone out of stone; re-run `cargo xtask \
+                                 extract --only constants` for it"
                             .to_owned(),
                     }
                 ),

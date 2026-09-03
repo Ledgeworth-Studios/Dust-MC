@@ -532,6 +532,13 @@ async function main () {
     // Clear the cell first, so what is measured is this run's block and not
     // whatever the last one left.
     if (survival) {
+      // **Sweep the floor first.** An item entity that is still lying there
+      // merges with the next row's, and the row after reads a count of two
+      // for a block that drops one. Eight rows of 245 said `sand*2`,
+      // `white_wool*2` and `oak_planks*2` before this line existed, and every
+      // one of them was this survey measuring its own litter.
+      say(`kill @e[type=minecraft:item]`)
+      await wait(200)
       say(`setblock ${at.x} ${at.y} ${at.z} minecraft:air replace`)
       await wait(250)
       say(`setblock ${at.x} ${at.y} ${at.z} ${block} replace`)
@@ -592,7 +599,13 @@ async function main () {
     await wait(SETTLE_MS)
 
     const after = b.blockAt(at)
-    const gone = after && after.name === 'air'
+    // A waterlogged block leaves **water** where it was, not air, and a run
+    // that only accepted air called every dead coral wall fan NOT BROKEN.
+    // Same shape as the `ice` row that reads back as `water` because it
+    // melted: what says the block went is that it is no longer there, and
+    // what it left behind is a second question.
+    const wet = Boolean(before.getProperties && before.getProperties().waterlogged)
+    const gone = after && (after.name === 'air' || (wet && after.name === 'water'))
     if (!gone) {
       rows.push([block, tool, dug ? 'NOT BROKEN' : 'REFUSED', after ? after.name : 'unloaded'])
       continue
