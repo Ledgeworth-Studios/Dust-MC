@@ -316,6 +316,23 @@ impl Client {
     /// The throwaway companion command is harmless by construction: worst case
     /// the server answers it with "Unknown or incomplete command", which is
     /// discarded with the rest of the framing.
+    ///
+    /// # The delimiter is sent after the first answer arrives, and it has to be
+    ///
+    /// Vanilla's RCON reads a whole packet with **one** `read`, and refuses
+    /// what it gets if the length field does not account for every byte of it:
+    /// two commands that arrive in one segment are not two commands to it, they
+    /// are a malformed packet, and it closes the connection without a word.
+    /// Writing the command and the delimiter back to back is therefore a race
+    /// against the kernel — and a race this loses more often the faster the
+    /// program is. It passed in a debug build and failed in a release one, on
+    /// the same server and the same command, which is the same shape as
+    /// `just bot`'s release-only failure and the opposite sign.
+    ///
+    /// Waiting for the first response packet is not a delay bolted on until it
+    /// worked. It makes the ordering a fact: the server has already answered,
+    /// so it is back in `read` with an empty buffer, and the delimiter is the
+    /// only thing in it.
     pub fn exec_delimited(&mut self, command: &str) -> Result<String, String> {
         let id = self.next_id;
         let sentinel = id.wrapping_add(1);
@@ -324,16 +341,20 @@ impl Client {
             kind: SERVERDATA_EXECCOMMAND,
             payload: command.as_bytes().to_vec(),
         })?;
-        self.send(Packet {
-            id: sentinel,
-            kind: SERVERDATA_EXECCOMMAND,
-            payload: b"dust-harness-delimiter".to_vec(),
-        })?;
 
         let deadline = Instant::now() + self.timeout;
         let mut collected = Vec::new();
+        let mut delimiter_sent = false;
         loop {
             let packet = self.read_packet(deadline)?;
+            if !delimiter_sent {
+                self.send(Packet {
+                    id: sentinel,
+                    kind: SERVERDATA_EXECCOMMAND,
+                    payload: b"dust-harness-delimiter".to_vec(),
+                })?;
+                delimiter_sent = true;
+            }
             if packet.kind != SERVERDATA_RESPONSE_VALUE {
                 continue;
             }
@@ -487,10 +508,104 @@ mod tests {
         address
     }
 
+    /// A fake that reads the way **vanilla** reads, which the one above does
+    /// not.
+    ///
+    /// `read_frame` takes a length prefix and then exactly that many bytes, so
+    /// two packets that arrive together are simply two packets to it. Vanilla
+    /// does not do that. It fills a buffer with **one** `read`, takes the
+    /// length field, and if that length does not account for every byte it just
+    /// read it stops talking — no error, no reply, the socket closes. Two
+    /// commands in one segment are a malformed packet to it.
+    ///
+    /// That is the whole of the defect this fake exists to catch, and the
+    /// forgiving fake above could never have caught it: a stand-in only
+    /// exposes the defects its own range reaches.
+    ///
+    /// The pause before each read is what makes the test a test rather than a
+    /// coin toss. Back-to-back writes only *sometimes* land in one segment —
+    /// often enough to fail every release build of the harness and rarely
+    /// enough to pass every debug one. Waiting first makes them land together
+    /// every time.
+    fn spawn_strict_fake(password: &'static str) -> std::net::SocketAddr {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback bind");
+        let address = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            loop {
+                std::thread::sleep(Duration::from_millis(50));
+                let mut buffer = [0u8; 1460];
+                let read = match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                if read < 10 {
+                    return;
+                }
+                let announced =
+                    u32::from_le_bytes(buffer[..4].try_into().expect("four bytes")) as usize;
+                if announced != read - 4 {
+                    // Vanilla's own refusal, byte for byte: the connection goes
+                    // away and the client is told nothing.
+                    return;
+                }
+                let Ok((packet, _)) = Packet::decode(&buffer[..read]) else {
+                    return;
+                };
+                let reply = if packet.kind == SERVERDATA_AUTH {
+                    Packet {
+                        id: if packet.payload == password.as_bytes() {
+                            packet.id
+                        } else {
+                            -1
+                        },
+                        kind: SERVERDATA_AUTH_RESPONSE,
+                        payload: Vec::new(),
+                    }
+                } else {
+                    Packet {
+                        id: packet.id,
+                        kind: SERVERDATA_RESPONSE_VALUE,
+                        payload: String::from_utf8_lossy(&packet.payload)
+                            .to_uppercase()
+                            .into_bytes(),
+                    }
+                };
+                if stream.write_all(&reply.encode()).is_err() {
+                    return;
+                }
+            }
+        });
+        address
+    }
+
     fn connect_and_auth(address: std::net::SocketAddr, password: &str) -> Client {
         let mut client = Client::connect(address, Duration::from_secs(5)).expect("connect");
         client.authenticate(password).expect("auth");
         client
+    }
+
+    /// A command and its delimiter must not reach the server in one read.
+    ///
+    /// This is the check that says `exec_delimited` waits for the command's
+    /// first answer before it sends the delimiter. Send both back to back and
+    /// this test fails every time, which is what it is for: on a real server
+    /// the same mistake failed every release build of the harness and passed
+    /// every debug one, and read as "the server closed the connection".
+    #[test]
+    fn a_command_and_its_delimiter_reach_the_server_as_two_reads() {
+        let address = spawn_strict_fake("pass");
+        let mut client = connect_and_auth(address, "pass");
+        assert_eq!(
+            client
+                .exec_delimited("forceload add 0 0 15 15")
+                .expect("a reply"),
+            "FORCELOAD ADD 0 0 15 15"
+        );
+        // And again on the same connection, because the ids move and the
+        // second command is the one that would collide with the first
+        // delimiter.
+        assert_eq!(client.exec_delimited("list").expect("a reply"), "LIST");
     }
 
     #[test]
