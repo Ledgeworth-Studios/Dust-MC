@@ -97,7 +97,10 @@ fn main() {
         "each row builds the same {} columns, split evenly over its threads",
         columns.len()
     );
-    println!("available parallelism: {:?}", std::thread::available_parallelism());
+    println!(
+        "available parallelism: {:?}",
+        std::thread::available_parallelism()
+    );
 
     control();
 
@@ -240,7 +243,10 @@ fn control() {
                     })
                 })
                 .collect();
-            handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
         });
         let wall = at.elapsed();
         latencies.sort_unstable();
@@ -283,7 +289,10 @@ fn run<'a>(
                 })
             })
             .collect();
-        handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
     });
     let wall = at.elapsed();
     latencies.sort_unstable();
@@ -313,7 +322,10 @@ fn print_row(threads: usize, row: &Row, alone: &mut Option<Duration>) {
         base.as_secs_f64() / row.wall.as_secs_f64(),
         at(0.50),
         at(0.99),
-        ms(*row.latencies.last().expect("a row builds at least one column")),
+        ms(*row
+            .latencies
+            .last()
+            .expect("a row builds at least one column")),
     );
 }
 

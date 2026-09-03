@@ -326,11 +326,14 @@ are what each of those is worth on the same sample, in cells; no
 physics or block updates, so a player is stopped from
 entering a block and never pushed out of one; **only one thread builds columns
 for a world**, so a cold join into generated terrain is about 3.3 seconds of
-world arriving around a player who is already walking, and four people joining a
-saved world at once contend where they used not to — the loading screen ends
-at 242 ms and record
-[0031](docs/decisions/0031-how-a-join-streams-its-chunks.md) says what a pool
-would move and why it is declined for now;
+world arriving around a player who is already walking — the loading screen ends
+at 242 ms, and records
+[0031](docs/decisions/0031-how-a-join-streams-its-chunks.md) and
+[0038](docs/decisions/0038-how-wide-the-region-lock-is.md) say what a pool would
+move and why it is declined; **four people joining at once stall a settled
+player for about a quarter of a second whatever the world is made of**, which
+0038 measured on a flat world, where a column is free and there is no lock to
+contend for, and did not move;
 **no water on the movement path**,
 so a player who says they are sprinting and airborne is measured at their feet
 rather than at their full height, because they might be swimming and no client
