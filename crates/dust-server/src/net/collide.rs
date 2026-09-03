@@ -82,6 +82,13 @@ pub struct Ground<'a> {
     /// recently used: with four entries and at most four columns in play there
     /// is nothing for a better policy to be better than.
     next: usize,
+    /// How many columns this session has had to build. Counted rather than
+    /// reasoned about: a build is a file read, a decompress, an NBT parse and
+    /// a light pass, and it is three orders of magnitude more expensive than
+    /// reading a cell out of the result — so whether this number is small is
+    /// the whole question about what a movement check costs on a real world.
+    /// `benches/movement.rs` prints it.
+    built_columns: u32,
 }
 
 impl<'a> Ground<'a> {
@@ -105,7 +112,18 @@ impl<'a> Ground<'a> {
             solid,
             built: [const { None }; CACHED_COLUMNS],
             next: 0,
+            built_columns: 0,
         })
+    }
+
+    /// How many columns this session has built out of the world source.
+    ///
+    /// Zero on a flat world, which lends its template. On a world read from
+    /// region files it is the number that says what the check costs: see the
+    /// field's own note.
+    #[must_use]
+    pub fn columns_built(&self) -> u32 {
+        self.built_columns
     }
 
     /// The state at a cell, from the edits if one has touched it and from the
@@ -157,6 +175,7 @@ impl Solidity for Ground<'_> {
                         Column::Built(chunk) => {
                             self.built[self.next] = Some((pos, chunk));
                             self.next = (self.next + 1) % CACHED_COLUMNS;
+                            self.built_columns += 1;
                         }
                     }
                 }

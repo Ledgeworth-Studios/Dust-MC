@@ -6,6 +6,8 @@ question is asked of the world as it is at that instant, of a box 0.6 across
 and 0.6 high measured up from the feet, and it costs 32 ns on a flat world and
 408 ns on a world read from region files.
 
+**Its cost figures are superseded by [D20](0020-what-a-movement-check-really-costs-on-a-saved-world.md)**: 408 ns was measured on a bench whose player had stopped moving, and the real number for a walking player on a world read from region files is 8.8 us.
+
 **Superseded in part by [D19](0019-how-tall-a-player-is.md), 2026-09-03**: the
 box is now the height of the pose the player's own packets describe, and 0.6 is
 the floor rather than the whole of it. Everything else here still holds.

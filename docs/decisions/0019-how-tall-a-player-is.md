@@ -8,6 +8,8 @@ and both are named below. On a world read from region files the check still
 costs 405 ns a packet, which is the number [D15](0015-what-a-movement-check-asks-the-world.md)
 reported and the number this was not allowed to move.
 
+**Its region-file figures are superseded by [D20](0020-what-a-movement-check-really-costs-on-a-saved-world.md)**, which found that the bench row they came from was measuring a player who had stopped walking. The conclusion below survives it — the three poses read the same on that row before and after — but the numbers are 8.8 us and not 411 ns.
+
 ## Context
 
 [D15](0015-what-a-movement-check-asks-the-world.md) refused a player who walked

@@ -193,7 +193,12 @@ has the counts and says what it declined.
 
 **Not yet**, and each of these is stated where the code for it would go: no
 physics, block updates, drops or tool checks, so a player is stopped from
-entering a block and never pushed out of one; **no water on the movement path**,
+entering a block and never pushed out of one; **no chunk residency**, so a
+movement check on a world read from region files rebuilds a column out of a
+region file every time a walking player leaves the four they carry, and costs
+8.8 microseconds a packet instead of 0.4 — decision record
+[0020](docs/decisions/0020-what-a-movement-check-really-costs-on-a-saved-world.md)
+has the counts; **no water on the movement path**,
 so a player who says they are sprinting and airborne is measured at their feet
 rather than at their full height, because they might be swimming and no client
 ever says so — decision record
