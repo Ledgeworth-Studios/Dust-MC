@@ -2165,6 +2165,22 @@ mod tests {
     }
 
     #[test]
+    fn the_sequence_number_a_client_quotes_is_the_last_one_sent() {
+        // Load-bearing for the stale-click check in `net::session`, which
+        // compares a click's `state_id` against this. If `state_id` ever
+        // returned the *next* number rather than the last one sent, every
+        // honest click would look stale and every one of them would be
+        // answered with the whole container — which is not a crash, not a
+        // wrong item, and not visible in any test that only looks at slots.
+        let mut inventory = Inventory::default();
+        let sent = inventory.next_state_id();
+        assert_eq!(inventory.state_id(), sent);
+        let again = inventory.next_state_id();
+        assert_eq!(inventory.state_id(), again);
+        assert_ne!(again, sent, "and a second update is a different number");
+    }
+
+    #[test]
     fn the_equipment_set_reads_the_six_slots_the_wire_numbers() {
         // Each of the six from a *different* item, because a set built with
         // one item in every slot agrees with any permutation of the table —

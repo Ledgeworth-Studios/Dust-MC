@@ -1656,12 +1656,43 @@ where
                     // about are sent back.
                     Ok(play::serverbound::Packet::ClickContainer(click)) => {
                         if click.window_id == PLAYER_WINDOW {
+                            // Which window the client thought it was clicking
+                            // on, read *before* the click moves anything. A
+                            // `state_id` that is not the current one means the
+                            // client acted on a container that has since
+                            // changed under it, so the corrections below would
+                            // be differences against a picture it no longer
+                            // holds.
+                            let stale = click.state_id.0 != inventory.state_id();
                             let changed =
                                 inventory.click(ClickMode::from(click.mode), click.slot, click.button);
                             if !changed.is_empty() {
                                 record_inventory(ctx, profile_id, me.entity_id, &inventory);
                             }
-                            push_back(conn, ctx, &mut inventory, changed, &click).await?;
+                            if stale {
+                                // The whole container, which is what Minecraft
+                                // answers the same thing with. The click still
+                                // happens — a stale number says the client is
+                                // out of date, not that it clicked on nothing —
+                                // and then the container is *stated* rather
+                                // than corrected, because a difference is only
+                                // meaningful against a picture both ends agree
+                                // on and this client has just said it does not
+                                // have one.
+                                //
+                                // Forty-seven stacks is the expensive answer
+                                // and it is the one that ends the
+                                // disagreement in a single packet. The
+                                // per-slot corrections cover only the slots
+                                // this click touched, so every *other* slot
+                                // the client is wrong about stays wrong until
+                                // something happens to move it — which is a
+                                // player looking at an inventory that is not
+                                // theirs, for as long as they leave it alone.
+                                send_container(conn, ctx, &mut inventory).await?;
+                            } else {
+                                push_back(conn, ctx, &mut inventory, changed, &click).await?;
+                            }
                         }
                     }
                     // The player closed their own inventory. Whatever was on
