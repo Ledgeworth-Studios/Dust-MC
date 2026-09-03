@@ -23,9 +23,23 @@
 //! 3. **flat, into the ground** — the same walk with the feet a block lower, so
 //!    the box does find something and the second question, about where the
 //!    player came from, is asked too. The worst case for a flat world.
-//! 4. **region files** — the same walk over a world read from `.mca`. This is
-//!    the row the four-column cache exists for; run it with
+//! 4. **region files** — the same walk over a world read from `.mca`, once
+//!    with the feet in the terrain and once on top of it. This is the row the
+//!    four-column cache exists for; run it with
 //!    `DUST_BENCH_REGION=<a world's region directory>`.
+//!
+//! **Read the two region rows as a pair and neither of them alone**, and know
+//! what the into-the-ground one is measuring. A box question stops at the
+//! first solid cell it finds, so a walk with the feet in the ground answers on
+//! its first cell and never reads the rest of the box; and because the bench
+//! sends the next packet from where the walk says rather than from where the
+//! server put the player, a refused packet is followed by a *longer* move,
+//! and a longer move is split into more samples. That row is therefore mostly
+//! a measurement of the sample loop, and it is blind to everything about the
+//! cells above the feet — the three poses all read the same on it, which is
+//! how you can tell. The in-the-open row walks the terrain's own surface, is
+//! accepted end to end, reads every cell in the box, and is the one a real
+//! player generates.
 //!
 //! Each of the world rows is then run again at the two shorter poses, because
 //! how much of a player is measured is the other input and a single number for
@@ -99,6 +113,7 @@ fn main() {
         walk(
             &mut Movement::new(limit(), start(surface)),
             surface,
+            Posture::default(),
             |m, to| m.claimed(to, 1, &mut dust_guard::Open),
         )
     });
@@ -107,7 +122,9 @@ fn main() {
             let mut ground =
                 Ground::of(&world, Some(&constants)).expect("the table said it was solid");
             let mut player = player(surface, posture);
-            walk(&mut player, surface, |m, to| m.claimed(to, 1, &mut ground))
+            walk(&mut player, surface, posture, |m, to| {
+                m.claimed(to, 1, &mut ground)
+            })
         });
     }
     // Feet one block under the surface, so every box question finds the grass
@@ -117,9 +134,12 @@ fn main() {
     let sunk = surface - 1.0;
     row("flat, into the ground", || {
         let mut ground = Ground::of(&world, Some(&constants)).expect("the table said it was solid");
-        walk(&mut player(sunk, Posture::default()), sunk, |m, to| {
-            m.claimed(to, 1, &mut ground)
-        })
+        walk(
+            &mut player(sunk, Posture::default()),
+            sunk,
+            Posture::default(),
+            |m, to| m.claimed(to, 1, &mut ground),
+        )
     });
 
     let Some(directory) = std::env::var_os("DUST_BENCH_REGION").map(std::path::PathBuf::from)
@@ -162,14 +182,65 @@ fn main() {
     // questions, over columns the region files really contain.
     let y = f64::from(top);
     for (pose, posture) in POSES {
-        row(&format!("region files, {pose}"), || {
+        row(&format!("region files, into the ground, {pose}"), || {
             let mut ground =
                 Ground::of(&world, Some(&constants)).expect("the table said it was solid");
-            walk(&mut player(y, posture), y, |m, to| {
+            walk(&mut player(y, posture), y, posture, |m, to| {
                 m.claimed(to, 1, &mut ground)
             })
         });
     }
+    // And the case that actually happens: a player over the terrain rather
+    // than through it, where nothing in the box answers and every cell in it
+    // has to be read. High enough to clear the whole walk, because a walk at
+    // a constant height over real terrain that is *sometimes* inside the
+    // ground is the row above wearing this row's name.
+    let Some(ceiling) = clearance(&world, &constants) else {
+        eprintln!("no ground along the walk; the in-the-open region rows cannot be built");
+        return;
+    };
+    let air = f64::from(ceiling + 1);
+    for (pose, posture) in POSES {
+        row(&format!("region files, in the open, {pose}"), || {
+            let mut ground =
+                Ground::of(&world, Some(&constants)).expect("the table said it was solid");
+            walk(&mut player(air, posture), air, posture, |m, to| {
+                m.claimed(to, 1, &mut ground)
+            })
+        });
+    }
+    // The number that explains the two blocks above, counted rather than
+    // inferred from the shape of them. Untimed and outside every row.
+    let mut ground = Ground::of(&world, Some(&constants)).expect("the table said it was solid");
+    let posture = POSES[0].1;
+    walk(&mut player(air, posture), air, posture, |m, to| {
+        m.claimed(to, 1, &mut ground)
+    });
+    println!(
+        "  one {PACKETS}-packet walk built {} columns out of the region files, \
+         which is {} blocks of walking and a chunk boundary every 16 of them",
+        ground.columns_built(),
+        (f64::from(PACKETS) * 0.216) as u32,
+    );
+}
+
+/// The highest solid block in the first column of the walk that has one, or
+/// `None` if none of them does. What the into-the-ground rows put the feet in.
+fn highest_solid(world: &EditedWorld, constants: &dust_registry::BlockConstants) -> Option<i32> {
+    let mut ground = Ground::of(world, Some(constants))?;
+    let height = world.height();
+    let mut x = 0;
+    while f64::from(x) <= SPAN {
+        let mut y = height.max_y_exclusive() - 1;
+        while y >= height.min_y() {
+            if dust_guard::Solidity::first_solid(&mut ground, (x, y, 0), (x, y, 0)).is_some() {
+                return Some(y);
+            }
+            y -= 1;
+        }
+        x += 8;
+    }
+    None
 }
 
 /// The three heights a player is measured at, and the signals that produce
@@ -218,21 +289,24 @@ fn player(y: f64, posture: Posture) -> Movement {
 }
 
 /// The highest solid block anywhere along the walk, or `None` if there is none.
-fn highest_solid(world: &EditedWorld, constants: &dust_registry::BlockConstants) -> Option<i32> {
+///
+/// Every whole block of it, unlike [`highest_solid`], which stops at the first
+/// column that has anything and answers about that column alone.
+fn clearance(world: &EditedWorld, constants: &dust_registry::BlockConstants) -> Option<i32> {
     let mut ground = Ground::of(world, Some(constants))?;
     let height = world.height();
-    let mut x = 0;
-    while f64::from(x) <= SPAN {
+    let mut best = None;
+    for x in 0..=(SPAN as i32) {
         let mut y = height.max_y_exclusive() - 1;
         while y >= height.min_y() {
             if dust_guard::Solidity::first_solid(&mut ground, (x, y, 0), (x, y, 0)).is_some() {
-                return Some(y);
+                best = Some(best.map_or(y, |b: i32| b.max(y)));
+                break;
             }
             y -= 1;
         }
-        x += 8;
     }
-    None
+    best
 }
 
 fn limit() -> SpeedLimit {
@@ -249,7 +323,7 @@ fn start(y: f64) -> (f64, f64, f64) {
 /// The distance is deliberately enough to cross chunk boundaries: 2,000 steps
 /// is 432 blocks of walking, which is a chunk boundary crossed every 74 steps
 /// and twenty-seven of them in a row.
-fn walk<F>(movement: &mut Movement, y: f64, mut judge: F) -> u32
+fn walk<F>(movement: &mut Movement, y: f64, posture: Posture, mut judge: F) -> u32
 where
     F: FnMut(&mut Movement, (f64, f64, f64)) -> dust_guard::Claim,
 {
@@ -261,8 +335,19 @@ where
         } else {
             2.0 * SPAN - along
         };
-        if judge(movement, (0.5 + x, y, 0.5)) == dust_guard::Claim::Accepted {
+        let to = (0.5 + x, y, 0.5);
+        if judge(movement, to) == dust_guard::Claim::Accepted {
             accepted += 1;
+        } else {
+            // A refused player is put back where they were, and the walk goes
+            // on from where it says rather than from there — so without this,
+            // the *next* packet is a longer move, and a longer move is split
+            // into more samples, and by the far end of the walk every packet
+            // is sixty-four box questions. That is a measurement of
+            // `SAMPLE_SPAN` and not of anything this bench is about; a row
+            // where the three poses read the same is how it shows.
+            *movement = Movement::new(limit(), to);
+            movement.posture(posture);
         }
     }
     accepted
