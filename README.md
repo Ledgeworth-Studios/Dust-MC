@@ -171,8 +171,15 @@ the two items no tag places named in the source and guarded by a third tag that
 fails the build if a version adds a wearable. `tools/bot/clicks.js` replays a
 hundred clicks against Dust and against a real 1.21.1 server and diffs the two
 recordings: **101 of 101 snapshots agree**, up from 60 of 83 when the armour
-clicks were first asked. Decision record
-[0016](docs/decisions/0016-which-slot-an-item-is-worn-in.md) has the table.
+clicks were first asked. And a click aimed at a window that has since moved is answered with the whole
+container rather than with corrections — the same repair Minecraft performs, and
+the difference between a hiccuping connection costing a packet and it costing a
+player an inventory that is not theirs until they touch the slot.
+`tools/bot/clicks.js --stateid` scores that against a real 1.21.1 server at
+**7 of 7**, up from 3 of 7. Decision records
+[0016](docs/decisions/0016-which-slot-an-item-is-worn-in.md) has the table and
+[0030](docs/decisions/0030-what-a-stale-container-click-gets-back.md) has the
+sequence numbers.
 
 **And everybody else can see it.** A helmet on a player's head, a shield in
 their offhand and the sword in their hand are sent to every other player who

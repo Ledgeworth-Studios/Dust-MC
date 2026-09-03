@@ -68,12 +68,26 @@ const SEED_STEP = -1
 
 const wait = ms => new Promise(r => setTimeout(r, ms))
 
+// The tracker is attached at *construction*, not after `spawn`.
+//
+// A join burst arrives in one TCP read and node runs every packet handler for
+// that read synchronously, while the promise a `spawn` listener resolves runs
+// as a microtask *after* all of them. A tracker attached once the bot has
+// spawned therefore misses everything the server said in the same breath as
+// the position packet — including the container and its sequence number.
+//
+// It cost a wrong reading. `--stateid` reported Dust treating a fresh click as
+// stale, because the number it quoted was the 0 it had never been told
+// otherwise, and vanilla passed the same row only because vanilla happens to
+// send a container update again afterwards. `tools/bot/equipment.js` was bitten
+// by the same thing on the same day, from the other end.
 function spawned (port, username) {
   return new Promise((resolve, reject) => {
     // Three characters minimum: a shorter name never spawns and never errors.
     const b = mineflayer.createBot({
       host: '127.0.0.1', port, username, auth: 'offline', version: VERSION
     })
+    b.tracked = tracker(b)
     const timer = setTimeout(
       () => reject(new Error(`${username} never reached the world in ${JOIN_TIMEOUT_MS / 1000}s`)),
       JOIN_TIMEOUT_MS
@@ -87,13 +101,33 @@ function spawned (port, username) {
 // What the server has told us the container holds, assembled from the packets
 // rather than from mineflayer's window. `null` is an empty slot.
 function tracker (b) {
-  const state = { slots: new Array(SLOTS).fill(null), cursor: null, told: new Set() }
+  const state = {
+    slots: new Array(SLOTS).fill(null),
+    cursor: null,
+    told: new Set(),
+    // How much the server said, and the last sequence number it stamped. Both
+    // are for `--stateid`: two servers can put a container into the same shape
+    // and say wildly different amounts doing it, and the amount is invisible
+    // to a recording that only holds the shape.
+    setSlots: 0,
+    windowItems: 0,
+    lastStateId: 0,
+    // The distinct sequence numbers stamped inside one step. Minecraft
+    // increments once per broadcast and stamps every packet in that broadcast
+    // with the same number, so a client that quotes what it last applied is
+    // never accidentally behind. A server that stamped a fresh number per slot
+    // would put numbers on the wire that a client can quote and be told are
+    // stale, and this is the count that says which one is happening.
+    stateIds: new Set()
+  }
   const name = id => (b.registry.items[id] ? b.registry.items[id].name : `id:${id}`)
   const read = item => {
     if (!item || !item.itemCount || item.itemCount === 0) return null
     return { name: name(item.itemId), count: item.itemCount, components: componentsOf(item) }
   }
   b._client.on('set_slot', p => {
+    state.setSlots++
+    if (p.stateId !== undefined) { state.lastStateId = p.stateId; state.stateIds.add(p.stateId) }
     // The cursor's window id is -1, and it arrives here as 255: minecraft-data
     // types `container_set_slot`'s window id as an unsigned byte on 1.21.1, so
     // prismarine hands back the two's complement rather than the number the
@@ -112,6 +146,8 @@ function tracker (b) {
     }
   })
   b._client.on('window_items', p => {
+    state.windowItems++
+    if (p.stateId !== undefined) { state.lastStateId = p.stateId; state.stateIds.add(p.stateId) }
     if (p.windowId !== 0) return
     for (let i = 0; i < p.items.length && i < SLOTS; i++) {
       state.slots[i] = read(p.items[i])
@@ -136,10 +172,10 @@ function creativeSlot (b, slot, itemName, count) {
   b._client.write('set_creative_slot', { slot, item })
 }
 
-function windowClick (b, slot, mouseButton, mode, changedSlots = [], cursorItem = { itemCount: 0 }) {
+function windowClick (b, slot, mouseButton, mode, changedSlots = [], cursorItem = { itemCount: 0 }, stateId = 0) {
   b._client.write('window_click', {
     windowId: 0,
-    stateId: 0,
+    stateId,
     slot,
     mouseButton,
     mode,
@@ -388,7 +424,7 @@ const RESEEDS = [RESEED, RESEED2]
 
 async function record (port, out) {
   const bot = await spawned(port, 'Clicker')
-  const state = tracker(bot)
+  const state = bot.tracked
   await wait(SPAWN_SETTLE_MS)
 
   // Every slot, not just the seeded ones. Both servers persist a player's
@@ -463,7 +499,7 @@ async function record (port, out) {
 //   node clicks.js <port> --predict
 async function predict (port) {
   const bot = await spawned(port, 'Predictor')
-  const state = tracker(bot)
+  const state = bot.tracked
   await wait(SPAWN_SETTLE_MS)
 
   const stone = 'cobblestone'
@@ -688,7 +724,7 @@ const UNANSWERED = '(the server never said)'
 
 async function recordComponents (port, out) {
   let bot = await spawned(port, 'Componenter')
-  let state = tracker(bot)
+  let state = bot.tracked
   await wait(SPAWN_SETTLE_MS)
 
   // A server that cannot decode a component kicks the connection, so the run
@@ -699,7 +735,7 @@ async function recordComponents (port, out) {
   const reconnect = async () => {
     try { bot.quit() } catch (e) { /* already gone */ }
     bot = await spawned(port, 'Componenter')
-    state = tracker(bot)
+    state = bot.tracked
     await wait(SPAWN_SETTLE_MS)
   }
   const alive = () => bot._client && !bot._client.ended
@@ -792,6 +828,99 @@ async function recordComponents (port, out) {
   process.exit(0)
 }
 
+// What a server sends back when the client quotes a stale sequence number.
+//
+//   node clicks.js <port> --stateid --out dust-stateid.json
+//   node clicks.js --compare vanilla-stateid.json dust-stateid.json
+//
+// `Click Container` carries a `stateId`: the sequence number of the last
+// container update the client applied. It is the client saying "this is the
+// window I clicked on". A number that is not the server's current one means
+// the click was aimed at a container that has since moved, and the two servers
+// answer that differently in a way no shape comparison can see — both end up
+// with the same forty-six slots, and one of them says it in a packet where the
+// other says it in eight.
+//
+// This is the same lesson as `--predict` one turn further on. There, two
+// servers that both send nothing agreed at 101 of 101 while a real client
+// showed a block on a player's head. Here, two servers send *different amounts
+// of the same answer*, and the amount is the whole finding. So this records
+// how many packets came back, not just what they said.
+//
+// Every click below claims nothing changed, like the rest of the script, so
+// the server has to state everything it believes — which is what makes the
+// counts comparable.
+const STATE_ID_SCRIPT = [
+  ['a click quoting the number the server last sent', 'fresh', PICKUP, 9, 0],
+  ['put it back, still quoting the current number', 'fresh', PICKUP, 9, 0],
+  ['a click quoting a number from before the last few updates', 'stale', PICKUP, 10, 0],
+  ['put it back, quoting a stale number again', 'stale', PICKUP, 10, 0],
+  ['a click that changes nothing, quoting the current number', 'fresh', PICKUP, 40, 0],
+  // Whether a click the server answered with *silence* spent a sequence
+  // number. It quotes the same number the row above did, which the row above
+  // established was current. If a silent answer spends one, this row is stale
+  // and comes back as a whole container; if it does not, this row is fresh and
+  // comes back as silence. Neither is obvious from the outside, and a server
+  // that spent one would be telling every client its next click was stale.
+  ['and another quoting the same number, which a silent answer must not have spent', 'held', PICKUP, 41, 0],
+  ['a click that changes nothing, quoting a stale number', 'stale', PICKUP, 40, 0]
+]
+
+// How far back a "stale" click reaches. Any number the server has moved past
+// is stale; five is far enough to be behind a burst of per-slot corrections
+// and small enough to still be a number the server once sent.
+const STALE_BY = 5
+
+async function recordStateIds (port, out) {
+  const bot = await spawned(port, 'Sequencer')
+  const state = bot.tracked
+  await wait(SPAWN_SETTLE_MS)
+
+  state.told.clear()
+  const seeded = new Map(SEED.map(([slot, name, count]) => [slot, [name, count]]))
+  for (let slot = 1; slot < SLOTS; slot++) {
+    const what = seeded.get(slot)
+    creativeSlot(bot, slot, what ? what[0] : null, what ? what[1] : 0)
+  }
+  await wait(SPAWN_SETTLE_MS)
+  for (let slot = 1; slot < SLOTS; slot++) {
+    if (state.told.has(slot)) continue
+    const what = seeded.get(slot)
+    state.slots[slot] = what ? { name: what[0], count: what[1] } : null
+  }
+
+  const steps = []
+  let held = 0
+  for (const [name, freshness, mode, slot, button] of STATE_ID_SCRIPT) {
+    let quoted
+    if (freshness === 'held') quoted = held
+    else if (freshness === 'fresh') quoted = state.lastStateId
+    else quoted = Math.max(0, state.lastStateId - STALE_BY)
+    held = quoted
+    state.cursor = null
+    state.setSlots = 0
+    state.windowItems = 0
+    state.stateIds.clear()
+    windowClick(bot, slot, button, mode, [], { itemCount: 0 }, quoted)
+    await wait(CLICK_SETTLE_MS)
+    steps.push({
+      step: `${name} [${freshness}]`,
+      setSlots: state.setSlots,
+      windowItems: state.windowItems,
+      stateIds: state.stateIds.size,
+      ...snapshot(state)
+    })
+  }
+
+  try { bot.quit() } catch (e) { /* already gone */ }
+  require('fs').writeFileSync(out, JSON.stringify(steps, null, 1))
+  console.log(`${steps.length} clicks recorded to ${out}`)
+  for (const s of steps) {
+    console.log(`  ${String(s.setSlots).padStart(2)} set_slot  ${s.windowItems} window_items  ${s.stateIds} sequence number(s)   ${s.step}`)
+  }
+  process.exit(0)
+}
+
 // Snapshots where the two servers are *expected* to disagree, and why.
 //
 // Not a list of things that are wrong. Every one of these is Minecraft
@@ -836,6 +965,13 @@ function compare (aPath, bPath) {
     if (a[i].cursor !== b[i].cursor) {
       lines.push(`      cursor: ${aPath} ${a[i].cursor || 'empty'} / ${bPath} ${b[i].cursor || 'empty'}`)
     }
+    // Only `--stateid` records these, and they are the whole point of it: two
+    // servers can put a container into the same shape and say a very different
+    // amount doing it.
+    for (const field of ['setSlots', 'windowItems', 'stateIds']) {
+      if (a[i][field] === undefined || a[i][field] === b[i][field]) continue
+      lines.push(`      ${field}: ${aPath} ${a[i][field]} / ${bPath} ${b[i][field]}`)
+    }
     if (lines.length) {
       const why = namedRewrite(a[i].step || '')
       if (why) {
@@ -859,6 +995,12 @@ if (args[0] === '--compare') {
 } else if (args.includes('--components')) {
   const outAt = args.indexOf('--out')
   recordComponents(Number(args[0]), outAt === -1 ? 'components.json' : args[outAt + 1]).catch(e => {
+    console.log(`FAIL  ${e.message}`)
+    process.exit(1)
+  })
+} else if (args.includes('--stateid')) {
+  const outAt = args.indexOf('--out')
+  recordStateIds(Number(args[0]), outAt === -1 ? 'stateid.json' : args[outAt + 1]).catch(e => {
     console.log(`FAIL  ${e.message}`)
     process.exit(1)
   })

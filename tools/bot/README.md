@@ -63,6 +63,19 @@ more clicks over the armour slots, the offhand and the crafting grid took it to
 60 of 83, and eighteen more seeded with a wearable that stacks to 64 took the
 repaired 83 of 83 back to 84 of 101. It is now 101 of 101.
 
+`--stateid` is the same idea pointed at the one field of a click that
+`clicks.js` had never varied. A click carries the sequence number of the last
+container update the client applied, and a number that is not the server's
+current one means the client acted on a window that has since moved. Both
+servers answer that with the **whole container** rather than with per-slot
+corrections — a repair rather than a correction — and none of it is visible in
+a recording that holds only the resulting shape, which is why this mode records
+how many packets came back and how many distinct sequence numbers were on them.
+Dust was 3 of 7 and is now 7 of 7; forcing the staleness comparison to `false`
+takes it to 4 of 7. Decision record 0030 is its output, including a hypothesis
+it killed: Minecraft stamps a fresh sequence number on **every packet**, not
+one per batch, which is what the `stateIds` column exists to say.
+
 `--components` is the same idea pointed at the fifty-seven data-component
 layouts, and it is the reason decision record 0024 exists. It sends a
 component-bearing stack from the client and then makes the server **say what it
@@ -141,14 +154,17 @@ took it to 13 of 15 on the latecomer's step alone; broadcasting the whole
 six-slot set on every container change took it to **1 of 15**, including both
 of the steps whose right answer is silence.
 
-**One trap, paid for here.** A packet listener attached in a `spawn` handler is
-attached too late. A join burst arrives in one TCP read and node runs every
+**One trap, paid for twice on one day — here and in `clicks.js`.** A packet
+listener attached in a `spawn` handler is attached too late. A join burst arrives in one TCP read and node runs every
 packet handler for that read synchronously, while the microtask a `spawn`
 listener resolves runs after all of them — so a listener attached on spawn
 misses everything the server said in the same breath as the position packet,
 which is exactly where the equipment of everybody already here is sent. The
 first run of this script reported a latecomer seeing nothing, and that reading
-was the instrument. `spawned()` now attaches at construction.
+was the instrument. `clicks.js --stateid` hit the same wall from the other end,
+missing the container sent on join and then quoting a sequence number of 0 that
+it had never been told otherwise, which made a fresh click look stale. Both
+scripts now attach at construction.
 
 ## Running it
 
