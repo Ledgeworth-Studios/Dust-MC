@@ -165,7 +165,9 @@ fn main() {
         row(&format!("region files, {pose}"), || {
             let mut ground =
                 Ground::of(&world, Some(&constants)).expect("the table said it was solid");
-            walk(&mut player(y, posture), y, |m, to| m.claimed(to, 1, &mut ground))
+            walk(&mut player(y, posture), y, |m, to| {
+                m.claimed(to, 1, &mut ground)
+            })
         });
     }
 }

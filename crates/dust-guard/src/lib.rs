@@ -825,8 +825,7 @@ impl Movement {
             let Some(block) = inside(world, at, height) else {
                 continue;
             };
-            let blocked = *was_blocked
-                .get_or_insert_with(|| inside(world, from, height).is_some());
+            let blocked = *was_blocked.get_or_insert_with(|| inside(world, from, height).is_some());
             if !blocked {
                 // Somewhere clear, into somewhere that is not. Refused.
                 return Some(block);
@@ -1595,7 +1594,10 @@ mod tests {
         // into the overhang's column is refused for one of them and not for
         // the other, and nothing else about the two runs differs.
         for (posture, expected) in [
-            (Posture::default(), Claim::Refused(Refusal::IntoSolid { block: (2, 2, 0) })),
+            (
+                Posture::default(),
+                Claim::Refused(Refusal::IntoSolid { block: (2, 2, 0) }),
+            ),
             (
                 Posture {
                     sneaking: true,
