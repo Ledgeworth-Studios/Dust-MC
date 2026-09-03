@@ -1251,6 +1251,7 @@ version = "0.0.0"
 dependencies = [
  "dust-config",
  "dust-data",
+ "dust-gen",
  "dust-nbt",
  "dust-registry",
  "dust-server",

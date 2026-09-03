@@ -5,7 +5,7 @@
 //! and weirdness — and picks the biome whose published region of that space is
 //! nearest the sample. The regions are Mojang's, so per decision records 0006,
 //! 0007 and 0008 they are not in this repository: they arrive at run time as
-//! `dust-biomes.tsv`, which `cargo xtask extract --only biomes` writes out of
+//! `dust-biomes.tsv`, which `cargo xtask extract --only worldgen` writes out of
 //! the operator's own server jar beside `dust-constants.tsv`.
 //!
 //! # Why a name sits beside every id
@@ -28,7 +28,8 @@ use std::path::Path;
 use crate::noise::build::{climate_graph, BuildError, ClimateGraph};
 use crate::noise::density::Evaluator;
 
-/// The file `cargo xtask extract --only biomes` writes into `[data] path`.
+/// The file `cargo xtask extract --only worldgen` writes, for the operator to
+/// copy into `[data] path`.
 pub const FILE: &str = "dust-biomes.tsv";
 
 /// How many of Minecraft's units one whole climate unit is worth.
@@ -353,7 +354,10 @@ impl Sampler<'_> {
     /// The biome at a cell, in quart coordinates.
     pub fn biome(&mut self, quart_x: i32, quart_y: i32, quart_z: i32) -> Option<u32> {
         let point = self.climate(quart_x, quart_y, quart_z);
-        self.source.parameters.nearest(&point).map(|region| region.id)
+        self.source
+            .parameters
+            .nearest(&point)
+            .map(|region| region.id)
     }
 }
 
@@ -381,7 +385,10 @@ mod tests {
 
     #[test]
     fn a_span_is_zero_distance_inside_and_the_gap_outside() {
-        let span = Span { min: -100, max: 100 };
+        let span = Span {
+            min: -100,
+            max: 100,
+        };
         assert_eq!(span.distance(0), 0);
         assert_eq!(span.distance(-100), 0);
         assert_eq!(span.distance(100), 0);
@@ -429,7 +436,12 @@ mod tests {
             let exhaustive = parameters
                 .regions()
                 .iter()
-                .map(|region| (region.fitness(&point, i64::MAX).expect("no bound"), region.id))
+                .map(|region| {
+                    (
+                        region.fitness(&point, i64::MAX).expect("no bound"),
+                        region.id,
+                    )
+                })
                 .min_by_key(|(fitness, _)| *fitness)
                 .expect("a nearest")
                 .1;
@@ -440,9 +452,7 @@ mod tests {
     #[test]
     fn an_offset_pushes_a_region_away_even_where_it_would_have_won() {
         let mut rows = vec![row(1, "minecraft:plain", (-10000, 10000))];
-        rows.push(
-            row(2, "minecraft:special", (-10000, 10000)).replace("\t0", "\t5000"),
-        );
+        rows.push(row(2, "minecraft:special", (-10000, 10000)).replace("\t0", "\t5000"));
         let parameters = BiomeParameters::parse(&table(&rows)).expect("parsed");
         assert_eq!(
             parameters.nearest(&[0, 0, 0, 0, 0, 0]).expect("found").name,

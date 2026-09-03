@@ -644,12 +644,17 @@ pub(super) fn capture_label(
     centres: &[(i32, i32)],
 ) -> String {
     let base = format!("{version}-seed-{seed}-radius-{radius}");
-    if centres == [(0, 0)] {
-        return base;
-    }
+    // Sorted and deduplicated *before* the origin is recognised, not after.
+    // `--at 0,0 --at 0,0` names the same square twice and generates exactly the
+    // chunks `--at 0,0` does, so it has to reach the same label; checking the
+    // argument list first gave it its own, and a second name for one capture is
+    // a capture regenerated for nothing.
     let mut sorted = centres.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
+    if sorted == [(0, 0)] {
+        return base;
+    }
     let mut out = base;
     for (x, z) in sorted {
         out.push_str(&format!("-at-{x}_{z}"));
@@ -795,22 +800,38 @@ mod tests {
     #[test]
     fn the_label_keys_a_capture_by_every_input_that_moves_its_digest() {
         assert_eq!(
-            capture_label("1.21.1", 0, 2, (0, 0)),
-            "1.21.1-seed-0-radius-2"
+            capture_label("1.21.1", 0, 2, &[(0, 0)]),
+            "1.21.1-seed-0-radius-2",
+            "the square on the origin keeps the label it has always had"
         );
         assert_eq!(
-            capture_label("1.21.1", 0, 2, (-400, 900)),
-            "1.21.1-seed-0-radius-2-at--400-900"
+            capture_label("1.21.1", 0, 2, &[(-400, 900)]),
+            "1.21.1-seed-0-radius-2-at--400_900"
         );
         assert_ne!(
-            capture_label("1.21.1", 0, 2, (0, 0)),
-            capture_label("1.21.1", 1, 2, (0, 0)),
+            capture_label("1.21.1", 0, 2, &[(0, 0)]),
+            capture_label("1.21.1", 1, 2, &[(0, 0)]),
             "seeds must not share a capture"
         );
         assert_ne!(
-            capture_label("1.21.1", 0, 2, (0, 0)),
-            capture_label("1.21.1", 0, 3, (0, 0)),
+            capture_label("1.21.1", 0, 2, &[(0, 0)]),
+            capture_label("1.21.1", 0, 3, &[(0, 0)]),
             "radii must not share a capture"
+        );
+        assert_ne!(
+            capture_label("1.21.1", 0, 2, &[(0, 0)]),
+            capture_label("1.21.1", 0, 2, &[(0, 0), (400, 400)]),
+            "a widened sample must not overwrite the square it widened"
+        );
+        assert_eq!(
+            capture_label("1.21.1", 0, 2, &[(400, 400), (0, 0)]),
+            capture_label("1.21.1", 0, 2, &[(0, 0), (400, 400)]),
+            "the same squares in either order name the same capture"
+        );
+        assert_eq!(
+            capture_label("1.21.1", 0, 2, &[(0, 0), (0, 0)]),
+            capture_label("1.21.1", 0, 2, &[(0, 0)]),
+            "a square given twice is one square"
         );
     }
 

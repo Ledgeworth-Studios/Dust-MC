@@ -26,6 +26,11 @@ flate2.workspace = true
 # the whole value of the comparison is that the judge was not built here.
 dust-nbt.workspace = true
 
+# The biome-parameter extraction writes the file `dust_gen::biome` reads, and
+# names it through that module rather than repeating the string here: one place
+# knows what the file is called and it is the reader.
+dust-gen.workspace = true
+
 # `harness light` names the block a disagreeing light cell is standing in.
 # That is presentation and not judgement: the *comparison* is between what
 # Minecraft wrote and what Dust's own engine produced, and this table only

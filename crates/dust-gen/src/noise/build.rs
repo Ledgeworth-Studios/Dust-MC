@@ -33,16 +33,27 @@ use super::rng::Xoroshiro;
 /// What went wrong, with the file and the place inside it.
 #[derive(Debug)]
 pub enum BuildError {
-    Unreadable { path: PathBuf, detail: String },
-    Malformed { path: PathBuf, detail: String },
+    Unreadable {
+        path: PathBuf,
+        detail: String,
+    },
+    Malformed {
+        path: PathBuf,
+        detail: String,
+    },
     /// A density function that refers to itself, directly or through others.
-    Cycle { name: String },
+    Cycle {
+        name: String,
+    },
     /// A type this evaluator does not implement.
     ///
     /// Refused rather than defaulted to zero. A missing density-function type
     /// silently answering 0.0 would generate a whole world that is wrong in a
     /// way no test could name.
-    UnknownType { name: String, kind: String },
+    UnknownType {
+        name: String,
+        kind: String,
+    },
 }
 
 impl std::fmt::Display for BuildError {
@@ -488,7 +499,8 @@ mod tests {
 
     impl Pack {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("dust-gen-build-{name}-{}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("dust-gen-build-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             Self { dir }
         }
@@ -602,8 +614,16 @@ mod tests {
     #[test]
     fn a_noise_is_read_once_however_many_places_reach_it() {
         let pack = Pack::new("noises");
-        pack.write("noise", "shared", r#"{"firstOctave": -7, "amplitudes": [1.0, 1.0]}"#);
-        pack.write("noise", "offset", r#"{"firstOctave": -3, "amplitudes": [1.0, 1.0, 1.0, 0.0]}"#);
+        pack.write(
+            "noise",
+            "shared",
+            r#"{"firstOctave": -7, "amplitudes": [1.0, 1.0]}"#,
+        );
+        pack.write(
+            "noise",
+            "offset",
+            r#"{"firstOctave": -3, "amplitudes": [1.0, 1.0, 1.0, 0.0]}"#,
+        );
         pack.write(
             "density_function",
             "shift_x",
@@ -634,7 +654,11 @@ mod tests {
     #[test]
     fn a_seed_changes_the_world_and_the_same_seed_does_not() {
         let pack = Pack::new("seeded");
-        pack.write("noise", "shared", r#"{"firstOctave": -7, "amplitudes": [1.0, 1.0]}"#);
+        pack.write(
+            "noise",
+            "shared",
+            r#"{"firstOctave": -7, "amplitudes": [1.0, 1.0]}"#,
+        );
         pack.write(
             "noise_settings",
             "test",
