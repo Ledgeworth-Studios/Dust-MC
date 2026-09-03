@@ -88,7 +88,12 @@ which reads back the world it started as and says nothing about it that it did
 not say about its own. Without a world source Dust generates a superflat and does
 not pretend otherwise: worldgen is Phase 6, and a column a real world does not
 contain falls back to the flat one, because a world is a disc in an infinite
-plane and a player can walk off the edge of it.
+plane and a player can walk off the edge of it. How far that superflat is from
+the world Minecraft generates for the same seed is measured rather than
+estimated — `cargo xtask harness worldgen` scores it in five parts, and
+decision record
+[0012](docs/decisions/0012-what-worldgen-is-worth-measured-first.md) is what
+each stage of vanilla's pipeline is worth and the order to build them in.
 
 What exists either way is the whole path from the socket to the block table —
 framing, compression, encryption, the four connection states, the paletted
@@ -295,6 +300,7 @@ cargo xtask harness compare captures/a captures/b
 cargo xtask harness rewrite --version 1.21.1 --seed 0 --radius 2
 cargo xtask harness registries --version 1.21.1
 cargo xtask harness light --version 1.21.1 --seed 0 --radius 2
+cargo xtask harness worldgen --version 1.21.1 --seed 0 --radius 4
 ```
 
 `provision` resolves the server jar through the same manifest-and-SHA-1 path
@@ -410,6 +416,55 @@ engine. And it took sky floors from *neighbours* vanilla had not finished: the
 last thirty-two, every one within a step of a chunk edge. Separating over-lighting
 from under-lighting is what made all three visible instead of letting them hide
 inside a number that already looked good.
+
+`worldgen` asks the same question of the terrain, and asks it in five parts.
+Dust generates a superflat; this counts how far that is from the world
+Minecraft generates for the same seed, and which stage of vanilla's pipeline
+owns which part of the gap. Seven models over the same chunks in one run, each
+row the one above it plus a single named change, and every figure a count of
+things **wrong**:
+
+```text
+seed 0, radius 4 -- inland
+
+  surface  surface     biome    caves    false      blocks  KiB/col
+    short    block     short  missing    caves       short
+    20736    20736    124416        0  2416513     2520828      2.2  the flat world Dust serves
+    17467    17551    124416   172558    52673     2627298     16.2  + the world's own sea level
+    17467    17551         0   172558    52673     2627298     16.6  + Minecraft's biomes
+        0    13497         0   198471        0     2632197     18.9  + Minecraft's surface height
+        0    13497         0        0        0     2433726     18.9  + Minecraft's carvers
+        0        0         0        0        0         360     19.6  + its blocks at and below it
+        0        0         0        0        0           0     19.6  + its blocks above it (control)
+```
+
+Out of 20,736 columns, 7,962,624 cells and 124,416 biome cells. The last row is
+a control: it hands over every block and every biome, so a non-zero anywhere in
+it is the harness's fault and not the generator's. It is exact on both seeds,
+and it is checked in CI against chunks the harness builds itself — watched to
+fail in both directions.
+
+**Five scores and not one, because a percentage hides which half it is about.**
+Putting the flat world's grass at sea level fixes 3,269 columns' surface height
+and makes the block count **106,470 worse**; one number would have called that
+a regression. The flat world scores 100% on caves — a world with no rock above
+y -60 contains every cave Minecraft carved — which is why the summary prints
+counts and a "false caves" column and no rate at all.
+
+**Two seeds, because one cannot see.** Seed 1 spawns in open ocean: every one
+of its 20,736 columns has water underfoot, all of them short by *exactly one*
+under the sea-level rung, because `sea_level: 63` names the level water reaches
+*to* and the topmost water block is at 62. Plants above the surface are 360
+cells inland and zero there.
+
+Cost is scored beside accuracy, because this code runs for every chunk a player
+walks toward: a real column's blocks are 19.6 KiB against a flat one's 2.2, and
+**light is 96 KiB more per column whatever the terrain** — at the default view
+distance a join is 5.5 MiB of blocks once terrain is real and 27 MiB of light
+either way. Decision record
+[0012](docs/decisions/0012-what-worldgen-is-worth-measured-first.md) is what
+the ladder was built to write: what each stage is worth, what it costs, and the
+order to build them in.
 
 `capture` boots the provisioned server headless, watches its own log for the
 readiness line, force-generates the square of chunks within `--radius` chunks

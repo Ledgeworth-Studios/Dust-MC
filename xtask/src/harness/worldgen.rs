@@ -1,0 +1,1142 @@
+//! `harness worldgen` — how far is the world Dust generates from the world
+//! Minecraft generates for the same seed?
+//!
+//! # What Dust generates today
+//!
+//! A superflat. Bedrock at the world's floor, three rows of dirt, one of grass
+//! at y -60, air above, `minecraft:plains` everywhere, and every column of
+//! every chunk identical — `dust_server::net::world::FlatWorld`, which says so
+//! in its own module note. A world read off disk falls back to it column by
+//! column, because a world is a disc in an infinite plane and a player can
+//! walk off the edge of it.
+//!
+//! This verb does not fix that. It measures it, before a line of noise is
+//! written, for the same reason `harness light` measured opacity before
+//! anything was changed: the number decides the order of the work, and three
+//! times on this project the number has disagreed with the intuition.
+//!
+//! # Counts, and five of them
+//!
+//! **A percentage hides which half it is about.** A world that is 96% air
+//! agrees with any other world that is 96% air, and a single "blocks match"
+//! figure would read as a score for the generator while being a fact about how
+//! much sky is in view. So five things are scored, each of them something a
+//! player standing in the world would notice, and each of them a count:
+//!
+//! * **surface height** — is the ground at the right y? Per column, from
+//!   `MOTION_BLOCKING`, which is the map `spawn_at` already puts players on.
+//! * **surface block** — is it the right block underfoot? Per column, asked at
+//!   *Minecraft's* surface y, because "what is the player standing on" is a
+//!   question about where the ground actually is.
+//! * **biome** — per 4x4x4 biome cell, and beside it how many distinct biomes
+//!   each side has in view at all.
+//! * **caves** — of the cells Minecraft carved open below its own surface, how
+//!   many are open in Dust. Kept apart from the reverse — cells Dust opened
+//!   that Minecraft did not — for the reason `harness light` keeps over-lit
+//!   cells apart from under-lit ones: a list they shared would let an
+//!   unexplained hundred hide inside an explained ten thousand.
+//! * **blocks** — every cell, state for state. The total the other four are
+//!   slices of.
+//!
+//! # The ladder
+//!
+//! Seven models over the same chunks in one run, each row the one above it
+//! plus a single named change, in the order vanilla's own pipeline runs:
+//!
+//! ```text
+//!   0  the flat world Dust serves today
+//!   1  + the world's own sea level
+//!   2  + Minecraft's biomes                     the biome source
+//!   3  + Minecraft's surface height             the density functions
+//!   4  + Minecraft's carvers                    caves
+//!   5  + Minecraft's blocks at and below it     surface rules, ores, trees
+//!   6  + Minecraft's blocks above it            plants -- the control
+//! ```
+//!
+//! Rows 2 to 6 read their answer out of the region file. **None of them is a
+//! mode a server could run in** — that is the whole point of them, and it is
+//! the same device `harness light`'s last rung uses. What each row *buys* is
+//! what that stage of worldgen is worth, in cells, on this world.
+//!
+//! **Row 6 is a control and has to be exact.** It hands every block and every
+//! biome over, so anything short of 100% on all five scores is the scorer
+//! lying rather than the generator failing. It is checked in CI against
+//! synthetic chunks, in both directions: the control agrees, and a single
+//! changed block makes it disagree.
+//!
+//! # Cost is a score here, more than anywhere else
+//!
+//! This code runs for every chunk a player walks toward, forever. A generator
+//! that is exact and too slow to serve is not a generator, so every rung is
+//! also timed and weighed: columns per second, and the bytes the built column
+//! holds, split into block storage and light arrays. The flat world's answer
+//! to both is unrepresentative *by construction* — it builds one column ever
+//! and shares it — and that is itself the number worth having written down
+//! before the template goes.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::{Duration, Instant};
+
+use dust_server::net::source::RegistryNames;
+use dust_server::net::world::{self, FlatWorld, Palette};
+use dust_world::anvil::{Ids as _, Names as _};
+use dust_world::chunk::Chunk;
+use dust_world::coords::ChunkPos;
+use dust_world::heightmap::{HeightmapKind, WorldHeight};
+
+use super::{cache, digest, region};
+
+const USAGE: &str = "\
+harness worldgen --version <v> [--seed <n>] [--radius <r>] [--at <x>,<z>]
+
+Reads a world Minecraft generated, builds the same chunks with Dust's own
+generator, and counts how far apart they are: surface height, surface block,
+biome, caves, and every block state. Needs a world captured first --
+`cargo xtask harness capture --version <v> --seed <n> --radius <r>`.
+
+A measurement and not a gate: exit 0 unless the run itself failed.
+
+  --version <v>   Minecraft version, e.g. 1.21.1.
+  --seed <n>      The provisioned world's seed. Default 0. Score more than
+                  one: seed 0 spawns inland and seed 1 in open ocean, and
+                  they disagree about nearly every number here.
+  --at <x>,<z>    Centre the square on this chunk instead of 0,0.
+  --radius <r>    Chunks either side of the centre. Default 4 (a 9x9).
+";
+
+/// Sea level in a 1.21.1 overworld: the y of the topmost water block.
+///
+/// Not a constant Dust may read out of Minecraft — it is a property of the
+/// overworld's dimension settings, which live in a data pack the operator's
+/// world carries. It is here as the *model's* sea level, one rung of a ladder,
+/// and the rung above it stops needing it.
+const SEA_LEVEL: i32 = 63;
+
+#[derive(Debug)]
+pub struct Options {
+    pub version: String,
+    pub seed: i64,
+    pub radius: i32,
+    pub centre: (i32, i32),
+}
+
+pub fn parse(args: &[String]) -> Result<Options, String> {
+    let mut version = None;
+    let mut seed = 0i64;
+    let mut radius = 4i32;
+    let mut centre = (0i32, 0i32);
+    let mut seen: Vec<(&'static str, String)> = Vec::new();
+    let mut at = 0;
+    while at < args.len() {
+        match args[at].as_str() {
+            "--version" => {
+                at = super::take_value(&mut seen, "--version", args, at + 1)?;
+                version = Some(seen.last().expect("just stored").1.clone());
+            }
+            "--seed" => {
+                at = super::take_value(&mut seen, "--seed", args, at + 1)?;
+                seed = seen
+                    .last()
+                    .expect("just stored")
+                    .1
+                    .parse()
+                    .map_err(|_| "--seed needs a signed 64-bit integer")?;
+            }
+            "--radius" => {
+                at = super::take_value(&mut seen, "--radius", args, at + 1)?;
+                radius = seen
+                    .last()
+                    .expect("just stored")
+                    .1
+                    .parse()
+                    .map_err(|_| "--radius needs a whole number")?;
+            }
+            "--at" => {
+                at = super::take_value(&mut seen, "--at", args, at + 1)?;
+                let value = seen.last().expect("just stored").1.clone();
+                let (x, z) = value
+                    .split_once(',')
+                    .ok_or("--at needs two chunk coordinates, as `x,z`")?;
+                centre = (
+                    x.trim()
+                        .parse()
+                        .map_err(|_| "--at's x is not a whole number")?,
+                    z.trim()
+                        .parse()
+                        .map_err(|_| "--at's z is not a whole number")?,
+                );
+            }
+            other => return Err(format!("unknown worldgen option `{other}`\n\n{USAGE}")),
+        }
+    }
+    Ok(Options {
+        version: version.ok_or_else(|| {
+            format!("worldgen needs --version, e.g. `--version 1.21.1`\n\n{USAGE}")
+        })?,
+        seed,
+        radius,
+        centre,
+    })
+}
+
+pub fn run(options: &Options) -> ExitCode {
+    match measure(options) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("harness worldgen: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// One rung of the ladder.
+///
+/// Ordered as vanilla's own pipeline runs, so the deltas read as what each
+/// stage of worldgen is worth rather than as an arbitrary sequence. Cheapest
+/// first would have put the sea-level constant beside the biome source and
+/// said nothing about the order the work should be done in, which is what this
+/// verb is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rung {
+    /// `FlatWorld`'s own column, unchanged and called through the server's own
+    /// code rather than restated here. **A differential whose reference
+    /// restates the thing under test proves nothing**, and the inverse holds
+    /// too: a model that claims to be the shipping generator has to *be* it.
+    Flat,
+    /// The same six lines with the grass at the world's sea level instead of
+    /// four blocks off its floor. The fill has to go somewhere and dirt is
+    /// what the flat world fills with.
+    FlatAtSeaLevel,
+    /// The biome of every cell, from Minecraft. Changes no block.
+    Biomes,
+    /// The flat stack again, with each column's grass at the y Minecraft's
+    /// `MOTION_BLOCKING` puts it. The terrain's *shape*, and nothing else:
+    /// stone is still dirt, an ocean is still filled in solid.
+    Heights,
+    /// Cells Minecraft left open below its own surface are open here too.
+    Carvers,
+    /// Every cell at or below the surface takes Minecraft's own block —
+    /// surface rules, aquifers and ores at once, carving included, since air
+    /// is a material.
+    ///
+    /// **And trees.** `MOTION_BLOCKING` counts leaves, so a tree sits *below*
+    /// this rung's surface and is handed over here rather than in the row
+    /// beneath it. What is left above is what blocks nothing: grass, flowers.
+    BelowTheSurface,
+    /// Every cell takes Minecraft's own block. What is above the surface and
+    /// blocks no motion: short grass, flowers.
+    /// **The control**, and the reason it is last: it hands everything over,
+    /// so anything short of exact is this file's fault and not the
+    /// generator's.
+    Everything,
+}
+
+impl Rung {
+    /// The ladder, in order.
+    const ALL: [Self; 7] = [
+        Self::Flat,
+        Self::FlatAtSeaLevel,
+        Self::Biomes,
+        Self::Heights,
+        Self::Carvers,
+        Self::BelowTheSurface,
+        Self::Everything,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Flat => "the flat world Dust serves today",
+            Self::FlatAtSeaLevel => "+ the world's own sea level",
+            Self::Biomes => "+ Minecraft's biomes                     (the biome source)",
+            Self::Heights => "+ Minecraft's surface height             (the density functions)",
+            Self::Carvers => "+ Minecraft's carvers                    (caves)",
+            Self::BelowTheSurface => {
+                "+ Minecraft's blocks at and below it     (surface rules, ores, trees)"
+            }
+            Self::Everything => "+ Minecraft's blocks above it            (plants) <- the control",
+        }
+    }
+
+    /// Whether this rung reads its answer out of the region file, and is
+    /// therefore not a mode any server could run in.
+    fn reads_the_region_file(self) -> bool {
+        !matches!(self, Self::Flat | Self::FlatAtSeaLevel)
+    }
+}
+
+/// The block states every model here is built from, resolved once.
+///
+/// The three air states are here because vanilla has three and Dust's own
+/// heightmap fallback knows about one — the omission decision record 0010
+/// named. A carver fills a cave with `minecraft:cave_air`, so a rung that
+/// asked only about `minecraft:air` would say Minecraft carved nothing.
+struct Blocks {
+    palette: Palette,
+    airs: [u32; 3],
+}
+
+impl Blocks {
+    fn resolve() -> Result<Self, String> {
+        let state = |name: &str| {
+            dust_registry::Block::from_name(name)
+                .map(|block| block.default_state().id())
+                .ok_or_else(|| format!("the generated block table has no {name}"))
+        };
+        Ok(Self {
+            palette: Palette::resolve().map_err(|e| e.to_string())?,
+            airs: [
+                state("minecraft:air")?,
+                state("minecraft:cave_air")?,
+                state("minecraft:void_air")?,
+            ],
+        })
+    }
+
+    fn is_air(&self, state: u32) -> bool {
+        self.airs.contains(&state)
+    }
+}
+
+/// What one rung found, over every chunk of the square.
+///
+/// Five scores and not one, for the reason the module note gives. Every field
+/// is a count; the percentages are printed from them and are never stored,
+/// so nothing here can be read without its denominator beside it.
+#[derive(Default)]
+struct Scores {
+    columns: u64,
+    surface_agree: u64,
+    /// Dust's surface y minus Minecraft's, for the columns that disagree.
+    /// Signed, because too high and too low are different defects: too high
+    /// is terrain that should have been carved or never raised, too low is a
+    /// hill that is not there.
+    surface_off_by: BTreeMap<i32, u64>,
+    surface_block_agree: u64,
+    /// What Minecraft has underfoot where Dust has something else. The
+    /// worklist a surface-rule engine would be written against.
+    surface_wanted: BTreeMap<String, u64>,
+    biome_cells: u64,
+    biome_agree: u64,
+    minecrafts_biomes: BTreeSet<String>,
+    dusts_biomes: BTreeSet<String>,
+    /// Cells Minecraft left open strictly below its own surface.
+    carved: u64,
+    /// ... of which Dust also leaves open.
+    carved_open: u64,
+    /// Cells below the surface Dust leaves open that Minecraft filled. Kept
+    /// apart from the line above: no stage of this ladder is supposed to
+    /// produce one, so a run with any is a run with something unexplained in
+    /// it.
+    opened_wrongly: u64,
+    cells: u64,
+    block_agree: u64,
+    /// What Minecraft has where Dust is wrong, most common first.
+    wanted: BTreeMap<String, u64>,
+    /// Wall time spent building the columns, the reads excluded.
+    built: Duration,
+    /// Bytes the built columns' paletted containers hold — block states and
+    /// biomes, palette and packed storage both.
+    block_bytes: u64,
+    /// Bytes their light arrays hold. Unconditional and identical for every
+    /// rung, which is the point of printing it apart: it is 96 KiB of every
+    /// column whatever the terrain does.
+    light_bytes: u64,
+}
+
+fn measure(options: &Options) -> Result<(), String> {
+    let dirs = cache::Layout::resolve()?;
+    let run_dir = dirs.server_dir(&options.version, options.seed);
+    let region_dir = run_dir.join("world/region");
+    if !region_dir.is_dir() {
+        return Err(format!(
+            "no world at {}; run `cargo xtask harness capture --version {} --seed {} \
+             --radius {}` first",
+            region_dir.display(),
+            options.version,
+            options.seed,
+            options.radius
+        ));
+    }
+    let names = RegistryNames::new()
+        .ok_or_else(|| "the generated registry has no biome table".to_owned())?;
+    let height = WorldHeight::OVERWORLD;
+    let blocks = Blocks::resolve()?;
+    let plains = names
+        .biome("minecraft:plains")
+        .ok_or_else(|| "the biome registry has no minecraft:plains".to_owned())?;
+    // The shipping generator itself, built the way the server builds it. Rung
+    // zero is this object's own output and not a copy of its rules.
+    let flat = FlatWorld::new(blocks.palette, plains, names.biome_registry_size());
+
+    let constants = constants_table(&options.version)?;
+    match &constants {
+        Some((path, table)) => println!(
+            "block constants: {} — {} states",
+            path.display(),
+            table.len()
+        ),
+        None => println!(
+            "no block constants in this checkout, so the surface is `not air` rather than \
+             Minecraft's own MOTION_BLOCKING; `cargo xtask extract --version {} --only constants` \
+             writes one",
+            options.version
+        ),
+    }
+
+    let expected: Vec<(i32, i32)> = digest::expected_chunks(options.radius)
+        .into_iter()
+        .map(|(x, z)| (x + options.centre.0, z + options.centre.1))
+        .collect();
+
+    // Only chunks vanilla finished. A chunk below `full` holds a partial
+    // answer that looks like a complete one, which is why `digest::scan` and
+    // `harness light` both refuse it.
+    let mut vanilla = Vec::with_capacity(expected.len());
+    for &(x, z) in &expected {
+        match read_chunk(&region_dir, x, z, height, &names)? {
+            Some(chunk) => vanilla.push(chunk),
+            None => continue,
+        }
+    }
+    let skipped = expected.len() - vanilla.len();
+    if skipped > 0 {
+        println!(
+            "{skipped} of {} chunk(s) skipped: vanilla has not finished them",
+            expected.len()
+        );
+    }
+    if vanilla.is_empty() {
+        return Err("every chunk was skipped; capture a world first".to_owned());
+    }
+    println!(
+        "comparing {} chunk(s) of Minecraft {} seed {} against Dust's generator",
+        vanilla.len(),
+        options.version,
+        options.seed
+    );
+
+    // Minecraft's surface, worked out once and shared by every rung: the
+    // question is asked of the *same* world seven times and a per-rung
+    // recompute would be seven chances for the models to be scored against
+    // slightly different ground.
+    let mut surfaces = Vec::with_capacity(vanilla.len());
+    for chunk in &mut vanilla {
+        chunk.recompute_heightmaps(world::heightmap_predicate(
+            blocks.palette.air,
+            constants.as_ref().map(|(_, table)| table),
+        ));
+        surfaces.push(surface_of(chunk));
+    }
+
+    let mut ladder = Vec::new();
+    for rung in Rung::ALL {
+        let mut scores = Scores::default();
+        for (chunk, surface) in vanilla.iter().zip(&surfaces) {
+            let started = Instant::now();
+            let built = build(
+                rung,
+                chunk,
+                surface,
+                &flat,
+                &blocks,
+                &names,
+                height,
+                constants.as_ref().map(|(_, table)| table),
+            );
+            scores.built += started.elapsed();
+            weigh(&built, &mut scores);
+            score(&built, chunk, surface, &blocks, &names, height, &mut scores);
+        }
+        report(rung, &scores);
+        ladder.push((rung, scores));
+    }
+    summary(&ladder);
+    Ok(())
+}
+
+/// Minecraft's `MOTION_BLOCKING` top for each of a chunk's 256 columns.
+///
+/// `None` where the column holds nothing the map counts — the top of a world
+/// is a boundary and not a position, and a column with no ground has no
+/// surface rather than a surface at the floor.
+fn surface_of(chunk: &Chunk) -> [Option<i32>; 256] {
+    let map = chunk.heightmaps().get(HeightmapKind::MotionBlocking);
+    let mut out = [None; 256];
+    for z in 0..16u32 {
+        for x in 0..16u32 {
+            out[(x + z * 16) as usize] = map.highest_taken(x, z);
+        }
+    }
+    out
+}
+
+/// Build one chunk with one rung's model.
+fn build(
+    rung: Rung,
+    vanilla: &Chunk,
+    surface: &[Option<i32>; 256],
+    flat: &FlatWorld,
+    blocks: &Blocks,
+    names: &RegistryNames,
+    height: WorldHeight,
+    constants: Option<&dust_registry::BlockConstants>,
+) -> Chunk {
+    // Rung zero is the server's own column, cloned rather than rebuilt: that
+    // clone is also what `Source::column` hands out for a position a real
+    // world does not contain, so it is the shipping answer and not a model of
+    // one.
+    if rung == Rung::Flat {
+        let mut column = flat.column().clone();
+        // **Asked the same question as the other side, and it caught the
+        // harness the first time it ran.** The control rung reproduced every
+        // block of the world and still reported 352 columns whose surface was
+        // wrong, all of them too high, because the built chunk's heightmaps
+        // were recomputed with `state != air` while Minecraft's were
+        // recomputed with Minecraft's own `MOTION_BLOCKING` predicate. Short
+        // grass and flowers are the difference — decision record 0010's
+        // finding, in a second place, found the same way. A comparison that
+        // asks the two sides different questions measures itself.
+        //
+        // It changes nothing for a flat world: bedrock, dirt and grass are
+        // what all six of vanilla's predicates agree about. It is done anyway,
+        // because a line that has to be remembered later is a line that will
+        // not be.
+        column.recompute_heightmaps(world::heightmap_predicate(blocks.palette.air, constants));
+        return column;
+    }
+
+    let air = blocks.palette.air;
+    let plains = flat.column().get_biome(0, height.min_y(), 0);
+    let mut chunk = Chunk::uniform(
+        vanilla.pos(),
+        height,
+        dust_registry::STATE_COUNT,
+        names.biome_registry_size(),
+        air,
+        plains,
+    );
+
+    let top = height.min_y() + height.height() as i32;
+    for z in 0..16u32 {
+        for x in 0..16u32 {
+            let column = (x + z * 16) as usize;
+            // Where this model puts the grass. The flat rungs put it at sea
+            // level everywhere; the rest take it from Minecraft, and a column
+            // Minecraft left empty gets no ground at all rather than a guess.
+            let ground = match rung {
+                Rung::Flat => unreachable!("returned above"),
+                Rung::FlatAtSeaLevel | Rung::Biomes => Some(SEA_LEVEL),
+                _ => surface[column],
+            };
+            for y in height.min_y()..top {
+                let state = if y == height.min_y() {
+                    blocks.palette.bedrock
+                } else {
+                    match rung {
+                        Rung::Flat => unreachable!("returned above"),
+                        Rung::FlatAtSeaLevel | Rung::Biomes | Rung::Heights => {
+                            stack(y, ground, blocks)
+                        }
+                        Rung::Carvers => {
+                            let v = vanilla.get_block(x, y, z);
+                            if ground.is_some_and(|g| y <= g) && blocks.is_air(v) {
+                                v
+                            } else {
+                                stack(y, ground, blocks)
+                            }
+                        }
+                        Rung::BelowTheSurface => {
+                            if ground.is_some_and(|g| y <= g) {
+                                vanilla.get_block(x, y, z)
+                            } else {
+                                air
+                            }
+                        }
+                        Rung::Everything => vanilla.get_block(x, y, z),
+                    }
+                };
+                if state != air {
+                    chunk.set_block(x, y, z, state);
+                }
+            }
+        }
+    }
+
+    if rung.reads_the_region_file() {
+        // Biome cells are 4x4x4 and the loop walks them at their own stride
+        // rather than per block: sixty-four writes a section instead of four
+        // thousand and ninety-six, for the same answer.
+        for y in (height.min_y()..top).step_by(4) {
+            for z in (0..16u32).step_by(4) {
+                for x in (0..16u32).step_by(4) {
+                    chunk.set_biome(x, y, z, vanilla.get_biome(x, y, z));
+                }
+            }
+        }
+    }
+
+    chunk.recompute_heightmaps(world::heightmap_predicate(air, constants));
+    chunk
+}
+
+/// The flat stack at one y: bedrock is the caller's, dirt below the ground,
+/// grass on it, air above.
+fn stack(y: i32, ground: Option<i32>, blocks: &Blocks) -> u32 {
+    match ground {
+        Some(g) if y == g => blocks.palette.grass,
+        Some(g) if y < g => blocks.palette.dirt,
+        _ => blocks.palette.air,
+    }
+}
+
+/// What a built column holds, in bytes.
+///
+/// The paletted containers are counted as they are stored — the palette's
+/// entries plus the packed longs — because that is what a server holding a
+/// view distance of columns actually pays. The light arrays are counted apart
+/// and are the same number for every rung: `LightArray` is an unconditional
+/// `Box<[u8; 2048]>` and a section has two, so every column carries 96 KiB of
+/// light whether or not anything ever lights it.
+fn weigh(chunk: &Chunk, scores: &mut Scores) {
+    for section in chunk.sections() {
+        for container in [section.states(), section.biomes()] {
+            scores.block_bytes += container.palette().len() as u64 * 4;
+            scores.block_bytes += container.storage().as_longs().len() as u64 * 8;
+        }
+        scores.light_bytes += 2 * dust_world::light::BYTES as u64;
+    }
+}
+
+/// Score one built chunk against the one Minecraft wrote.
+fn score(
+    dust: &Chunk,
+    vanilla: &Chunk,
+    surface: &[Option<i32>; 256],
+    blocks: &Blocks,
+    names: &RegistryNames,
+    height: WorldHeight,
+    scores: &mut Scores,
+) {
+    let dust_surface = surface_of(dust);
+    let top = height.min_y() + height.height() as i32;
+    for z in 0..16u32 {
+        for x in 0..16u32 {
+            let column = (x + z * 16) as usize;
+            scores.columns += 1;
+            let want = surface[column];
+            let got = dust_surface[column];
+            if want == got {
+                scores.surface_agree += 1;
+            } else if let (Some(want), Some(got)) = (want, got) {
+                *scores.surface_off_by.entry(got - want).or_default() += 1;
+            }
+            // Asked at Minecraft's y and not at Dust's. A column whose ground
+            // is thirty blocks too low can still be grass on top of dirt, and
+            // scoring it there would call that a match while the player is
+            // standing in the air above it.
+            if let Some(y) = want {
+                let wanted = vanilla.get_block(x, y, z);
+                if dust.get_block(x, y, z) == wanted {
+                    scores.surface_block_agree += 1;
+                } else {
+                    *scores.surface_wanted.entry(block_name(wanted)).or_default() += 1;
+                }
+            } else {
+                // No ground at all is a match when Dust has none either.
+                if got.is_none() {
+                    scores.surface_block_agree += 1;
+                }
+            }
+
+            for y in height.min_y()..top {
+                let wanted = vanilla.get_block(x, y, z);
+                let built = dust.get_block(x, y, z);
+                scores.cells += 1;
+                if built == wanted {
+                    scores.block_agree += 1;
+                } else {
+                    *scores.wanted.entry(block_name(wanted)).or_default() += 1;
+                }
+                let Some(ground) = want else { continue };
+                if y >= ground {
+                    continue;
+                }
+                match (blocks.is_air(wanted), blocks.is_air(built)) {
+                    (true, true) => {
+                        scores.carved += 1;
+                        scores.carved_open += 1;
+                    }
+                    (true, false) => scores.carved += 1,
+                    (false, true) => scores.opened_wrongly += 1,
+                    (false, false) => {}
+                }
+            }
+        }
+    }
+
+    for y in (height.min_y()..top).step_by(4) {
+        for z in (0..16u32).step_by(4) {
+            for x in (0..16u32).step_by(4) {
+                let wanted = vanilla.get_biome(x, y, z);
+                let built = dust.get_biome(x, y, z);
+                scores.biome_cells += 1;
+                if wanted == built {
+                    scores.biome_agree += 1;
+                }
+                if let Some(name) = names.biome_name(wanted) {
+                    scores.minecrafts_biomes.insert(name.to_owned());
+                }
+                if let Some(name) = names.biome_name(built) {
+                    scores.dusts_biomes.insert(name.to_owned());
+                }
+            }
+        }
+    }
+}
+
+fn block_name(state: u32) -> String {
+    dust_registry::BlockState::from_id(state)
+        .map(|s| s.block().name().to_owned())
+        .unwrap_or_else(|| format!("state {state}"))
+}
+
+#[expect(clippy::cast_precision_loss, reason = "counts here are far below 2^53")]
+fn percent(part: u64, whole: u64) -> f64 {
+    if whole == 0 {
+        100.0
+    } else {
+        part as f64 * 100.0 / whole as f64
+    }
+}
+
+fn report(rung: Rung, scores: &Scores) {
+    println!();
+    println!("--- {} ---", rung.name());
+    println!(
+        "  surface height  {:>10} of {:>10} column(s)  ({:.3}%)",
+        scores.surface_agree,
+        scores.columns,
+        percent(scores.surface_agree, scores.columns)
+    );
+    if !scores.surface_off_by.is_empty() {
+        let mut rows: Vec<(&i32, &u64)> = scores.surface_off_by.iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        let shown: Vec<String> = rows
+            .iter()
+            .take(6)
+            .map(|(delta, count)| format!("{delta:+} x {count}"))
+            .collect();
+        println!("      off by (Dust minus Minecraft): {}", shown.join(", "));
+    }
+    println!(
+        "  surface block   {:>10} of {:>10} column(s)  ({:.3}%)",
+        scores.surface_block_agree,
+        scores.columns,
+        percent(scores.surface_block_agree, scores.columns)
+    );
+    histogram("      Minecraft has underfoot:", &scores.surface_wanted);
+    println!(
+        "  biome           {:>10} of {:>10} cell(s)    ({:.3}%)  Minecraft has {} kind(s) here, \
+         Dust {}",
+        scores.biome_agree,
+        scores.biome_cells,
+        percent(scores.biome_agree, scores.biome_cells),
+        scores.minecrafts_biomes.len(),
+        scores.dusts_biomes.len()
+    );
+    println!(
+        "  caves           {:>10} of {:>10} carved cell(s) open ({:.3}%); {} cell(s) Dust opened \
+         that Minecraft filled",
+        scores.carved_open,
+        scores.carved,
+        percent(scores.carved_open, scores.carved),
+        scores.opened_wrongly
+    );
+    println!(
+        "  blocks          {:>10} of {:>10} cell(s)    ({:.3}%)",
+        scores.block_agree,
+        scores.cells,
+        percent(scores.block_agree, scores.cells)
+    );
+    histogram("      Minecraft has where Dust is wrong:", &scores.wanted);
+}
+
+fn histogram(label: &str, counts: &BTreeMap<String, u64>) {
+    if counts.is_empty() {
+        return;
+    }
+    println!("{label}");
+    let mut rows: Vec<(&String, &u64)> = counts.iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    for (name, count) in rows.iter().take(6) {
+        println!("        {name:<34} {count}");
+    }
+    if rows.len() > 6 {
+        println!("        ... and {} more kind(s)", rows.len() - 6);
+    }
+}
+
+/// The whole ladder side by side, printed last because it is the conclusion.
+///
+/// **Shortfalls, in cells, and not one percentage.** The first run of this
+/// verb printed rates here and the flat world scored **100% on caves** — a
+/// world with no rock in it above y -60 contains every cave Minecraft carved,
+/// and the rate said so without a word about the six million cells of stone it
+/// had turned into sky. The count beside it, "false caves", is the one that
+/// reads that row correctly. Every column here is a number of things wrong.
+///
+/// The cost columns are the reason this table is wider than `harness light`'s.
+/// Worldgen runs for every chunk a player walks toward, forever, and a rung
+/// that closes the gap at ten times the cost is a different answer from one
+/// that closes it free.
+fn summary(ladder: &[(Rung, Scores)]) {
+    println!();
+    println!("what each one leaves wrong, over the same chunks (counts, not rates):");
+    println!();
+    println!(
+        "    surface    surface      biome      caves      false      blocks    cols/s  KiB/col  \
+         model"
+    );
+    println!(
+        "      short      block      short    missing      caves       short                     "
+    );
+    for (rung, scores) in ladder {
+        #[expect(clippy::cast_precision_loss, reason = "counts here are far below 2^53")]
+        let per_second = if scores.built.as_secs_f64() > 0.0 {
+            scores.columns as f64 / 256.0 / scores.built.as_secs_f64()
+        } else {
+            f64::INFINITY
+        };
+        let columns = (scores.columns / 256).max(1);
+        #[expect(clippy::cast_precision_loss, reason = "counts here are far below 2^53")]
+        let kib = scores.block_bytes as f64 / columns as f64 / 1024.0;
+        println!(
+            "  {:>9} {:>10} {:>10} {:>10} {:>10} {:>11} {:>9.0} {:>8.1}  {}",
+            scores.columns - scores.surface_agree,
+            scores.columns - scores.surface_block_agree,
+            scores.biome_cells - scores.biome_agree,
+            scores.carved - scores.carved_open,
+            scores.opened_wrongly,
+            scores.cells - scores.block_agree,
+            per_second,
+            kib,
+            rung.name()
+        );
+    }
+    let (columns, cells, biomes, carved) = ladder
+        .first()
+        .map(|(_, s)| (s.columns, s.cells, s.biome_cells, s.carved))
+        .unwrap_or_default();
+    println!();
+    println!(
+        "  Out of {columns} column(s), {cells} cell(s), {biomes} biome cell(s) and {carved} \
+         cell(s) Minecraft carved."
+    );
+    println!();
+    println!("  Each row is the one above it plus a single named change, and every change");
+    println!("  from the third row down hands Dust an answer it read out of the region");
+    println!("  file -- none of those is a mode a server could run in.");
+    println!();
+    println!("  The last row is a control: it hands over every block and every biome, so");
+    println!("  a non-zero anywhere in it is this verb's fault and not the generator's.");
+    println!();
+    println!("  \"false caves\" is cells below Minecraft's own surface that Dust leaves open");
+    println!("  and Minecraft filled. It is what stops the caves column being read as a");
+    println!("  score: a world of pure air has none missing and all of them false.");
+    println!();
+    println!("  cols/s is this verb's own building, the region reads excluded, on whatever");
+    println!("  machine ran it -- read the ratio between rows and not the number. KiB/col");
+    let light = ladder
+        .first()
+        .map(|(_, scores)| scores.light_bytes / (scores.columns / 256).max(1) / 1024)
+        .unwrap_or(0);
+    println!("  is block states and biomes as they are stored. Light is {light} KiB more per");
+    println!("  column, the same for every row, and unconditional.");
+}
+
+/// The constants `cargo xtask extract --only constants` wrote for this version,
+/// if this checkout has one. A developer route, exactly as in `harness light`.
+fn constants_table(
+    version: &str,
+) -> Result<Option<(PathBuf, dust_registry::BlockConstants)>, String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask lives one level below the workspace root")
+        .join(format!(".dust-extract/oracle-{version}/constants.tsv"));
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    let table = dust_registry::BlockConstants::parse(&text)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Some((path, table)))
+}
+
+/// One chunk of the captured world, or `None` if vanilla has not finished it.
+fn read_chunk(
+    region_dir: &Path,
+    x: i32,
+    z: i32,
+    height: WorldHeight,
+    names: &RegistryNames,
+) -> Result<Option<Chunk>, String> {
+    let path = region::region_file_path(region_dir, x, z);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Ok(None);
+    };
+    let Some((compression, payload)) = region::read_chunk(&bytes, x, z)? else {
+        return Ok(None);
+    };
+    let decompressed = region::decompress(compression, &payload)?;
+    let named =
+        dust_nbt::read::from_bytes(&decompressed).map_err(|e| format!("chunk {x},{z}: {e}"))?;
+    let dust_nbt::Tag::Compound(root) = &named.tag else {
+        return Err(format!("chunk {x},{z} is not a compound"));
+    };
+    let status = root.get("Status").and_then(|tag| match tag {
+        dust_nbt::Tag::String(s) => Some(s.as_str()),
+        _ => None,
+    });
+    if !matches!(status, Some("minecraft:full" | "full")) {
+        return Ok(None);
+    }
+    let _ = ChunkPos::new(x, z);
+    dust_world::anvil::chunk(root, height, names)
+        .map(Some)
+        .map_err(|e| format!("chunk {x},{z}: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stand-in world with one hill, one cave and one tree's worth of
+    /// leaves, built here rather than read from a file: this harness tests
+    /// against bytes it constructed, never against Mojang's.
+    fn synthetic(blocks: &Blocks, height: WorldHeight, plains: u32, other: u32) -> Chunk {
+        let stone = dust_registry::Block::from_name("minecraft:stone")
+            .expect("the block table has stone")
+            .default_state()
+            .id();
+        let mut chunk = Chunk::uniform(
+            ChunkPos::new(0, 0),
+            height,
+            dust_registry::STATE_COUNT,
+            64,
+            blocks.palette.air,
+            plains,
+        );
+        for z in 0..16u32 {
+            for x in 0..16u32 {
+                // A slope, so the surface is not one number everywhere and a
+                // model that got the height right by accident cannot pass.
+                let ground = 60 + (x as i32 % 5) + (z as i32 % 3);
+                chunk.set_block(x, height.min_y(), z, blocks.palette.bedrock);
+                for y in (height.min_y() + 1)..ground {
+                    chunk.set_block(x, y, z, stone);
+                }
+                chunk.set_block(x, ground, z, blocks.palette.grass);
+            }
+        }
+        // A cave: cave_air, which is the state a carver leaves and the one a
+        // model that only knows `minecraft:air` would miss.
+        for y in 20..24 {
+            for x in 3..7u32 {
+                chunk.set_block(x, y, 5, blocks.airs[1]);
+            }
+        }
+        // One biome cell that is not plains, so a biome score of 100% has to
+        // have been earned.
+        chunk.set_biome(8, 0, 8, other);
+        chunk.recompute_heightmaps(|_kind, state| state != blocks.palette.air);
+        chunk
+    }
+
+    fn parts() -> (Blocks, WorldHeight, RegistryNames) {
+        (
+            Blocks::resolve().expect("the block table"),
+            WorldHeight::OVERWORLD,
+            RegistryNames::new().expect("the biome table"),
+        )
+    }
+
+    /// The control rung reproduces the world exactly, on all five scores.
+    ///
+    /// Without this the ladder's last row could read 99.99% forever and nobody
+    /// would know whether that was the generator or the scorer.
+    #[test]
+    fn the_control_rung_is_exact_on_every_score() {
+        let (blocks, height, names) = parts();
+        let plains = names.biome("minecraft:plains").expect("plains");
+        let other = names.biome("minecraft:desert").expect("desert");
+        let mut vanilla = synthetic(&blocks, height, plains, other);
+        vanilla.recompute_heightmaps(world::heightmap_predicate(blocks.palette.air, None));
+        let surface = surface_of(&vanilla);
+        let flat = FlatWorld::new(blocks.palette, plains, names.biome_registry_size());
+
+        let built = build(
+            Rung::Everything,
+            &vanilla,
+            &surface,
+            &flat,
+            &blocks,
+            &names,
+            height,
+            None,
+        );
+        let mut scores = Scores::default();
+        score(
+            &built,
+            &vanilla,
+            &surface,
+            &blocks,
+            &names,
+            height,
+            &mut scores,
+        );
+        assert_eq!(scores.block_agree, scores.cells, "blocks");
+        assert_eq!(scores.surface_agree, scores.columns, "surface height");
+        assert_eq!(scores.surface_block_agree, scores.columns, "surface block");
+        assert_eq!(scores.biome_agree, scores.biome_cells, "biomes");
+        assert_eq!(scores.carved_open, scores.carved, "caves");
+        assert!(scores.carved > 0, "the stand-in has a cave to find");
+        assert_eq!(scores.opened_wrongly, 0);
+        assert_eq!(scores.minecrafts_biomes.len(), 2, "plains and desert");
+    }
+
+    /// ... and it is exact because the world is, not because the comparison
+    /// cannot see.
+    ///
+    /// **The negative half of the control.** One block changed in the world
+    /// the control was built from has to move every score it touches. Watching
+    /// this fail is what says the assertions above are load-bearing.
+    #[test]
+    fn one_changed_block_moves_the_control_off_exact() {
+        let (blocks, height, names) = parts();
+        let plains = names.biome("minecraft:plains").expect("plains");
+        let other = names.biome("minecraft:desert").expect("desert");
+        let mut vanilla = synthetic(&blocks, height, plains, other);
+        vanilla.recompute_heightmaps(world::heightmap_predicate(blocks.palette.air, None));
+        let surface = surface_of(&vanilla);
+        let flat = FlatWorld::new(blocks.palette, plains, names.biome_registry_size());
+        let mut built = build(
+            Rung::Everything,
+            &vanilla,
+            &surface,
+            &flat,
+            &blocks,
+            &names,
+            height,
+            None,
+        );
+        // Take the top block of one column away. The surface drops, the block
+        // underfoot changes and one cell of the world differs.
+        let y = surface[0].expect("the stand-in has ground everywhere");
+        built.set_block(0, y, 0, blocks.palette.air);
+        built.recompute_heightmaps(world::heightmap_predicate(blocks.palette.air, None));
+
+        let mut scores = Scores::default();
+        score(
+            &built,
+            &vanilla,
+            &surface,
+            &blocks,
+            &names,
+            height,
+            &mut scores,
+        );
+        assert_eq!(scores.block_agree, scores.cells - 1, "exactly one cell");
+        assert_eq!(scores.surface_agree, scores.columns - 1);
+        assert_eq!(scores.surface_block_agree, scores.columns - 1);
+        assert_eq!(scores.surface_off_by.get(&-1).copied(), Some(1));
+    }
+
+    /// The carver rung finds a cave filled with `cave_air`.
+    ///
+    /// A model that asked only about `minecraft:air` would report the cave
+    /// missing, which is decision record 0010's omission in a second place.
+    #[test]
+    fn a_cave_of_cave_air_counts_as_carved() {
+        let (blocks, height, names) = parts();
+        let plains = names.biome("minecraft:plains").expect("plains");
+        let other = names.biome("minecraft:desert").expect("desert");
+        let mut vanilla = synthetic(&blocks, height, plains, other);
+        vanilla.recompute_heightmaps(world::heightmap_predicate(blocks.palette.air, None));
+        let surface = surface_of(&vanilla);
+        let flat = FlatWorld::new(blocks.palette, plains, names.biome_registry_size());
+
+        for (rung, open) in [(Rung::Heights, false), (Rung::Carvers, true)] {
+            let built = build(
+                rung, &vanilla, &surface, &flat, &blocks, &names, height, None,
+            );
+            let mut scores = Scores::default();
+            score(
+                &built,
+                &vanilla,
+                &surface,
+                &blocks,
+                &names,
+                height,
+                &mut scores,
+            );
+            assert_eq!(scores.carved, 16, "4x4 cells of cave_air");
+            assert_eq!(
+                scores.carved_open > 0,
+                open,
+                "{rung:?} should {} find the cave",
+                if open { "" } else { "not" }
+            );
+            // The height rung takes its shape from Minecraft, so the surface
+            // is exact even where the material is not.
+            assert_eq!(scores.surface_agree, scores.columns, "{rung:?} surface");
+        }
+    }
+
+    /// The flat rung is the world the server serves, not a restatement of it.
+    #[test]
+    fn the_flat_rung_is_the_servers_own_column() {
+        let (blocks, height, names) = parts();
+        let plains = names.biome("minecraft:plains").expect("plains");
+        let flat = FlatWorld::new(blocks.palette, plains, names.biome_registry_size());
+        let vanilla = synthetic(&blocks, height, plains, plains);
+        let surface = surface_of(&vanilla);
+        let built = build(
+            Rung::Flat,
+            &vanilla,
+            &surface,
+            &flat,
+            &blocks,
+            &names,
+            height,
+            None,
+        );
+        assert_eq!(&built, flat.column());
+    }
+
+    #[test]
+    fn the_ladder_changes_one_thing_per_rung_and_ends_at_the_control() {
+        assert_eq!(Rung::ALL.len(), 7);
+        assert_eq!(Rung::ALL[0], Rung::Flat);
+        assert_eq!(*Rung::ALL.last().expect("seven"), Rung::Everything);
+        assert!(!Rung::Flat.reads_the_region_file());
+        assert!(!Rung::FlatAtSeaLevel.reads_the_region_file());
+        assert!(Rung::Biomes.reads_the_region_file());
+    }
+
+    #[test]
+    fn parsing_takes_the_documented_spelling_and_refuses_the_rest() {
+        let args: Vec<String> = ["--version", "1.21.1", "--seed", "1", "--radius", "3"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let options = parse(&args).expect("parses");
+        assert_eq!(options.seed, 1);
+        assert_eq!(options.radius, 3);
+        assert_eq!(options.centre, (0, 0));
+        assert!(parse(&[]).is_err(), "no --version");
+        assert!(parse(&["--nope".to_owned()]).is_err());
+    }
+}
