@@ -44,6 +44,37 @@ use tokio::sync::broadcast;
 
 use super::source::Source;
 
+/// The six sides of a cell, in [`Face`] order — which is the order
+/// `dust_sim::placement::Around` indexes by, so the two never need translating.
+///
+/// [`Face`]: dust_sim::placement::Face
+const SIDES: [dust_sim::placement::Face; 6] = [
+    dust_sim::placement::Face::Down,
+    dust_sim::placement::Face::Up,
+    dust_sim::placement::Face::North,
+    dust_sim::placement::Face::South,
+    dust_sim::placement::Face::West,
+    dust_sim::placement::Face::East,
+];
+
+/// The cell one step from `position` in a given direction.
+fn offset(position: Position, side: dust_sim::placement::Face) -> Position {
+    use dust_sim::placement::Face;
+    let (x, y, z) = match side {
+        Face::Down => (0, -1, 0),
+        Face::Up => (0, 1, 0),
+        Face::North => (0, 0, -1),
+        Face::South => (0, 0, 1),
+        Face::West => (-1, 0, 0),
+        Face::East => (1, 0, 0),
+    };
+    Position {
+        x: position.x + x,
+        y: position.y + y,
+        z: position.z + z,
+    }
+}
+
 /// A column, as the edit map keys it. Not [`ChunkPos`], because this is a hash
 /// key and giving a domain type a `Hash` it does not otherwise need would put
 /// the map's requirements into the world's vocabulary.
@@ -134,6 +165,11 @@ pub struct EditedWorld {
     /// How many events have chosen a sound sample, which is what the next one
     /// is derived from. See [`EditedWorld::next_seed`].
     sounds: std::sync::atomic::AtomicU64,
+    /// Minecraft's own per-state constants, when the operator put a table
+    /// beside their data. The only thing this module reads out of it is which
+    /// of a block state's faces are full, which is what a fence, a wall and a
+    /// glass pane ask of the block beside them — see [`EditedWorld::reshape`].
+    constants: Option<Arc<dust_registry::BlockConstants>>,
 }
 
 impl EditedWorld {
@@ -144,6 +180,93 @@ impl EditedWorld {
             edits: RwLock::new(HashMap::new()),
             announce,
             sounds: std::sync::atomic::AtomicU64::new(0),
+            constants: None,
+        }
+    }
+
+    /// The table that says which of a block state's faces are full.
+    ///
+    /// A separate step rather than an argument to [`EditedWorld::new`] because
+    /// a world without one is a world that works — it lights nothing and makes
+    /// no sound either — and five callers that do not have one should not have
+    /// to say so.
+    #[must_use]
+    pub fn with_constants(mut self, constants: Option<Arc<dust_registry::BlockConstants>>) -> Self {
+        self.constants = constants;
+        self
+    }
+
+    /// The predicate the shape rules need, if this world has the table for it.
+    fn solid(&self) -> Option<dust_sim::placement::Solid<'_>> {
+        dust_sim::placement::Solid::from_constants(self.constants.as_deref()?)
+    }
+
+    /// What is in the six cells around one.
+    fn around(&self, position: Position) -> dust_sim::placement::Around {
+        let mut around = dust_sim::placement::Around::empty();
+        for side in SIDES {
+            let state = self.block_at(offset(position, side));
+            if let Some(state) = dust_registry::BlockState::from_id(state) {
+                around = around.with(side, state);
+            }
+        }
+        around
+    }
+
+    /// The state a block takes in this cell, given what is already around it.
+    ///
+    /// Applied **before** the write and not after, so that a fence goes into
+    /// the world with its arms already on. Written the other way the cell would
+    /// be announced twice for one click, and a player would watch the fence
+    /// appear bare and then connect.
+    fn shaped_at(&self, position: Position, state: u32) -> u32 {
+        let Some(solid) = self.solid() else {
+            return state;
+        };
+        let Some(placed) = dust_registry::BlockState::from_id(state) else {
+            return state;
+        };
+        if !dust_sim::placement::reads_neighbours(placed) {
+            return state;
+        }
+        dust_sim::placement::shaped(placed, self.around(position), solid).id()
+    }
+
+    /// Give every cell around `position` the shape its surroundings now imply.
+    ///
+    /// **This is the half that makes a fence a fence.** A rule applied only
+    /// where the click landed connects a fence to what was already there and
+    /// not to what arrives later, so a wall built west to east has arms and the
+    /// same wall built east to west does not. The player sees a half-connected
+    /// fence, which is worse to look at than one that never connects.
+    ///
+    /// One ring and not a search. A fence's connection reads whether its
+    /// neighbour *is* a fence and never which way that fence is connected, so
+    /// nothing here cascades — with one exception worth naming rather than
+    /// hiding: a wall's post reads the post of the wall directly above it, so
+    /// changing the top of a stack three walls high leaves the bottom one a
+    /// tick behind. That is the whole of what one ring misses.
+    ///
+    /// Costs six block reads and, for each neighbour that is a fence, a wall, a
+    /// pane or a stair, six more. A neighbour that is stone costs one property
+    /// scan and nothing else, which is what almost every neighbour of almost
+    /// every edit actually is.
+    fn reshape(&self, position: Position) {
+        let Some(solid) = self.solid() else { return };
+        for side in SIDES {
+            let at = offset(position, side);
+            let Some(state) = dust_registry::BlockState::from_id(self.block_at(at)) else {
+                continue;
+            };
+            if !dust_sim::placement::reads_neighbours(state) {
+                continue;
+            }
+            let next = dust_sim::placement::shaped(state, self.around(at), solid);
+            if next != state {
+                // Announced with nobody's name on it, because nobody did it:
+                // a fence growing an arm is not a placement and makes no sound.
+                self.set_block(at, next.id());
+            }
         }
     }
 
@@ -287,6 +410,10 @@ impl EditedWorld {
             // or not.
             return true;
         }
+        // The neighbours lose an arm. Breaking has to do this for the same
+        // reason placing does, and forgetting it here would leave a fence
+        // reaching towards a block that is not there any more.
+        self.reshape(position);
         let _ = self.announce.send(Edit {
             position,
             state: air,
@@ -334,9 +461,11 @@ impl EditedWorld {
 
     pub fn place_block(&self, position: Position, state: u32, by: i32) -> bool {
         let previous = self.block_at(position);
+        let state = self.shaped_at(position, state);
         if !self.set_block_quietly(position, state) {
             return false;
         }
+        self.reshape(position);
         if previous == state {
             return true;
         }
@@ -444,6 +573,104 @@ mod tests {
         EditedWorld::new(Source::Flat(Box::new(super::super::world::FlatWorld::new(
             palette, 0, 64,
         ))))
+    }
+
+    /// A world that knows which of a block state's faces are full.
+    ///
+    /// The table is written here and says exactly the named blocks are full on
+    /// every side. It is a stand-in and reaches only what its own range
+    /// reaches; what says the rules are right against Minecraft is
+    /// `cargo xtask harness placement`.
+    fn world_knowing(names: &[&str]) -> EditedWorld {
+        let states: std::collections::HashSet<u32> = names
+            .iter()
+            .flat_map(|name| {
+                dust_registry::Block::from_name(name)
+                    .expect("this build has that block")
+                    .states()
+                    .map(dust_registry::BlockState::id)
+            })
+            .collect();
+        let mut text = String::from("# state_id\topacity\temission");
+        for column in dust_sim::placement::STURDY {
+            text.push('\t');
+            text.push_str(column);
+        }
+        text.push('\n');
+        for state in 0..dust_registry::STATE_COUNT {
+            let full = u32::from(states.contains(&state));
+            text.push_str(&format!("{state}\t0\t0"));
+            for _ in dust_sim::placement::STURDY {
+                text.push_str(&format!("\t{full}"));
+            }
+            text.push('\n');
+        }
+        let table = dust_registry::BlockConstants::parse(&text).expect("a complete table");
+        fresh_world().with_constants(Some(Arc::new(table)))
+    }
+
+    fn state_of(name: &str) -> u32 {
+        dust_registry::Block::from_name(name)
+            .expect("this build has that block")
+            .default_state()
+            .id()
+    }
+
+    fn property_at(world: &EditedWorld, position: Position, property: &str) -> String {
+        dust_registry::BlockState::from_id(world.block_at(position))
+            .expect("a state this build has")
+            .property(property)
+            .expect("the block has that property")
+            .to_owned()
+    }
+
+    #[test]
+    fn a_fence_connects_whichever_way_the_wall_is_built() {
+        // The half a placement-time rule alone cannot do. Two fences, built
+        // west to east; the *first* one has to grow an arm when the second
+        // arrives, and a server that only shaped the cell being written would
+        // leave it reaching at nothing while its neighbour reached back.
+        let world = world_knowing(&[]);
+        let west = Position { x: 4, y: 70, z: 4 };
+        let east = Position { x: 5, y: 70, z: 4 };
+        world.place_block(west, state_of("minecraft:oak_fence"), 1);
+        assert_eq!(
+            property_at(&world, west, "east"),
+            "false",
+            "nothing there yet"
+        );
+        world.place_block(east, state_of("minecraft:oak_fence"), 1);
+        assert_eq!(property_at(&world, west, "east"), "true", "the older fence");
+        assert_eq!(property_at(&world, east, "west"), "true", "the newer fence");
+    }
+
+    #[test]
+    fn a_fence_lets_go_when_what_it_held_is_broken() {
+        // And the other direction, which is the same rule and a different path
+        // through this module: an arm reaching at a block that is not there any
+        // more is the same defect seen from the other end.
+        let world = world_knowing(&["minecraft:stone"]);
+        let fence = Position { x: 4, y: 70, z: 4 };
+        let post = Position { x: 5, y: 70, z: 4 };
+        world.place_block(post, state_of("minecraft:stone"), 1);
+        world.place_block(fence, state_of("minecraft:oak_fence"), 1);
+        assert_eq!(property_at(&world, fence, "east"), "true");
+        let air = state_of("minecraft:air");
+        world.break_block(post, air, 1);
+        assert_eq!(property_at(&world, fence, "east"), "false");
+    }
+
+    #[test]
+    fn a_world_with_no_table_places_a_bare_fence_rather_than_half_a_connected_one() {
+        // The deliberate answer to "no constants table". Half-connected looks
+        // worse than never connected, so a world that cannot answer the
+        // full-face question does not guess at it.
+        let world = fresh_world();
+        let west = Position { x: 4, y: 70, z: 4 };
+        let east = Position { x: 5, y: 70, z: 4 };
+        world.place_block(west, state_of("minecraft:oak_fence"), 1);
+        world.place_block(east, state_of("minecraft:oak_fence"), 1);
+        assert_eq!(property_at(&world, west, "east"), "false");
     }
 
     #[test]

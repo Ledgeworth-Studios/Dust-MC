@@ -17,10 +17,26 @@
 // comparison and not a measurement.
 //
 // Usage: node placement.js <port> [items.txt|item,item,...] [--survey] > answers.tsv
+//        node placement.js <port> [items] --neighbours [--against all|blocks.txt]
 //
 // `--survey` trades the full 144-situation grid for eight chosen to answer only
 // "does this block's placement depend on anything at all?", which is the
 // question worth asking of every placeable item rather than of a handful.
+//
+// `--neighbours` asks the other question entirely. It holds the click still and
+// varies what is **beside** the target instead, because the grid cannot see a
+// rule that reads a neighbour and sixty-one of the items it calls wrong are
+// exactly that: a fence connects to what it touches, a wall and a pane do, a
+// rail bends toward the rail next to it, and a stair becomes an inner or an
+// outer corner. Its rows carry two more columns — the neighbourhood the
+// placement went out into, and which of those cells the placement *changed* —
+// and both are read back off the wire rather than copied from the commands that
+// built them.
+//
+// `--against` replaces the built-in scenes with one per block in a list, each
+// putting that block to the north of the target. `--against all` is every block
+// this build knows, which is how "does a fence connect to X" is answered for
+// every X at once rather than guessed at from a rule.
 //
 // Notes to whoever runs it next:
 //
@@ -222,14 +238,83 @@ function situations (survey) {
   return list.sort((a, b) => (a.yaw - b.yaw) || (a.pitch - b.pitch))
 }
 
+/// What to put around the target, one scene per sample.
+///
+/// The neighbourhood is the variable here and the click is the constant, which
+/// is the opposite of what `situations` does. Every scene is a list of
+/// `[direction, block]` pairs written the way `/setblock` takes them, and the
+/// row records what actually landed rather than what was asked for.
+///
+/// The common seven ask the questions that are the same for every family:
+/// nothing beside it, a full block, a **full block that does not occlude**
+/// (glass, which a fence connects to and a rule keyed on opacity would miss), a
+/// **block with no full side** (a bottom slab, which a fence does not connect
+/// to and a rule keyed on "is it solid" would get wrong), something above, and
+/// the straight run that decides whether a wall raises its post.
+///
+/// The four after them put the block's *own* kind beside it, which is the case
+/// a player builds all day: a fence next to a fence, a pane next to a pane, a
+/// rail next to a rail. And where the block has a four-valued `facing` there
+/// are four more with the neighbour turned, because a stair only becomes a
+/// corner next to a stair facing across it — a scene using the neighbour's
+/// default facing would report `straight` and call the rule correct.
+function scenesFor (item, registry, against) {
+  if (against) return against.map(block => [['north', block]])
+  const list = [
+    [],
+    [['north', 'stone']],
+    [['north', 'glass']],
+    [['north', 'oak_slab[type=bottom]']],
+    [['up', 'stone']],
+    [['north', 'stone'], ['up', 'stone']],
+    [['north', 'stone'], ['south', 'stone']],
+    [['north', 'stone'], ['south', 'stone'], ['up', 'stone']]
+  ]
+  const self = registry.blocksByName[item] ? item : null
+  if (!self) return list
+  list.push(
+    [['north', self]],
+    [['north', self], ['south', self]],
+    [['north', self], ['east', self]],
+    [['north', self], ['south', self], ['east', self], ['west', self]]
+  )
+  const properties = registry.blocksByName[self].states || []
+  const facing = properties.find(state => state.name === 'facing')
+  if (facing && facing.num_values === 4) {
+    list.push(
+      [['north', `${self}[facing=east]`]],
+      [['north', `${self}[facing=west]`]],
+      [['south', `${self}[facing=east]`]],
+      [['south', `${self}[facing=west]`], ['north', `${self}[facing=east]`]]
+    )
+    // The same corner with the neighbour in the *other* half. A stair only
+    // takes a corner from a stair in its own half, and a rule that read the
+    // facing and forgot the half would agree with every scene above and be
+    // wrong about this one — which is the only reason it is worth a sample.
+    const half = properties.find(state => state.name === 'half')
+    if (half && half.num_values === 2) {
+      list.push([['north', `${self}[facing=east,half=top]`]])
+    }
+  }
+  return list
+}
+
 function main () {
   const survey = process.argv.includes('--survey')
-  const argument = process.argv.slice(3).find(a => !a.startsWith('--'))
+  const neighbours = process.argv.includes('--neighbours')
+  const againstAt = process.argv.indexOf('--against')
+  const againstArgument = againstAt === -1 ? null : process.argv[againstAt + 1]
+  const names = argument => fs.existsSync(argument)
+    ? fs.readFileSync(argument, 'utf8').split(/\s+/).filter(Boolean)
+    : argument.split(',')
+  const argument = process.argv
+    .slice(3)
+    .find((a, i) => !a.startsWith('--') && process.argv[i + 2] !== '--against')
   let items = DEFAULT_ITEMS
-  if (argument) {
-    items = fs.existsSync(argument)
-      ? fs.readFileSync(argument, 'utf8').split(/\s+/).filter(Boolean)
-      : argument.split(',')
+  if (argument) items = names(argument)
+  if (againstArgument && !neighbours) {
+    process.stderr.write('--against only means anything with --neighbours.\n')
+    process.exit(2)
   }
 
   const console_ = process.env.DUST_SERVER_CONSOLE
@@ -318,6 +403,33 @@ function main () {
   }
 
 
+  /// What each of the six cells around the target holds, right now.
+  ///
+  /// Read out of the change log and never out of `bot.blockAt`, for the reason
+  /// the note at the top of this file gives about the placement itself: the
+  /// bot's own world lags by an unbounded amount, and a neighbourhood read that
+  /// way describes the sample before this one.
+  const read = (around, registry) => {
+    const out = {}
+    for (const [direction, cell] of Object.entries(around)) {
+      const seen = changes.get(at(cell))
+      out[direction] = seen && seen.length
+        ? describe(seen[seen.length - 1], registry)
+        : 'minecraft:air'
+    }
+    return out
+  }
+
+  /// A neighbourhood as one field: `north=minecraft:stone;up=…`, air left out.
+  ///
+  /// Air is left out because a reader that assumes it for anything unnamed is
+  /// right, and writing five `=minecraft:air` per row would treble the file to
+  /// say nothing.
+  const spell = states => Object.entries(states)
+    .filter(([, state]) => state !== 'minecraft:air')
+    .map(([direction, state]) => `${direction}=${state}`)
+    .join(';')
+
   bot.once('spawn', async () => {
     await wait(2500)
     const registry = bot.registry
@@ -346,6 +458,181 @@ function main () {
     if (!await settles(support, 'stone', registry, 200)) {
       process.stderr.write('the arena never appeared; is the console pipe connected?\n')
       process.exit(1)
+    }
+
+    // -----------------------------------------------------------------------
+    // The neighbour survey.
+    //
+    // The grid above varies the four numbers a right-click carries and nothing
+    // else, so it cannot see a rule that reads the block *beside* the one going
+    // down — and sixty-one of the items it reports wrong are exactly that. This
+    // varies the surroundings instead and holds the click still.
+    //
+    // The target is always the cell on top of the support, clicked on the
+    // support's up face at yaw 0. That leaves five cells free — north, south,
+    // east, west and up — and each scene sets some of them from the console
+    // before the placement goes out.
+    //
+    // **Two columns are added and both are measurements rather than
+    // intentions.** `before` is what the six cells around the target actually
+    // held when the placement went out, read back out of the change log rather
+    // than copied from the command that was sent: a `/setblock` naming a
+    // property the block does not have is refused by the server and leaves air,
+    // and a scene written down as what was *asked for* would score a rule
+    // against a neighbourhood that was never there. `after` is which of those
+    // six changed *because* of the placement, which is the other half of the
+    // rule: a fence has to connect when the block beside it arrives later, and
+    // a survey that only recorded the placed cell could not tell whether it
+    // did.
+    async function neighbourSurvey (against) {
+      const target = { x: support.x, y: support.y + 1, z: support.z }
+      const around = {
+        down: support,
+        up: { x: target.x, y: target.y + 1, z: target.z },
+        north: { x: target.x, y: target.y, z: target.z - 1 },
+        south: { x: target.x, y: target.y, z: target.z + 1 },
+        west: { x: target.x - 1, y: target.y, z: target.z },
+        east: { x: target.x + 1, y: target.y, z: target.z }
+      }
+      // Face 1 is the support's top, so the placement lands in `target`. The
+      // look is set once for the whole run and never again, which is the same
+      // rule the grid loop follows for a different reason: here the click is
+      // the constant and the surroundings are the variable.
+      await bot.look(0, 0, true)
+      await wait(300)
+
+      let sequence = 1
+      const seen = []
+      process.stdout.write(
+        '# item\tface\tyaw\tpitch\tcursor_y\tresult\tsurvived\tbefore\tafter\n'
+      )
+      for (const item of [CONTROL, ...items.filter(i => i !== CONTROL)]) {
+        const entry = registry.itemsByName[item]
+        if (!entry) {
+          process.stdout.write(`${item}\t-\t-\t-\t-\tNO SUCH ITEM\t-\t-\t-\n`)
+          continue
+        }
+        bot._client.write('set_creative_slot', {
+          slot: 36,
+          item: {
+            itemCount: 1,
+            itemId: entry.id,
+            addedComponentCount: 0,
+            removedComponentCount: 0,
+            components: [],
+            removeComponents: []
+          }
+        })
+        bot._client.write('held_item_slot', { slotId: 0 })
+        await wait(120)
+
+        for (const scene of scenesFor(item, registry, against)) {
+          // Forget the whole neighbourhood before the commands that change it
+          // go out, for the reason the grid loop's comment gives: waiting on a
+          // barrier without forgetting first matches the *previous* sample.
+          for (const cell of Object.values(around)) changes.delete(at(cell))
+          changes.delete(at(target))
+          say(`fill ${support.x - 2} ${support.y - 2} ${support.z - 2} ` +
+              `${support.x + 2} ${support.y + 3} ${support.z + 2} air`)
+          // A floor under the four cells beside the target, and not only under
+          // the target itself. Without it every neighbour that needs something
+          // to stand on falls the tick after it is set — which recorded a rail
+          // beside a rail as `north=minecraft:air` and scored the shape rule
+          // against a neighbourhood that had emptied itself. The support is
+          // *not* laid here: it is the barrier below and has to be the last
+          // change of the batch.
+          for (const [dx, dz] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+            say(`setblock ${support.x + dx} ${support.y} ${support.z + dz} stone`)
+          }
+          for (const [direction, block] of scene) {
+            const cell = around[direction]
+            say(`setblock ${cell.x} ${cell.y} ${cell.z} ${block}`)
+          }
+          // The support goes down **last**, so that seeing it turn to stone
+          // means the scene before it has landed too. The grid loop can put it
+          // first because nothing follows it there; here something does, and a
+          // barrier that is not last is not a barrier.
+          say(`setblock ${support.x} ${support.y} ${support.z} stone`)
+          if (!await settles(support, 'stone', registry)) {
+            process.stdout.write(
+              `minecraft:${item}\t1\t${round(sent.yaw)}\t${round(sent.pitch)}\t` +
+              `0.25\tARENA DID NOT SETTLE\t-\t-\t-\n`
+            )
+            continue
+          }
+          // A tick or two for the world to react to the scene before it is
+          // written down. **`before` has to be true at the moment the
+          // placement goes out, and the barrier only says the commands were
+          // delivered.** A `/setblock` puts a ladder or a torch wherever it is
+          // told and the block falls on the next tick, so a scene read the
+          // instant the barrier passed recorded a ladder that was already
+          // gone by the time the click arrived — and the placement was then
+          // scored against a neighbourhood that had emptied itself. One row in
+          // 799 of a fence-against-every-block run, and it looked exactly like
+          // a wrong connection rule.
+          await wait(100)
+          const before = read(around, registry)
+          changes.delete(at(target))
+
+          bot._client.write('block_place', {
+            hand: 0,
+            location: support,
+            direction: 1,
+            cursorX: 0.5,
+            cursorY: 0.25,
+            cursorZ: 0.5,
+            insideBlock: false,
+            sequence: sequence++
+          })
+          await wait(200)
+          const got = changes.get(at(target))
+          const first = got ? describe(got[0], registry) : null
+          const result = first === null || first === 'minecraft:air'
+            ? 'REFUSED\t-'
+            : first + (got.length > 1 && got[got.length - 1] !== got[0] ? '\tbroke' : '\tstood')
+          const after = read(around, registry)
+          const moved = Object.keys(after)
+            .filter(direction => after[direction] !== before[direction])
+            .map(direction => `${direction}=${after[direction]}`)
+          if (item === CONTROL) seen.push(`${spell(before)} -> ${result}`)
+          process.stdout.write(
+            `minecraft:${item}\t1\t${round(sent.yaw)}\t${round(sent.pitch)}\t` +
+            `0.25\t${result}\t${spell(before) || '-'}\t${moved.join(';') || '-'}\n`
+          )
+        }
+
+        if (item === CONTROL) {
+          // The same control as the grid run and for the same reason, asking
+          // the same question of a different variable: stone has one state, so
+          // no arrangement of neighbours may change it. It catches a scene that
+          // leaked into the next sample, which is this loop's own way to be
+          // wrong.
+          const states = new Set(
+            seen.map(s => s.split(' -> ')[1].split('\t')[0]).filter(r => r !== 'REFUSED')
+          )
+          if (states.size !== 1 || !states.has(`minecraft:${CONTROL}`)) {
+            process.stderr.write(
+              `the control disagreed with itself, so nothing below it is worth reading.\n` +
+              `${CONTROL} has one state and this run saw ${states.size}:\n  ` +
+              seen.join('\n  ') + '\n'
+            )
+            process.exit(1)
+          }
+          process.stderr.write(
+            `control: ${CONTROL} agrees with itself over ${seen.length} neighbourhoods\n`
+          )
+        }
+      }
+    }
+
+    if (neighbours) {
+      const against = againstArgument === null
+        ? null
+        : againstArgument === 'all'
+          ? Object.keys(registry.blocksByName).sort()
+          : names(againstArgument)
+      await neighbourSurvey(against)
+      process.exit(0)
     }
 
     const grid = situations(survey)
