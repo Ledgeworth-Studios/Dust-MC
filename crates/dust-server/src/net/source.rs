@@ -6,14 +6,22 @@
 //! will be a variant here rather than a rewrite of everything that asks for a
 //! column.
 //!
-//! # What an Anvil world costs to serve, and what is cached
+//! # What a world costs to serve, and who keeps what
 //!
 //! Region files are held open — a world is a few dozen of them and reopening
 //! one per column would be a syscall storm — behind a mutex, because they are
-//! read from every session's task and a `RegionFile` seeks as it reads. What is
-//! **not** cached is the parsed column: a chunk is about a megabyte and a view
-//! distance of ten is four hundred of them, so caching them all is a design
-//! decision with a memory budget attached and not something to slip in.
+//! read from every session's task and a `RegionFile` seeks as it reads.
+//!
+//! The parsed columns are kept by a [`ColumnStore`], and **only the ones
+//! somebody is holding**: a player's ring, the columns falling items will read,
+//! and the window a chunk stream is about to send. A column of a real world is
+//! **111 KB** — measured by `benches/movement.rs` with a counting allocator,
+//! against the "about a megabyte" three modules including this one claimed for
+//! the life of the project — so what makes a cache of them a design decision is
+//! how many are held and by whom, not their size. Decision records
+//! [0025](../../../../docs/decisions/0025-who-keeps-a-chunk-column.md) and
+//! [0031](../../../../docs/decisions/0031-how-a-join-streams-its-chunks.md) are
+//! the two that answer it.
 //!
 //! # What *is* cached is 256 integers per column
 //!
@@ -35,11 +43,11 @@
 //! # A missing column is not an error
 //!
 //! A real world is a disc of generated chunks in an infinite plane, and a
-//! player can walk off the edge of it. Vanilla generates what is missing; Dust
-//! has no generator yet, so it falls back to the flat column. That is visible —
-//! terrain stops and a plain runs on — which is the right kind of wrong: an
-//! error would disconnect a player for walking, and a hole would look like a
-//! bug in the chunk packet.
+//! player can walk off the edge of it. Vanilla generates what is missing, and
+//! so does Dust when it could read the world's own seed — see [`Fallback`],
+//! which is where the two answers are chosen between and why the choice is not
+//! a setting. Either way an error would disconnect a player for walking, and a
+//! hole would look like a bug in the chunk packet.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -114,8 +122,174 @@ pub enum Source {
     Flat(Box<FlatWorld>),
     /// Built from noise, for a server with no world file: every column, out
     /// to the edge of the coordinate space.
-    Generated(Box<GeneratedWorld>),
+    Generated(Box<GeneratedColumns>),
     Anvil(Box<AnvilWorld>),
+}
+
+/// Something that can build a column, for a [`ColumnStore`]'s thread to call.
+///
+/// Two implementors and both of them cost something a hot path may not pay: a
+/// region read is a disk seek and a generated column is four milliseconds of
+/// noise. That is the whole of what the store is about, and the reason it is
+/// one type rather than one per world: **the rules for who may build a column
+/// are a property of the threads, not of where the blocks come from.**
+pub trait Columns: Send + Sync + 'static {
+    fn column(&self, pos: ChunkPos) -> Chunk;
+}
+
+impl Columns for AnvilCore {
+    fn column(&self, pos: ChunkPos) -> Chunk {
+        AnvilCore::column(self, pos)
+    }
+}
+
+impl Columns for GeneratedWorld {
+    fn column(&self, pos: ChunkPos) -> Chunk {
+        GeneratedWorld::column(self, pos)
+    }
+}
+
+/// The columns a world is keeping, and the thread that builds them.
+///
+/// Lifted out of `AnvilWorld` when the generator landed, because a generated
+/// column is **sixteen times more expensive than a region-file one** — 3.8 ms
+/// against 0.24 ms, `benches/join.rs` — and the world that needed residency
+/// least was the only one that had it. A server with no `world_source` now
+/// serves generated terrain, so this is the default world and not a corner.
+///
+/// The thread is the answer to a question the server asks in two places and
+/// cannot answer the same way in either. A session runs on a tokio worker and a
+/// tick participant runs on the engine's own `std` thread; neither may block on
+/// a column, and `tokio::task::spawn_blocking` exists only for the first. One
+/// thread here serves both, and neither caller has to know it is there.
+///
+/// **One thread and not a pool**, measured rather than chosen: what this thread
+/// serves is the ring ahead of a walking player, nine columns, which is 34 ms
+/// of generated terrain against the 1,600 ms decision record 0017's speed limit
+/// gives a player to cross the column they are standing in. A margin of 47 to
+/// one does not need a second thread, and a join — the one caller that wants
+/// 289 columns at once — does not come through here at all. See
+/// `net::session::stream_inner`.
+/// How many columns a builder offers to the residency at once.
+///
+/// Eight, which is `net::session::STREAM_BATCH`: the stream takes columns in
+/// eights, so a builder that offers them in eights hands over exactly what the
+/// next pass can use. The point of the batch is the write lock — offering one
+/// column at a time takes it about a thousand times a second on a region-file
+/// world, and it is the lock a movement check on every other session is waiting
+/// to read. The cost is that the first column of a batch waits for the eighth,
+/// which on a generated world is 46 ms against a 20 ms streaming tick that was
+/// never going to keep up with the builder anyway.
+const FILL_BATCH: usize = 8;
+
+pub struct ColumnStore {
+    residency: Arc<Residency>,
+    /// Columns somebody has claimed and nobody has built yet. `None` where the
+    /// thread could not be started, which is a world that warms nothing and
+    /// still works: every caller builds its own column, exactly as they did
+    /// before any of this.
+    wanted: Option<std::sync::mpsc::Sender<Vec<ChunkPos>>>,
+    warming: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ColumnStore {
+    fn new(core: Arc<dyn Columns>) -> Self {
+        let residency = Arc::new(Residency::new());
+        let (wanted, requests) = std::sync::mpsc::channel::<Vec<ChunkPos>>();
+        let warming = std::thread::Builder::new()
+            .name("dust-warming".to_owned())
+            .spawn({
+                let residency = Arc::clone(&residency);
+                move || {
+                    // Ends when the world drops its sender. Nothing here holds
+                    // a lock across a build: `cold` takes a snapshot, the
+                    // column is built with nothing held, and `fill` takes the
+                    // write lock for one insert.
+                    let mut built = Vec::with_capacity(FILL_BATCH);
+                    while let Ok(columns) = requests.recv() {
+                        for pos in residency.cold_columns(&columns) {
+                            built.push((pos, core.column(pos)));
+                            if built.len() == FILL_BATCH {
+                                residency.fill_many(std::mem::take(&mut built));
+                                built.reserve(FILL_BATCH);
+                            }
+                        }
+                        residency.fill_many(std::mem::take(&mut built));
+                        built.reserve(FILL_BATCH);
+                    }
+                }
+            })
+            .ok();
+        Self {
+            residency,
+            wanted: warming.is_some().then_some(wanted),
+            warming,
+        }
+    }
+
+    /// How many of `columns`, counted from the front, are built. See
+    /// [`Source::built_prefix`], which is where the rule is written down.
+    fn built_prefix(&self, columns: &[ChunkPos]) -> usize {
+        if self.wanted.is_none() {
+            return columns.len();
+        }
+        columns
+            .iter()
+            .take_while(|pos| self.residency.resident(**pos).is_some())
+            .count()
+    }
+}
+
+impl std::fmt::Debug for ColumnStore {
+    /// What a reader wants is how much of the world is being kept, which is
+    /// the number the policy is about. The channel and the join handle are
+    /// bookkeeping.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ColumnStore")
+            .field("resident_columns", &self.residency.len())
+            .field("warming", &self.warming.is_some())
+            .finish()
+    }
+}
+
+impl Drop for ColumnStore {
+    /// The sender goes first, which ends the thread's loop, and then the thread
+    /// is waited for. Not detached: a warming thread still holding the region
+    /// mutex while the process tears the world down is a shutdown that hangs
+    /// on a lock nobody owns any more.
+    fn drop(&mut self) {
+        self.wanted = None;
+        if let Some(thread) = self.warming.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A generated world and the columns the server is keeping of it.
+pub struct GeneratedColumns {
+    core: Arc<GeneratedWorld>,
+    store: ColumnStore,
+}
+
+impl GeneratedColumns {
+    #[must_use]
+    pub fn new(world: GeneratedWorld) -> Self {
+        let core = Arc::new(world);
+        let store = ColumnStore::new(Arc::clone(&core) as Arc<dyn Columns>);
+        Self { core, store }
+    }
+
+    pub fn flat(&self) -> &FlatWorld {
+        self.core.flat()
+    }
+}
+
+impl std::fmt::Debug for GeneratedColumns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeneratedColumns")
+            .field("resident_columns", &self.store.residency.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// What a position a world file does not contain is served with.
@@ -168,12 +342,11 @@ impl Source {
     pub fn column(&self, pos: ChunkPos) -> Column<'_> {
         match self {
             Self::Flat(flat) => Column::Shared(flat.column()),
-            // Nobody keeps a generated column yet. It is built on whatever
-            // thread asked, which is what an Anvil column was before residency
-            // existed; the two meet when residency stops being about a world
-            // that has a file.
-            Self::Generated(world) => Column::Built(world.column(pos)),
-            Self::Anvil(world) => match world.residency.resident(pos) {
+            Self::Generated(world) => match world.store.residency.resident(pos) {
+                Some(chunk) => Column::Resident(chunk),
+                None => Column::Built(world.core.column(pos)),
+            },
+            Self::Anvil(world) => match world.store.residency.resident(pos) {
                 Some(chunk) => Column::Resident(chunk),
                 // Nobody is keeping this one. Built here, on whatever thread
                 // asked, which is what every caller did before residency
@@ -192,30 +365,40 @@ impl Source {
     /// A flat world has nothing to keep: it lends one template column to every
     /// position, so residency would be a refcount on a borrow.
     pub fn hold(&self, centre: ChunkPos) {
-        if let Self::Anvil(world) = self {
-            world.residency.hold(centre);
+        if let Some(store) = self.store() {
+            store.residency.hold(centre);
         }
     }
 
     /// Give up one player's claim on the columns around `centre`.
     pub fn release(&self, centre: ChunkPos) {
-        if let Self::Anvil(world) = self {
-            world.residency.release(centre);
+        if let Some(store) = self.store() {
+            store.residency.release(centre);
+        }
+    }
+
+    /// The columns this world is keeping, or `None` for a flat one, which
+    /// lends one template column to every position and has nothing to keep.
+    fn store(&self) -> Option<&ColumnStore> {
+        match self {
+            Self::Flat(_) => None,
+            Self::Generated(world) => Some(&world.store),
+            Self::Anvil(world) => Some(&world.store),
         }
     }
 
     /// Claim named columns for one holder, for a caller whose working set is
     /// not a ring around a player. See [`Residency::hold_columns`].
     pub fn hold_columns(&self, columns: &[ChunkPos]) {
-        if let Self::Anvil(world) = self {
-            world.residency.hold_columns(columns);
+        if let Some(store) = self.store() {
+            store.residency.hold_columns(columns);
         }
     }
 
     /// Give up a claim taken by [`Source::hold_columns`].
     pub fn release_columns(&self, columns: &[ChunkPos]) {
-        if let Self::Anvil(world) = self {
-            world.residency.release_columns(columns);
+        if let Some(store) = self.store() {
+            store.residency.release_columns(columns);
         }
     }
 
@@ -231,20 +414,18 @@ impl Source {
     /// thread does builds it, which is what every caller did before residency
     /// existed — the floor is the old behaviour, never a hole in the world.
     pub fn want(&self, columns: Vec<ChunkPos>) {
-        if let Self::Anvil(world) = self {
-            if let Some(wanted) = &world.wanted {
-                // Fails only if the warming thread has gone, which happens
-                // while the world is being dropped. There is nothing to warm
-                // for a world that is going away.
-                let _ = wanted.send(columns);
-            }
+        if let Some(wanted) = self.store().and_then(|store| store.wanted.as_ref()) {
+            // Fails only if the warming thread has gone, which happens while
+            // the world is being dropped. There is nothing to warm for a world
+            // that is going away.
+            let _ = wanted.send(columns);
         }
     }
 
     /// Ask for the ring around `centre` to be built, and carry on.
     pub fn want_ring(&self, centre: ChunkPos) {
-        if let Self::Anvil(world) = self {
-            self.want(world.residency.cold(centre));
+        if let Some(store) = self.store() {
+            self.want(store.residency.cold(centre));
         }
     }
 
@@ -257,24 +438,28 @@ impl Source {
     /// bench, which is measuring the cost itself. Everything else calls
     /// [`Source::want`].
     pub fn warm(&self, centre: ChunkPos) -> u32 {
-        let Self::Anvil(world) = self else { return 0 };
-        self.warm_columns(&world.residency.cold(centre))
+        let Some(store) = self.store() else { return 0 };
+        self.warm_columns(&store.residency.cold(centre))
     }
 
     /// The same, for a named set of columns rather than a ring.
     pub fn warm_columns(&self, columns: &[ChunkPos]) -> u32 {
-        let Self::Anvil(world) = self else { return 0 };
+        let (store, core): (&ColumnStore, &dyn Columns) = match self {
+            Self::Flat(_) => return 0,
+            Self::Generated(world) => (&world.store, world.core.as_ref()),
+            Self::Anvil(world) => (&world.store, world.core.as_ref()),
+        };
         let mut built = 0;
-        for pos in world.residency.cold_columns(columns) {
-            // Built with no lock held, then offered. A player who walked away
-            // in the meantime, or another thread that got there first, means
-            // the column is dropped here rather than kept — see
-            // [`Residency::fill`].
-            let chunk = world.core.column(pos);
-            world.residency.fill(pos, chunk);
-            built += 1;
+        let cold = store.residency.cold_columns(columns);
+        // Built with no lock held, then offered in batches. A player who walked
+        // away in the meantime, or another thread that got there first, means
+        // the column is dropped rather than kept — see [`Residency::fill_many`].
+        for run in cold.chunks(FILL_BATCH) {
+            let batch: Vec<_> = run.iter().map(|pos| (*pos, core.column(*pos))).collect();
+            built += batch.len();
+            store.residency.fill_many(batch);
         }
-        built
+        u32::try_from(built).unwrap_or(u32::MAX)
     }
 
     /// The server's resident set, for a caller that keeps a claim on it —
@@ -286,10 +471,7 @@ impl Source {
     /// that is the right nothing: there is no column to hold.
     #[must_use]
     pub fn residency(&self) -> Option<Arc<Residency>> {
-        match self {
-            Self::Flat(_) | Self::Generated(_) => None,
-            Self::Anvil(world) => Some(Arc::clone(&world.residency)),
-        }
+        self.store().map(|store| Arc::clone(&store.residency))
     }
 
     /// Where a claim sends the columns it has just taken, to be built off the
@@ -297,19 +479,35 @@ impl Source {
     /// warming thread would not start.
     #[must_use]
     pub fn warming(&self) -> Option<std::sync::mpsc::Sender<Vec<ChunkPos>>> {
-        match self {
-            Self::Flat(_) | Self::Generated(_) => None,
-            Self::Anvil(world) => world.wanted.clone(),
-        }
+        self.store().and_then(|store| store.wanted.clone())
+    }
+
+    /// How many of `columns`, counted **from the front**, this world has
+    /// already built.
+    ///
+    /// The chunk stream's back-pressure and its ordering rule in one number.
+    /// A session sends this many and no more, so it never builds a column on
+    /// its own task and never sends the far corner of a view before the ground
+    /// under the player's feet: a prefix has no holes in it, and a client
+    /// renders what it has.
+    ///
+    /// Two worlds answer `columns.len()` and neither of them is a shortcut.
+    /// **A flat world** lends one template column to every position, so there
+    /// is nothing to wait for. **A world whose warming thread would not
+    /// start** has nobody to wait *on*, and a stream that paced itself against
+    /// a thread that does not exist would be a player looking at a hole in the
+    /// world forever; it builds its own columns instead, which is what every
+    /// caller did before any of this existed.
+    #[must_use]
+    pub fn built_prefix(&self, columns: &[ChunkPos]) -> usize {
+        self.store()
+            .map_or(columns.len(), |store| store.built_prefix(columns))
     }
 
     /// How many columns the server is keeping. Zero on a flat world.
     #[must_use]
     pub fn resident_columns(&self) -> usize {
-        match self {
-            Self::Flat(_) | Self::Generated(_) => 0,
-            Self::Anvil(world) => world.residency.len(),
-        }
+        self.store().map_or(0, |store| store.residency.len())
     }
 
     /// The flat world underneath, which every source has: it is the fallback
@@ -324,43 +522,18 @@ impl Source {
     }
 }
 
-/// A world on disk, and the thread that reads it ahead of the players.
+/// A world on disk, and the columns the server is keeping of it.
 ///
 /// Two halves on purpose. [`AnvilCore`] is everything that answers a question
 /// about the world, behind an `Arc` so that the warming thread can hold it; the
-/// wrapper is the residency, the channel and the thread's own lifetime, which
-/// belong to the world rather than to anything asking it for a column.
-///
-/// The thread is the answer to a question the server asks in two places and
-/// cannot answer the same way in either. A session runs on a tokio worker and a
-/// tick participant runs on the engine's own `std` thread; neither may block on
-/// a region file, and `tokio::task::spawn_blocking` exists only for the first.
-/// One thread here serves both, and neither caller has to know it is there.
+/// [`ColumnStore`] is the residency, the channel and the thread's own lifetime,
+/// which belong to the world rather than to anything asking it for a column.
 pub struct AnvilWorld {
     core: Arc<AnvilCore>,
     /// The columns the server is keeping because players or items are near
-    /// them. Shared with the warming thread; see [`Residency`] for what it is
-    /// serialised against.
-    residency: Arc<Residency>,
-    /// Columns somebody has claimed and nobody has built yet. `None` where the
-    /// thread could not be started, which is a world that warms nothing and
-    /// still works: every caller builds its own column, exactly as they did
-    /// before any of this.
-    wanted: Option<std::sync::mpsc::Sender<Vec<ChunkPos>>>,
-    warming: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Drop for AnvilWorld {
-    /// The sender goes first, which ends the thread's loop, and then the thread
-    /// is waited for. Not detached: a warming thread still holding the region
-    /// mutex while the process tears the world down is a shutdown that hangs
-    /// on a lock nobody owns any more.
-    fn drop(&mut self) {
-        self.wanted = None;
-        if let Some(thread) = self.warming.take() {
-            let _ = thread.join();
-        }
-    }
+    /// them. See [`ColumnStore`], and [`Residency`] for what it is serialised
+    /// against.
+    store: ColumnStore,
 }
 
 /// Everything that answers a question about a world on disk.
@@ -413,7 +586,7 @@ impl std::fmt::Debug for AnvilWorld {
                     .map(|open| open.len())
                     .unwrap_or_default(),
             )
-            .field("resident_columns", &self.residency.len())
+            .field("resident_columns", &self.store.residency.len())
             .finish_non_exhaustive()
     }
 }
@@ -502,34 +675,8 @@ impl AnvilWorld {
         let core = Arc::new(AnvilCore::new(
             directory, names, fallback, opacity, constants,
         ));
-        let residency = Arc::new(Residency::new());
-        let (wanted, requests) = std::sync::mpsc::channel::<Vec<ChunkPos>>();
-        let warming = std::thread::Builder::new()
-            .name("dust-warming".to_owned())
-            .spawn({
-                let core = Arc::clone(&core);
-                let residency = Arc::clone(&residency);
-                move || {
-                    // Ends when the world drops its sender. Nothing here holds
-                    // a lock across a build: `cold` takes a snapshot, the
-                    // column is read with nothing held, and `fill` takes the
-                    // write lock for one insert.
-                    while let Ok(columns) = requests.recv() {
-                        for pos in residency.cold_columns(&columns) {
-                            residency.fill(pos, core.column(pos));
-                        }
-                    }
-                }
-            })
-            .ok();
-        Self {
-            core,
-            residency,
-            // A thread that would not start leaves every caller building its
-            // own columns, which is what they all did before this existed.
-            wanted: warming.is_some().then_some(wanted),
-            warming,
-        }
+        let store = ColumnStore::new(Arc::clone(&core) as Arc<dyn Columns>);
+        Self { core, store }
     }
 
     /// Whether this looks like a world directory at all, checked at boot so an
@@ -754,5 +901,155 @@ impl Ids for RegistryNames {
 
     fn biome_name(&self, id: u32) -> Option<&str> {
         self.biome_names.get(id as usize).copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// A world that costs nothing and counts what it was asked for.
+    ///
+    /// Neither real world can be built in a test — one needs a directory of
+    /// `.mca` files and the other needs Minecraft's own worldgen tables, and
+    /// nothing Mojang's is ever committed. What is under test here is not
+    /// where the blocks come from: it is **which thread builds them and who
+    /// keeps the result**, which is the whole of [`ColumnStore`] and is the
+    /// same code for both worlds.
+    struct Counted {
+        built: AtomicUsize,
+    }
+
+    impl Columns for Counted {
+        fn column(&self, pos: ChunkPos) -> Chunk {
+            self.built.fetch_add(1, Ordering::SeqCst);
+            Chunk::uniform(
+                pos,
+                dust_world::heightmap::WorldHeight::new(-64, 384),
+                2,
+                2,
+                0,
+                0,
+            )
+        }
+    }
+
+    /// Wait for `f`, up to a second, so a slow machine does not decide the
+    /// answer. A failure here is the thread never doing the work, not the
+    /// thread being late.
+    fn within_a_second(mut f: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        f()
+    }
+
+    fn store() -> (Arc<Counted>, ColumnStore) {
+        let core = Arc::new(Counted {
+            built: AtomicUsize::new(0),
+        });
+        let store = ColumnStore::new(Arc::clone(&core) as Arc<dyn Columns>);
+        (core, store)
+    }
+
+    /// The one answer that must not be "wait": a flat world builds nothing, so
+    /// a stream that paced itself against its store would never send a column
+    /// at all.
+    #[test]
+    fn a_flat_world_has_every_column_ready_because_it_builds_none() {
+        let palette = super::super::world::Palette::resolve().expect("the block table");
+        let source = Source::Flat(Box::new(FlatWorld::new(palette, 0, 64)));
+        let columns: Vec<ChunkPos> = (0..9).map(|x| ChunkPos::new(x, 0)).collect();
+        assert_eq!(source.built_prefix(&columns), 9);
+        assert!(source.residency().is_none());
+    }
+
+    #[test]
+    fn a_store_answers_with_the_built_prefix_and_never_past_a_gap() {
+        let (_core, store) = store();
+        let columns: Vec<ChunkPos> = (0..4).map(|x| ChunkPos::new(x, 0)).collect();
+        store.residency.hold_columns(&columns);
+        // The first two and the fourth. A stream that sent what was *ready*
+        // rather than what was ready *in order* would put the fourth column on
+        // the wire before the third and leave a hole in front of the player.
+        for pos in [columns[0], columns[1], columns[3]] {
+            store.residency.fill(
+                pos,
+                Chunk::uniform(
+                    pos,
+                    dust_world::heightmap::WorldHeight::new(-64, 384),
+                    2,
+                    2,
+                    0,
+                    0,
+                ),
+            );
+        }
+        assert_eq!(store.built_prefix(&columns), 2);
+        assert_eq!(
+            store.built_prefix(&columns[3..]),
+            1,
+            "and it counts from the front"
+        );
+    }
+
+    #[test]
+    fn a_wanted_column_is_built_by_the_store_and_not_by_the_caller() {
+        let (core, store) = store();
+        let pos = ChunkPos::new(3, 4);
+        store.residency.hold_columns(&[pos]);
+        // Nothing is built by holding: a hold is a refcount and runs on a
+        // session's own task.
+        assert_eq!(core.built.load(Ordering::SeqCst), 0);
+        assert!(store.residency.resident(pos).is_none());
+
+        store
+            .wanted
+            .as_ref()
+            .expect("the warming thread started")
+            .send(vec![pos])
+            .expect("the warming thread is listening");
+        assert!(within_a_second(|| store.residency.resident(pos).is_some()));
+        assert_eq!(core.built.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_column_nobody_holds_is_not_kept_when_it_is_built() {
+        let (_core, store) = store();
+        let pos = ChunkPos::new(-2, 7);
+        store
+            .wanted
+            .as_ref()
+            .expect("the warming thread started")
+            .send(vec![pos])
+            .expect("the warming thread is listening");
+        // `cold_columns` only names columns somebody is keeping, so an
+        // unclaimed one is never even built. The store is a cache of what is
+        // *claimed*, which is what bounds it without a cap.
+        assert!(!within_a_second(|| store.residency.resident(pos).is_some()));
+        assert_eq!(store.residency.len(), 0);
+    }
+
+    #[test]
+    fn a_column_the_store_already_holds_is_not_built_twice() {
+        let (core, store) = store();
+        let pos = ChunkPos::new(0, 0);
+        store.residency.hold_columns(&[pos]);
+        let wanted = store.wanted.as_ref().expect("the warming thread started");
+        wanted.send(vec![pos]).expect("listening");
+        assert!(within_a_second(|| store.residency.resident(pos).is_some()));
+        wanted.send(vec![pos]).expect("listening");
+        wanted.send(vec![pos]).expect("listening");
+        // Three requests, one build. This is the guarantee a third caller for
+        // the chunk stream depends on: asking for a column the store has costs
+        // a hash lookup, not a world.
+        assert!(!within_a_second(|| core.built.load(Ordering::SeqCst) > 1));
+        assert_eq!(core.built.load(Ordering::SeqCst), 1);
     }
 }

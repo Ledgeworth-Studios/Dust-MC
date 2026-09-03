@@ -119,22 +119,8 @@ impl View {
         let recentre = self.centre != Some(centre);
         self.centre = Some(centre);
 
-        let radius = self.radius;
-        let mut wanted = BTreeSet::new();
-        for dx in -radius..=radius {
-            for dz in -radius..=radius {
-                wanted.insert((centre.x + dx, centre.z + dz));
-            }
-        }
-
-        let mut send: Vec<ChunkPos> = wanted
-            .difference(&self.loaded)
-            .map(|(x, z)| ChunkPos::new(*x, *z))
-            .collect();
-        send.sort_by_key(|pos| distance_squared(*pos, centre));
-        if let Some(limit) = limit {
-            send.truncate(limit);
-        }
+        let wanted = self.square(centre);
+        let send = self.next(centre, limit);
 
         let forget: Vec<ChunkPos> = self
             .loaded
@@ -161,6 +147,50 @@ impl View {
         }
     }
 
+    /// The columns a move to `centre` would send next, **recording nothing**.
+    ///
+    /// The look-ahead the chunk stream builds against. A session asks for more
+    /// than it is about to send, hands the answer to the column store to be
+    /// built off its own task, and then sends only what came back — see
+    /// `net::session::stream_inner`. That is only safe because this leaves the
+    /// record alone: a peek that marked columns loaded would be a client
+    /// credited with a world it was never sent.
+    ///
+    /// Same order and same rule as [`View::move_to_limited`], because it is
+    /// the same code. Two implementations of "which column is next" is two
+    /// answers, and the one the stream builds has to be the one it sends.
+    #[must_use]
+    pub fn peek(&self, centre: ChunkPos, limit: usize) -> Vec<ChunkPos> {
+        self.next(centre, Some(limit))
+    }
+
+    /// Every column within `radius` of `centre`.
+    fn square(&self, centre: ChunkPos) -> BTreeSet<(i32, i32)> {
+        let radius = self.radius;
+        let mut wanted = BTreeSet::new();
+        for dx in -radius..=radius {
+            for dz in -radius..=radius {
+                wanted.insert((centre.x + dx, centre.z + dz));
+            }
+        }
+        wanted
+    }
+
+    /// The columns in range of `centre` the client does not hold, nearest
+    /// first, at most `limit` of them.
+    fn next(&self, centre: ChunkPos, limit: Option<usize>) -> Vec<ChunkPos> {
+        let mut send: Vec<ChunkPos> = self
+            .square(centre)
+            .difference(&self.loaded)
+            .map(|(x, z)| ChunkPos::new(*x, *z))
+            .collect();
+        send.sort_by_key(|pos| distance_squared(*pos, centre));
+        if let Some(limit) = limit {
+            send.truncate(limit);
+        }
+        send
+    }
+
     /// The column the view is centred on, or `None` before the first move.
     pub fn centre(&self) -> Option<ChunkPos> {
         self.centre
@@ -169,6 +199,20 @@ impl View {
     /// How many columns the client is holding.
     pub fn loaded(&self) -> usize {
         self.loaded.len()
+    }
+
+    /// Whether this client already holds everything a view centred on `centre`
+    /// reaches.
+    ///
+    /// A comparison and a count, which is the point: the chunk stream's own
+    /// tick fires fifty times a second for the life of every session, and for
+    /// almost all of that life there is nothing to send. Asking `move_to` costs
+    /// a set of every column in range built and differenced to answer "none";
+    /// asking this costs two integers.
+    #[must_use]
+    pub fn complete(&self, centre: ChunkPos) -> bool {
+        let span = (2 * self.radius + 1) as usize;
+        self.centre == Some(centre) && self.loaded.len() == span * span
     }
 
     /// Whether the client holds this column.
@@ -221,6 +265,50 @@ mod tests {
             8,
             "and a corner last"
         );
+    }
+
+    /// The look-ahead the chunk stream builds against, and the one thing it
+    /// must not do.
+    #[test]
+    fn a_peek_names_what_the_next_send_will_send_and_records_none_of_it() {
+        let mut view = View::with_radius(2);
+        let centre = ChunkPos::new(0, 0);
+        let ahead = view.peek(centre, 4);
+        assert_eq!(ahead.len(), 4);
+        assert_eq!(ahead[0], centre, "nearest first, the same as a send");
+        // The whole of why this is safe: a session hands these to the column
+        // store to be built and sends only the ones that come back, so a view
+        // that had recorded them would be crediting a client with a world it
+        // was never sent.
+        assert_eq!(view.loaded(), 0, "a peek is not a send");
+        assert_eq!(view.centre(), None, "and it does not move the view");
+        // And the same code answers both questions, so what was built is what
+        // goes out.
+        assert_eq!(view.move_to_limited(centre, Some(4)).send, ahead);
+    }
+
+    /// The stream sends a prefix of what it peeked, so a partial pass has to
+    /// leave the rest wanted in the same order.
+    #[test]
+    fn a_peek_after_a_partial_send_names_the_columns_that_were_left() {
+        let mut view = View::with_radius(2);
+        let centre = ChunkPos::new(0, 0);
+        let ahead = view.peek(centre, 25);
+        view.move_to_limited(centre, Some(4));
+        assert_eq!(view.peek(centre, 21), ahead[4..], "in the same order");
+    }
+
+    #[test]
+    fn a_view_is_complete_only_where_it_stands_and_only_when_it_is_full() {
+        let mut view = View::with_radius(2);
+        let centre = ChunkPos::new(0, 0);
+        assert!(!view.complete(centre), "before it has ever moved");
+        view.move_to_limited(centre, Some(4));
+        assert!(!view.complete(centre), "a partial pass is not a full view");
+        view.move_to(centre);
+        assert!(view.complete(centre));
+        // Somewhere else, the same twenty-five columns are the wrong ones.
+        assert!(!view.complete(ChunkPos::new(1, 0)));
     }
 
     #[test]

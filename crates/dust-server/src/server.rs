@@ -1101,7 +1101,9 @@ impl Server {
         }
         let source = if world_source.is_empty() {
             match generated {
-                Some((world, _, _)) => crate::net::source::Source::Generated(Box::new(world)),
+                Some((world, _, _)) => crate::net::source::Source::Generated(Box::new(
+                    crate::net::source::GeneratedColumns::new(world),
+                )),
                 None => crate::net::source::Source::Flat(Box::new(flat)),
             }
         } else {
