@@ -64,10 +64,21 @@ precisely that.
   --into all, oak_fence and stone   2,120 situations     2 items
 ```
 
+**2,330 situations added**, and every one of them is a question neither of the
+other two surveys can ask.
+
+```text
+  --into                  108 placements into a full cell, 108 agree
+  --into all               178 placements into a full cell, 178 agree
+                            89 of the 1,060 cells accept a fence at all
+                             4 of those 89 make it waterlogged
+```
+
 The `--into` run scores **108 of 108** placements into a non-empty cell, and
 with its own column cut out of the file the same rows score 65 of 108. That is
 the check watched to fail: the number the rule depends on, removed, and the
-score going back.
+score going back. `--into all` scores **178 of 178**, and 174 of 178 with the
+column removed — four rows, and they are the four this record is about.
 
 ## The three rules, and the one that is not about water
 
@@ -79,10 +90,22 @@ dry land. 122 of the 496 rows the grid called wrong were that, and not one of
 them involved water.
 
 Which cells count as water is `getFluidState` and not "is this block water".
-Kelp, seagrass and a bubble column stand *in* water and report it, so a fence
-put into seagrass comes out waterlogged and one put into a lily pad does not.
+Seagrass and a bubble column stand *in* water and report it, so a fence put
+into seagrass comes out waterlogged and one put into a lily pad does not.
+
 That is why `--into all` was run: a name list is only worth having if somebody
-has asked every block whether it belongs in it.
+has asked every block whether it belongs in it. An oak fence was put into every
+one of the **1,060 blocks this build knows**. 89 accepted it — the other 971
+are not replaceable by a fence and the placement went to the cell above — and
+of those 89, **exactly four made it wet**: water, a bubble column, seagrass and
+tall seagrass. Lava did not, and lava is one of the 89, so that is a measured
+answer rather than an untested one.
+
+Kelp and a kelp plant hold water too and are deliberately **not** in the list.
+Nothing can be placed into either, so no run reaches them, and a line no check
+covers is a line that will be wrong one day without anybody hearing about it.
+The control for the same run is the one 0014 uses: stone has one state, and it
+came out stone over all 1,060 cells.
 
 ## Where the placement lands is now an item-aware question
 

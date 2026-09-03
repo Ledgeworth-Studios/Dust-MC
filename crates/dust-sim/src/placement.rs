@@ -332,18 +332,22 @@ fn watered(state: BlockState, click: Click) -> BlockState {
 /// Whether a cell holding this state holds **water**.
 ///
 /// Minecraft's `BlockState.getFluidState`, which is not the same question as
-/// "is this block water": kelp, seagrass and a bubble column are blocks that
-/// stand *in* water and report it, so a fence placed into seagrass comes out
-/// waterlogged. Measured against every block this build knows rather than
-/// guessed — decision record 0015 has the run and the count — which is why
-/// this is a list and not `state.block().name() == "minecraft:water"`.
+/// "is this block water": seagrass and a bubble column are blocks that stand
+/// *in* water and report it, so a fence put into seagrass comes out
+/// waterlogged and one put into a lily pad does not.
+///
+/// **This is the list the measurement produced and not a list somebody
+/// remembered.** `tools/bot/placement.js --into all` put an oak fence into
+/// every one of the 1,060 blocks this build knows; 89 of them accepted it and
+/// exactly four of those made it wet. Kelp and a kelp plant hold water too and
+/// are deliberately *not* here: nothing can be placed into either, so no
+/// measurement reaches them and a line here would be one nothing checks.
+/// Decision record 0016 has the run.
 fn holds_water(state: BlockState) -> bool {
     matches!(
         state.block().name(),
         "minecraft:water"
             | "minecraft:bubble_column"
-            | "minecraft:kelp"
-            | "minecraft:kelp_plant"
             | "minecraft:seagrass"
             | "minecraft:tall_seagrass"
     )
@@ -1692,11 +1696,20 @@ mod tests {
     fn seagrass_is_water_and_a_lily_pad_is_not() {
         // `getFluidState`, not "is this block water". Seagrass stands in it
         // and reports it; a lily pad floats on it and does not, because the
-        // cell a lily pad is in holds air.
-        assert!(holds_water(there("minecraft:seagrass", &[])));
-        assert!(holds_water(there("minecraft:kelp_plant", &[])));
-        assert!(holds_water(there("minecraft:bubble_column", &[])));
+        // cell a lily pad is in holds air. All four names came out of a run
+        // that put a fence into every block in the game.
+        for name in [
+            "minecraft:water",
+            "minecraft:seagrass",
+            "minecraft:tall_seagrass",
+            "minecraft:bubble_column",
+        ] {
+            assert!(holds_water(there(name, &[])), "{name}");
+        }
         assert!(!holds_water(there("minecraft:lily_pad", &[])));
+        // Lava is the twin that must not waterlog anything, and it is a cell a
+        // placement really does land in — 89 blocks accepted the fence and
+        // lava was one of them.
         assert!(!holds_water(there("minecraft:lava", &[])));
     }
 
