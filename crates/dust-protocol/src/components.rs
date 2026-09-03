@@ -449,7 +449,19 @@ fn measure_at(name: &str, bytes: &[u8], depth: u32) -> Result<usize, DecodeError
             c.skip(4)?; // saturation, f32
             c.skip(1)?; // can always eat
             c.skip(4)?; // seconds to eat, f32
-            c.slot(depth + 1)?; // what eating it leaves behind
+                        // What eating it leaves behind, as an *optional* stack: a flag and
+                        // then, only if it is set, a whole stack. minecraft-data 3.115 has
+                        // a bare stack here and the two agree on the common case, because
+                        // a count of zero and a flag of false are both one zero byte. They
+                        // disagree the moment there is a bowl to leave behind, and a real
+                        // 1.21.1 server settled it: given a bare stack it answered "Failed
+                        // to decode", which is reading past the end rather than stopping
+                        // short, so it had taken the count for the flag. Given the same
+                        // bytes a bare-stack reader consumes exactly, so the complaint can
+                        // only be the flag.
+            if c.bool()? {
+                c.slot(depth + 1)?;
+            }
             let n = c.count("food effects")?;
             for _ in 0..n {
                 c.mob_effect(depth + 1)?;
@@ -492,9 +504,11 @@ fn measure_at(name: &str, bytes: &[u8], depth: u32) -> Result<usize, DecodeError
                 c.var_int()?;
                 c.mob_effect_details(depth + 1)?;
             }
-            if c.bool()? {
-                c.string()?; // custom name
-            }
+            // And that is the end of it in 1.21.1. There is a fourth field —
+            // an optional custom name — and it arrived in 1.21.2. It was here
+            // once, and a real 1.21.1 server answered a stack carrying it with
+            // "was larger than I expected, found 1 bytes extra". A layout is
+            // version-shaped, and this is the one that proved it.
         }
         "suspicious_stew_effects" => {
             let n = c.count("stew effects")?;
@@ -979,9 +993,12 @@ mod tests {
         // by a whole effect.
         let inner = bytes(&[&var(0), &var(200), &[0, 1, 1], &[0]]);
         let outer = bytes(&[&var(1), &var(600), &[0, 1, 1], &[1], &inner]);
+        // Three fields in 1.21.1: an optional potion, an optional colour, and
+        // the effects. The fourth field a later version adds is deliberately
+        // not here; see the layout.
         walks(
             "minecraft:potion_contents",
-            &bytes(&[&[0], &[0], &var(1), &var(3), &outer, &[0]]),
+            &bytes(&[&[0], &[0], &var(1), &var(3), &outer]),
         );
     }
 

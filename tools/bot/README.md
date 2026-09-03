@@ -49,6 +49,7 @@ node clicks.js 25603 --out dust.json          # a running Dust server
 node clicks.js 25703 --out vanilla.json       # a real 1.21.1 server, same script
 node clicks.js --compare vanilla.json dust.json
 node clicks.js 25603 --predict                # the one thing the diff cannot see
+node clicks.js 25603 --components --out dust-components.json
 ```
 
 A hundred clicks over a seeded container, one snapshot of every slot per click.
@@ -61,6 +62,22 @@ about the fifty-eight situations it reached, not about the container. Twenty-fiv
 more clicks over the armour slots, the offhand and the crafting grid took it to
 60 of 83, and eighteen more seeded with a wearable that stacks to 64 took the
 repaired 83 of 83 back to 84 of 101. It is now 101 of 101.
+
+`--components` is the same idea pointed at the fifty-seven data-component
+layouts, and it is the reason decision record 0024 exists. It sends a
+component-bearing stack from the client and then makes the server **say what it
+holds** — two clicks per component, each claiming that nothing moved, so a
+server that stayed silent would be reporting an empty inventory rather than
+agreeing. 107 of 117 snapshots agree; the other 10 are Minecraft rewriting a
+value it understands, each named in the script with its reason, and a difference
+that is *not* named still fails.
+
+It found two wrong layouts, and both were wrong in minecraft-data first: 1.21.1
+`potion_contents` has no custom-name field, and a food's `usingConvertsTo` is an
+*optional* stack rather than a bare one. A third disagreement went the other
+way, with Dust right and the dataset wrong. **The dataset was where the rule
+came from; Minecraft was the check.** A differential run against the source of
+your own hypothesis is not a differential.
 
 Three things had to be learned to make the recording honest, and each is a way
 of getting a confident wrong answer:

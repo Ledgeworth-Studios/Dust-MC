@@ -38,14 +38,20 @@
 //! plus which hotbar slot was in hand. Those come back exactly, and an item
 //! this build has no entry for is dropped and named the way a block is.
 //!
-//! **What it does not promise:** components. A stack's name is written and its
-//! data components are not, because Dust does not model them — a renamed
-//! block, an enchanted tool and a shulker box with things inside it all save
-//! and reload as the plain item. That is not a saving decision; it is
-//! `dust_protocol::types::Slot`'s wall, and this format cannot record what
-//! nothing upstream of it can read. It is written here rather than discovered
-//! later, because a saved record that quietly means less than it looks like it
-//! means is worse than one that refuses to be written.
+//! **Components, and exactly what they promise.** A stack's data components are
+//! written beside it, as hex of the bytes that arrived, and the Minecraft
+//! version whose component registry those bytes belong to is written once for
+//! the file. That version is the whole promise. A component type id is a
+//! position in a table Minecraft regenerates, so the same eleven bytes are an
+//! enchantment in one version and a food value in the next; a file whose
+//! components another version wrote comes back with its items and **without**
+//! their components, and the count is reported the way a renamed block's is.
+//!
+//! What it does not promise is that a component means the same thing next
+//! year. It promises that one this reader cannot vouch for is dropped loudly
+//! rather than handed back as a different one — because a saved record that
+//! quietly means less than it looks like it means is worse than one that
+//! refuses to be written.
 //!
 //! # Writing
 //!

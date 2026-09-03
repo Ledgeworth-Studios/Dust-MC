@@ -40,22 +40,28 @@
 //! from the same number, and a version that changed a stack size changes this
 //! with no edit.
 //!
-//! # What is stored, and what is lost
+//! # What is stored
 //!
-//! A [`Stack`] is an [`Item`] and a `u8`: four bytes, `Copy`, no allocation.
-//! The whole container is a fixed array, so reading a slot is an index and
-//! writing one is a store. Nothing on this path allocates, which matters
-//! because `held()` is read on every right-click and the container is written
-//! on every click a player makes.
+//! A [`Stack`] is an [`Item`], a `u8` and a component patch. The first two are
+//! four bytes; the third is one `Option<Arc<[u8]>>` that is `None` for the
+//! overwhelming majority of stacks. The whole container is a fixed array, so
+//! reading a slot is an index and writing one is a store, and nothing on the
+//! read path allocates — which matters because `held()` is read on every
+//! right-click and the container is written on every click a player makes.
 //!
-//! What that costs is **components**. [`Slot`] carries a list of component
-//! *removals* and Dust cannot decode component *additions* at all — see
-//! [`dust_protocol::types::Slot`] for why partial decoding is not on offer —
-//! so a stack's removals are dropped on the way in. A renamed block, a shulker
-//! box with things in it, a tool with an enchantment: all of them are stored
-//! and given back as the plain item. That is the same limitation the hotbar
-//! had; what has changed is that it is now a limitation about a stack that
-//! *survives a relog* rather than one that vanished anyway.
+//! The components are the whole of what makes one diamond sword different from
+//! another: its name, its enchantments, how worn it is, what is inside it.
+//! Dust does not model any of that and does not need to — see
+//! [`dust_protocol::components`] — it walks a component to find where it ends
+//! and then keeps, compares and returns the bytes exactly as they arrived.
+//!
+//! **Two stacks merge only if their components are equal**, and that rule
+//! reaches every mode: a left click, a right click, a shift-click, a
+//! double-click and a drag all ask [`Stack::stacks_with`] rather than comparing
+//! items. Getting it wrong in one direction duplicates a player's property and
+//! in the other destroys it. A real 1.21.1 server was asked: a stack named Bob
+//! put down on a plain stack of the same block **swaps**, and it is the same
+//! here.
 //!
 //! # What a click does
 //!
