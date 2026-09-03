@@ -58,12 +58,14 @@ pub struct Options {
     pub version: String,
     pub seed: i64,
     pub radius: i32,
-    /// The chunk the square is centred on. Not a convenience: two biomes in a
-    /// 9x9 is the multi-noise field being smooth at that scale, so a biome
+    /// The chunks the squares are centred on. Not a convenience: two biomes in
+    /// a 9x9 is the multi-noise field being smooth at that scale, so a biome
     /// source cannot be *scored* on one square wherever it is put. Several
     /// small squares far apart reach climate a wide square never would, at a
-    /// cost linear in chunks rather than in the square of the radius.
-    pub centre: (i32, i32),
+    /// cost linear in chunks rather than in the square of the radius — and one
+    /// boot rather than one boot per square, which is the difference between
+    /// two minutes of vanilla and twelve.
+    pub centres: Vec<(i32, i32)>,
     /// A jar the operator has already obtained, instead of downloading.
     pub jar: Option<PathBuf>,
     /// Whole-run budget: boot, pregeneration, stop and scan together.
@@ -75,7 +77,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
     let mut version = None;
     let mut seed = None;
     let mut radius = None;
-    let mut centre = (0i32, 0i32);
+    let mut centres: Vec<(i32, i32)> = Vec::new();
     let mut jar = None;
     let mut timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECS);
     let mut seen: Vec<(&'static str, String)> = Vec::new();
@@ -112,14 +114,14 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
                 let (x, z) = value
                     .split_once(',')
                     .ok_or("--at needs two chunk coordinates, as `x,z`")?;
-                centre = (
+                centres.push((
                     x.trim()
                         .parse()
                         .map_err(|_| "--at's x is not a whole number")?,
                     z.trim()
                         .parse()
                         .map_err(|_| "--at's z is not a whole number")?,
-                );
+                ));
             }
             "--jar" => {
                 at = super::take_value(&mut seen, "--jar", args, at + 1)?;
@@ -155,7 +157,11 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
         version,
         seed,
         radius,
-        centre,
+        centres: if centres.is_empty() {
+            vec![(0, 0)]
+        } else {
+            centres
+        },
         jar,
         timeout,
     })
@@ -192,7 +198,7 @@ pub fn run(options: &Options) -> Result<(), String> {
         &options.version,
         options.seed,
         options.radius,
-        options.centre,
+        &options.centres,
     );
     capture_from(options, &jar, &dir, &label, &layout, started)
 }
@@ -218,16 +224,15 @@ pub(super) fn capture_from(
     layout: &cache::Layout,
     started: Instant,
 ) -> Result<(), String> {
-    let expected = digest::expected_chunks_at(options.radius, options.centre);
+    let expected = digest::expected_chunks_over(options.radius, &options.centres);
     println!(
-        "capturing {} seed {} from {}: {} chunks within radius {} of chunk {},{}, budget {}s",
+        "capturing {} seed {} from {}: {} chunks within radius {} of {}, budget {}s",
         options.version,
         options.seed,
         dir.display(),
         expected.len(),
         options.radius,
-        options.centre.0,
-        options.centre.1,
+        describe_centres(&options.centres),
         options.timeout.as_secs()
     );
 
@@ -328,7 +333,15 @@ fn supervise_run(
     // Every failure path below leaves a running server behind unless this
     // owns the shutdown: whatever goes wrong, the process does not outlive
     // the command that started it.
-    let outcome = run_phases(&rx, &mut child, region_dir, expected, deadline);
+    let outcome = run_phases(
+        &rx,
+        &mut child,
+        region_dir,
+        expected,
+        options.radius,
+        &options.centres,
+        deadline,
+    );
     if outcome.is_err() && child.try_wait().ok().flatten().is_none() {
         let _ = child.kill();
         let _ = child.wait();
@@ -351,10 +364,12 @@ fn run_phases(
     child: &mut std::process::Child,
     region_dir: &Path,
     expected: &[(i32, i32)],
+    radius: i32,
+    squares: &[(i32, i32)],
     deadline: Instant,
 ) -> Result<(), String> {
     wait_until_ready(rx, child, deadline)?;
-    pregenerate(expected, region_dir, deadline)?;
+    pregenerate(expected, radius, squares, region_dir, deadline)?;
     flush_and_stop(deadline)?;
     wait_for_exit(child, deadline)?;
 
@@ -440,17 +455,28 @@ pub(super) fn startup_complete(line: &str) -> bool {
 /// and pins them loaded so view-distance settings cannot thin the square out.
 fn pregenerate(
     expected: &[(i32, i32)],
+    radius: i32,
+    squares: &[(i32, i32)],
     region_dir: &Path,
     deadline: Instant,
 ) -> Result<(), String> {
-    let ((min_x, min_z), (max_x, max_z)) = forceload_box(expected);
+    // One command per square, not one over their bounding box. Two squares a
+    // thousand chunks apart share a box holding a million chunks, and vanilla
+    // would either refuse it or generate the lot; the whole point of scattering
+    // the sample is that the space between the squares is never visited.
+    let boxes: Vec<((i32, i32), (i32, i32))> = squares
+        .iter()
+        .map(|&centre| forceload_box(&digest::expected_chunks_at(radius, centre)))
+        .collect();
     rcon_with_retries(deadline, &mut |client: &mut rcon::Client| {
-        client.exec_delimited(&format!("forceload add {min_x} {min_z} {max_x} {max_z}"))?;
+        for ((min_x, min_z), (max_x, max_z)) in &boxes {
+            client.exec_delimited(&format!("forceload add {min_x} {min_z} {max_x} {max_z}"))?;
+        }
         Ok(())
     })?;
     println!(
-        "forced load over blocks ({min_x},{min_z})..({max_x},{max_z}); waiting for {} \
-         chunks to reach disk",
+        "forced load over {} square(s); waiting for {} chunks to reach disk",
+        boxes.len(),
         expected.len()
     );
 
@@ -611,13 +637,33 @@ fn jvm_flags() -> &'static [&'static str] {
 /// not move. Anywhere else the centre is part of the name, because two squares
 /// of the same radius on the same seed are different worlds and a shared label
 /// would have the second silently overwrite the first.
-pub(super) fn capture_label(version: &str, seed: i64, radius: i32, centre: (i32, i32)) -> String {
+pub(super) fn capture_label(
+    version: &str,
+    seed: i64,
+    radius: i32,
+    centres: &[(i32, i32)],
+) -> String {
     let base = format!("{version}-seed-{seed}-radius-{radius}");
-    if centre == (0, 0) {
-        base
-    } else {
-        format!("{base}-at-{}-{}", centre.0, centre.1)
+    if centres == [(0, 0)] {
+        return base;
     }
+    let mut sorted = centres.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut out = base;
+    for (x, z) in sorted {
+        out.push_str(&format!("-at-{x}_{z}"));
+    }
+    out
+}
+
+/// The centres, for the one line that says what is about to be generated.
+fn describe_centres(centres: &[(i32, i32)]) -> String {
+    centres
+        .iter()
+        .map(|(x, z)| format!("{x},{z}"))
+        .collect::<Vec<_>>()
+        .join(" / ")
 }
 
 #[cfg(test)]

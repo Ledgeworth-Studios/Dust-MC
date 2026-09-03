@@ -99,11 +99,12 @@ outside the repository (override with DUST_HARNESS_CACHE).
       Defaults match what provision writes: 127.0.0.1:25575, password
       dust-harness.
 
-  capture --version <v> --seed <n> --radius <r> [--at <x>,<z>] [--jar <path>]
+  capture --version <v> --seed <n> --radius <r> [--at <x>,<z>]... [--jar <path>]
           [--timeout <s>]
       Boot the provisioned server headless, force-generate the square of
-      chunks within <r> chunks of chunk <x>,<z> (spawn by default; the same
-      flag `worldgen` scores with, and a square anywhere holds one climate),
+      chunks within <r> chunks of each <x>,<z> (spawn by default; `--at` is
+      repeatable and is the same flag `worldgen` scores with, because a square
+      anywhere holds one climate and one boot can generate several),
       flush and stop it, then hash every
       chunk directly out of the region files: a block-state multiset digest, a
       biome digest and per-heightmap digests per chunk. Writes chunks.bin plus
@@ -146,7 +147,7 @@ outside the repository (override with DUST_HARNESS_CACHE).
       not a gate, for the same reason `light` is: exit 0 unless the run itself
       failed. Decision record 0011 is why this exists.
 
-  worldgen --version <v> [--seed <n>] [--radius <r>] [--at <x>,<z>]
+  worldgen --version <v> [--seed <n>] [--radius <r>] [--at <x>,<z>]...
       Read a world Minecraft generated, build the same chunks with Dust's own
       generator, and count how far apart they are: surface height, surface
       block, biome, caves and every block state, as a ladder of seven models

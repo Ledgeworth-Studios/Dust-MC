@@ -89,7 +89,7 @@ use dust_world::heightmap::{HeightmapKind, WorldHeight};
 use super::{cache, digest, region};
 
 const USAGE: &str = "\
-harness worldgen --version <v> [--seed <n>] [--radius <r>] [--at <x>,<z>]
+harness worldgen --version <v> [--seed <n>] [--radius <r>] [--at <x>,<z>]...
 
 Reads a world Minecraft generated, builds the same chunks with Dust's own
 generator, and counts how far apart they are: surface height, surface block,
@@ -102,8 +102,12 @@ A measurement and not a gate: exit 0 unless the run itself failed.
   --seed <n>      The provisioned world's seed. Default 0. Score more than
                   one: seed 0 spawns inland and seed 1 in open ocean, and
                   they disagree about nearly every number here.
-  --at <x>,<z>    Centre the square on this chunk instead of 0,0.
-  --radius <r>    Chunks either side of the centre. Default 4 (a 9x9).
+  --at <x>,<z>    Centre a square on this chunk instead of 0,0. Repeatable,
+                  and repeating it is how a biome source gets scored: a square
+                  anywhere holds one climate, so several small squares far
+                  apart reach biomes a wide square never would. Score the same
+                  squares the capture generated.
+  --radius <r>    Chunks either side of each centre. Default 4 (a 9x9).
 ";
 
 /// Sea level in a 1.21.1 overworld: the y of the topmost water block.
@@ -119,14 +123,14 @@ pub struct Options {
     pub version: String,
     pub seed: i64,
     pub radius: i32,
-    pub centre: (i32, i32),
+    pub centres: Vec<(i32, i32)>,
 }
 
 pub fn parse(args: &[String]) -> Result<Options, String> {
     let mut version = None;
     let mut seed = 0i64;
     let mut radius = 4i32;
-    let mut centre = (0i32, 0i32);
+    let mut centres: Vec<(i32, i32)> = Vec::new();
     let mut seen: Vec<(&'static str, String)> = Vec::new();
     let mut at = 0;
     while at < args.len() {
@@ -159,14 +163,14 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
                 let (x, z) = value
                     .split_once(',')
                     .ok_or("--at needs two chunk coordinates, as `x,z`")?;
-                centre = (
+                centres.push((
                     x.trim()
                         .parse()
                         .map_err(|_| "--at's x is not a whole number")?,
                     z.trim()
                         .parse()
                         .map_err(|_| "--at's z is not a whole number")?,
-                );
+                ));
             }
             other => return Err(format!("unknown worldgen option `{other}`\n\n{USAGE}")),
         }
@@ -177,7 +181,11 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
         })?,
         seed,
         radius,
-        centre,
+        centres: if centres.is_empty() {
+            vec![(0, 0)]
+        } else {
+            centres
+        },
     })
 }
 
@@ -385,7 +393,7 @@ fn measure(options: &Options) -> Result<(), String> {
         ),
     }
 
-    let expected = digest::expected_chunks_at(options.radius, options.centre);
+    let expected = digest::expected_chunks_over(options.radius, &options.centres);
 
     // Only chunks vanilla finished. A chunk below `full` holds a partial
     // answer that looks like a complete one, which is why `digest::scan` and
@@ -1132,7 +1140,7 @@ mod tests {
         let options = parse(&args).expect("parses");
         assert_eq!(options.seed, 1);
         assert_eq!(options.radius, 3);
-        assert_eq!(options.centre, (0, 0));
+        assert_eq!(options.centres, vec![(0, 0)]);
         assert!(parse(&[]).is_err(), "no --version");
         assert!(parse(&["--nope".to_owned()]).is_err());
     }
