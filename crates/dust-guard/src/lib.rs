@@ -16,9 +16,11 @@
 //! # What is here
 //!
 //! [`Reach`], which bounds how far a player may act from where they stand, and
-//! [`Movement`], which bounds where they may say they are. The rules that are
-//! still missing are stated where the code for them would go rather than listed
-//! here, because a list in two places is a list that disagrees with itself.
+//! [`Movement`], which bounds where they may say they are — in time, through
+//! [`SpeedLimit`], and through solid ground, through [`Solidity`]. The rules
+//! that are still missing are stated where the code for them would go rather
+//! than listed here, because a list in two places is a list that disagrees with
+//! itself.
 
 #![forbid(unsafe_code)]
 
@@ -218,6 +220,133 @@ impl SpeedLimit {
     }
 }
 
+/// A world, asked the only question a movement check has for it.
+///
+/// # Why this is a range and not a cell
+///
+/// The obvious shape is `solid(x, y, z) -> bool`, and it is the wrong one.
+/// Resolving *which column* a cell belongs to costs the same as resolving the
+/// column and reading eight cells out of it, and on a world read from region
+/// files it can cost a file read — so a per-cell question makes the caller pay
+/// that eight times for one player box. Handing the whole box over at once lets
+/// the implementation hoist that work, and there is nothing else a movement
+/// check ever wants to know.
+///
+/// # What "solid" has to mean
+///
+/// A block whose **collision shape is the whole cube**, and nothing looser. Not
+/// "opaque", not "occludes", not "blocks motion": a stair, a slab, a fence, a
+/// farmland block and a lump of soul sand all block motion and all let a player
+/// stand somewhere inside the cube they occupy. Counting any of them refuses a
+/// player for standing where the game put them, which is the one failure this
+/// check cannot be forgiven for. Under-counting only lets a cheat through.
+///
+/// # What an implementation does about a chunk it does not have
+///
+/// Say it is not solid. A player walking into ground the server has not loaded
+/// is a player the server cannot judge, and the honest answer to a question you
+/// cannot answer is not "refused".
+///
+/// `&mut self` so that an implementation may cache the column it just resolved;
+/// [`Movement::claimed`] asks at most twice per packet and the second question
+/// is nearly always about the same column as the first.
+pub trait Solidity {
+    /// The first solid cell in the inclusive box from `lo` to `hi`, or `None`
+    /// if there is none. Which one, when there are several, is not specified —
+    /// it is used to say what a refused player walked into.
+    fn first_solid(&mut self, lo: (i32, i32, i32), hi: (i32, i32, i32)) -> Option<(i32, i32, i32)>;
+}
+
+/// A world with nothing solid in it.
+///
+/// What a server hands [`Movement::claimed`] when the collision check is turned
+/// off, or when it has no table saying which block states are solid. Both are
+/// real states rather than error cases: the block constants are extracted from
+/// the operator's own jar and a server can legitimately be running without them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Open;
+
+impl Solidity for Open {
+    fn first_solid(&mut self, _: (i32, i32, i32), _: (i32, i32, i32)) -> Option<(i32, i32, i32)> {
+        None
+    }
+}
+
+/// How wide a player is, in blocks. Vanilla's `EntityDimensions.scalable(0.6F,
+/// 1.8F)` — the width, which no pose changes.
+pub const PLAYER_WIDTH: f64 = 0.6;
+
+/// How much of a player, upwards from their feet, this check watches.
+///
+/// **Not their height, and deliberately not.** A standing player is 1.8 tall, a
+/// crouching one 1.5 and a crawling one 0.6, and this server does not track
+/// pose — so a check that measured 1.8 would refuse every player who crawled
+/// into a one-block gap, which is ordinary play and which the player did on
+/// purpose. Measuring the bottom 0.6 costs one thing: a cheat that puts its head
+/// through a wall while its feet stand in a hole underneath it. Everything else
+/// that walks through a wall walks its feet through it first.
+///
+/// 0.6 is also vanilla's own step height, which makes the rule sayable in one
+/// sentence: a player may not put their feet somewhere they could not have
+/// stepped.
+pub const FOOT_HEIGHT: f64 = 0.6;
+
+/// How far inside a face a player has to be before they count as inside it.
+///
+/// A client that has resolved its own collision leaves itself against the face,
+/// within about `1e-7` of it, and a player who is *exactly* against a wall is
+/// not in it. A millimetre is four orders of magnitude more room than that
+/// needs, and it costs at most one tick of detection: a player walking into a
+/// wall at 0.216 blocks a tick is a millimetre in for a fiftieth of a tick.
+const SKIN: f64 = 1.0e-3;
+
+/// The furthest a sample may be from the one before it, in blocks on any axis.
+///
+/// A player box is 0.6 wide, so a full cube can hide strictly between two boxes
+/// only if they are more than 1.6 apart on some axis; sampling at 1.0 leaves
+/// six tenths of a block of margin and keeps the ordinary case — every step a
+/// measured client takes is under 1.0 — at exactly one sample.
+const SAMPLE_SPAN: f64 = 1.0;
+
+/// The most samples one packet may be split into.
+///
+/// Reached only by a move the speed limit already allowed, which at the default
+/// is fifty blocks after a five-tick gap, and only by an operator who set the
+/// limit to `inf`. Past it the sampling is coarser than [`SAMPLE_SPAN`] and a
+/// wall can be stepped over — a cheat that gets through, never an honest player
+/// refused, which is the direction to be wrong in.
+const MAX_SAMPLES: u32 = 64;
+
+/// The cells a player standing at `feet` is inside, inset by [`SKIN`].
+///
+/// Inclusive on both ends. At most two cells across on x and z and two high,
+/// which is where the cost of the whole check comes from: eight cells at the
+/// worst and two when a player stands in the middle of one.
+#[must_use]
+fn foot_cells(feet: (f64, f64, f64)) -> ((i32, i32, i32), (i32, i32, i32)) {
+    let half = PLAYER_WIDTH / 2.0 - SKIN;
+    let floor = |v: f64| v.floor() as i32;
+    (
+        (
+            floor(feet.0 - half),
+            floor(feet.1 + SKIN),
+            floor(feet.2 - half),
+        ),
+        (
+            floor(feet.0 + half),
+            floor(feet.1 + FOOT_HEIGHT - SKIN),
+            floor(feet.2 + half),
+        ),
+    )
+}
+
+/// Whether a player standing at `feet` is inside solid ground.
+#[must_use]
+fn inside(world: &mut impl Solidity, feet: (f64, f64, f64)) -> Option<(i32, i32, i32)> {
+    let (lo, hi) = foot_cells(feet);
+    world.first_solid(lo, hi)
+}
+
 /// The furthest from the origin, on any axis, a position may claim to be.
 ///
 /// Minecraft's own `MAX_LEVEL_SIZE`. Past it a player is outside every world
@@ -260,6 +389,13 @@ pub enum Refusal {
         moved_squared: f64,
         /// The squared distance the elapsed ticks allowed.
         allowed_squared: f64,
+    },
+    /// Into a block a player cannot be inside, from somewhere they were not
+    /// already inside one. See [`Movement::claimed`].
+    IntoSolid {
+        /// The block they walked into. One of them, where the box they claimed
+        /// covers several — enough to log, not a list.
+        block: (i32, i32, i32),
     },
 }
 
@@ -332,7 +468,47 @@ impl Movement {
     ///
     /// An [`Accepted`](Claim::Accepted) claim has already been stored: `at`
     /// returns the new position on return.
-    pub fn claimed(&mut self, to: (f64, f64, f64), ticks: u32) -> Claim {
+    ///
+    /// # The collision rule, and where the line is drawn
+    ///
+    /// **A player may not move from outside solid ground to inside it. A player
+    /// already inside it may move anywhere.**
+    ///
+    /// That second sentence is the whole design, and it is not a loophole. A
+    /// player legitimately ends up inside a block often: somebody places one on
+    /// them, they spawn in terrain, a chunk arrives late, one day a piston
+    /// pushes them. Every one of those resolves by the player *moving out*, and
+    /// a rule that refused a move because it started inside a block would hold
+    /// them there for as long as they were unlucky. So being inside is never
+    /// itself refused — only crossing in from outside is, and that is the one
+    /// thing an honest client cannot do, because its own collision stopped it.
+    ///
+    /// The two questions are asked of the world as it is *now*, not remembered
+    /// from the last packet: a block placed into a standing player changes the
+    /// answer to "were they inside one" from no to yes, and a remembered answer
+    /// would refuse them for the next thing they did.
+    ///
+    /// A move long enough to step over a block is sampled — see
+    /// [`SAMPLE_SPAN`] — so a claim that jumps a wall is judged at the points
+    /// between as well as at its end.
+    ///
+    /// # What this deliberately allows
+    ///
+    /// Standing on a stair, a slab, a farmland block or soul sand, and crawling
+    /// through a one-block gap: none of those are a full cube or are measured
+    /// against a full-height player, and all of them are ordinary play. Riding,
+    /// being pushed and being knocked back, which no part of this server does
+    /// yet, will all be moves the player did not make and will need a way to say
+    /// so before they exist. And a chunk the server has not loaded is not
+    /// solid, so a player walking into unloaded ground is believed.
+    ///
+    /// # Cost
+    ///
+    /// One [`Solidity::first_solid`] call over a box of at most eight cells for
+    /// a step under a block long, which is every step a measured client takes.
+    /// A second call, over the position they came from, only when the first one
+    /// found something — which for a player in the open is never.
+    pub fn claimed(&mut self, to: (f64, f64, f64), ticks: u32, world: &mut impl Solidity) -> Claim {
         if !to.0.is_finite() || !to.1.is_finite() || !to.2.is_finite() {
             return Claim::Refused(Refusal::NotFinite);
         }
@@ -347,10 +523,24 @@ impl Movement {
             // than trusting a position that would have been accepted anyway,
             // and this cannot be exploited to skip the check: it accepts only
             // what the check already allows.
+            //
+            // The collision rule still applies, and has to. Without it a
+            // player refused for walking into a wall could answer the
+            // correction with a position *inside* the wall — one step, well
+            // within the budget from where they were put — and arrive at the
+            // one state this check never refuses: already inside. Every road
+            // into solid ground is the same road.
             if distance_squared(target, to) <= self.limit.budget_squared(ticks) {
-                self.awaiting = None;
-                self.at = to;
-                return Claim::Accepted;
+                let back = Self {
+                    limit: self.limit,
+                    at: target,
+                    awaiting: None,
+                };
+                if back.walked_into(to, world).is_none() {
+                    self.awaiting = None;
+                    self.at = to;
+                    return Claim::Accepted;
+                }
             }
             return Claim::Ignored;
         }
@@ -362,8 +552,43 @@ impl Movement {
                 allowed_squared,
             });
         }
+        if let Some(block) = self.walked_into(to, world) {
+            return Claim::Refused(Refusal::IntoSolid { block });
+        }
         self.at = to;
         Claim::Accepted
+    }
+
+    /// The block a move from `at` to `to` puts the player inside, having not
+    /// been inside one to start with.
+    ///
+    /// The sampling is by the largest single-axis displacement rather than by
+    /// the distance, and that is not an approximation of the distance: what has
+    /// to stay under a block's width is the step on each axis, and the largest
+    /// of the three is exactly what bounds all of them.
+    fn walked_into(
+        &self,
+        to: (f64, f64, f64),
+        world: &mut impl Solidity,
+    ) -> Option<(i32, i32, i32)> {
+        let from = self.at;
+        let d = (to.0 - from.0, to.1 - from.1, to.2 - from.2);
+        let span = d.0.abs().max(d.1.abs()).max(d.2.abs());
+        let samples = ((span / SAMPLE_SPAN).ceil() as u32).clamp(1, MAX_SAMPLES);
+        for i in 1..=samples {
+            let t = f64::from(i) / f64::from(samples);
+            let at = (from.0 + d.0 * t, from.1 + d.1 * t, from.2 + d.2 * t);
+            if let Some(block) = inside(world, at) {
+                // Inside already, and on their way out. Believed — see this
+                // type's own documentation for why that is the important half.
+                return if inside(world, from).is_some() {
+                    None
+                } else {
+                    Some(block)
+                };
+            }
+        }
+        None
     }
 
     /// Start correcting a player, and say where to put them.
@@ -504,7 +729,7 @@ mod tests {
             let mut player = walker();
             let to = (0.0, 64.0 - step, 0.0);
             assert_eq!(
-                player.claimed(to, 1),
+                player.claimed(to, 1, &mut Open),
                 Claim::Accepted,
                 "a measured client moved {step} blocks in one tick and was refused"
             );
@@ -520,7 +745,10 @@ mod tests {
         // with no elytra, and the limit has to clear it by enough that adding
         // elytra later is a decision rather than an emergency.
         let mut player = walker();
-        assert_eq!(player.claimed((0.0, 64.0 - 3.92, 0.0), 1), Claim::Accepted);
+        assert_eq!(
+            player.claimed((0.0, 64.0 - 3.92, 0.0), 1, &mut Open),
+            Claim::Accepted
+        );
         let headroom = DEFAULT / 3.92;
         assert!(headroom > 2.5, "only {headroom}x over free fall");
     }
@@ -532,7 +760,7 @@ mod tests {
         let Claim::Refused(Refusal::TooFast {
             moved_squared,
             allowed_squared,
-        }) = player.claimed((500.0, 64.0, 500.0), 1)
+        }) = player.claimed((500.0, 64.0, 500.0), 1, &mut Open)
         else {
             panic!("a 707-block step was not refused");
         };
@@ -553,7 +781,7 @@ mod tests {
         let mut y = 64.0;
         for _ in 0..14 {
             y -= 0.216;
-            assert_eq!(player.claimed((0.0, y, 0.0), 0), Claim::Accepted);
+            assert_eq!(player.claimed((0.0, y, 0.0), 0, &mut Open), Claim::Accepted);
         }
     }
 
@@ -564,16 +792,19 @@ mod tests {
         // second buys no more than a gap of a quarter, because past that the
         // honest explanation is a queue of packets rather than one large one.
         let mut player = walker();
-        assert_eq!(player.claimed((49.0, 64.0, 0.0), 5), Claim::Accepted);
+        assert_eq!(
+            player.claimed((49.0, 64.0, 0.0), 5, &mut Open),
+            Claim::Accepted
+        );
         let mut player = walker();
         assert!(matches!(
-            player.claimed((51.0, 64.0, 0.0), 5),
+            player.claimed((51.0, 64.0, 0.0), 5, &mut Open),
             Claim::Refused(Refusal::TooFast { .. })
         ));
         let mut player = walker();
         assert!(
             matches!(
-                player.claimed((51.0, 64.0, 0.0), 200),
+                player.claimed((51.0, 64.0, 0.0), 200, &mut Open),
                 Claim::Refused(Refusal::TooFast { .. })
             ),
             "a four-second gap bought more than the clamp allows"
@@ -595,7 +826,7 @@ mod tests {
                 }
                 let mut player = walker();
                 assert_eq!(
-                    player.claimed(to, 1),
+                    player.claimed(to, 1, &mut Open),
                     Claim::Refused(Refusal::NotFinite),
                     "{bad} on axis {axis}"
                 );
@@ -607,7 +838,7 @@ mod tests {
     fn a_position_outside_every_world_is_refused_however_long_it_took() {
         let mut player = Movement::new(SpeedLimit::new(DEFAULT), (WORLD_LIMIT - 1.0, 64.0, 0.0));
         assert_eq!(
-            player.claimed((WORLD_LIMIT + 1.0, 64.0, 0.0), 5),
+            player.claimed((WORLD_LIMIT + 1.0, 64.0, 0.0), 5, &mut Open),
             Claim::Refused(Refusal::OutOfWorld),
             "two blocks east of the edge of the world is still off the map"
         );
@@ -618,9 +849,12 @@ mod tests {
         // Turning the speed bound off is a legitimate thing for an operator to
         // want and a malformed coordinate is not a speed.
         let mut player = Movement::new(SpeedLimit::new(f64::INFINITY), (0.0, 64.0, 0.0));
-        assert_eq!(player.claimed((1e6, 64.0, 1e6), 1), Claim::Accepted);
         assert_eq!(
-            player.claimed((f64::NAN, 64.0, 0.0), 1),
+            player.claimed((1e6, 64.0, 1e6), 1, &mut Open),
+            Claim::Accepted
+        );
+        assert_eq!(
+            player.claimed((f64::NAN, 64.0, 0.0), 1, &mut Open),
             Claim::Refused(Refusal::NotFinite)
         );
     }
@@ -634,14 +868,17 @@ mod tests {
         // stop.
         let mut player = walker();
         assert!(matches!(
-            player.claimed((500.0, 64.0, 500.0), 1),
+            player.claimed((500.0, 64.0, 500.0), 1, &mut Open),
             Claim::Refused(_)
         ));
         let back = player.correct(7);
         assert_eq!(back, (0.0, 64.0, 0.0));
         assert!(!player.settled());
         for _ in 0..5 {
-            assert_eq!(player.claimed((501.0, 64.0, 501.0), 1), Claim::Ignored);
+            assert_eq!(
+                player.claimed((501.0, 64.0, 501.0), 1, &mut Open),
+                Claim::Ignored
+            );
         }
         assert!(player.confirmed(7));
         assert!(player.settled());
@@ -656,7 +893,10 @@ mod tests {
         player.correct(7);
         assert!(!player.confirmed(1));
         assert!(!player.settled());
-        assert_eq!(player.claimed((500.0, 64.0, 500.0), 1), Claim::Ignored);
+        assert_eq!(
+            player.claimed((500.0, 64.0, 500.0), 1, &mut Open),
+            Claim::Ignored
+        );
     }
 
     #[test]
@@ -668,7 +908,10 @@ mod tests {
         // does.
         let mut player = walker();
         player.correct(7);
-        assert_eq!(player.claimed((0.3, 64.0, 0.0), 1), Claim::Accepted);
+        assert_eq!(
+            player.claimed((0.3, 64.0, 0.0), 1, &mut Open),
+            Claim::Accepted
+        );
         assert!(player.settled());
         assert_eq!(player.at(), (0.3, 64.0, 0.0));
     }
@@ -678,7 +921,10 @@ mod tests {
         for bad in [0.0, -1.0, f64::NAN] {
             let mut player = Movement::new(SpeedLimit::new(bad), (0.0, 64.0, 0.0));
             assert!(
-                matches!(player.claimed((0.001, 64.0, 0.0), 1), Claim::Refused(_)),
+                matches!(
+                    player.claimed((0.001, 64.0, 0.0), 1, &mut Open),
+                    Claim::Refused(_)
+                ),
                 "a limit of {bad} allowed a millimetre"
             );
         }
@@ -697,6 +943,292 @@ mod tests {
         assert!(
             (limit.budget_squared(99) - limit.budget_squared(SpeedLimit::MAX_TICKS)).abs() < 1e-9
         );
+    }
+
+    /// A world made of whichever cells the test names, and a count of how many
+    /// boxes it was asked about — which is what the cost claims in
+    /// [`Movement::claimed`] are checked against.
+    #[derive(Default)]
+    struct Ground {
+        solid: std::collections::HashSet<(i32, i32, i32)>,
+        asked: u32,
+    }
+
+    impl Ground {
+        /// A floor at y = -1 and nothing else, from -8 to 8 on both axes.
+        fn floor() -> Self {
+            let mut world = Self::default();
+            for x in -8..8 {
+                for z in -8..8 {
+                    world.solid.insert((x, -1, z));
+                }
+            }
+            world
+        }
+
+        /// A wall two blocks tall across x = 2.
+        fn with_wall(mut self) -> Self {
+            for z in -8..8 {
+                for y in 0..2 {
+                    self.solid.insert((2, y, z));
+                }
+            }
+            self
+        }
+    }
+
+    impl Solidity for Ground {
+        fn first_solid(
+            &mut self,
+            lo: (i32, i32, i32),
+            hi: (i32, i32, i32),
+        ) -> Option<(i32, i32, i32)> {
+            self.asked += 1;
+            for y in lo.1..=hi.1 {
+                for z in lo.2..=hi.2 {
+                    for x in lo.0..=hi.0 {
+                        if self.solid.contains(&(x, y, z)) {
+                            return Some((x, y, z));
+                        }
+                    }
+                }
+            }
+            None
+        }
+    }
+
+    /// A player standing on the floor at the origin.
+    fn stander() -> Movement {
+        Movement::new(SpeedLimit::new(DEFAULT), (0.5, 0.0, 0.5))
+    }
+
+    #[test]
+    fn a_player_walking_into_a_wall_is_refused_at_the_face() {
+        // The defect this exists for, at the pace it is actually done at: a
+        // walking client, 0.216 blocks a tick, straight at a wall. It is
+        // believed for every step up to the face and refused by the one that
+        // puts a foot through it.
+        let mut world = Ground::floor().with_wall();
+        let mut player = stander();
+        let mut x = 0.5;
+        let mut refused = None;
+        for _ in 0..20 {
+            x += 0.216;
+            match player.claimed((x, 0.0, 0.5), 1, &mut world) {
+                Claim::Accepted => {}
+                Claim::Refused(Refusal::IntoSolid { block }) => {
+                    refused = Some((x, block));
+                    break;
+                }
+                other => panic!("{other:?} at x {x}"),
+            }
+        }
+        let Some((at, block)) = refused else {
+            panic!("walked all the way through a wall at a walking pace");
+        };
+        assert_eq!(block, (2, 0, 0), "refused for the wrong block");
+        // The wall's west face is at x = 2 and the player is 0.6 wide, so the
+        // first position with a foot in it is just past 1.7. Nothing before
+        // that was refused, which is the half that matters.
+        assert!((1.7..1.95).contains(&at), "refused at {at}");
+        // And they are left standing where they legitimately got to, not
+        // where they claimed and not back at the origin.
+        assert!(
+            player.at().0 < 2.0 && player.at().0 > 1.4,
+            "{:?}",
+            player.at()
+        );
+    }
+
+    #[test]
+    fn the_same_walk_with_no_world_is_not_refused() {
+        // The negative control for the test above, in the form the brief asks
+        // for: the same twenty steps against a world with nothing solid in it
+        // go all the way through. If `Open` ever grew an opinion this goes red.
+        let mut player = stander();
+        let mut x = 0.5;
+        for _ in 0..20 {
+            x += 0.216;
+            assert_eq!(player.claimed((x, 0.0, 0.5), 1, &mut Open), Claim::Accepted);
+        }
+        assert!(player.at().0 > 4.0, "{:?}", player.at());
+    }
+
+    #[test]
+    fn a_player_may_walk_out_of_a_block_they_are_already_inside() {
+        // Somebody placed a block on them, or they spawned in terrain. The
+        // rule is that being inside is never itself refused — including the
+        // move that takes them further in, because a player who has to pick
+        // the right direction to be believed is a player being punished for
+        // somebody else's block.
+        let mut world = Ground::floor();
+        world.solid.insert((0, 0, 0));
+        let mut player = Movement::new(SpeedLimit::new(DEFAULT), (0.5, 0.0, 0.5));
+        assert_eq!(
+            player.claimed((0.4, 0.0, 0.5), 1, &mut world),
+            Claim::Accepted
+        );
+        assert_eq!(
+            player.claimed((0.2, 0.0, 0.5), 1, &mut world),
+            Claim::Accepted
+        );
+        // And out the west side, which is where they were heading.
+        assert_eq!(
+            player.claimed((-0.4, 0.0, 0.5), 1, &mut world),
+            Claim::Accepted
+        );
+        assert_eq!(player.at(), (-0.4, 0.0, 0.5));
+    }
+
+    #[test]
+    fn a_block_placed_onto_a_standing_player_does_not_freeze_them() {
+        // The same case reached the way it actually happens: the player was
+        // outside solid ground last packet and the *world* changed, not them.
+        // The check asks the world as it is now on both sides, so the position
+        // they came from is inside too and nothing is refused. A remembered
+        // answer would refuse this.
+        let mut world = Ground::floor();
+        let mut player = stander();
+        assert_eq!(
+            player.claimed((0.5, 0.0, 0.6), 1, &mut world),
+            Claim::Accepted
+        );
+        world.solid.insert((0, 0, 0));
+        assert_eq!(
+            player.claimed((0.5, 0.0, 0.7), 1, &mut world),
+            Claim::Accepted
+        );
+    }
+
+    #[test]
+    fn standing_on_the_floor_is_not_standing_in_it() {
+        // Feet exactly on the top face of a block, which is where a client's
+        // own collision leaves them and therefore what nearly every packet
+        // this check ever sees looks like. Touching is not inside.
+        let mut world = Ground::floor();
+        let mut player = stander();
+        for step in [0.216, 0.281, 0.742] {
+            let to = (player.at().0 + step, 0.0, 0.5);
+            assert_eq!(
+                player.claimed(to, 1, &mut world),
+                Claim::Accepted,
+                "a {step} block step along the floor was refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_jump_over_a_wall_is_believed_and_a_dash_through_it_is_not() {
+        // Two claims of the same length either side of the same wall. The one
+        // that goes over the top is believed; the one that goes through is
+        // refused by a sample between the ends, which is the whole reason the
+        // long ones are sampled at all.
+        let mut world = Ground::floor().with_wall();
+        let mut over = Movement::new(SpeedLimit::new(DEFAULT), (0.5, 2.0, 0.5));
+        assert_eq!(
+            over.claimed((4.5, 2.0, 0.5), 1, &mut world),
+            Claim::Accepted
+        );
+        let mut through = stander();
+        assert!(
+            matches!(
+                through.claimed((4.5, 0.0, 0.5), 1, &mut world),
+                Claim::Refused(Refusal::IntoSolid { .. })
+            ),
+            "a four-block dash straight through a wall was believed"
+        );
+    }
+
+    #[test]
+    fn a_correction_cannot_be_answered_with_a_position_inside_the_wall() {
+        // The exploit the recovery path would otherwise have. Walk into the
+        // wall, get put back, and then answer the teleport with a position in
+        // the wall — one step, well inside the speed budget from where the
+        // correction put them. Accepting it would land the player in the one
+        // state this check never refuses, and every subsequent step through
+        // the wall would be believed.
+        let mut world = Ground::floor().with_wall();
+        let mut player = Movement::new(SpeedLimit::new(DEFAULT), (1.5, 0.0, 0.5));
+        assert!(matches!(
+            player.claimed((2.5, 0.0, 0.5), 1, &mut world),
+            Claim::Refused(Refusal::IntoSolid { .. })
+        ));
+        player.correct(4);
+        assert_eq!(
+            player.claimed((2.5, 0.0, 0.5), 1, &mut world),
+            Claim::Ignored
+        );
+        assert!(
+            !player.settled(),
+            "a position in the wall settled the player"
+        );
+        // A legal one still clears the correction, which is the behaviour the
+        // recovery path exists for and which this must not have broken.
+        assert_eq!(
+            player.claimed((1.4, 0.0, 0.5), 1, &mut world),
+            Claim::Accepted
+        );
+        assert!(player.settled());
+    }
+
+    #[test]
+    fn ground_the_server_does_not_have_is_not_solid() {
+        // `Ground` holds a floor from -8 to 8 and nothing beyond it, which is
+        // what a server that has not loaded a chunk looks like from here. A
+        // player walking off the edge of what is loaded is believed rather
+        // than refused: an answer nobody has is not a refusal.
+        let mut world = Ground::floor().with_wall();
+        let mut player = Movement::new(SpeedLimit::new(DEFAULT), (0.5, 0.0, 20.5));
+        assert_eq!(
+            player.claimed((2.5, 0.0, 20.5), 1, &mut world),
+            Claim::Accepted
+        );
+    }
+
+    #[test]
+    fn one_ordinary_step_asks_the_world_once() {
+        // The cost claim, as a test rather than as a sentence. A player in the
+        // open costs one box question per packet — the second one is only
+        // asked when the first found something, and for a player walking
+        // across a floor it never does.
+        let mut world = Ground::floor();
+        let mut player = stander();
+        world.asked = 0;
+        for i in 1..=100 {
+            let to = (0.5 + f64::from(i) * 0.216, 0.0, 0.5);
+            assert_eq!(player.claimed(to, 1, &mut world), Claim::Accepted);
+        }
+        assert_eq!(world.asked, 100, "a step in the open asked more than once");
+    }
+
+    #[test]
+    fn the_box_asked_about_is_the_bottom_of_a_player_and_never_their_head() {
+        // Pose is not tracked, so the check watches the bottom 0.6 of a
+        // player and not their 1.8. This is the test that says so: a player
+        // crawling along a one-block gap — floor under them, ceiling on top of
+        // them — is not refused, and a 1.8 box would refuse every packet of it.
+        let mut world = Ground::floor();
+        for x in -8..8 {
+            for z in -8..8 {
+                world.solid.insert((x, 1, z));
+            }
+        }
+        let mut player = stander();
+        for i in 1..=10 {
+            let to = (0.5 + f64::from(i) * 0.216, 0.0, 0.5);
+            assert_eq!(
+                player.claimed(to, 1, &mut world),
+                Claim::Accepted,
+                "a crawling player was refused for having a ceiling"
+            );
+        }
+        // And the box really is 0.6 high: raise the ceiling into it and the
+        // same move is refused.
+        let (lo, hi) = foot_cells((0.5, 0.0, 0.5));
+        assert_eq!(lo, (0, 0, 0));
+        assert_eq!(hi, (0, 0, 0));
+        let (_, hi) = foot_cells((0.5, 0.5, 0.5));
+        assert_eq!(hi.1, 1, "the box does not reach 0.6 above the feet");
     }
 
     #[test]
