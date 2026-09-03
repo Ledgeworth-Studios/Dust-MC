@@ -58,6 +58,20 @@ const WRONG_DIVISOR: f32 = 100.0;
 /// purpose: the cost of being too strict is a block that visibly comes back.
 const STOP_THRESHOLD: f32 = 0.7;
 
+/// Minecraft's `Player.hasCorrectToolForDrops`, from the two facts a server
+/// holds separately.
+///
+/// `requires_tool` is the block state's own `requiresCorrectToolForDrops`, out
+/// of `dust-constants.tsv`. `correct_for_drops` is the held item's
+/// `minecraft:tool` component read against the block. **A block that asks for
+/// no tool is correctly tooled by anything**, which is the half a caller with
+/// only the second fact gets wrong — and it is not a rare case: dirt, sand,
+/// wood, wool and every plant are in it.
+#[must_use]
+pub fn tool_is_correct(requires_tool: bool, correct_for_drops: bool) -> bool {
+    !requires_tool || correct_for_drops
+}
+
 /// A player being off the ground divides their mining speed by this.
 const AIRBORNE_DIVISOR: f32 = 5.0;
 
@@ -99,8 +113,17 @@ pub struct Digger {
     pub speed: f32,
     /// The `minecraft:efficiency` level on the held stack, zero for none.
     pub efficiency: u32,
-    /// Whether the block the drops want is the block in the hand. Decides the
-    /// divisor, and nothing else here.
+    /// Whether Minecraft would call this the correct tool — and **it is not
+    /// the same question `dust_registry::mining::correct_for_drops` answers.**
+    /// Build it with [`tool_is_correct`], never from the drops verdict alone.
+    ///
+    /// `Player.hasCorrectToolForDrops` is `!requiresCorrectToolForDrops ||
+    /// isCorrectToolForDrops`: a block that asks for no tool is correctly
+    /// tooled by *anything*, a bare hand included. So dirt, sand and oak
+    /// planks all take the 30 divisor from an empty hand, and a server that
+    /// passed the drops verdict straight in would make every one of them 3.3
+    /// times slower than the game does. Measured on a real 1.21.1 server:
+    /// dirt bare-handed is 15 ticks and not 50, oak planks 60 and not 200.
     pub correct: bool,
     /// Whether the player's feet are on something.
     pub on_ground: bool,
@@ -358,6 +381,31 @@ mod tests {
     fn the_wrong_tool_is_slower_even_when_the_drops_do_not_care() {
         assert_eq!(Progress::of(2.0, &tool(4.0, true)).ticks(), Some(15));
         assert_eq!(Progress::of(2.0, &tool(4.0, false)).ticks(), Some(50));
+    }
+
+    /// The composed question, which is the one the divisor is about. Every row
+    /// here was measured on a real 1.21.1 server; see decision record 0028.
+    #[test]
+    fn a_block_that_wants_no_tool_is_correctly_tooled_by_a_bare_hand() {
+        // Dirt: hardness 0.5, no tool wanted. 15 ticks bare-handed and not 50.
+        let bare = Digger {
+            correct: tool_is_correct(false, false),
+            ..Digger::bare()
+        };
+        assert_eq!(Progress::of(0.5, &bare).ticks(), Some(15));
+        // Iron ore: hardness 3, and it does want one. 300 bare-handed.
+        let wrong = Digger {
+            correct: tool_is_correct(true, false),
+            ..Digger::bare()
+        };
+        assert_eq!(Progress::of(3.0, &wrong).ticks(), Some(300));
+        // And the same ore with a pickaxe of the right tier, speed 9: 10.
+        let right = Digger {
+            speed: 9.0,
+            correct: tool_is_correct(true, true),
+            ..Digger::bare()
+        };
+        assert_eq!(Progress::of(3.0, &right).ticks(), Some(10));
     }
 
     #[test]

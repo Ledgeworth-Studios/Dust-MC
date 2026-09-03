@@ -23,5 +23,5 @@ pub mod placement;
 
 pub use crafting::{Recipe, Recipes};
 pub use drops::{compile, Break, Drop, Rng, Table, Tables, Tool};
-pub use mining::{Digger, Progress};
+pub use mining::{tool_is_correct, Digger, Progress};
 pub use placement::{replaces_beside, replaces_clicked, state_for, state_for_item, Click, Face};

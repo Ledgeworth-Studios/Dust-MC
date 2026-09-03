@@ -2665,12 +2665,21 @@ fn break_progress(
         // starts working, and it is the same seam `spill` names for silk
         // touch and fortune.
         efficiency: 0,
-        // **Whether the tool is right for the drops, not whether the block
-        // asks for one.** The wrong tool costs time on every block, including
-        // the ones that drop themselves to a bare hand — an axe on oak planks
-        // is three times faster than a pickaxe of the same speed, and a server
-        // that read `requires_tool` here would make them the same.
-        correct: dust_registry::mining::correct_for_drops(held, block),
+        // **Both facts, composed — and this is the line a real server was
+        // measured correcting.** The drops verdict alone says a bare hand is
+        // wrong for dirt, and Minecraft says it is right: a block that asks
+        // for no tool is correctly tooled by anything, so dirt bare-handed is
+        // 15 ticks and not 50. See `dust_sim::mining::tool_is_correct`.
+        correct: dust_sim::mining::tool_is_correct(
+            match ctx.requires_tool {
+                Some(flag) => constants.is_set(flag, state),
+                // No column: no block asks for a tool, so every hand is the
+                // right one. The generous direction, and the same reading
+                // `spill` takes of the same absent column.
+                None => false,
+            },
+            dust_registry::mining::correct_for_drops(held, block),
+        ),
         on_ground,
     };
     dust_sim::mining::Progress::of(hardness, &digger)

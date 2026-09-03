@@ -126,6 +126,15 @@ pub fn run(options: &Options) -> std::process::ExitCode {
         }
     );
 
+    // Resolved once, outside the loop. `None` is a table extracted before the
+    // column existed, and it reads as "no block asks for a tool" — which makes
+    // every hand the right one and every break the fast divisor. That is a
+    // different wrong answer from the one `--without-hardness` produces, and
+    // it is said above rather than left to the score.
+    let requires_tool = constants
+        .flag("requires_tool")
+        .map(|flag| (&constants, flag));
+
     let (mut agreed, mut disagreed, mut unmeasured, mut unknown) = (0u32, 0u32, 0u32, 0u32);
     let mut worst: i64 = 0;
     let mut worklist: Vec<String> = Vec::new();
@@ -162,8 +171,19 @@ pub fn run(options: &Options) -> std::process::ExitCode {
         };
         let digger = Digger {
             speed: dust_registry::mining::speed(timing.tool, block),
+            // The survey holds a plain `/give` tool, so no row here is about
+            // an enchantment. A run that put an efficiency pickaxe in the hand
+            // and scored it against this would be scoring a zero.
             efficiency: 0,
-            correct: dust_registry::mining::correct_for_drops(timing.tool, block),
+            // Composed, never the drops verdict alone — see
+            // `dust_sim::mining::tool_is_correct`, and the eight rows of this
+            // survey that say 15 and 60 where the drops verdict alone predicts
+            // 50 and 200.
+            correct: dust_sim::mining::tool_is_correct(
+                requires_tool
+                    .is_some_and(|(table, flag)| table.is_set(flag, state)),
+                dust_registry::mining::correct_for_drops(timing.tool, block),
+            ),
             on_ground: true,
         };
         let progress = Progress::of(hardness, &digger);
