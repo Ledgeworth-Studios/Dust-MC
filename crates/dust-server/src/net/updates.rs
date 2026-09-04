@@ -370,7 +370,9 @@ pub struct WorldTicker {
 pub struct Counts {
     /// Positions taken off the queue and looked at.
     pub examined: u64,
-    /// Cells that could not stay and were dropped.
+    /// Cells that could not stay and were dropped, `decayed` included: a leaf
+    /// that runs out of tree breaks like anything else and is counted twice on
+    /// purpose, once as a break and once as the kind of break it was.
     pub broken: u64,
     /// Cells that became a falling entity.
     pub fell: u64,
@@ -378,6 +380,10 @@ pub struct Counts {
     pub landed: u64,
     /// Falling entities that could not, and spilled as an item instead.
     pub spilled: u64,
+    /// Cells that wanted to fall and were put back on the schedule because
+    /// the entity ceiling was full. Not a failure — a rate — and the number
+    /// that says so.
+    pub deferred: u64,
     /// Leaves given a new `distance` because the nearest log moved.
     pub relabelled: u64,
     /// Leaves that ran out of tree and came down.
@@ -424,6 +430,14 @@ impl WorldTicker {
             seed: 0x9e37_79b9_7f4a_7c15,
             counts: Counts::default(),
         }
+    }
+
+    /// How many cells are waiting for a tick of their own. Public for the
+    /// bench, which cannot say a workload has settled without it: a sand
+    /// column two ticks from falling has an empty queue and is not finished.
+    #[must_use]
+    pub fn scheduled(&self) -> usize {
+        self.schedule.len()
     }
 
     /// What this participant has done. Public for the bench and the log.
@@ -497,20 +511,30 @@ impl WorldTicker {
         self.counts.relabelled += 1;
     }
 
-    /// Turn a cell into a falling entity, or leave it alone if it cannot be.
-    fn launch(&mut self, at: Position, state: u32) {
+    /// Turn a cell into a falling entity. `false` if the ceiling refused it.
+    ///
+    /// A refusal is **not** an answer, and finding that out is what the
+    /// thousand-block raft in `benches/updates.rs` is for. The first version
+    /// of this returned quietly and left the block where it was, on the
+    /// reasoning that a server which refuses to animate is one a player can
+    /// dig out of. It measured 512 fell and 512 landed out of 1,024 — and the
+    /// other 512 hung in the air for ever, because nothing ever queued them
+    /// again. That is the defect this whole task exists to remove, reproduced
+    /// by its own ceiling at a scale an ordinary gravel pit reaches.
+    ///
+    /// The caller therefore puts a refused cell back on the schedule. A
+    /// ceiling that bounds the *rate* is a server that stays up; a ceiling
+    /// that bounds the *outcome* is sand hanging in the air.
+    fn launch(&mut self, at: Position, state: u32) -> bool {
         let id = self.roster.claim_entity_id();
         // Air first and the entity second, so the cell is never both a block
         // and an entity. The other order is a block a client draws twice.
         if self.falling.spawn(id, state, at.x, at.y, at.z).is_none() {
-            // The ceiling. The block stays where it is, which is the right
-            // failure: a server under a sand flood that refuses to animate is
-            // one a player can dig out of, and one that deletes the sand is
-            // not.
-            return;
+            return false;
         }
         self.world.set_block(at, self.air);
         self.counts.fell += 1;
+        true
     }
 }
 
@@ -595,7 +619,12 @@ impl crate::participant::TickParticipant for WorldTicker {
                 match rules.reaction(state, around) {
                     Reaction::Stay => {}
                     Reaction::Break => self.topple(at, id),
-                    Reaction::Fall => self.launch(at, id),
+                    Reaction::Fall => {
+                        if !self.launch(at, id) {
+                            self.schedule.at(ctx.tick_index + FALL_DELAY, at);
+                            self.counts.deferred += 1;
+                        }
+                    }
                     Reaction::Relabel(next) => self.relabel(at, next),
                     Reaction::Decay => {
                         self.topple(at, id);
