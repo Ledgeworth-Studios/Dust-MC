@@ -48,15 +48,17 @@ The columns themselves are built by the world rather than by the session that
 wants them, and a session sends only the ones that are ready — nearest first, a
 prefix with no holes in it, over a window of 24 columns it claims in the shared
 column store and gives back as they go out. That is what keeps a join off its
-own tokio worker and out of everybody else's way. Four bots joining at once,
-while a settled player timed a chat round trip twenty times a second: the
-settled player's worst round trip on a generated world went from 469, 298 and
-697 ms over three runs to 20, 71 and 20 ms, and the four joiners were sent 273
-to 279 of their 289 columns in the same three seconds where they used to get 181
-to 253 — finishing within 20 ms of each other rather than staggered across 400,
-because the store builds their columns once between them. Decision record
-[0031](docs/decisions/0031-how-a-join-streams-its-chunks.md) has the ladder
-that says which world each number is about.
+own tokio worker and out of everybody else's way. Four bots joining at once
+were sent 273 to 279 of their 289 columns in the same three seconds where they
+used to get 181 to 253, finishing within 20 ms of each other rather than
+staggered across 400, because the store builds their columns once between them.
+Decision record [0031](docs/decisions/0031-how-a-join-streams-its-chunks.md) has
+the ladder that says which world each number is about, and
+[0042](docs/decisions/0042-what-a-joining-crowd-costs-a-bystander.md) retracts
+what it said about the *settled* player: that number was the test harness, which
+parsed every joiner's chunks on the same node thread it timed the settler with.
+Measured from a process of its own, a settled player's worst chat round trip
+while four people join is **7 ms**, and while eight join it is 9.
 
 A player who changes their render distance mid-game is served the new one, which
 the pacing made cheap enough to bother with: the view forgets or sends the
@@ -337,10 +339,10 @@ world arriving around a player who is already walking — the loading screen end
 at 242 ms, and records
 [0031](docs/decisions/0031-how-a-join-streams-its-chunks.md) and
 [0038](docs/decisions/0038-how-wide-the-region-lock-is.md) say what a pool would
-move and why it is declined; **four people joining at once stall a settled
-player for about a quarter of a second whatever the world is made of**, which
-0038 measured on a flat world, where a column is free and there is no lock to
-contend for, and did not move;
+move and why it is declined —
+[0042](docs/decisions/0042-what-a-joining-crowd-costs-a-bystander.md) declines
+it a third time, because the stall it was for turned out to be the harness and
+a bystander measured from her own process waits 7 ms while four people join;
 **no water on the movement path**,
 so a player who says they are sprinting and airborne is measured at their feet
 rather than at their full height, because they might be swimming and no client

@@ -111,6 +111,20 @@ break port="25565":
 collide port="25565":
     cd tools/bot && node collide.js {{port}}
 
+# What four people joining at once does to somebody already standing there.
+#
+#   just join 25565 4          four joiners, one process each
+#   just join 25565 4 same     every bot in one process, which is the trap
+#
+# A settler streams its whole view, then times a chat round trip twenty times a
+# second while N others join. The mode is load-bearing and is not a tuning
+# knob: with every bot in one node process the settler is timing an event loop
+# that four joins have filled with chunk parsing, and that measurement — not
+# this server — is what decision records 0031 and 0038 read as a stall. See
+# decision record 0042. Outside `verify` for the same reason `bot` is.
+join port="25565" joiners="4" where="each":
+    cd tools/bot && node join.js {{port}} {{joiners}} {{where}}
+
 # What one player can see of another player's armour and hand.
 #
 #   just equipment 25565                    record from a running server
