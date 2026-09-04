@@ -29,7 +29,7 @@ dust-server = { path = "crates/dust-server" }
 dust-sim = { path = "crates/dust-sim" }
 dust-world = { path = "crates/dust-world" }
 
-ctrlc = "3"
+ctrlc = { version = "3", features = ["termination"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 proc-macro2 = "1"
 quote = "1"

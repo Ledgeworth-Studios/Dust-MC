@@ -320,8 +320,7 @@ impl Drop for Watch {
             .inner
             .lock()
             .expect("the furnace world is never poisoned");
-        if let std::collections::hash_map::Entry::Occupied(mut entry) =
-            inner.watched.entry(self.at)
+        if let std::collections::hash_map::Entry::Occupied(mut entry) = inner.watched.entry(self.at)
         {
             *entry.get_mut() -= 1;
             if *entry.get() == 0 {
@@ -462,7 +461,10 @@ impl Furnaces {
     #[must_use]
     pub fn watch(self: &std::sync::Arc<Self>, at: Position) -> Watch {
         {
-            let mut inner = self.inner.lock().expect("the furnace world is never poisoned");
+            let mut inner = self
+                .inner
+                .lock()
+                .expect("the furnace world is never poisoned");
             *inner.watched.entry(at).or_insert(0) += 1;
         }
         Watch {
@@ -474,7 +476,10 @@ impl Furnaces {
     /// How many furnaces have a screen open on them.
     #[must_use]
     pub fn watched(&self) -> usize {
-        let inner = self.inner.lock().expect("the furnace world is never poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .expect("the furnace world is never poisoned");
         inner.watched.len()
     }
 

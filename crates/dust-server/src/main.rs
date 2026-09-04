@@ -1,11 +1,21 @@
 //! The `dust` binary: a thin shell over the library.
 //!
 //! Everything interesting lives behind [`dust_server`]; this file parses the
-//! command line, installs the ctrl-C handler and turns results into exit
+//! command line, installs the stop-signal handler and turns results into exit
 //! codes. Its one policy decision is written down where it is made: signal
 //! registration failure is a warning, not an abort, because a server that
 //! cannot hear ctrl-C still serves players — the operator just has to stop it
 //! another way.
+//!
+//! **SIGTERM stops the server the same way ctrl-C does**, which is the whole
+//! reason `ctrlc`'s `termination` feature is on. Nothing at a keyboard sends
+//! SIGTERM; `systemctl stop`, `docker stop` and a supervisor restart all do,
+//! and those are how a real server is stopped. Without it the default
+//! disposition killed the process outright and the world went back to its
+//! last save: a furnace armed with 1,512 ticks of coal and stopped with
+//! `kill` came back cold, 3 of 9 restart checks passing, and the same `kill
+//! -INT` passed 9 of 9. Priority 1 — a player who logs in after an operator
+//! restart and finds the last hour undone has lost real work.
 
 use std::io::Write;
 
@@ -50,6 +60,7 @@ fn run() -> i32 {
     };
     let server = Server::new(options);
     let stop = server.stop_handle();
+    // Fires on SIGINT (ctrl-C), SIGTERM and SIGHUP; see the module note.
     match ctrlc::set_handler(move || {
         stop.request_stop();
     }) {
@@ -59,8 +70,9 @@ fn run() -> i32 {
             // next keypress kills the process outright. Say so loudly and
             // keep serving.
             eprintln!(
-                "[dust] warning: could not install the ctrl-C handler ({e}); \
-                 ctrl-C will terminate abruptly instead of shutting down cleanly"
+                "[dust] warning: could not install the stop-signal handler ({e}); \
+                 ctrl-C and SIGTERM will terminate abruptly, losing anything \
+                 not yet saved"
             );
         }
     }
