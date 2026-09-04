@@ -883,11 +883,20 @@ packet_group! {
         velocity: EntityVelocity,
     },
 
-    /// The experience bar's shape: fill, points, level.
+    /// The experience bar's shape: fill, level, points.
+    ///
+    /// **The order is bar, then level, then total**, and it was written here
+    /// as bar, total, level until somebody sent one. The two are both `VarInt`
+    /// so nothing about the wire complains; a client just draws the wrong
+    /// number. Read out of the operator's own jar rather than out of a
+    /// reference: `ClientboundSetExperiencePacket`'s write puts
+    /// `experienceProgress`, then `experienceLevel`, then `totalExperience`,
+    /// which `javap -p -c` on the inner server jar shows as fields `b`, `d`,
+    /// `c` in that order. `minecraft-data` agrees; this repository did not.
     "minecraft:set_experience" => SetExperience {
         experience_bar: f32,
-        total_experience: VarInt,
         level: VarInt,
+        total_experience: VarInt,
     },
 
     /// Health, hunger, saturation. At health zero the death screen waits
