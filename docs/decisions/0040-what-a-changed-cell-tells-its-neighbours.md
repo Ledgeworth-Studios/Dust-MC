@@ -183,22 +183,64 @@ the operator's own constants table:
 
 ```text
                                         as it is    support columns cut
-  rows scored, of 255 read                   243                    243
-  agree with the server                      231                    195
-  Minecraft broke and Dust keeps              12                     48
-  Minecraft kept and Dust breaks               0                      0
-  never stood the block up                    24                     24
-  reshaped rather than broke (D14's)           9                      9
-  the arena and not a rule                    12                     12
+  rows scored, of 1,149 read               1,017                  1,017
+  agree with the server                      977                    843
+  Minecraft broke and Dust keeps              32                    174
+  Minecraft kept and Dust breaks               8                      0
+  never stood the block up                    48                     48
+  reshaped rather than broke (D14's)          63                     63
+  the arena and not a rule                   132                    132
 ```
 
-**Zero rows in the dangerous direction**, in both columns. The 12 that remain
-are 10 vine — a multiface state, one of the 379 the probe could not resolve —
-and 2 `oak_door`, which vanilla breaks through `updateShape` rather than
-`canSurvive` and which is a different mechanism this record does not build.
+Cutting the support columns is the negative control and it moves 134 rows,
+which is the check biting.
 
-Cutting the support columns is the negative control and it moves 36 rows, which
-is the check biting.
+**Widening the survey is what found the eight.** The first run asked about the
+24 blocks one per family of support rule and reported 231 of 243 with **zero**
+rows in the dangerous direction. Asking the same questions of 313 — every block
+with a state that needs something, taken off the constants table — turned that
+zero into eight, and the eight are the finding below. A survey of twenty-four
+blocks is a statement about twenty-four blocks.
+
+## The eight: `canSurvive` is a placement predicate, not the update rule
+
+The eight rows Dust breaks and Minecraft keeps are **candles**, on `down`, in
+both shells. `CandleBlock.canSurvive` is `canSupportCenter(level, below, UP)`
+and answers exactly what the support column says. Vanilla leaves the candle
+floating anyway, and the reason is in the bytecode rather than in that method.
+
+```text
+  CandleBlock.updateShape           schedules a tick if waterlogged, then
+  (dgn.a(dtc,ji,dtc,dcx,jd,jd))     calls super and returns the state.
+                                    canSurvive is never reached.
+
+  BaseTorchBlock.updateShape        if direction == DOWN and !canSurvive,
+  (dfo.a(dtc,ji,dtc,dcx,jd,jd))     return AIR. Otherwise call super.
+```
+
+`canSurvive` is the predicate a **placement** consults. `updateShape` is what
+actually runs when a neighbour changes, and whether it consults `canSurvive`
+is a decision each block makes for itself — **and makes per direction**: a
+torch checks its floor and nothing else, whatever `canSurvive` would say about
+the other five sides.
+
+So the six support columns are extracted from the wrong method. They should
+come from `updateShape` per direction, which is the same six columns from the
+mechanism that runs rather than from the predicate it sometimes calls, and it
+would answer the two `oak_door` rows in the same pass. `LevelAccessor` is an
+interface like `LevelReader`, so the same `java.lang.reflect.Proxy` route
+reaches it. **That is the first thing the next record does**, and it is left
+undone here rather than guessed at, because the guess available — a list of
+which blocks enforce — is Mojang's data and would be thirty rows of it in this
+repository.
+
+Until then a candle whose shelf is mined breaks and drops where vanilla leaves
+it in the air. It drops rather than being deleted, so nothing is lost, and it
+is eight rows of 1,017 — but it is the dangerous direction and it is written
+here rather than rounded off, because the general form is the part worth
+keeping: **a predicate is not a rule until something calls it, and which
+callers call it is a per-block, per-direction decision that only the bytecode
+answers.**
 
 ### The arena is not a rule, and counting it as one was a defect in the scorer
 
@@ -206,10 +248,16 @@ is the check biting.
 stood in a shell of stone it could never legitimately occupy — and it then dies
 at the first update whichever side moved. Five of the first run's disagreements
 were that, and five more were an oak sapling doing the same thing. A shell that
-refused the block on **all six sides** measured the arena; no state in 1.21.1
-needs all six of its neighbours. Those rows are now named and set apart rather
+refused the block on **every** side measured the arena; no state in 1.21.1
+needs all six of its neighbours. 132 rows are now named and set apart rather
 than counted against Dust. In the dirt shell the same two blocks agree with
-Minecraft on all twelve rows.
+Minecraft on all six rows.
+
+The first version of that filter asked for **exactly** six rows per block and
+shell, which is what one survey file holds. Scoring two files that both cover a
+block gives twelve, the filter stopped firing, and ten rows of arena came back
+as Dust defects. It asks for six *or more* now. A rule keyed on a count is a
+rule about how many files were passed in.
 
 ### The gate that runs against Dust rather than against the answers
 
@@ -276,8 +324,8 @@ measurement asked for was a bucket emptied on a flat plain: today it costs
 **0 ns, because nothing happens**, and that is the defect rather than the
 result.
 
-**Two `oak_door` rows** break through `updateShape` rather than `canSurvive`.
-The top half of a door whose bottom half is mined is the visible one.
+**Sixteen candles and five doors** are the `updateShape` gap above. The doors
+are the visible half: the top of a door whose bottom is mined stays.
 
 **The 379 unresolved states** keep blocks a vanilla server would drop. 232 of
 them are lichen and sculk vein, which a player rarely mines the wall out from

@@ -132,13 +132,16 @@ pub fn run(options: &Options) -> std::process::ExitCode {
     // Which blocks disagree, and about which faces.
     let mut worklist: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
-    // A shell that refused the block on all six sides did not measure a
+    // A shell that refused the block on every side did not measure a
     // support rule; it measured the arena. `/setblock` places a state without
     // asking `canSurvive`, so a dandelion can be stood on stone and then dies
     // at the first update whichever side moved. Six of six is the signature,
     // because no state in 1.21.1 needs all six of its neighbours, and the
     // block that made this visible is a flower that scored five disagreements
-    // in stone and six agreements in dirt.
+    // in stone and six agreements in dirt. `>=` and not `==` six, because two
+    // answer files may both cover a block and a rule that assumed exactly six
+    // rows per shell stopped firing the moment a second survey was scored
+    // beside the first.
     let refusing: std::collections::BTreeSet<(String, String)> = {
         let mut broke: BTreeMap<(String, String), (usize, usize)> = BTreeMap::new();
         for row in &rows {
@@ -150,7 +153,7 @@ pub fn run(options: &Options) -> std::process::ExitCode {
         }
         broke
             .into_iter()
-            .filter(|(_, (seen, broke))| *seen == Face::ALL.len() && seen == broke)
+            .filter(|(_, (seen, broke))| *seen >= Face::ALL.len() && seen == broke)
             .map(|(key, _)| key)
             .collect()
     };

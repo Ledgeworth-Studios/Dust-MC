@@ -328,8 +328,11 @@ what falls, and `LeavesBlock.getOptionalDistanceAt` for the leaf, whose log half
 comes out of the tag table because a jar's static initialisation has loaded no
 data pack and that half comes back empty.
 
-Against a real 1.21.1 server, 231 of 243 scored rows agree and **none of the 12
-that do not is a block Dust breaks and Minecraft kept**. `node updates.js
+Against a real 1.21.1 server, over 313 blocks — every one with a state that
+needs something — **977 of 1,017 scored rows agree**, 32 are blocks Minecraft
+broke and Dust keeps, and 8 are the other way: candles, whose `updateShape`
+never consults the `canSurvive` the support columns are extracted from.
+Decision record 0040 has the bytecode and names the fix. `node updates.js
 <port> --check` puts a torch on a block, mines the block and watches the torch
 fall the way a player would: 10 of 10 on a release build, 6 of 10 with the rule
 turned off. One break costs 1,271 nanoseconds of a 50-millisecond tick, a
