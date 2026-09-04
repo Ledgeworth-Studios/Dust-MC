@@ -515,6 +515,83 @@ pub const LIGHT_ORACLE: &[Wanted<'static>] = &[
         class: STANDING_AND_WALL_BLOCK_ITEM,
         field: "attachmentDirection",
     },
+    // **How long an item burns for.** `AbstractFurnaceBlockEntity.getFuel()` is
+    // a static method that builds a `Map<Item, Integer>` in Java code — a
+    // literal per fuel, and a tag expanded per fuel for the wood — and there is
+    // no report and no data pack that carries any of it on 1.21.1. It is the
+    // same class of thing as a block's opacity, so it comes the same way.
+    //
+    // The **map**, and not `isFuel`. A boolean would say which items burn and
+    // not for how long, and how long is the whole question: a furnace is a
+    // timer a player stands and watches, and one that burned coal for the
+    // wrong number of seconds would be wrong in the place they are looking.
+    // Binding the item tags before `getFuel()` is asked, which is the
+    // difference between forty-one fuels and every fuel there is.
+    //
+    // `getFuel` expands six item tags — `#logs_that_burn`, `#planks`,
+    // `#wooden_slabs`, `#wool`, `#boats` and the rest — through
+    // `Registry.getTagOrEmpty`, and after `Bootstrap` nothing has bound any
+    // tag, so every one of those expands to nothing. The map that comes back
+    // is well-formed, has the literals in it, and is missing every fuel a
+    // player actually burns. Nothing says so: an unbound tag is empty, not
+    // absent.
+    //
+    // So the oracle binds them first, out of the vanilla data pack **inside
+    // the operator's own jar** — `data/<ns>/tags/item/*.json`, which is where
+    // Minecraft itself reads them from. Same jar, same files, one bootstrap
+    // later.
+    Wanted::Method {
+        key: "registry.key",
+        class: REGISTRY,
+        method: "key",
+        parameters: &[],
+    },
+    Wanted::Method {
+        key: "registry.bind_tags",
+        class: REGISTRY,
+        method: "bindTags",
+        parameters: &["java.util.Map"],
+    },
+    // `getHolder(ResourceLocation)` and not `wrapAsHolder(Object)`: a tag
+    // file names items by name, and the name is what the reader has. Going
+    // name to item to holder would be two lookups and one more place to be
+    // wrong about an item this version does not have.
+    Wanted::Method {
+        key: "registry.get_holder",
+        class: REGISTRY,
+        method: "getHolder",
+        parameters: &[RESOURCE_LOCATION],
+    },
+    Wanted::Class {
+        key: "resourcelocation.class",
+        class: RESOURCE_LOCATION,
+    },
+    Wanted::Method {
+        key: "resourcelocation.parse",
+        class: RESOURCE_LOCATION,
+        method: "parse",
+        parameters: &["java.lang.String"],
+    },
+    Wanted::Class {
+        key: "tagkey.class",
+        class: TAG_KEY,
+    },
+    Wanted::Method {
+        key: "tagkey.create",
+        class: TAG_KEY,
+        method: "create",
+        parameters: &[RESOURCE_KEY, RESOURCE_LOCATION],
+    },
+    Wanted::Class {
+        key: "furnace.class",
+        class: ABSTRACT_FURNACE_BLOCK_ENTITY,
+    },
+    Wanted::Method {
+        key: "furnace.get_fuel",
+        class: ABSTRACT_FURNACE_BLOCK_ENTITY,
+        method: "getFuel",
+        parameters: &[],
+    },
     Wanted::Class {
         key: "builtin_registries.class",
         class: BUILT_IN_REGISTRIES,
@@ -614,7 +691,11 @@ const RESOURCE_KEY: &str = "net.minecraft.resources.ResourceKey";
 const BLOCK_ITEM: &str = "net.minecraft.world.item.BlockItem";
 const STANDING_AND_WALL_BLOCK_ITEM: &str = "net.minecraft.world.item.StandingAndWallBlockItem";
 const BUILT_IN_REGISTRIES: &str = "net.minecraft.core.registries.BuiltInRegistries";
+const ABSTRACT_FURNACE_BLOCK_ENTITY: &str =
+    "net.minecraft.world.level.block.entity.AbstractFurnaceBlockEntity";
 const REGISTRY: &str = "net.minecraft.core.Registry";
+const RESOURCE_LOCATION: &str = "net.minecraft.resources.ResourceLocation";
+const TAG_KEY: &str = "net.minecraft.tags.TagKey";
 
 /// Resolve a list of wanted names into a properties file for the Java side.
 ///

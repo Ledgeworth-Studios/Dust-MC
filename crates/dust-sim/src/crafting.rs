@@ -397,35 +397,7 @@ impl Recipes {
     /// Handing a player a sword without the enchantment they crafted it for is
     /// the same class of loss as eating the ingredients.
     fn result(&self, value: &serde_json::Value) -> Result<(Item, u8), Refusal> {
-        let result = value
-            .get("result")
-            .and_then(serde_json::Value::as_object)
-            .ok_or(Refusal::Malformed("`result` is not an object"))?;
-        for key in result.keys() {
-            if key != "id" && key != "count" {
-                return Err(Refusal::Malformed("`result` carries more than a stack"));
-            }
-        }
-        let name = result
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(Refusal::Malformed("`result` has no `id`"))?;
-        let item = Item::from_name(name).ok_or_else(|| Refusal::Unknown(name.to_owned()))?;
-        let count = match result.get("count") {
-            None => 1,
-            Some(count) => u8::try_from(
-                count
-                    .as_u64()
-                    .ok_or(Refusal::Malformed("`result`'s `count` is not a number"))?,
-            )
-            .map_err(|_| Refusal::Malformed("`result`'s `count` does not fit a stack"))?,
-        };
-        if count == 0 || count > item.max_stack_size() {
-            return Err(Refusal::Malformed(
-                "`result`'s `count` does not fit a stack",
-            ));
-        }
-        Ok((item, count))
+        result_stack(value)
     }
 
     /// One ingredient's accepted items, appended to the flat pool.
@@ -457,33 +429,7 @@ impl Recipes {
 
     /// One `{"item": …}` or `{"tag": …}`, pushed onto the pool.
     fn one(&mut self, value: &serde_json::Value, tags: &ItemTags) -> Result<(), Refusal> {
-        let object = value
-            .as_object()
-            .ok_or(Refusal::Malformed("an ingredient is not an object"))?;
-        if object.len() != 1 {
-            return Err(Refusal::Malformed(
-                "an ingredient is not one of item or tag",
-            ));
-        }
-        if let Some(name) = object.get("item").and_then(serde_json::Value::as_str) {
-            let item = Item::from_name(name).ok_or_else(|| Refusal::Unknown(name.to_owned()))?;
-            self.choices.push(item.protocol_id() as u16);
-            return Ok(());
-        }
-        if let Some(name) = object.get("tag").and_then(serde_json::Value::as_str) {
-            let members = tags
-                .get(name)
-                .ok_or_else(|| Refusal::Unknown(format!("#{name}")))?;
-            if members.is_empty() {
-                return Err(Refusal::EmptyTag(name.to_owned()));
-            }
-            self.choices
-                .extend(members.iter().map(|item| item.protocol_id() as u16));
-            return Ok(());
-        }
-        Err(Refusal::Malformed(
-            "an ingredient is not one of item or tag",
-        ))
+        one_into(value, tags, &mut self.choices)
     }
 
     fn push(&mut self, recipe: Recipe) {
@@ -815,6 +761,87 @@ fn dedup(values: &mut [u16]) -> usize {
         }
     }
     kept
+}
+
+/// The result stack of a recipe file, whatever kind of recipe it is.
+///
+/// Free rather than a method because a furnace reads the same key out of the
+/// same shape of file, and two readers of one rule is what decision record
+/// 0034 argues against.
+///
+/// Two keys and no others. A `components` key on a result — which a data pack
+/// may write and which 1.21.2 puts on vanilla's own — makes the recipe refuse
+/// rather than produce a plain item where a named or enchanted one was
+/// described. Handing a player a sword without the enchantment they crafted it
+/// for is the same class of loss as eating the ingredients.
+pub(crate) fn result_stack(value: &serde_json::Value) -> Result<(Item, u8), Refusal> {
+    let result = value
+        .get("result")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(Refusal::Malformed("`result` is not an object"))?;
+    for key in result.keys() {
+        if key != "id" && key != "count" {
+            return Err(Refusal::Malformed("`result` carries more than a stack"));
+        }
+    }
+    let name = result
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(Refusal::Malformed("`result` has no `id`"))?;
+    let item = Item::from_name(name).ok_or_else(|| Refusal::Unknown(name.to_owned()))?;
+    let count = match result.get("count") {
+        None => 1,
+        Some(count) => u8::try_from(
+            count
+                .as_u64()
+                .ok_or(Refusal::Malformed("`result`'s `count` is not a number"))?,
+        )
+        .map_err(|_| Refusal::Malformed("`result`'s `count` does not fit a stack"))?,
+    };
+    if count == 0 || count > item.max_stack_size() {
+        return Err(Refusal::Malformed(
+            "`result`'s `count` does not fit a stack",
+        ));
+    }
+    Ok((item, count))
+}
+
+/// One `{"item": …}` or `{"tag": …}`, appended to `out` as protocol ids.
+///
+/// Free for the reason [`result_stack`] is: a furnace's single ingredient is
+/// written in exactly this language, and a second reader of it would be a
+/// second place for `#minecraft:planks` to mean something slightly different.
+pub(crate) fn one_into(
+    value: &serde_json::Value,
+    tags: &ItemTags,
+    out: &mut Vec<u16>,
+) -> Result<(), Refusal> {
+    let object = value
+        .as_object()
+        .ok_or(Refusal::Malformed("an ingredient is not an object"))?;
+    if object.len() != 1 {
+        return Err(Refusal::Malformed(
+            "an ingredient is not one of item or tag",
+        ));
+    }
+    if let Some(name) = object.get("item").and_then(serde_json::Value::as_str) {
+        let item = Item::from_name(name).ok_or_else(|| Refusal::Unknown(name.to_owned()))?;
+        out.push(item.protocol_id() as u16);
+        return Ok(());
+    }
+    if let Some(name) = object.get("tag").and_then(serde_json::Value::as_str) {
+        let members = tags
+            .get(name)
+            .ok_or_else(|| Refusal::Unknown(format!("#{name}")))?;
+        if members.is_empty() {
+            return Err(Refusal::EmptyTag(name.to_owned()));
+        }
+        out.extend(members.iter().map(|item| item.protocol_id() as u16));
+        return Ok(());
+    }
+    Err(Refusal::Malformed(
+        "an ingredient is not one of item or tag",
+    ))
 }
 
 #[cfg(test)]

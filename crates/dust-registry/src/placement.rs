@@ -52,6 +52,11 @@ pub struct ItemBlocks {
     /// that have a second form. `None` throughout for a table written before
     /// the columns.
     walls: Option<Box<[Option<WallForm>]>>,
+    /// How many ticks each item burns for in a furnace, out of
+    /// `AbstractFurnaceBlockEntity.getFuel()`. `None` throughout for a table
+    /// written before the column, which is not the same answer as "no item is
+    /// fuel" — see [`ItemBlocks::has_burn`].
+    burn: Option<Box<[u16]>>,
 }
 
 /// An item's wall form: the block, and which way its *standing* form attaches.
@@ -94,6 +99,34 @@ impl ItemBlocks {
     #[must_use]
     pub fn has_walls(&self) -> bool {
         self.walls.is_some()
+    }
+
+    /// How many ticks `item` burns for in a furnace, or `None` for an item
+    /// that is not fuel.
+    ///
+    /// A table written before the column answers `None` for everything, and a
+    /// caller must not read that as "nothing burns" — a furnace that took it
+    /// so would refuse every fuel a player owns and look broken rather than
+    /// unconfigured. Ask [`ItemBlocks::has_burn`] first, which is the same
+    /// argument [`ItemBlocks::on_wall`] makes.
+    #[must_use]
+    pub fn burn(&self, item: Item) -> Option<u16> {
+        let ticks = *self.burn.as_ref()?.get(item.protocol_id() as usize)?;
+        (ticks > 0).then_some(ticks)
+    }
+
+    /// Whether this table carries the burn column at all.
+    #[must_use]
+    pub fn has_burn(&self) -> bool {
+        self.burn.is_some()
+    }
+
+    /// How many items are fuel. 78 on 1.21.1.
+    #[must_use]
+    pub fn fuels(&self) -> usize {
+        self.burn
+            .as_ref()
+            .map_or(0, |burn| burn.iter().filter(|t| **t > 0).count())
     }
 
     /// How many items have a wall form. 53 on 1.21.1.
@@ -143,6 +176,7 @@ impl ItemBlocks {
         let header = Header::read(text)?;
         let mut places: Vec<Option<Option<Block>>> = vec![None; expected];
         let mut walls: Vec<Option<WallForm>> = vec![None; expected];
+        let mut burn: Vec<u16> = vec![0; expected];
 
         for (index, line) in text.lines().enumerate() {
             let line = line.trim_end_matches('\r');
@@ -229,6 +263,26 @@ impl ItemBlocks {
                 }
             }
 
+            if let Some(column) = header.burn {
+                if fields[column] != NOTHING {
+                    // A `u16` holds every burn time vanilla has — a lava
+                    // bucket is 20,000 and the ceiling is 65,535 — and the
+                    // parse refuses anything longer rather than truncating it,
+                    // because a data pack that wanted an hour-long fuel would
+                    // otherwise silently get twenty minutes.
+                    burn[id as usize] =
+                        fields[column]
+                            .parse()
+                            .map_err(|_| PlacementError::Malformed {
+                                line: at,
+                                detail: format!(
+                                    "burn is {:?}, which is not a tick count in 0..=65535",
+                                    fields[column]
+                                ),
+                            })?;
+                }
+            }
+
             let slot = &mut places[id as usize];
             if slot.is_some() {
                 return Err(PlacementError::DuplicateItem { line: at, id });
@@ -246,6 +300,7 @@ impl ItemBlocks {
                 .map(|p| p.expect("every slot was just counted as present"))
                 .collect(),
             walls: header.wall.map(|_| walls.into_boxed_slice()),
+            burn: header.burn.map(|_| burn.into_boxed_slice()),
         })
     }
 }
@@ -268,6 +323,8 @@ struct Header {
     /// build cannot decide when to use, and reading one without the other
     /// would be a table that half answers.
     wall: Option<(usize, usize)>,
+    /// Where `burn` is, when the table has it.
+    burn: Option<usize>,
 }
 
 impl Header {
@@ -298,6 +355,7 @@ impl Header {
             item: required("item")?,
             places: required("places")?,
             wall: optional("on_wall").zip(optional("attaches")),
+            burn: optional("burn"),
         })
     }
 }

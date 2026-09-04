@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use dust_registry::Item;
+use dust_sim::cooking::{Cooking, Fire, FIRES};
 use dust_sim::crafting::{ItemTags, Recipes, Refusal};
 
 /// Where the recipes live inside one namespace.
@@ -43,9 +44,16 @@ pub struct Report {
     pub files: u32,
     /// Recipes that compiled into something a grid can make.
     pub compiled: usize,
-    /// Files whose `type` is not made in a crafting grid — smelting,
-    /// stonecutting, smithing. Counted apart because they are not defects;
-    /// they are recipes for blocks this server does not open yet.
+    /// Recipes one of the four fires can cook.
+    pub cooked: usize,
+    /// How many (fire, item) pairs the cooking lookup holds, larger than
+    /// [`Report::cooked`] wherever an ingredient is a tag or a list.
+    pub cooked_pairs: usize,
+    /// A pair a later file wanted and an earlier one already held.
+    pub cooked_collisions: usize,
+    /// Files whose `type` is neither made in a crafting grid nor cooked at a
+    /// fire — stonecutting, smithing. Counted apart because they are not
+    /// defects; they are recipes for blocks this server does not open yet.
     pub not_a_grid: u32,
     /// The `crafting_special_*` markers, which are Java classes rather than
     /// described recipes. A firework, a dyed leather cap, a copied map.
@@ -70,18 +78,27 @@ impl Report {
     /// The one line the boot log prints.
     pub fn summary(&self) -> String {
         let mut line = format!(
-            "{} recipe file(s) in {}, {} craftable in a grid; \
-             {} not made in a grid, {} are code rather than data, {} refused; \
-             {} item tag(s); index {} pair(s), {} ingredient slot(s)",
+            "{} recipe file(s) in {}, {} craftable in a grid, {} cooked at a fire; \
+             {} made at a block this server does not open, {} are code rather than data, \
+             {} refused; \
+             {} item tag(s); index {} pair(s), {} ingredient slot(s); \
+             cooking {} pair(s){}",
             self.files,
             self.namespaces.join(", "),
             self.compiled,
+            self.cooked,
             self.not_a_grid,
             self.special,
             self.refused,
             self.tags,
             self.index_len,
             self.choice_len,
+            self.cooked_pairs,
+            if self.cooked_collisions == 0 {
+                String::new()
+            } else {
+                format!(", {} claimed twice", self.cooked_collisions)
+            },
         );
         for error in &self.errors {
             line.push_str("\n  ");
@@ -99,16 +116,17 @@ impl Report {
 /// [`super::drops::beside`] gives: one unreadable recipe is one thing a player
 /// cannot make and a named line in the log, where refusing to boot over it is
 /// a server an operator cannot run.
-pub fn beside(root: impl AsRef<Path>) -> (Recipes, Report) {
+pub fn beside(root: impl AsRef<Path>) -> (Recipes, Cooking, Report) {
     let root = root.as_ref();
     let mut recipes = Recipes::default();
+    let mut cooking = Cooking::new();
     let mut report = Report::default();
 
     let tags = item_tags(root);
     report.tags = tags.len();
 
     let Ok(namespaces) = std::fs::read_dir(root) else {
-        return (recipes, report);
+        return (recipes, cooking, report);
     };
     let mut roots: Vec<(String, PathBuf)> = Vec::new();
     for entry in namespaces.flatten() {
@@ -144,11 +162,27 @@ pub fn beside(root: impl AsRef<Path>) -> (Recipes, Report) {
                     continue;
                 }
             };
-            match recipes.add(&id, &value, &tags) {
-                Ok(()) => {}
-                Err(Refusal::NotAGrid(_)) => report.not_a_grid += 1,
-                Err(Refusal::Special(_)) => report.special += 1,
-                Err(other) => {
+            // The grid first, then the four fires. Both compilers answer
+            // `NotAGrid` for a file that is not theirs, so a file is only
+            // counted as belonging to a block this server does not open when
+            // **both** have said so — a file counted against the first
+            // compiler that shrugged at it would count every smelting recipe
+            // as unreachable on the day the furnace started reading them.
+            let refusal = match recipes.add(&id, &value, &tags) {
+                Ok(()) => continue,
+                Err(refusal) => refusal,
+            };
+            let refusal = match refusal {
+                Refusal::NotAGrid(_) => match cooking.add(&value, &tags) {
+                    Ok(()) => continue,
+                    Err(second) => second,
+                },
+                first => first,
+            };
+            match refusal {
+                Refusal::NotAGrid(_) => report.not_a_grid += 1,
+                Refusal::Special(_) => report.special += 1,
+                other => {
                     report.refused += 1;
                     note(&mut report, &id, &other.to_string());
                 }
@@ -160,7 +194,19 @@ pub fn beside(root: impl AsRef<Path>) -> (Recipes, Report) {
     report.compiled = recipes.len();
     report.index_len = recipes.index_len();
     report.choice_len = recipes.choice_len();
-    (recipes, report)
+    report.cooked = cooking.len();
+    report.cooked_pairs = cooking.pairs();
+    report.cooked_collisions = cooking.collisions();
+    (recipes, cooking, report)
+}
+
+/// How many pairs each fire cooks, for the boot line and for a check that one
+/// of them is not quietly empty.
+pub fn per_fire(cooking: &Cooking) -> Vec<(Fire, usize)> {
+    FIRES
+        .into_iter()
+        .map(|fire| (fire, cooking.pairs_in(fire)))
+        .collect()
 }
 
 fn note(report: &mut Report, id: &str, why: &str) {

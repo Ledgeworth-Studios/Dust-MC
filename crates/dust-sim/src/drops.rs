@@ -176,6 +176,13 @@ impl Rng {
         ((self.next_u64() >> 40) as f32) / ((1u32 << 24) as f32)
     }
 
+    /// A float in `[0, 1)`, for a caller outside this module that has a
+    /// fraction to settle — a furnace's banked experience is 5.6 points and
+    /// somebody has to decide whether the sixth is paid.
+    pub fn unit(&mut self) -> f32 {
+        self.next_f32()
+    }
+
     /// A whole number in `low..=high`, or `low` when the range is empty.
     fn between(&mut self, low: i32, high: i32) -> i32 {
         if high <= low {

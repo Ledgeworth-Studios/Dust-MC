@@ -173,6 +173,13 @@ pub struct SessionContext {
     /// Empty when there is no `[data] path`, and an empty table crafts
     /// nothing rather than crafting wrongly.
     pub recipes: Arc<dust_sim::crafting::Recipes>,
+    /// What the four fires cook. Same road as the recipes, same file, same
+    /// share.
+    pub cooking: Arc<dust_sim::cooking::Cooking>,
+    /// Every furnace in the world. Not a per-session thing at all: the same
+    /// `Arc` the tick loop holds, because a furnace goes on burning after the
+    /// session that lit it has gone.
+    pub furnaces: Arc<super::furnaces::Furnaces>,
     /// Minecraft's own per-state constants, if the operator put a table beside
     /// their data.
     ///
@@ -1003,20 +1010,43 @@ where
     // What this player is carrying. Restored from the last time they were
     // here, which is the difference between a server people play on and one
     // that empties their pockets at the door.
-    let mut inventory = ctx
-        .inventories
-        .lock()
-        .expect("the inventory map is never poisoned")
-        .get(&profile_id)
-        .map(|carried| Inventory::restored(carried.slots.clone(), carried.selected))
-        .unwrap_or_default()
-        .crafting_with(Arc::clone(&ctx.recipes));
+    let (inventory, mut experience) = {
+        let held = ctx
+            .inventories
+            .lock()
+            .expect("the inventory map is never poisoned");
+        let carried = held.get(&profile_id);
+        (
+            carried
+                .map(|carried| Inventory::restored(carried.slots.clone(), carried.selected))
+                .unwrap_or_default(),
+            carried.map_or(0, |carried| carried.experience),
+        )
+    };
+    let mut inventory = inventory.crafting_with(Arc::clone(&ctx.recipes));
+    if let Some(items) = ctx.item_blocks.clone() {
+        inventory = inventory.burning_with(items, Arc::clone(&ctx.cooking));
+    }
+    // The fraction of a point a furnace's banked experience leaves over. Seeded
+    // from the profile and the entity id so two players smelting at once do not
+    // share a stream, and so a single run is reproducible.
+    let mut roll = dust_sim::Rng::from_seed(
+        u64::from_le_bytes(profile_id[..8].try_into().expect("sixteen bytes"))
+            ^ me.entity_id as u64,
+    );
 
     // Which container the client has open. A join has only its own, and every
     // right-click on a crafting table replaces it until the client says it
     // closed one.
     let mut screen = Screen::player();
     let mut next_window = FIRST_CONTAINER_WINDOW;
+    // Held for as long as a furnace's screen is open, and dropped by the
+    // close, by the next open, and by this function returning at all — which
+    // is what covers the player whose connection is cut and who therefore
+    // never sends a close packet. While it is held the furnace announces every
+    // tick, so the flame comes down and the arrow crosses; without it the bars
+    // would move once per ingot.
+    let mut watching: Option<super::furnaces::Watch> = None;
 
     // And told to the client, all forty-six slots at once. This is the one
     // place the whole container goes out: a join has nothing to compare
@@ -1104,6 +1134,11 @@ where
     // conditional would mean a `select!` arm that is sometimes absent, which
     // is a lot of shape for a comparison.
     let mut streaming = tokio::time::interval(STREAM_BATCH_PERIOD);
+    // Every furnace in the world announces on one channel and this filters by
+    // the block it has open. One comparison per change on a server where
+    // changes happen only where somebody is smelting; a channel per furnace
+    // would be a channel per block.
+    let mut furnace_changes = ctx.furnaces.subscribe();
     loop {
         tokio::select! {
             _ = streaming.tick() => {
@@ -1175,7 +1210,7 @@ where
                         // also the one change that can arm a player without a
                         // click — a sword collected into the selected hotbar
                         // slot is a sword everybody else has to see.
-                        record_inventory(ctx, profile_id, me.entity_id, &inventory);
+                        record_inventory(ctx, profile_id, me.entity_id, &inventory, experience);
                         // A full inventory puts it straight back on the floor
                         // where the player is standing, so nothing is deleted
                         // and they can see what would not fit.
@@ -1220,6 +1255,56 @@ where
                     // what the edit channel does for the same reason: the
                     // alternative is a `select!` arm that resolves instantly
                     // on every pass and spins a core.
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+            }
+            // A furnace this player is watching moved on its own. The only
+            // arm here that is not about a packet the client sent or a block
+            // somebody placed: the fire did it, and if nothing were sent the
+            // player would stand in front of a working furnace watching a
+            // cold one.
+            change = furnace_changes.recv() => {
+                match change {
+                    Ok(change) => {
+                        if screen.window == Window::Furnace && screen.at == Some(change.at) {
+                            let moved = inventory.mirror_furnace(&change.slots);
+                            for index in moved.iter() {
+                                send_slot(conn, ctx, &mut inventory, screen, index).await?;
+                            }
+                            // The two bars, every time. They are three bytes
+                            // each and they move every tick a furnace cooks;
+                            // sending only the ones that changed would be a
+                            // comparison per property to save a packet that is
+                            // smaller than the comparison's own bookkeeping.
+                            send_furnace_properties(conn, ctx, screen, change.properties).await?;
+                        }
+                    }
+                    // Fell behind. A furnace's state is a picture, not a
+                    // sequence, so the answer to a missed change is the
+                    // current one rather than a resync of the world.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        if let (Window::Furnace, Some(at), Some(fire)) =
+                            (screen.window, screen.at, inventory.fire())
+                        {
+                            let properties = ctx.furnaces.with(
+                                at,
+                                fire,
+                                Some(&ctx.cooking),
+                                ctx.item_blocks.as_deref(),
+                                |furnace| {
+                                    inventory.mirror_furnace(&furnace.slots);
+                                    super::furnaces::properties_of(furnace)
+                                },
+                            );
+                            send_container(conn, ctx, &mut inventory, screen).await?;
+                            send_furnace_properties(conn, ctx, screen, properties).await?;
+                        }
+                    }
+                    // The world is going away, and the same answer the two
+                    // arms beside this one give. Not an empty arm: a closed
+                    // receiver resolves instantly for ever, so `{}` here would
+                    // be a `select!` spinning a core for the rest of the
+                    // session.
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
                 }
             }
@@ -1839,13 +1924,40 @@ where
                         // crouches. Getting this backwards would make the
                         // table unusable for anyone carrying blocks, which is
                         // everyone.
-                        let opens = !posture.sneaking
-                            && crafting_table()
-                                .is_some_and(|table| {
-                                    cell(&ctx.world, use_on.hit.location).block() == table
-                                })
+                        let there = cell(&ctx.world, use_on.hit.location).block();
+                        let reachable = !posture.sneaking
                             && within_reach(ctx, position, movement.pose(), use_on.hit.location);
-                        if opens {
+                        // A fire the player can reach, if the block is one.
+                        // Read before the crafting table for no reason but
+                        // that both branches ask the same two questions; a
+                        // block is never both.
+                        let fire = reachable
+                            .then(|| dust_sim::cooking::Fire::from_block(there.name()))
+                            .flatten()
+                            .filter(|fire| fire.menu().is_some());
+                        let opens = reachable
+                            && crafting_table().is_some_and(|table| there == table);
+                        if let Some(fire) = fire {
+                            if screen.id != PLAYER_WINDOW {
+                                inventory.closed(screen.window);
+                            }
+                            inventory.clear_furnace_mirror();
+                            next_window = if next_window >= LAST_CONTAINER_WINDOW {
+                                FIRST_CONTAINER_WINDOW
+                            } else {
+                                next_window + 1
+                            };
+                            screen = Screen {
+                                id: next_window,
+                                window: Window::Furnace,
+                                at: Some(use_on.hit.location),
+                            };
+                            inventory.at_fire(Some(fire));
+                            drop(watching.replace(ctx.furnaces.watch(use_on.hit.location)));
+                            open_furnace(conn, ctx, &mut inventory, screen, fire).await?;
+                        }
+                        let opens = opens || fire.is_some();
+                        if crafting_table().is_some_and(|table| there == table) && reachable {
                             if let Some(menu) = crafting_menu() {
                                 // A window the player had open is closed
                                 // first, which returns whatever was in its
@@ -1855,6 +1967,12 @@ where
                                 if screen.id != PLAYER_WINDOW {
                                     inventory.closed(screen.window);
                                 }
+                                // A table replacing a furnace's screen. The
+                                // watch has to go with it, or the furnace they
+                                // walked away from announces every tick until
+                                // they log out.
+                                inventory.clear_furnace_mirror();
+                                drop(watching.take());
                                 next_window = if next_window >= LAST_CONTAINER_WINDOW {
                                     FIRST_CONTAINER_WINDOW
                                 } else {
@@ -1863,6 +1981,7 @@ where
                                 screen = Screen {
                                     id: next_window,
                                     window: Window::Table,
+                                    at: None,
                                 };
                                 send_play(
                                     conn,
@@ -1923,7 +2042,7 @@ where
                     // right-click is a different block because of it.
                     Ok(play::serverbound::Packet::SetCarriedItem(carried)) => {
                         if inventory.select(carried.slot) {
-                            record_inventory(ctx, profile_id, me.entity_id, &inventory);
+                            record_inventory(ctx, profile_id, me.entity_id, &inventory, experience);
                         }
                     }
                     // A creative client writing a slot directly, which is the
@@ -1934,7 +2053,7 @@ where
                     Ok(play::serverbound::Packet::SetCreativeModeSlot(set)) => {
                         match inventory.set_creative(set.slot, &set.item) {
                             Ok(changed) if !changed.is_empty() => {
-                                record_inventory(ctx, profile_id, me.entity_id, &inventory);
+                                record_inventory(ctx, profile_id, me.entity_id, &inventory, experience);
                                 // The slot the client named is not echoed
                                 // back: it wrote that one itself and already
                                 // draws it, and a set-slot here would be a
@@ -1977,14 +2096,39 @@ where
                             // be differences against a picture it no longer
                             // holds.
                             let stale = click.state_id.0 != inventory.state_id();
-                            let changed = inventory.click(
-                                screen.window,
-                                ClickMode::from(click.mode),
-                                click.slot,
-                                click.button,
-                            );
+                            // A furnace's click runs **inside** the furnace
+                            // world's lock: the mirror is refreshed from the
+                            // block, the click runs against it, and the result
+                            // is written back, all before the tick can touch
+                            // the same furnace. Any other order has a window
+                            // in it, and the tick runs in that window — which
+                            // is a click overwriting an ingot the fire made
+                            // between the read and the write.
+                            let (changed, awarded) = match (screen.window, screen.at, fire_of(&inventory)) {
+                                (Window::Furnace, Some(at), Some(fire)) => click_at_furnace(
+                                    ctx,
+                                    &mut inventory,
+                                    at,
+                                    fire,
+                                    &click,
+                                    &mut roll,
+                                ),
+                                _ => (
+                                    inventory.click(
+                                        screen.window,
+                                        ClickMode::from(click.mode),
+                                        click.slot,
+                                        click.button,
+                                    ),
+                                    0,
+                                ),
+                            };
+                            if awarded > 0 {
+                                experience = experience.saturating_add(awarded);
+                                send_experience(conn, ctx, experience).await?;
+                            }
                             if !changed.is_empty() {
-                                record_inventory(ctx, profile_id, me.entity_id, &inventory);
+                                record_inventory(ctx, profile_id, me.entity_id, &inventory, experience);
                             }
                             if stale {
                                 // The whole container, which is what Minecraft
@@ -2019,12 +2163,19 @@ where
                     Ok(play::serverbound::Packet::CloseContainer(closed)) => {
                         if closed.window_id == screen.id {
                             let moved = inventory.closed(screen.window);
+                            // The three slots stay with the block. Clearing
+                            // the mirror is what makes that true in this
+                            // process as well as on paper, and dropping the
+                            // watch stops a furnace nobody is looking at from
+                            // announcing every tick for ever.
+                            inventory.clear_furnace_mirror();
+                            drop(watching.take());
                             let was = screen;
                             // Whatever it was, the player is looking at their
                             // own inventory again.
                             screen = Screen::player();
                             if !moved.is_empty() {
-                                record_inventory(ctx, profile_id, me.entity_id, &inventory);
+                                record_inventory(ctx, profile_id, me.entity_id, &inventory, experience);
                             }
                             // A table's contents come back into slots the
                             // table's own numbering could not name, so the
@@ -2418,6 +2569,12 @@ const LAST_CONTAINER_WINDOW: u8 = 100;
 struct Screen {
     id: u8,
     window: Window,
+    /// The block this screen belongs to, for a window that belongs to one.
+    ///
+    /// `None` for the player's own inventory and for a crafting table, whose
+    /// grid is the player's while the screen is open. A furnace's is not: the
+    /// slots are the block's, and every click has to say which block.
+    at: Option<dust_protocol::types::Position>,
 }
 
 impl Screen {
@@ -2426,6 +2583,7 @@ impl Screen {
         Self {
             id: PLAYER_WINDOW,
             window: Window::Player,
+            at: None,
         }
     }
 }
@@ -2655,6 +2813,7 @@ fn record_inventory(
     profile_id: [u8; 16],
     entity_id: i32,
     inventory: &super::inventory::Inventory,
+    experience: u32,
 ) {
     ctx.inventories
         .lock()
@@ -2664,6 +2823,7 @@ fn record_inventory(
             super::save::Carried {
                 slots: inventory.saved(),
                 selected: inventory.selected(),
+                experience,
             },
         );
     ctx.roster.equipped(entity_id, inventory.equipment());
@@ -2955,6 +3115,23 @@ fn spill(
     held: Option<&super::inventory::Stack>,
     seed: u64,
 ) {
+    // Whatever was inside it, if it was a furnace, and **before every early
+    // return below**: a block with no loot table drops nothing, but the coal
+    // and the iron a player put in a furnace are their items and a pickaxe
+    // must not delete them. Forgetting the furnace here is also what stops a
+    // new one built on the same block inheriting a stranger's half-burned
+    // coal.
+    if let Some(furnace) = ctx.furnaces.remove(at) {
+        for stack in furnace.slots.into_iter().flatten() {
+            ctx.items.pop(
+                &ctx.roster,
+                at,
+                stack.item,
+                stack.count,
+                seed ^ u64::from(stack.item.protocol_id()),
+            );
+        }
+    }
     let Some(state) = dust_registry::BlockState::from_id(previous) else {
         return;
     };
@@ -3082,6 +3259,180 @@ where
         }
     }
     Ok(())
+}
+
+/// Which fire the open furnace is, if one is open.
+fn fire_of(inventory: &super::inventory::Inventory) -> Option<dust_sim::cooking::Fire> {
+    inventory.fire()
+}
+
+/// One click on a furnace's window, under the furnace world's lock.
+///
+/// Returns what moved and how much experience the player just earned by taking
+/// something out of the output.
+///
+/// The whole of this is one closure on purpose. A version that read the
+/// furnace, ran the click and then wrote it back would have two lock
+/// acquisitions with a gap between them, and the tick loop runs in that gap
+/// twenty times a second — so a player clicking at the instant a smelt
+/// completed would write a mirror that predates the ingot and delete it. There
+/// is no way to make that rare enough to be acceptable; the answer is that
+/// there is no gap.
+fn click_at_furnace(
+    ctx: &SessionContext,
+    inventory: &mut super::inventory::Inventory,
+    at: dust_protocol::types::Position,
+    fire: dust_sim::cooking::Fire,
+    click: &play::serverbound::ClickContainer,
+    roll: &mut dust_sim::Rng,
+) -> (super::inventory::Changed, u32) {
+    let cooking = &*ctx.cooking;
+    let fuel = ctx.item_blocks.as_deref();
+    ctx.furnaces.with(at, fire, Some(cooking), fuel, |furnace| {
+        // The mirror, from the block, now. Whatever the fire has done
+        // since the last click is marked so the client is told about it in
+        // the same breath as its own click.
+        let mut changed = inventory.mirror_furnace(&furnace.slots);
+        let before_input = furnace.slots[super::furnaces::INPUT].clone();
+        let before_output = furnace.slots[super::furnaces::OUTPUT]
+            .as_ref()
+            .map_or(0u16, |stack| u16::from(stack.count));
+
+        changed = changed.and(inventory.click(
+            super::inventory::Window::Furnace,
+            ClickMode::from(click.mode),
+            click.slot,
+            click.button,
+        ));
+
+        let after = inventory.furnace_slots();
+        let after_output = after[super::furnaces::OUTPUT]
+            .as_ref()
+            .map_or(0u16, |stack| u16::from(stack.count));
+        // Vanilla's `AbstractFurnaceBlockEntity.setItem`: a *different*
+        // item in the input starts the cook over. Adding to the stack that
+        // is already there does not, which is what lets a player top a
+        // furnace up without losing the item halfway through.
+        let input_changed = match (&before_input, &after[super::furnaces::INPUT]) {
+            (None, None) => false,
+            (Some(a), Some(b)) => !a.stacks_with(b),
+            _ => true,
+        };
+        furnace.slots = after;
+        if input_changed {
+            furnace.cooking = 0;
+            furnace.total = 0;
+        }
+        // Experience is paid for **taking**, not for the output changing:
+        // a player who puts an ingot back in would otherwise be paid for
+        // it. Vanilla pays the whole bank on any take.
+        let awarded = if after_output < before_output {
+            furnace.take_experience(roll.unit())
+        } else {
+            0
+        };
+        (changed, awarded)
+    })
+}
+
+/// Open a furnace's screen and state what is in it.
+async fn open_furnace<W>(
+    conn: &mut Conn<W>,
+    ctx: &SessionContext,
+    inventory: &mut super::inventory::Inventory,
+    screen: Screen,
+    fire: dust_sim::cooking::Fire,
+) -> Result<(), SessionError>
+where
+    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let Some(menu) = fire
+        .menu()
+        .and_then(|name| dust_registry::Registry::from_name("minecraft:menu")?.entry_id(name))
+    else {
+        return Ok(());
+    };
+    let Some(at) = screen.at else {
+        return Ok(());
+    };
+    let (title, fallback) = match fire {
+        dust_sim::cooking::Fire::BlastFurnace => ("container.blast_furnace", "Blast Furnace"),
+        dust_sim::cooking::Fire::Smoker => ("container.smoker", "Smoker"),
+        _ => ("container.furnace", "Furnace"),
+    };
+    send_play(
+        conn,
+        play::clientbound::OpenScreen {
+            window_id: screen.id,
+            menu_kind: VarInt(menu as i32),
+            title: dust_protocol::text::Component::translate(title, Some(fallback.to_owned())),
+        },
+        ctx.version,
+    )
+    .await?;
+    // The contents and the two bars. Both, and in this order: an `open_screen`
+    // says which layout and nothing else, and a furnace whose properties were
+    // never sent draws a cold fire and an empty arrow however far through a
+    // smelt it is — which is a player watching a working furnace look broken.
+    let properties = ctx.furnaces.with(
+        at,
+        fire,
+        Some(&ctx.cooking),
+        ctx.item_blocks.as_deref(),
+        |furnace| {
+            inventory.mirror_furnace(&furnace.slots);
+            super::furnaces::properties_of(furnace)
+        },
+    );
+    send_container(conn, ctx, inventory, screen).await?;
+    send_furnace_properties(conn, ctx, screen, properties).await
+}
+
+/// The four numbers a furnace screen draws its two bars from.
+async fn send_furnace_properties<W>(
+    conn: &mut Conn<W>,
+    ctx: &SessionContext,
+    screen: Screen,
+    properties: [i16; super::furnaces::PROPERTIES],
+) -> Result<(), SessionError>
+where
+    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    for (index, value) in properties.iter().enumerate() {
+        send_play(
+            conn,
+            play::clientbound::ContainerSetData {
+                window_id: screen.id,
+                property: index as i16,
+                value: *value,
+            },
+            ctx.version,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Tell the client how much experience it has.
+async fn send_experience<W>(
+    conn: &mut Conn<W>,
+    ctx: &SessionContext,
+    total: u32,
+) -> Result<(), SessionError>
+where
+    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (bar, level) = super::furnaces::bar_of(total);
+    send_play(
+        conn,
+        play::clientbound::SetExperience {
+            experience_bar: bar,
+            total_experience: VarInt(total as i32),
+            level: VarInt(level as i32),
+        },
+        ctx.version,
+    )
+    .await
 }
 
 #[cfg(test)]

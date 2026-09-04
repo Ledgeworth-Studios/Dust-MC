@@ -2425,8 +2425,8 @@ fn play_frames(out: &mut Vec<Frame>) {
         Clientbound,
         cb::SetExperience {
             experience_bar: 0.5,
-            total_experience: VarInt(1024),
             level: VarInt(33),
+            total_experience: VarInt(1024),
         }
     ));
     out.push(frame!(

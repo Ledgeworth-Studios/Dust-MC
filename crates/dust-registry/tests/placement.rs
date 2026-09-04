@@ -192,3 +192,64 @@ fn a_row_that_is_not_as_wide_as_the_header_is_refused() {
     let error = ItemBlocks::parse(&text).expect_err("a row one field short");
     assert!(matches!(error, PlacementError::Malformed { .. }), "{error}");
 }
+
+/// The same table with a `burn` column, where one named item is fuel.
+///
+/// The number is arbitrary for the same reason [`full`]'s blocks are: what
+/// Minecraft says coal burns for is Mojang's, arrives from the operator's own
+/// jar, and is not in this repository. What is checked here is that the column
+/// is read by its name, that a dash is an item that does not burn, and — the
+/// one that matters to a caller — that a table *without* the column is
+/// distinguishable from a table where nothing burns.
+fn with_burn(fuel: &str, ticks: u32) -> String {
+    let mut text = String::from("# item_id\titem\tplaces\tburn\n");
+    for item in Item::all() {
+        let places = Block::from_name(item.name()).map_or("-", Block::name);
+        let burn = if item.name() == fuel {
+            ticks.to_string()
+        } else {
+            "-".to_owned()
+        };
+        text.push_str(&format!(
+            "{}\t{}\t{places}\t{burn}\n",
+            item.protocol_id(),
+            item.name()
+        ));
+    }
+    text
+}
+
+#[test]
+fn a_burn_column_is_read_by_name_and_a_dash_is_an_item_that_does_not_burn() {
+    let table = ItemBlocks::parse(&with_burn("minecraft:coal", 1600)).expect("a complete table");
+    let coal = Item::from_name("minecraft:coal").expect("this build has coal");
+    let stone = Item::from_name("minecraft:stone").expect("this build has stone");
+    assert!(table.has_burn());
+    assert_eq!(table.burn(coal), Some(1600));
+    assert_eq!(table.burn(stone), None);
+    assert_eq!(table.fuels(), 1);
+}
+
+#[test]
+fn a_table_without_the_column_says_it_does_not_know_rather_than_that_nothing_burns() {
+    let table = ItemBlocks::parse(&full()).expect("a complete table");
+    let coal = Item::from_name("minecraft:coal").expect("this build has coal");
+    // Both answer `None`, and they are not the same answer. A furnace that
+    // could not tell them apart would refuse every fuel a player owns on a
+    // server whose operator had not re-run the extractor, and would look
+    // broken rather than unconfigured.
+    assert!(!table.has_burn());
+    assert_eq!(table.burn(coal), None);
+    assert_eq!(table.fuels(), 0);
+}
+
+#[test]
+fn a_burn_time_longer_than_the_column_holds_is_refused_rather_than_truncated() {
+    let text = with_burn("minecraft:coal", 70_000);
+    match ItemBlocks::parse(&text) {
+        Err(PlacementError::Malformed { detail, .. }) => {
+            assert!(detail.contains("burn"), "{detail}");
+        }
+        other => panic!("a burn time past 65,535 must be refused, got {other:?}"),
+    }
+}
