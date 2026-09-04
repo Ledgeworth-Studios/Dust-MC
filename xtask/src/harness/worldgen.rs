@@ -1414,6 +1414,13 @@ mod tests {
     /// This is the same device the synthetic chunk above is: the harness is
     /// tested against bytes it wrote.
     fn scratch_pack(root: &Path) {
+        scratch_pack_naming(root, "{}");
+    }
+
+    /// The same pack with every biome naming `carvers`, so a test can put a
+    /// real tunnel through it. `{}` is no carvers at all, which is what the
+    /// rest of these tests want: a tunnel would move the very cells they count.
+    fn scratch_pack_naming(root: &Path, carvers: &str) {
         let write = |relative: &str, text: &str| {
             let path = root.join(relative);
             std::fs::create_dir_all(path.parent().expect("has a parent")).expect("mkdir");
@@ -1457,7 +1464,43 @@ mod tests {
                  }
                }}"#,
         );
+        // Every biome any of these tables names, so that `Generator::new` can
+        // ask each one which carvers it runs. They have to agree with one
+        // another or the generator refuses; see decision record 0039.
+        for biome in ["snowy_plains", "desert", "savanna", "jungle", "plains"] {
+            write(
+                &format!("minecraft/worldgen/biome/{biome}.json"),
+                &format!(r#"{{"carvers": {carvers}}}"#),
+            );
+        }
+        // The tag the scratch carver names, and the one block in it.
+        write(
+            "minecraft/tags/block/scratch_replaceables.json",
+            r#"{"values": ["minecraft:stone"]}"#,
+        );
+        write(
+            "minecraft/worldgen/configured_carver/scratch_cave.json",
+            SCRATCH_CARVER,
+        );
     }
+
+    /// A cave carver that always starts, working between y 0 and y 30 — inside
+    /// this pack's stone, and below its sea level, so what it leaves behind in
+    /// a dimension with no aquifers is the global fluid picker's water.
+    const SCRATCH_CARVER: &str = r##"{"type": "minecraft:cave", "config": {
+        "probability": 1.0,
+        "y": {"type": "minecraft:uniform",
+              "min_inclusive": {"absolute": 0},
+              "max_inclusive": {"absolute": 30}},
+        "yScale": {"type": "minecraft:uniform", "min_inclusive": 0.1, "max_exclusive": 0.9},
+        "lava_level": {"above_bottom": 8},
+        "replaceable": "#minecraft:scratch_replaceables",
+        "horizontal_radius_multiplier": {"type": "minecraft:uniform",
+            "min_inclusive": 0.7, "max_exclusive": 1.4},
+        "vertical_radius_multiplier": {"type": "minecraft:uniform",
+            "min_inclusive": 0.8, "max_exclusive": 1.3},
+        "floor_level": {"type": "minecraft:uniform",
+            "min_inclusive": -1.0, "max_exclusive": -0.4}}}"##;
 
     /// Two biomes split on temperature alone, so which one a cell gets is a
     /// statement about its y that can be worked out by hand.
@@ -1697,6 +1740,77 @@ mod tests {
     /// Watched to fail: the synthetic chunk this is scored beside is solid
     /// stone to y 100 with a cave in it, so a rung that copied the region file
     /// would disagree with every line here.
+    /// **The carve rung is Dust's carvers and not another name for the rung
+    /// above it.**
+    ///
+    /// The same chunk built twice from one pack, once at each rung. A wiring
+    /// mistake in `build` — the carve arm calling `aquifer`, or falling into
+    /// the region-file branch — would give a ladder that looks right and says
+    /// the carvers are worth nothing.
+    #[test]
+    fn the_carve_rung_cuts_cells_the_rung_above_it_left_solid() {
+        let (blocks, height, names) = parts();
+        let plains = names.biome("minecraft:plains").expect("plains");
+        let cold = names.biome("minecraft:snowy_plains").expect("snowy plains");
+        let warm = names.biome("minecraft:desert").expect("desert");
+        let mut vanilla = synthetic(&blocks, height, plains, plains);
+        vanilla.recompute_heightmaps(world::heightmap_predicate(blocks.palette.air, None));
+        let surface = surface_of(&vanilla);
+        let flat = FlatWorld::new(blocks.palette, plains, names.biome_registry_size());
+        let scratch = scratch_dir("worldgen-carve-rung");
+        scratch_pack_naming(&scratch, r#"{"air": ["minecraft:scratch_cave"]}"#);
+        let parameters =
+            BiomeParameters::parse(&scratch_table(cold, warm)).expect("the table parses");
+        let source =
+            Generator::new(&scratch, "overworld", 1234, parameters).expect("the pack compiles");
+        assert_eq!(
+            source.carvers().map(dust_gen::carver::Carvers::len),
+            Some(1),
+            "the fixture's biomes name one carver"
+        );
+
+        let model = model(&flat, &blocks, &names, height);
+        let uncarved = build(
+            Rung::Aquifers,
+            &vanilla,
+            &surface,
+            &model,
+            &mut source.columns(),
+        );
+        let carved = build(
+            Rung::Carve,
+            &vanilla,
+            &surface,
+            &model,
+            &mut source.columns(),
+        );
+
+        // The fixture's carver works between y 0 and y 30, which is inside
+        // this pack's stone and below its sea level. With no aquifers the
+        // carve state is the global fluid picker's, which is water down there,
+        // so what a cut cell becomes is water and never the other way about.
+        let stone = dust_registry::Block::from_name("minecraft:stone")
+            .expect("stone")
+            .default_state()
+            .id();
+        let mut cut = 0;
+        for y in height.min_y()..height.min_y() + height.height() as i32 {
+            for z in 0..16u32 {
+                for x in 0..16u32 {
+                    let was = uncarved.get_block(x, y, z);
+                    let now = carved.get_block(x, y, z);
+                    if was == now {
+                        continue;
+                    }
+                    assert_eq!(was, stone, "a carver only ever takes a block away");
+                    assert_ne!(now, stone);
+                    cut += 1;
+                }
+            }
+        }
+        assert!(cut > 0, "the carve rung cut nothing at all");
+    }
+
     #[test]
     fn the_density_rung_builds_the_stack_the_data_pack_states() {
         let (blocks, height, names) = parts();
@@ -1877,9 +1991,9 @@ mod tests {
 
     #[test]
     fn the_ladder_changes_one_thing_per_rung_and_ends_at_the_control() {
-        assert_eq!(Rung::ALL.len(), 10);
+        assert_eq!(Rung::ALL.len(), 11);
         assert_eq!(Rung::ALL[0], Rung::Flat);
-        assert_eq!(*Rung::ALL.last().expect("ten"), Rung::Everything);
+        assert_eq!(*Rung::ALL.last().expect("eleven"), Rung::Everything);
         assert!(!Rung::Flat.reads_the_region_file());
         assert!(!Rung::FlatAtSeaLevel.reads_the_region_file());
         assert!(
@@ -1897,6 +2011,11 @@ mod tests {
         assert!(
             !Rung::Aquifers.reads_the_region_file(),
             "the aquifer rung is the operator's own pack and this crate's own \
+             arithmetic"
+        );
+        assert!(
+            !Rung::Carve.reads_the_region_file(),
+            "the carve rung is the operator's own pack and this crate's own \
              arithmetic, and is the last rung a server could run in"
         );
         assert!(Rung::Heights.reads_the_region_file());

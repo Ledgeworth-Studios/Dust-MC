@@ -738,3 +738,24 @@ body.** The first version of these checks called its slot-describing helper
 detail string came out as the literal `undefined` while the checks themselves
 passed. The helper is called `carrying` now. A detail string that lies is worse
 than none: it is what somebody reads when a check fails.
+
+## `openness.js`
+
+`openness.js` asks nothing of the protocol and everything of the world: it
+joins, waits for its chunks, and counts what a 33x33 footprint around the
+player holds between y -60 and y 59 — air, water, lava, solid — as a real
+client's own block table reports it.
+
+```sh
+node openness.js 25604
+```
+
+It exists because the worldgen harness and the generator share a process. A
+generator that carves caves and a server that does not send them would score
+perfectly on the ladder and be unplayable, and only a client that was handed
+nothing but the socket can tell the two apart. One JSON line, so two builds
+diff: decision record 0039 has the before and after that proved the carvers
+reach a player, 8 cells of air to 1,738.
+
+A carver fills a cave with `minecraft:cave_air` and not `minecraft:air`, which
+is why the count asks about three names and not one.

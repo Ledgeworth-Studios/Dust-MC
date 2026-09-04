@@ -1192,3 +1192,350 @@ fn split_id(id: &str) -> (&str, &str) {
         None => ("minecraft", id),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::noise::rng::{mth_cos, mth_sin, Legacy};
+
+    /// A data pack on disk, written by the test. Nothing of Mojang's is needed
+    /// to check that the reader reads or that the tunnel walks.
+    struct Pack {
+        dir: std::path::PathBuf,
+    }
+
+    impl Pack {
+        fn new(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("dust-gen-carver-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            Self { dir }
+        }
+
+        fn write(&self, relative: &str, text: &str) {
+            let path = self.dir.join(relative);
+            std::fs::create_dir_all(path.parent().expect("has a parent")).expect("mkdir");
+            std::fs::write(path, text).expect("write");
+        }
+
+        fn biome(&self, name: &str, carvers: &str) {
+            self.write(
+                &format!("minecraft/worldgen/biome/{name}.json"),
+                &format!(r#"{{"carvers": {carvers}}}"#),
+            );
+        }
+
+        /// A cave carver that always starts, always cuts, and cuts well above
+        /// the sea level so that what it leaves behind is air and not water.
+        fn cave(&self, name: &str, probability: f64) {
+            self.write(
+                &format!("minecraft/worldgen/configured_carver/{name}.json"),
+                &format!(
+                    r##"{{"type": "minecraft:cave", "config": {{
+                        "probability": {probability},
+                        "y": {{"type": "minecraft:uniform",
+                               "min_inclusive": {{"absolute": 100}},
+                               "max_inclusive": {{"absolute": 180}}}},
+                        "yScale": {{"type": "minecraft:uniform",
+                                    "min_inclusive": 0.1, "max_exclusive": 0.9}},
+                        "lava_level": {{"above_bottom": 8}},
+                        "replaceable": "#minecraft:test_replaceables",
+                        "horizontal_radius_multiplier": {{"type": "minecraft:uniform",
+                            "min_inclusive": 0.7, "max_exclusive": 1.4}},
+                        "vertical_radius_multiplier": {{"type": "minecraft:uniform",
+                            "min_inclusive": 0.8, "max_exclusive": 1.3}},
+                        "floor_level": {{"type": "minecraft:uniform",
+                            "min_inclusive": -1.0, "max_exclusive": -0.4}}
+                    }}}}"##
+                ),
+            );
+        }
+
+        /// A tag that reaches its second member only through another tag, so a
+        /// reader that stopped at the first level would be caught.
+        fn tags(&self) {
+            self.write(
+                "minecraft/tags/block/test_replaceables.json",
+                r##"{"values": ["minecraft:stone", "#minecraft:test_nested"]}"##,
+            );
+            self.write(
+                "minecraft/tags/block/test_nested.json",
+                r#"{"values": ["minecraft:dirt"]}"#,
+            );
+        }
+    }
+
+    impl Drop for Pack {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn settings() -> NoiseSettings {
+        NoiseSettings {
+            min_y: -64,
+            height: 384,
+            cell_width: 4,
+            cell_height: 8,
+            sea_level: 63,
+            default_block: spec("minecraft:stone"),
+            default_fluid: spec("minecraft:water"),
+            aquifers_enabled: false,
+        }
+    }
+
+    fn spec(name: &str) -> BlockSpec {
+        BlockSpec {
+            name: name.to_owned(),
+            properties: Vec::new(),
+        }
+    }
+
+    /// A chunk of one material, `256 * height` codes.
+    fn filled(code: u8) -> Vec<u8> {
+        vec![code; 256 * 384]
+    }
+
+    fn changed(before: &[u8], after: &[u8]) -> usize {
+        before
+            .iter()
+            .zip(after)
+            .filter(|(was, now)| was != now)
+            .count()
+    }
+
+    /// **The stream is `java.util.Random` and nothing near it.**
+    ///
+    /// Every value below came out of a JDK on this machine, not out of this
+    /// file: `new Random(0L)` and friends, printed by a five-line Java program.
+    /// A generator that is one draw out of step generates a different world
+    /// that still looks like a world, and only a golden says so.
+    #[test]
+    fn legacy_is_java_util_random() {
+        let mut rng = Legacy::from_seed(0);
+        assert_eq!(rng.next_i64(), -4962768465676381896);
+        assert_eq!(rng.next_i64(), 4437113781045784766);
+
+        let mut rng = Legacy::from_seed(0);
+        assert_eq!(
+            [
+                rng.next_f32(),
+                rng.next_f32(),
+                rng.next_f32(),
+                rng.next_f32()
+            ],
+            [0.73096776, 0.831441, 0.24053639, 0.6063452]
+        );
+
+        // Fifteen is not a power of two and sixteen is, and they take different
+        // paths through `nextInt`. Both are drawn by a cave carver on its first
+        // two lines, so getting one of them wrong would be most of the world.
+        let mut rng = Legacy::from_seed(0);
+        let fifteen: Vec<i32> = (0..8).map(|_| rng.next_i32_below(15)).collect();
+        assert_eq!(fifteen, vec![0, 13, 4, 2, 5, 8, 11, 6]);
+        let mut rng = Legacy::from_seed(0);
+        let sixteen: Vec<i32> = (0..8).map(|_| rng.next_i32_below(16)).collect();
+        assert_eq!(sixteen, vec![11, 13, 3, 9, 10, 4, 8, 1]);
+
+        let mut rng = Legacy::from_seed(-42);
+        let tens: Vec<i32> = (0..5).map(|_| rng.next_i32_below(10)).collect();
+        assert_eq!(tens, vec![5, 6, 2, 6, 6]);
+        assert_eq!(rng.next_f32(), 0.78621805);
+    }
+
+    /// **A carver turns by a table, not by a sine.**
+    ///
+    /// `Mth.sin` is 65,536 samples indexed by a truncated `float`, and the gap
+    /// between it and the real function is what a tunnel accumulates over a
+    /// hundred steps. This check is a differential against `f32::sin`, and it
+    /// requires them to *disagree*: a version of this file that called the real
+    /// function would pass every other test here and generate a world whose
+    /// caves are in the wrong place.
+    #[test]
+    fn sin_is_the_table_and_not_the_function() {
+        // A quarter turn lands exactly on entry 16,384, which is why a room's
+        // radius is its thickness and not something one part in ten thousand
+        // off it.
+        assert_eq!(mth_sin(QUARTER_TURN), 1.0);
+        assert_eq!(mth_cos(0.0), 1.0);
+        // And one that does not land on an entry.
+        let angle = 1.234_f32;
+        assert_ne!(mth_sin(angle), angle.sin());
+        assert!((f64::from(mth_sin(angle)) - f64::from(angle.sin())).abs() > 1e-6);
+        // The table is a sine of the *index*, so the entry either side of a
+        // value brackets it.
+        let index = (angle * 10430.378) as i32 & 65535;
+        let expected = ((f64::from(index) * std::f64::consts::PI * 2.0) / 65536.0).sin() as f32;
+        assert_eq!(mth_sin(angle), expected);
+    }
+
+    /// **A carver cuts what its tag names and nothing else, and the tag is
+    /// followed through the tag it names.**
+    ///
+    /// Three chunks of one block each, carved by the same carver at the same
+    /// coordinates. Stone is named directly, dirt only through a nested tag,
+    /// and bedrock not at all. A reader that stopped at the first level of the
+    /// tag would leave the dirt standing; a carver that ignored the tag would
+    /// cut the bedrock.
+    #[test]
+    fn a_carver_cuts_what_its_tag_names_and_follows_the_tag_it_names() {
+        let pack = Pack::new("tag");
+        pack.tags();
+        pack.cave("cave", 1.0);
+        pack.biome("plains", r#"{"air": ["minecraft:cave"]}"#);
+        // Palette code 4 is dirt, 5 is bedrock.
+        let palette = [spec("minecraft:dirt"), spec("minecraft:bedrock")];
+        let carvers = Carvers::over(
+            &pack.dir,
+            &settings(),
+            7,
+            &["minecraft:plains".into()],
+            &palette,
+        )
+        .expect("the pack reads")
+        .expect("a biome names a carver");
+
+        let mut stone = filled(1);
+        let mut dirt = filled(4);
+        let mut bedrock = filled(5);
+        let mut cutter = carvers.cutter();
+        cutter.carve(0, 0, &mut stone, None);
+        cutter.carve(0, 0, &mut dirt, None);
+        cutter.carve(0, 0, &mut bedrock, None);
+
+        let stone_cut = changed(&filled(1), &stone);
+        let dirt_cut = changed(&filled(4), &dirt);
+        let bedrock_cut = changed(&filled(5), &bedrock);
+        assert!(stone_cut > 0, "the carver cut nothing at all");
+        assert_eq!(
+            stone_cut, dirt_cut,
+            "stone is named directly and dirt through a nested tag; the same cells should go"
+        );
+        assert_eq!(bedrock_cut, 0, "bedrock is in no tag this carver names");
+    }
+
+    /// **Every chunk within eight is drawn, and a probability of zero draws
+    /// none of them.**
+    ///
+    /// 289 is the whole of why a tunnel that starts nine chunks away still
+    /// arrives. A narrower neighbourhood would leave holes at the seams that
+    /// no single-chunk test could see.
+    #[test]
+    fn a_chunk_draws_the_carvers_of_every_chunk_within_eight() {
+        let pack = Pack::new("reach");
+        pack.tags();
+        pack.cave("always", 1.0);
+        pack.cave("never", 0.0);
+        pack.biome(
+            "plains",
+            r#"{"air": ["minecraft:always", "minecraft:never"]}"#,
+        );
+        let carvers = Carvers::over(&pack.dir, &settings(), 3, &["minecraft:plains".into()], &[])
+            .expect("the pack reads")
+            .expect("a biome names carvers");
+        assert_eq!(carvers.len(), 2);
+
+        let mut materials = filled(1);
+        let mut cutter = carvers.cutter();
+        cutter.carve(0, 0, &mut materials, None);
+        let counts = cutter.counts();
+        assert_eq!(counts.neighbours, 289);
+        // One of the two always starts and the other never does, so the count
+        // separates the loop bounds from the probability test.
+        assert_eq!(counts.starts, 289);
+    }
+
+    /// **A chunk is carved the same however it is visited.**
+    ///
+    /// The mask is scratch and not state. A `Cutter` that carried a mask
+    /// between chunks would leave the second chunk it saw with holes the first
+    /// one had already claimed, and the world would depend on which player
+    /// walked where first.
+    #[test]
+    fn a_chunk_is_carved_the_same_however_it_is_visited() {
+        let pack = Pack::new("order");
+        pack.tags();
+        pack.cave("cave", 0.4);
+        pack.biome("plains", r#"{"air": "minecraft:cave"}"#);
+        let carvers = Carvers::over(
+            &pack.dir,
+            &settings(),
+            11,
+            &["minecraft:plains".into()],
+            &[],
+        )
+        .expect("the pack reads")
+        .expect("a biome names a carver");
+
+        let mut alone = filled(1);
+        carvers.cutter().carve(3, -5, &mut alone, None);
+
+        let mut after = filled(1);
+        let mut cutter = carvers.cutter();
+        let mut elsewhere = filled(1);
+        cutter.carve(40, 40, &mut elsewhere, None);
+        cutter.carve(-7, 2, &mut filled(1), None);
+        cutter.carve(3, -5, &mut after, None);
+
+        assert!(
+            changed(&filled(1), &alone) > 0,
+            "the fixture carved nothing, so this proves nothing"
+        );
+        assert_eq!(alone, after);
+    }
+
+    /// **Biomes that disagree about their carvers are refused by name.**
+    ///
+    /// Not merged, and not silently given the first one's list. See D39: the
+    /// alternative is a biome lookup at each of 289 corners per chunk, and a
+    /// world that quietly used one biome's caves everywhere would look right.
+    #[test]
+    fn biomes_that_disagree_about_their_carvers_are_refused() {
+        let pack = Pack::new("disagree");
+        pack.tags();
+        pack.cave("cave", 0.4);
+        pack.cave("other", 0.4);
+        pack.biome("plains", r#"{"air": ["minecraft:cave"]}"#);
+        pack.biome("desert", r#"{"air": ["minecraft:other"]}"#);
+        let error = Carvers::over(
+            &pack.dir,
+            &settings(),
+            0,
+            &["minecraft:desert".into(), "minecraft:plains".into()],
+            &[],
+        )
+        .expect_err("two lists is a refusal");
+        let text = error.to_string();
+        assert!(text.contains("minecraft:desert"), "{text}");
+        assert!(text.contains("minecraft:plains"), "{text}");
+
+        // And the same two biomes agreeing is not a refusal, so the check is
+        // about the disagreement and not about having two biomes.
+        pack.biome("desert", r#"{"air": ["minecraft:cave"]}"#);
+        Carvers::over(
+            &pack.dir,
+            &settings(),
+            0,
+            &["minecraft:desert".into(), "minecraft:plains".into()],
+            &[],
+        )
+        .expect("agreeing biomes read");
+    }
+
+    /// A dimension whose biomes name nothing has no carvers, rather than an
+    /// empty list that costs 289 draws a chunk to produce nothing.
+    #[test]
+    fn a_dimension_whose_biomes_name_no_carver_has_none() {
+        let pack = Pack::new("none");
+        pack.biome("the_void", "{}");
+        assert!(Carvers::over(
+            &pack.dir,
+            &settings(),
+            0,
+            &["minecraft:the_void".into()],
+            &[]
+        )
+        .expect("the pack reads")
+        .is_none());
+    }
+}

@@ -10,18 +10,22 @@
 //!
 //! # What a player gets, and what they do not
 //!
-//! `dust_gen::terrain` is vanilla's **noise stage** and `dust_gen::surface` is
-//! the dimension's own surface rules painted over it. So a player lands on
-//! grass over dirt, sand on a beach, gravel on a shore and deepslate below,
-//! and the mountains, valleys, overhangs, coastlines, oceans and sea floors
-//! are all where Minecraft puts them, with the biome Minecraft would have put
-//! there. Decision record 0032 is what that is worth: 682 of the 1,089 columns
-//! around seed 0's spawn are grass, and every one of them was stone before it.
+//! `dust_gen::terrain` is vanilla's **noise stage**, `dust_gen::aquifer`
+//! decides what a pocket under it holds, `dust_gen::surface` paints the
+//! dimension's own surface rules over both, and `dust_gen::carver` cuts the
+//! caves and canyons through the result — vanilla's own four stages in
+//! vanilla's own order. So a player lands on grass over dirt, sand on a beach,
+//! gravel on a shore and deepslate below; the mountains, valleys, overhangs,
+//! coastlines, oceans and sea floors are where Minecraft puts them, with the
+//! biome Minecraft would have put there; and a cave under the sea is somewhere
+//! to walk rather than somewhere to drown. Decision records 0032, 0035 and
+//! 0039 are what each of those is worth.
 //!
-//! What is still missing is aquifers, carvers and features — no trees, no ore
-//! veins, no caves, no villages, and every pocket below the sea level holds
-//! water where vanilla would leave two thirds of it dry. Record 0032 prices
-//! each of those in cells on the same sample.
+//! What is still missing is **features and structures** — no trees, no ore
+//! veins, no mineshafts, no villages. Record 0039 prices what is left: 97.3%
+//! of the cells Minecraft carved on seed 0's sample are open here too, and the
+//! 18,433 that are not are mostly things something *built*, not something a
+//! carver dug.
 //!
 //! # Why the light needs the four columns around it
 //!
@@ -197,7 +201,7 @@ impl GeneratedWorld {
         let top = min_y + self.height.height() as i32;
         {
             let materials = if with_biomes {
-                columns.aquifer(pos.x, pos.z)
+                columns.carve(pos.x, pos.z)
             } else {
                 columns.terrain(pos.x, pos.z)
             };
