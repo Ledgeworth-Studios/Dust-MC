@@ -72,6 +72,7 @@ mod rcon;
 mod region;
 pub mod registries;
 mod rewrite;
+mod updates;
 mod wire;
 pub mod worldgen;
 
@@ -173,6 +174,21 @@ outside the repository (override with DUST_HARNESS_CACHE).
       half. A measurement and not a gate: exit 0 unless the run failed.
       Decision records 0022 and 0028 are why this exists.
 
+  updates --answers <file> [--answers <file>]... [--tables <[data] path>]
+          [--without-support] [--verbose]
+      Score what Dust does about a block whose neighbourhood changed against
+      what a real server did, from the answers `tools/bot/updates.js` wrote.
+      The survey stands a block in a shell of six, takes one away and records
+      whether the block was still there; this asks `dust_sim::updates` the same
+      question of the operator's own constants table. Pass `--answers` once per
+      shell -- the survey is run with `stone` and with `dirt`, because a
+      dandelion in a shell of stone dies of the arena rather than of a support
+      rule. `--without-support` cuts the support columns out of the table,
+      which is the negative control: with no columns nothing ever breaks and
+      every row Minecraft broke has to go red. A measurement and not a gate:
+      exit 0 unless the run itself failed. Decision record 0040 is why this
+      exists.
+
   worldgen --version <v> [--seed <n>] [--radius <r>] [--at <x>,<z>]...
       Read a world Minecraft generated, build the same chunks with Dust's own
       generator, and count how far apart they are: surface height, surface
@@ -198,6 +214,7 @@ enum Verb {
     Placement(placement::Options),
     Drops(drops::Options),
     Break(breaking::Options),
+    Updates(updates::Options),
     Worldgen(worldgen::Options),
 }
 
@@ -235,6 +252,7 @@ pub fn dispatch(args: &[String]) -> Result<ExitCode, String> {
         Verb::Placement(options) => Ok(placement::run(&options)),
         Verb::Drops(options) => Ok(drops::run(&options)),
         Verb::Break(options) => Ok(breaking::run(&options)),
+        Verb::Updates(options) => Ok(updates::run(&options)),
         Verb::Worldgen(options) => Ok(worldgen::run(&options)),
     }
 }
@@ -255,10 +273,12 @@ fn parse(args: &[String]) -> Result<Verb, String> {
         "placement" => placement::parse(rest).map(Verb::Placement),
         "drops" => drops::parse(rest).map(Verb::Drops),
         "break" => breaking::parse(rest).map(Verb::Break),
+        "updates" => updates::parse(rest).map(Verb::Updates),
         "worldgen" => worldgen::parse(rest).map(Verb::Worldgen),
         other => Err(format!(
             "unknown harness verb `{other}`\n\nThe verbs are: provision, rcon, capture, \
-             compare, rewrite, registries, light, placement, drops, break, worldgen."
+             compare, rewrite, registries, light, placement, drops, break, updates, \
+             worldgen."
         )),
     }
 }

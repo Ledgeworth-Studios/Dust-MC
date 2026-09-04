@@ -654,6 +654,45 @@ withheld. Decision record 0028 is its output, and eight of those twenty rows
 caught a real defect: a block that asks for no tool is correctly tooled by a
 bare hand, so dirt is 15 ticks and not 50.
 
+## Asking a server what happens to a block whose neighbour went away
+
+```
+# against a real server, for the answers
+mkfifo /tmp/mc-console
+( tail -f /tmp/mc-console | java -jar server.jar nogui > /tmp/mc.log 2>&1 & )
+DUST_SERVER_CONSOLE=/tmp/mc-console node updates.js 25565 > support-stone.tsv
+DUST_SERVER_CONSOLE=/tmp/mc-console node updates.js 25565 --shell dirt > support-dirt.tsv
+DUST_SERVER_CONSOLE=/tmp/mc-console node updates.js 25565 --fall > fall.tsv
+
+# and against Dust, for the gate
+node updates.js 25601 --check
+```
+
+The four earlier surveys here all hold the world still and vary one input.
+None of them can see this rule, because it does not run until **after** a
+change: a torch whose wall is mined breaks, a rail whose ground is dug out
+breaks, a column of sand whose bottom block goes falls. This stands a block in
+a shell of six, takes one neighbour away, and writes down what the server did.
+`cargo xtask harness updates` scores `dust_sim::updates` against the file.
+
+**Run it with two shells and score both.** A dandelion in a shell of stone
+breaks when *any* of its six neighbours is taken away, because a dandelion
+wants dirt and stone is not dirt: `/setblock` put it somewhere it could never
+legitimately be and the arena is what killed it. Six of six broken is the
+signature, and the scorer names those rows apart rather than counting them
+against Dust — but a run that never used a second shell has no legitimate rows
+for those blocks at all.
+
+`--check` is the other half and the only mode that runs against **Dust**. It
+does everything a player does — a creative inventory write, a right-click, a
+dig — and reads the answer out of the block-change packets rather than out of
+`bot.blockAt`, which lags an edit by an unbounded amount. Ten checks, four of
+them controls, and the controls are the point: a server that broke everything
+on every update would pass all six of the others. It was watched to fail —
+6 of 10 with `Rules::reacts` forced to `false` — and one of the controls had to
+be repaired to survive that, because it originally failed for the row above
+it's reason rather than its own.
+
 ## The long one
 
 ```

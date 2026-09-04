@@ -170,6 +170,12 @@ pub struct EditedWorld {
     /// of a block state's faces are full, which is what a fence, a wall and a
     /// glass pane ask of the block beside them — see [`EditedWorld::reshape`].
     constants: Option<Arc<dust_registry::BlockConstants>>,
+    /// Cells whose surroundings have changed and that nobody has looked at
+    /// yet. Filled by every write here and drained by
+    /// [`super::updates::WorldTicker`] — the world says *what changed* and
+    /// the tick loop decides *what to do about it*, because deciding needs
+    /// the loot tables and the entity worlds and this module has neither.
+    pending: RwLock<super::updates::Pending>,
 }
 
 impl EditedWorld {
@@ -181,6 +187,7 @@ impl EditedWorld {
             announce,
             sounds: std::sync::atomic::AtomicU64::new(0),
             constants: None,
+            pending: RwLock::new(super::updates::Pending::default()),
         }
     }
 
@@ -202,7 +209,12 @@ impl EditedWorld {
     }
 
     /// What is in the six cells around one.
-    fn around(&self, position: Position) -> dust_sim::placement::Around {
+    ///
+    /// Public because the block-update tick asks the same question of the same
+    /// six cells, in the same [`Face`](dust_sim::placement::Face) order, and
+    /// two spellings of "what is beside this" would be two chances to index
+    /// the array the other way round.
+    pub fn around(&self, position: Position) -> dust_sim::placement::Around {
         let mut around = dust_sim::placement::Around::empty();
         for side in SIDES {
             let state = self.block_at(offset(position, side));
@@ -498,7 +510,44 @@ impl EditedWorld {
                 .or_default()
                 .insert(local_of(position), state);
         }
+        // **Every write, in one place.** All three of the announcing verbs go
+        // through here, so a block that changes is a block whose neighbours
+        // are told, whoever changed it and whether or not anybody was told
+        // about the change itself. `restore` deliberately does not: a save
+        // being read back is not a world reacting, and a boot that queued a
+        // hundred thousand updates would spend its first ticks re-deciding
+        // what the last shutdown already decided.
+        self.pending
+            .write()
+            .expect("the pending queue is never poisoned")
+            .touch(position);
         true
+    }
+
+    /// Take up to `limit` cells that need looking at.
+    pub fn take_updates(&self, limit: usize, out: &mut Vec<Position>) {
+        self.pending
+            .write()
+            .expect("the pending queue is never poisoned")
+            .take(limit, out);
+    }
+
+    /// How many cells are waiting to be looked at.
+    #[must_use]
+    pub fn updates_pending(&self) -> usize {
+        self.pending
+            .read()
+            .expect("the pending queue is never poisoned")
+            .len()
+    }
+
+    /// How many updates were refused because the queue was full.
+    #[must_use]
+    pub fn updates_refused(&self) -> u64 {
+        self.pending
+            .read()
+            .expect("the pending queue is never poisoned")
+            .refused()
     }
 
     /// Break a block on a player's behalf, and tell everyone what broke.

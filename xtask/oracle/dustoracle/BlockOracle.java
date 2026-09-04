@@ -5,12 +5,17 @@ import java.io.IOException;
 import java.io.PrintStream;
 import java.io.OutputStream;
 import java.io.UncheckedIOException;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Locale;
 import java.util.Map;
 import java.util.function.Predicate;
@@ -100,6 +105,39 @@ public final class BlockOracle {
 
         List<Heightmap> heightmaps = heightmaps(names);
 
+        // Whether the block falls when nothing holds it up, and whether the
+        // state can stay where it is. Both are the same kind of thing as
+        // everything above — Java, in no report and no data pack — and both
+        // are what a world that reacts to being changed is made of.
+        Method getBlock = names.method("blockstate.class", "blockstate.get_block");
+        Class<?> fallingBlock = names.type("falling_block.class");
+        Support support = new Support(names, emptyLevel, registry, getBlock);
+
+        // How far a leaf is from the nearest log, which is what decides
+        // whether a felled tree's canopy stays in the air.
+        //
+        // `getOptionalDistanceAt` is Minecraft's own whole relation: zero for
+        // anything in `BlockTags.LOGS`, the state's own `distance` for a leaf,
+        // and absent for everything else. **It answers only half of that here,
+        // and the half it drops is silent.** This oracle runs Minecraft's
+        // static initialisation and nothing else, and a block tag's contents
+        // arrive from the data pack when a server loads one — so
+        // `BlockTags.LOGS` is empty, every log falls through to the property
+        // test, and every log is reported as having no answer. The count
+        // printed as `log_states` is what says so: it is zero, and a rule that
+        // read this column alone would put every leaf in the world at distance
+        // seven and decay the tree it is still attached to. Dust takes the log
+        // half from its own tag table, which is data and is extracted, and
+        // this column carries the half that is Java.
+        //
+        // The number itself, where there is one, is a property of the state
+        // and is already in the protocol table both sides share, so one flag
+        // column carries the whole of what is left. The extractor checks that
+        // claim below rather than assuming it.
+        Method optionalDistanceAt = names.method(
+            "leaves_block.class", "leaves_block.optional_distance_at",
+            names.type("blockstate.concrete_class"));
+
         // Whether the state has a full square face on each of the six sides,
         // which is what a fence, a wall and a glass pane ask of the block
         // beside them before they grow an arm towards it. It is the block's
@@ -135,6 +173,11 @@ public final class BlockOracle {
         Method getId = names.method("idmapper.class", "idmapper.get_id", Object.class);
         int written = 0;
         int sturdyFaces = 0;
+        int falling = 0;
+        int needsSupport = 0;
+        int leaves = 0;
+        int logs = 0;
+        int distanceDisagreed = 0;
         try (BufferedWriter out = Files.newBufferedWriter(Path.of(args[1]))) {
             StringBuilder header = new StringBuilder(
                 "# state_id\topacity\temission\tocclude\treplaceable"
@@ -144,6 +187,10 @@ public final class BlockOracle {
                 header.append('\t').append(heightmap.key);
             }
             for (String side : sideNames) {
+                header.append('\t').append(side);
+            }
+            header.append("\tfalls\tLEAF_DISTANCE\tSURVIVES_ALONE");
+            for (String side : Support.COLUMNS) {
                 header.append('\t').append(side);
             }
             out.write(header.append('\n').toString());
@@ -178,6 +225,37 @@ public final class BlockOracle {
                         sturdyFaces++;
                     }
                 }
+                boolean falls = fallingBlock.isInstance(getBlock.invoke(state));
+                row.append('\t').append(falls ? 1 : 0);
+                if (falls) {
+                    falling++;
+                }
+                java.util.OptionalInt distance =
+                    (java.util.OptionalInt) optionalDistanceAt.invoke(null, state);
+                boolean known = distance.isPresent();
+                boolean zero = known && distance.getAsInt() == 0;
+                row.append('\t').append(known && !zero ? 1 : 0);
+                if (zero) {
+                    logs++;
+                } else if (known) {
+                    leaves++;
+                    // The claim the two columns rest on: where Minecraft has a
+                    // non-zero answer, that answer is the state's own
+                    // `distance` property, which the Rust side already has out
+                    // of the protocol table. If a version ever makes those two
+                    // different this says so instead of Dust quietly
+                    // restating a rule that has stopped being true.
+                    if (distance.getAsInt() != leafDistanceProperty(state)) {
+                        distanceDisagreed++;
+                    }
+                }
+                boolean[] survives = support.of(state);
+                for (boolean answer : survives) {
+                    row.append('\t').append(answer ? 1 : 0);
+                }
+                if (!survives[0]) {
+                    needsSupport++;
+                }
                 out.write(row.append('\n').toString());
                 written++;
             }
@@ -185,9 +263,337 @@ public final class BlockOracle {
         System.out.println("states=" + written);
         System.out.println("heightmaps=" + heightmaps.size());
         System.out.println("sturdy_faces=" + sturdyFaces);
+        System.out.println("falling_states=" + falling);
+        System.out.println("needs_support=" + needsSupport);
+        System.out.println("leaf_states=" + leaves);
+        // Expected to be zero, and it is the evidence for the note above: a
+        // bare static initialisation has loaded no data pack, so the log tag
+        // `getOptionalDistanceAt` consults is empty. Printed rather than
+        // asserted because a version that made it non-zero would be telling
+        // this oracle something true and new.
+        System.out.println("log_states=" + logs);
+        System.out.println("leaf_distance_disagreed=" + distanceDisagreed);
+        System.out.println("unaskable_probes=" + support.unaskable());
+        System.out.println("unsupported_states=" + support.unsupported());
         System.out.println("sound_groups=" + sounds.seen());
         System.out.println("items=" + writeItems(names, Path.of(args[2])));
         System.out.println("blocks=" + writeBlocks(names, Path.of(args[3])));
+    }
+
+    /**
+     * The `distance` a state's own properties say it is at.
+     *
+     * Read off `toString`, which is the one name on a Minecraft class that
+     * obfuscation cannot take away, and used for one purpose: to check that
+     * Minecraft's `getOptionalDistanceAt` and the state's own property agree,
+     * so that the Rust side may read the number out of the protocol table it
+     * already has instead of being handed a third column. `-1` where there is
+     * no such property, which makes a disagreement rather than hiding one.
+     */
+    private static int leafDistanceProperty(Object state) {
+        String text = state.toString();
+        int at = text.indexOf("distance=");
+        if (at < 0) {
+            return -1;
+        }
+        int end = at + "distance=".length();
+        int stop = end;
+        while (stop < text.length() && Character.isDigit(text.charAt(stop))) {
+            stop++;
+        }
+        if (stop == end) {
+            return -1;
+        }
+        return Integer.parseInt(text.substring(end, stop));
+    }
+
+    /**
+     * Whether a block state can stay where it is, and which neighbour it is
+     * standing on.
+     *
+     * `canSurvive` is what breaks a torch off a wall that is mined, drops a
+     * rail whose ground is dug out and pops a flower off dirt. It is Java, it
+     * is per state, and it takes a `LevelReader` — which is the whole reason
+     * it was out of reach until now. `Level` is an abstract class and cannot
+     * be faked, which is the wall `tools/bot/placement.js` documents for
+     * `getStateForPlacement`. **`LevelReader` is an interface**, and an
+     * interface can be implemented by a `java.lang.reflect.Proxy` that answers
+     * `getBlockState` out of a map of seven cells and hands everything else to
+     * `EmptyBlockGetter`, which is the level Minecraft itself passes where
+     * there is no world.
+     *
+     * # The two columns, and why one would have been useless
+     *
+     *   `SURVIVES_ALONE`  every neighbour is air. True for 20,110 of the
+     *                     26,684 states, and it is the column a caller tests
+     *                     first, because it costs one bit to answer "this
+     *                     block does not care what happens around it".
+     *   `SUPPORT_<side>`  **that one neighbour alone is enough.** Read as an
+     *                     `or`: a state that names two sides survives on
+     *                     either.
+     *
+     * A first version probed with stone and nothing else, and it said a
+     * sapling has no support at all — because a sapling wants dirt and stone
+     * is not dirt. A rule reading that column would have deleted every flower
+     * and every sapling in the world the first time anything near one changed.
+     * So the probe sweeps [`MATERIALS`] and stops at the first that the state
+     * survives on, and what the column means is **which side is load bearing**
+     * rather than what may be underneath it. That is the question a neighbour
+     * update actually asks, because the thing that happens to a support in
+     * play is that it is mined, and air holds nothing up.
+     *
+     * # What it does not answer, in counts rather than in adjectives
+     *
+     * A state that needs **two** neighbours at once — a sugar cane wants sand
+     * under it *and* water beside that sand, which is a cell this
+     * neighbourhood does not contain — comes out with `SURVIVES_ALONE` false
+     * and no side named. Nothing breaks it, which is the safe direction: a
+     * world that keeps a block it should have dropped is wrong in a way a
+     * player calls a bug in one block, and a world that drops blocks it should
+     * have kept is wrong in a way they call the server eating their build.
+     * The count is printed as `unsupported_states`.
+     */
+    private static final class Support {
+        /** The six per-face columns, in the order `Direction` declares. */
+        static final String[] COLUMNS = {
+            "SUPPORT_DOWN", "SUPPORT_UP", "SUPPORT_NORTH",
+            "SUPPORT_SOUTH", "SUPPORT_WEST", "SUPPORT_EAST"
+        };
+
+        /** The six offsets, in the same order as the columns. */
+        private static final int[][] OFFSETS = {
+            {0, -1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}, {-1, 0, 0}, {1, 0, 0}
+        };
+
+        /**
+         * What the probe puts next to a state, in the order it tries them.
+         *
+         * One per family of `mayPlaceOn` predicate rather than a list of
+         * everything: stone is what a torch, a rail and a lever want, the
+         * three soils are what the plants want, farmland is what the crops
+         * want, and the last few are the odd ones that name a single block.
+         * The sweep stops at the first material that the state survives on, so
+         * the order is a cost and never an answer — a state that survives on
+         * two of them names the same sides either way.
+         */
+        private static final String[] MATERIALS = {
+            "minecraft:stone",
+            "minecraft:dirt",
+            "minecraft:grass_block",
+            "minecraft:farmland",
+            "minecraft:sand",
+            "minecraft:soul_sand",
+            "minecraft:soul_soil",
+            "minecraft:end_stone",
+            "minecraft:netherrack",
+            "minecraft:moss_block",
+            "minecraft:hay_block",
+            "minecraft:honey_block",
+            "minecraft:water",
+            "minecraft:oak_log"
+        };
+
+        private final Method canSurvive;
+        private final Object level;
+        private final Object origin;
+        private final Object[] sides = new Object[6];
+        private final Map<Object, Object> cells = new HashMap<>();
+        private final List<Object> materials = new ArrayList<>();
+        /** Reused by [`withSelf`], so a sweep is not fifteen allocations. */
+        private final List<Object> sweep = new ArrayList<>();
+        private final Object air;
+        private int unaskable;
+        private int unsupported;
+
+        Support(Names names, Object emptyLevel, Object states, Method getBlock) throws Exception {
+            Class<?> blockPosClass = names.type("blockpos.class");
+            Constructor<?> blockPos =
+                names.constructor("blockpos.class", int.class, int.class, int.class);
+            this.origin = blockPos.newInstance(0, 0, 0);
+            for (int i = 0; i < OFFSETS.length; i++) {
+                sides[i] = blockPos.newInstance(OFFSETS[i][0], OFFSETS[i][1], OFFSETS[i][2]);
+            }
+            this.canSurvive = names.method(
+                "blockstate.class",
+                "blockstate.can_survive",
+                names.type("levelreader.class"),
+                blockPosClass);
+
+            // The states the probe puts in the world. Found by walking the
+            // registry rather than by naming a class, for the reason the whole
+            // oracle walks `BLOCK_STATE_REGISTRY`: the ids are the ones the
+            // Rust side already has, and a name lookup would be a second place
+            // for the two vocabularies to disagree. A material this version
+            // does not have is skipped rather than fatal.
+            Object blocks = names.field("builtin_registries.class", "builtin_registries.block")
+                .get(null);
+            Method getKey = names.method("registry.class", "registry.get_key", Object.class);
+            Object foundAir = null;
+            Object[] found = new Object[MATERIALS.length];
+            for (Object state : (Iterable<?>) states) {
+                String key = getKey.invoke(blocks, getBlock.invoke(state)).toString();
+                if (foundAir == null && key.equals("minecraft:air")) {
+                    foundAir = state;
+                }
+                for (int i = 0; i < MATERIALS.length; i++) {
+                    if (found[i] == null && key.equals(MATERIALS[i])) {
+                        found[i] = state;
+                    }
+                }
+            }
+            if (foundAir == null) {
+                throw new IllegalStateException(
+                    "the block state registry has no minecraft:air, so the support probe has "
+                    + "nothing to build an empty neighbourhood out of");
+            }
+            this.air = foundAir;
+            for (Object material : found) {
+                if (material != null) {
+                    materials.add(material);
+                }
+            }
+            if (materials.isEmpty()) {
+                throw new IllegalStateException(
+                    "this version has none of the blocks the support probe stands things on");
+            }
+
+            Class<?> levelReader = names.type("levelreader.class");
+            String getBlockState = getBlockStateName(names);
+            InvocationHandler handler = (proxy, method, arguments) -> {
+                if (method.getName().equals(getBlockState)
+                    && method.getParameterCount() == 1
+                    && method.getParameterTypes()[0] == blockPosClass) {
+                    Object there = cells.get(arguments[0]);
+                    return there != null ? there : air;
+                }
+                // Everything `BlockGetter` declares is answered by the empty
+                // level, which is what vanilla passes in the same situation.
+                // Everything `LevelReader` adds on top of it — biomes, light,
+                // chunk lookups — is answered with a blank, and a `canSurvive`
+                // that reached for one of those throws and is counted.
+                if (method.getDeclaringClass().isAssignableFrom(emptyLevel.getClass())) {
+                    return method.invoke(emptyLevel, arguments);
+                }
+                return blank(method.getReturnType());
+            };
+            this.level = Proxy.newProxyInstance(
+                levelReader.getClassLoader(), new Class<?>[] {levelReader}, handler);
+        }
+
+        /**
+         * The obfuscated name of `BlockGetter.getBlockState`.
+         *
+         * Read out of the same table everything else is, so this file still
+         * names nothing of Minecraft's.
+         */
+        private static String getBlockStateName(Names names) throws Exception {
+            return names.method(
+                "block_getter.class",
+                "block_getter.get_block_state",
+                names.type("blockpos.class")).getName();
+        }
+
+        /** Seven answers for one state: alone, then one per side. */
+        boolean[] of(Object state) {
+            boolean[] out = new boolean[7];
+            out[0] = ask(state, -1, null);
+            if (out[0]) {
+                return out;
+            }
+            // The state's own block is the last material tried, and it is the
+            // one that answers the top half of a door, a stalk of sugar cane
+            // and a bamboo shoot: what holds those up is more of themselves.
+            // Written as a sweep ending in `state` rather than as a special
+            // case because it is the same question — "what, on this side, is
+            // enough" — and because the top half of a door being left floating
+            // over a doorway that was mined is the most visible way this
+            // column can be wrong.
+            for (Object material : withSelf(state)) {
+                boolean any = false;
+                for (int i = 0; i < 6; i++) {
+                    if (ask(state, i, material)) {
+                        out[i + 1] = true;
+                        any = true;
+                    }
+                }
+                // The first material that holds this state up is the answer.
+                // A later one names the same sides — a torch stands on stone
+                // and on dirt and on both for the same reason — so carrying on
+                // would cost thirteen more sweeps to learn nothing.
+                if (any) {
+                    return out;
+                }
+            }
+            unsupported++;
+            return out;
+        }
+
+        /** The material sweep for one state, ending in the state itself. */
+        private List<Object> withSelf(Object state) {
+            sweep.clear();
+            sweep.addAll(materials);
+            sweep.add(state);
+            return sweep;
+        }
+
+        /** How many probes threw rather than answering. */
+        int unaskable() {
+            return unaskable;
+        }
+
+        /** How many states need something and named no side. */
+        int unsupported() {
+            return unsupported;
+        }
+
+        private boolean ask(Object state, int side, Object material) {
+            cells.clear();
+            // The state itself is in its own cell, because some rules read it:
+            // the upper half of a door asks what is below it and finds the
+            // lower half there, or does not.
+            cells.put(origin, state);
+            if (side >= 0) {
+                cells.put(sides[side], material);
+            }
+            try {
+                return (boolean) canSurvive.invoke(state, level, origin);
+            } catch (Throwable failed) {
+                unaskable++;
+                return true;
+            }
+        }
+
+        /** A value of the right shape for a method the proxy cannot answer. */
+        private static Object blank(Class<?> type) {
+            if (!type.isPrimitive()) {
+                return null;
+            }
+            if (type == boolean.class) {
+                return Boolean.FALSE;
+            }
+            if (type == int.class) {
+                return 0;
+            }
+            if (type == long.class) {
+                return 0L;
+            }
+            if (type == float.class) {
+                return 0.0f;
+            }
+            if (type == double.class) {
+                return 0.0d;
+            }
+            if (type == short.class) {
+                return (short) 0;
+            }
+            if (type == byte.class) {
+                return (byte) 0;
+            }
+            if (type == char.class) {
+                return (char) 0;
+            }
+            return null;
+        }
     }
 
     /** One heightmap: the name a chunk's NBT calls it, and what it counts. */

@@ -673,11 +673,85 @@ pub const LIGHT_ORACLE: &[Wanted<'static>] = &[
         class: BLOCK_STATE_BASE,
         field: "destroySpeed",
     },
+    // **Whether a block can stay where it is.** A torch on a wall that is
+    // removed, a rail on ground that is mined, a flower on dirt that is dug
+    // out: every one of them is `canSurvive`, and every one of them is Java.
+    // It takes a `LevelReader`, which is why this was out of reach until now —
+    // `LevelReader` is an *interface*, so the oracle can hand it a
+    // `java.lang.reflect.Proxy` that answers `getBlockState` out of a map of
+    // eight cells and delegates everything else to `EmptyBlockGetter`. A
+    // `Level` could not have been faked that way, which is the wall
+    // `tools/bot/placement.js` documents for `getStateForPlacement` and the
+    // reason that answer is surveyed rather than extracted.
+    Wanted::Method {
+        key: "blockstate.can_survive",
+        class: BLOCK_STATE_BASE,
+        method: "canSurvive",
+        parameters: &[LEVEL_READER, BLOCK_POS],
+    },
+    Wanted::Class {
+        key: "levelreader.class",
+        class: LEVEL_READER,
+    },
+    // The one method the proxy answers itself. Everything else a `canSurvive`
+    // reaches for is delegated to `EmptyBlockGetter`, which is what Minecraft
+    // itself passes where there is no world.
+    Wanted::Method {
+        key: "block_getter.get_block_state",
+        class: BLOCK_GETTER,
+        method: "getBlockState",
+        parameters: &[BLOCK_POS],
+    },
+    // Which blocks fall when nothing holds them up. `FallingBlock` is a class
+    // and the whole answer is `isInstance`: sand, gravel, the concrete
+    // powders, the anvils and the dragon egg are its subclasses and nothing
+    // else is. A name list would be thirty rows of Mojang's data in this
+    // repository and would go stale the first time a version adds a colour.
+    Wanted::Class {
+        key: "falling_block.class",
+        class: FALLING_BLOCK,
+    },
+    Wanted::Method {
+        key: "blockstate.get_block",
+        class: BLOCK_STATE_BASE,
+        method: "getBlock",
+        parameters: &[],
+    },
+    // **How far a leaf is from the nearest log.** A felled tree leaves a
+    // canopy that has to go, and what decides it is `distance`, which counts
+    // up from a log and stops at seven. `LeavesBlock.getOptionalDistanceAt` is
+    // the whole relation in one static method: zero for anything in
+    // `BlockTags.LOGS`, the state's own `distance` for a leaf, and absent for
+    // everything else. Asking Minecraft for it rather than writing it out is
+    // the difference between reading the rule and extracting it — and the tag
+    // half in particular is a data-pack list this repository must not hold.
+    Wanted::Class {
+        key: "leaves_block.class",
+        class: LEAVES_BLOCK,
+    },
+    // `BlockState` and not `BlockBehaviour$BlockStateBase`, which is what
+    // every other entry here means by a state. They are different classes —
+    // the second is the base the first extends — and a method *declared* as
+    // taking the first cannot be found by the name of the second.
+    Wanted::Class {
+        key: "blockstate.concrete_class",
+        class: BLOCK_STATE,
+    },
+    Wanted::Method {
+        key: "leaves_block.optional_distance_at",
+        class: LEAVES_BLOCK,
+        method: "getOptionalDistanceAt",
+        parameters: &[BLOCK_STATE],
+    },
 ];
 
 const BLOCK_STATE_BASE: &str =
     "net.minecraft.world.level.block.state.BlockBehaviour$BlockStateBase";
 const BLOCK_GETTER: &str = "net.minecraft.world.level.BlockGetter";
+const LEVEL_READER: &str = "net.minecraft.world.level.LevelReader";
+const FALLING_BLOCK: &str = "net.minecraft.world.level.block.FallingBlock";
+const LEAVES_BLOCK: &str = "net.minecraft.world.level.block.LeavesBlock";
+const BLOCK_STATE: &str = "net.minecraft.world.level.block.state.BlockState";
 const BLOCK_POS: &str = "net.minecraft.core.BlockPos";
 const DIRECTION: &str = "net.minecraft.core.Direction";
 const EMPTY_BLOCK_GETTER: &str = "net.minecraft.world.level.EmptyBlockGetter";

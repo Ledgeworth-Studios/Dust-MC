@@ -156,6 +156,10 @@ pub struct SessionContext {
     pub player_entity_type: i32,
     /// `minecraft:item`'s id in the same table.
     pub item_entity_type: i32,
+    /// `minecraft:falling_block`'s id in the same table.
+    pub falling_entity_type: i32,
+    /// Every block currently in the air, and the channel they travel on.
+    pub falling: Arc<super::falling::FallingWorld>,
     /// Every item lying on the ground, and the channel their comings and
     /// goings travel on.
     pub items: Arc<super::items::ItemWorld>,
@@ -1083,6 +1087,18 @@ where
             relay_item(conn, ctx, change).await?;
         }
     }
+    // And every block in the air, on the same argument: a player who joins
+    // mid-collapse should see the sand that is still falling, not a cell that
+    // is empty until it lands.
+    let mut falling_changes = ctx.falling.subscribe();
+    if !ctx.falling.is_empty() {
+        let mut already = Vec::new();
+        ctx.falling
+            .visible_from(position, f64::from(view.radius() * 16), &mut already);
+        for change in &already {
+            relay_falling(conn, ctx, change).await?;
+        }
+    }
     // Picking things up is asked at the tick rate rather than on every
     // movement packet: a client sends those faster than the world moves, and a
     // player walking over a stack does not need to be told twice in one tick
@@ -1305,6 +1321,30 @@ where
                     // receiver resolves instantly for ever, so `{}` here would
                     // be a `select!` spinning a core for the rest of the
                     // session.
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+            }
+            change = falling_changes.recv() => {
+                match change {
+                    Ok(change) => {
+                        let (x, z) = change.at();
+                        if view.holds(view::column_of(x, z)) {
+                            relay_falling(conn, ctx, &change).await?;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        // A missed falling block leaves a client drawing sand
+                        // that has already landed, or not drawing sand that
+                        // is falling. **The block itself is not lost either
+                        // way**: the cell it lands in travels on the edit
+                        // channel, which is resent as a column when that one
+                        // lags. So this is a cosmetic loss and is logged as
+                        // one.
+                        ctx.logger.warn(
+                            "dust::net",
+                            format!("{} missed {missed} falling block(s)", me.name),
+                        );
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
                 }
             }
@@ -3107,6 +3147,12 @@ fn held_enchantments(held: Option<&super::inventory::Stack>) -> Vec<(&'static st
         .unwrap_or_default()
 }
 
+/// Roll a break's loot and pop it out of the cell that broke.
+///
+/// One line, because the rule is `net::updates::Spill` and is shared with the
+/// world's own breaks: a torch that falls off a mined wall drops what a torch
+/// a player broke drops, and two copies of that roll would be two places for a
+/// silk-touch branch to be wrong.
 fn spill(
     ctx: &SessionContext,
     at: dust_protocol::types::Position,
@@ -3115,12 +3161,11 @@ fn spill(
     held: Option<&super::inventory::Stack>,
     seed: u64,
 ) {
-    // Whatever was inside it, if it was a furnace, and **before every early
-    // return below**: a block with no loot table drops nothing, but the coal
-    // and the iron a player put in a furnace are their items and a pickaxe
-    // must not delete them. Forgetting the furnace here is also what stops a
-    // new one built on the same block inheriting a stranger's half-burned
-    // coal.
+    // Whatever was inside it, if it was a furnace, and **before the roll
+    // below**: a block with no loot table drops nothing, but the coal and the
+    // iron a player put in a furnace are their items and a pickaxe must not
+    // delete them. Forgetting the furnace here is also what stops a new one
+    // built on the same block inheriting a stranger's half-burned coal.
     if let Some(furnace) = ctx.furnaces.remove(at) {
         for stack in furnace.slots.into_iter().flatten() {
             ctx.items.pop(
@@ -3132,67 +3177,41 @@ fn spill(
             );
         }
     }
-    let Some(state) = dust_registry::BlockState::from_id(previous) else {
-        return;
-    };
-    let Some(table) = ctx.drops.table(state.block()) else {
-        // No table for this block, which is not "drops nothing" — see
-        // `dust_sim::drops::Tables::table`. Nothing is dropped either way, and
-        // the difference is why this branch is written down rather than being
-        // the same `return` as an empty roll.
-        return;
-    };
-    let around: Vec<(i8, dust_registry::BlockState)> = neighbours
-        .iter()
-        .filter_map(|(offset, state)| {
-            dust_registry::BlockState::from_id(*state).map(|state| (*offset, state))
-        })
-        .collect();
-    let enchantments = held_enchantments(held);
-    let context = dust_sim::drops::Break {
-        state,
-        // Whether this state yields anything to the wrong tool. Read off the
-        // same table the sound comes from, with the column resolved at boot.
-        // Whether the tool in the hand is the *right* one is not asked here:
-        // that is the item's own `minecraft:tool` component, and `dust-sim`
-        // reads it, so the server and `cargo xtask harness drops` are asking
-        // one implementation rather than agreeing with each other.
-        requires_tool: match (ctx.constants.as_deref(), ctx.requires_tool) {
-            (Some(constants), Some(flag)) => constants.is_set(flag, previous),
-            _ => false,
-        },
-        tool: dust_sim::drops::Tool {
-            item: held.map(|stack| stack.item),
-            // **Read from the stack the player is actually holding.** Every
-            // silk-touch and fortune branch of every table has been compiled
-            // and unreachable since the tables landed; this is the line that
-            // reaches them. An unenchanted stack — which is almost every stack
-            // — produces an empty `Vec`, and an empty `Vec` allocates nothing,
-            // so the ordinary break pays one walk of a patch that is usually
-            // absent.
-            enchantments: &enchantments,
-        },
-        broken_by_entity: true,
-        neighbours: &around,
-    };
-    let mut rolled = Vec::new();
-    let mut rng = dust_sim::drops::Rng::from_seed(seed);
-    table.roll(&context, &mut rng, &mut rolled);
-    for drop in rolled {
-        let limit = u32::from(drop.item.max_stack_size().max(1));
-        let mut left = drop.count;
-        while left > 0 {
-            let taken = left.min(limit);
-            left -= taken;
-            ctx.items.pop(
-                &ctx.roster,
-                at,
-                drop.item,
-                u8::try_from(taken).unwrap_or(u8::MAX),
-                seed ^ u64::from(left),
-            );
+    super::updates::Spill {
+        drops: &ctx.drops,
+        items: &ctx.items,
+        roster: &ctx.roster,
+        constants: ctx.constants.as_deref(),
+        requires_tool: ctx.requires_tool,
+    }
+    .at(at, previous, neighbours, held, seed);
+}
+
+/// Put one falling block on the wire.
+///
+/// One packet to spawn and one to remove, and nothing in between: a client
+/// runs a falling block entity's physics itself, the same gravity and the same
+/// drag, exactly as it runs an item's. See `net::items` for the argument.
+async fn relay_falling<W>(
+    conn: &mut Conn<W>,
+    ctx: &SessionContext,
+    change: &super::falling::FallingChange,
+) -> Result<(), SessionError>
+where
+    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    use super::falling::FallingChange;
+    match change {
+        FallingChange::Spawned { .. } => {
+            if let Some(packet) = super::falling::spawn_packet(change, ctx.falling_entity_type) {
+                send_play(conn, packet, ctx.version).await?;
+            }
+        }
+        FallingChange::Gone { id, .. } => {
+            send_play(conn, super::play::despawn(*id), ctx.version).await?;
         }
     }
+    Ok(())
 }
 
 /// Put one item change on the wire.

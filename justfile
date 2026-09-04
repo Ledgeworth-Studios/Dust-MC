@@ -57,6 +57,16 @@ build:
 bot port="25565":
     cd tools/bot && node check.js {{port}}
 
+# Whether a block whose support is gone actually goes: a torch on a mined
+# block, a control that must not move, a sand column that has to become an
+# entity and land, and a leaf that has to learn its distance from the log put
+# beside it.
+#
+# Outside `verify` for the same reason `bot` is: it needs a server already
+# running and an npm install. Decision record 0040 is its account.
+updates port="25565":
+    cd tools/bot && node updates.js {{port}} --check
+
 # The long one: a bot that stays, flies a square, digs and talks for a while,
 # and says whether anything ended or went quiet. Phase 3's exit criterion asks
 # for ten minutes, which is the default.

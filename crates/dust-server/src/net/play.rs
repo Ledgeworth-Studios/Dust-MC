@@ -665,6 +665,12 @@ pub fn item_entity_type() -> Option<i32> {
         .and_then(|t| i32::try_from(t.protocol_id()).ok())
 }
 
+/// `minecraft:falling_block`'s id in the same table.
+pub fn falling_entity_type() -> Option<i32> {
+    dust_registry::EntityType::from_name("minecraft:falling_block")
+        .and_then(|t| i32::try_from(t.protocol_id()).ok())
+}
+
 // ---------------------------------------------------------------------------
 // The rest of what a joining client is told
 // ---------------------------------------------------------------------------

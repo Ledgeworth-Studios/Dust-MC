@@ -88,3 +88,7 @@ harness = false
 [[bench]]
 name = "furnaces"
 harness = false
+
+[[bench]]
+name = "updates"
+harness = false

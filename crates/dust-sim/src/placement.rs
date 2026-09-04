@@ -70,6 +70,33 @@ pub enum Face {
 }
 
 impl Face {
+    /// The six, in declaration order — down, up, north, south, west, east.
+    ///
+    /// The order [`Around`] indexes by and the order the constants table's
+    /// per-side columns are written in, so a loop over this and a loop over
+    /// either of those are the same loop.
+    pub const ALL: [Self; 6] = [
+        Self::Down,
+        Self::Up,
+        Self::North,
+        Self::South,
+        Self::West,
+        Self::East,
+    ];
+
+    /// The step from a cell to its neighbour on this side.
+    #[must_use]
+    pub fn offset(self) -> (i32, i32, i32) {
+        match self {
+            Self::Down => (0, -1, 0),
+            Self::Up => (0, 1, 0),
+            Self::North => (0, 0, -1),
+            Self::South => (0, 0, 1),
+            Self::West => (-1, 0, 0),
+            Self::East => (1, 0, 0),
+        }
+    }
+
     /// The face a protocol number names, or `None` for one this build does not
     /// know — which vanilla refuses outright rather than reading as a guess.
     #[must_use]
