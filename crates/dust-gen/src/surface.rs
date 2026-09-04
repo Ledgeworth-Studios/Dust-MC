@@ -1187,6 +1187,15 @@ mod tests {
                                                          "argument": {TERRAIN}}}}}}}"#
             ),
         );
+        // The one biome this fixture's parameter table names, so that
+        // `Generator::new` can ask it which carvers it runs. It names none;
+        // these tests are about the block underfoot and a tunnel through it
+        // would move the very cells they count.
+        write(
+            &root,
+            "minecraft/worldgen/biome/plains.json",
+            r#"{"carvers": {}}"#,
+        );
         root
     }
 

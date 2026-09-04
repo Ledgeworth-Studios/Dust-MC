@@ -109,11 +109,14 @@ result, so a player lands on grass over dirt, sand on a beach, gravel on a shore
 and deepslate below, and not on stone. Then it runs the dimension's own
 **aquifers**, so a cave under the sea is somewhere a player walks rather than
 somewhere they drown: 400,638 of seed 0's 588,215 missing cave cells were
-pockets Dust had flooded, and 23 of them still are. **Not** the carvers or the
-features that come after, so there are still no trees and a cave that is only a
-cave because something dug it is not there. How far that is from the world
+pockets Dust had flooded, and 23 of them still are. Then it cuts the dimension's
+own **carvers** through the result — the tunnels and the ravines — which takes
+what is left of that count from 187,614 to 18,433, so **97.3% of the cells
+Minecraft carved on seed 0's sample are open here too**, and turns eight cells
+of air under a player at spawn into 1,738. **Not** the features that come after,
+so there are still no trees and no ore veins. How far that is from the world
 Minecraft generates for the same seed is measured rather than estimated —
-`cargo xtask harness worldgen` scores it in five parts. Decision record
+`cargo xtask harness worldgen` scores it in six parts. Decision record
 [0012](docs/decisions/0012-what-worldgen-is-worth-measured-first.md) is what
 each stage of vanilla's pipeline is worth and the order to build them in,
 [0021](docs/decisions/0021-which-biome-a-cell-gets.md) is the biome source,
@@ -123,8 +126,10 @@ is the terrain and what a served world does at the edge of a world file, and
 — and the finding that two thirds of what reads as a missing carver is a missing
 aquifer — and
 [0035](docs/decisions/0035-what-a-cave-holds.md) is the aquifers that finding
-sent for, recovered from the operator's own server jar because they are the one
-stage of worldgen that is code rather than data. A world
+sent for and
+[0039](docs/decisions/0039-what-a-carver-digs.md) the carvers after them, both
+recovered from the operator's own server jar because they are the stages of
+worldgen that are code rather than data. A world
 is a disc in an infinite plane and a player can walk off the edge of it: with
 that world's own seed, read from the `level.dat` beside it, the far side is the
 terrain it would have had; without one, the superflat runs on as it always did,
@@ -317,11 +322,13 @@ what it costs at 1, 10 and 100 players — which is *more* memory, for a reason
 that is about the player and not about the megabytes.
 
 **Not yet**, and each of these is stated where the code for it would go: **no
-carvers and no features**, so a generated world has no trees or ore veins, the
-caves something dug are missing 187,614 cells of seed 0's 681,715, and there are
-no icebergs — decision records
-[0032](docs/decisions/0032-what-the-ground-is-made-of.md) and
-[0035](docs/decisions/0035-what-a-cave-holds.md)
+features and no structures**, so a generated world has no trees or ore veins,
+18,433 of seed 0's 681,715 open cells below its own surface are still filled in
+— mineshafts, dungeons and geodes open cells too and none of them is a carver —
+and there are no icebergs; decision records
+[0032](docs/decisions/0032-what-the-ground-is-made-of.md),
+[0035](docs/decisions/0035-what-a-cave-holds.md) and
+[0039](docs/decisions/0039-what-a-carver-digs.md)
 are what each of those is worth on the same sample, in cells; no
 physics or block updates, so a player is stopped from
 entering a block and never pushed out of one; **only one thread builds columns
@@ -686,7 +693,7 @@ inside a number that already looked good.
 
 `worldgen` asks the same question of the terrain, and asks it in five parts. It
 counts how far Dust's world is from the one Minecraft generates for the same
-seed, and which stage of vanilla's pipeline owns which part of the gap. Ten
+seed, and which stage of vanilla's pipeline owns which part of the gap. Eleven
 models over the same chunks in one run, each row the one above it plus a single
 named change, and every figure a count of things **wrong**:
 
@@ -701,6 +708,7 @@ seed 0, twelve 5x5 squares to sixteen thousand blocks out -- 17 biomes in view
     28796    49128       382   588215     75560     6840919     18.8  + Dust's terrain
     28796    32398       382   588215     75560     2529567     18.8  + Dust's surface rules
     28784    32393       382   187614     90892     2097950     18.8  + Dust's aquifers
+    28349    32345       382    18433     92418     1838763     18.8  + Dust's carvers
         0    60037         0   681715         0    10405644     19.6  + Minecraft's surface height
         0    60037         0        0         0     9723929     19.6  + Minecraft's carvers
         0        0         0        0         0       12140     20.6  + its blocks at and below it
