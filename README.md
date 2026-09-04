@@ -313,6 +313,31 @@ microseconds of a 50-millisecond tick, and a thousand with nobody near cost
 [0022](docs/decisions/0022-what-a-broken-block-yields.md) and
 [0023](docs/decisions/0023-what-shape-an-entity-has.md) are the accounts.
 
+**The world reacts to being changed.** Every write to a loaded column queues
+seven positions — the cell and its six neighbours — and the tick loop asks each
+one whether it can still stay where it is. A torch whose wall is mined breaks
+and drops, a rail whose ground is dug out breaks and drops, and one of the 32
+falling states with nothing under it becomes an entity, falls with vanilla's own
+gravity and drag, and lands as a block again. A **felled tree's canopy comes
+down**: a leaf holds a `distance` counted up from the nearest log, the relabel
+spreads outward one ring per pass, and a leaf that reaches seven waits about a
+minute — the same distribution vanilla's random tick produces — and then breaks
+and drops. All of it is Minecraft's own answer, asked of the operator's own jar:
+`canSurvive` per state through a `java.lang.reflect.Proxy`, `FallingBlock` for
+what falls, and `LeavesBlock.getOptionalDistanceAt` for the leaf, whose log half
+comes out of the tag table because a jar's static initialisation has loaded no
+data pack and that half comes back empty.
+
+Against a real 1.21.1 server, 231 of 243 scored rows agree and **none of the 12
+that do not is a block Dust breaks and Minecraft kept**. `node updates.js
+<port> --check` puts a torch on a block, mines the block and watches the torch
+fall the way a player would: 10 of 10 on a release build, 6 of 10 with the rule
+turned off. One break costs 1,271 nanoseconds of a 50-millisecond tick, a
+64-block sand column 2,346, a thousand-block raft of sand 75,827, and felling an
+oak 1.7 milliseconds spread over four minutes. Decision record
+[0040](docs/decisions/0040-what-a-changed-cell-tells-its-neighbours.md) has the
+counts, the two ceilings, and the one it found bounding the wrong thing.
+
 The server **keeps the columns its players and its falling items are near**,
 once, shared, and reads region files on a thread of the world's own rather than
 on the network path or the tick loop. On a world Minecraft wrote, the worst
@@ -331,8 +356,11 @@ and there are no icebergs; decision records
 [0032](docs/decisions/0032-what-the-ground-is-made-of.md),
 [0035](docs/decisions/0035-what-a-cave-holds.md) and
 [0039](docs/decisions/0039-what-a-carver-digs.md)
-are what each of those is worth on the same sample, in cells; no
-physics or block updates, so a player is stopped from
+are what each of those is worth on the same sample, in cells; **no fluids**,
+so water and lava sit where they are put and a bucket does nothing at all,
+which is the largest thing left and is decision record
+[0040](docs/decisions/0040-what-a-changed-cell-tells-its-neighbours.md)'s
+named next step; **no player physics**, so a player is stopped from
 entering a block and never pushed out of one; **only one thread builds columns
 for a world**, so a cold join into generated terrain is about 3.3 seconds of
 world arriving around a player who is already walking — the loading screen ends
@@ -374,7 +402,8 @@ stack carries its data components and a break now reads its
 against a real 1.21.1 server and 15/27 with the component withheld — but
 **nothing else in the world reads a component**, so a broken chest still drops
 a chest without its contents; **armour protects from nothing**, since there is no
-damage to protect from yet; no
+damage to protect from yet, and **hunger and health are the two things left
+between this server and survival mode** now that crafting has landed; no
 **redstone wire** and no **scaffolding distance**, which are the last two
 neighbour rules of the sixty-one decision record
 [0014](docs/decisions/0014-what-a-block-reads-from-the-cell-next-door.md)

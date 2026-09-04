@@ -79,6 +79,7 @@
 //     rather than as a break. Nineteen of the first run's rows were that.
 
 const mineflayer = require('mineflayer')
+const { Vec3 } = require('vec3')
 const fs = require('fs')
 
 const PORT = Number(process.argv[2] || 25565)
@@ -404,7 +405,7 @@ function main () {
 /// queue, the tick loop, the entity or the packets, so a rule that is perfect
 /// in a crate with no caller passes it and leaves a world that never moves.
 ///
-/// Five checks and one of them is the control. The control is not decoration:
+/// Eight checks and two of them are controls. The control is not decoration:
 /// cobblestone on a block whose support is mined **must stay**, and a server
 /// that broke everything on every update would pass all four of the others.
 function gate () {
@@ -450,7 +451,7 @@ function gate () {
     const name = cell => {
       const state = changes.get(at(cell))
       if (state === undefined) {
-        const block = bot.blockAt(cell)
+        const block = bot.blockAt(new Vec3(cell.x, cell.y, cell.z))
         return block ? (block.name.includes(':') ? block.name : `minecraft:${block.name}`) : null
       }
       return properties(state, registry).name.replace(/^(?!.*:)/, 'minecraft:')
@@ -499,6 +500,8 @@ function gate () {
     arm(1, 'sand')
     arm(2, 'cobblestone')
     arm(3, 'stone')
+    arm(4, 'oak_leaves')
+    arm(5, 'oak_log')
     await wait(600)
 
     const stood = bot.entity.position.floored()
@@ -524,6 +527,15 @@ function gate () {
     )
 
     // 3. The control. Cobblestone is not held up by anything and must not move.
+    //
+    // The arena is cleared first, and that is not tidiness. A control's job is
+    // to stay green when every other row goes red, and the first version of
+    // this one did not: with the rules turned off the torch above never broke,
+    // the cobblestone had nowhere to go, and the control failed for a reason
+    // that was the check above's. A control that fails when its subject is
+    // fine has stopped being a control.
+    dig(torchAt)
+    await wait(400)
     place(ground, 3)
     await wait(400)
     place(pillar, 2)
@@ -564,6 +576,50 @@ function gate () {
       'the sand landed on the floor',
       name({ x: ground.x, y: ground.y + 1, z: ground.z }) === 'minecraft:sand',
       `the cell above the floor holds ${name({ x: ground.x, y: ground.y + 1, z: ground.z })}`
+    )
+
+    // 6, 7 and 8. The leaf cascade, which is the only rule here that is about
+    // more than one cell. A placed leaf is `persistent` — vanilla's own
+    // `getStateForPlacement` says so and Dust's placement agrees — so it will
+    // never decay, and what is watched instead is `distance`: the number a
+    // felled canopy learns from the log beside it, one cell at a time. The
+    // third of these is the control that matters most in this whole file,
+    // because a rule that got leaves wrong in the other direction eats a
+    // player's tree house.
+    const props = cell => {
+      const state = changes.get(at(cell))
+      return state === undefined ? {} : properties(state, registry).props
+    }
+    // Two towers, side by side: a leaf on one and a log on the other.
+    const east = { x: ground.x + 1, y: ground.y, z: ground.z }
+    dig({ x: ground.x, y: ground.y + 1, z: ground.z })
+    await wait(400)
+    place(ground, 3)
+    await wait(300)
+    const leafAt = { x: ground.x, y: ground.y + 2, z: ground.z }
+    place({ x: ground.x, y: ground.y + 1, z: ground.z }, 4)
+    await wait(700)
+    report(
+      'a leaf that has never seen a log is seven away from one',
+      props(leafAt).distance === '7',
+      `distance=${props(leafAt).distance}`
+    )
+    place(east, 3)
+    await wait(300)
+    const logAt = { x: east.x, y: east.y + 2, z: east.z }
+    place({ x: east.x, y: east.y + 1, z: east.z }, 5)
+    await wait(900)
+    report(
+      'the leaf is one away from the log put beside it',
+      props(leafAt).distance === '1',
+      `distance=${props(leafAt).distance}, the log cell holds ${name(logAt)}`
+    )
+    dig(logAt)
+    await wait(900)
+    report(
+      'a leaf a player put there survives losing the log',
+      name(leafAt) === 'minecraft:oak_leaves' && props(leafAt).distance === '7',
+      `the cell holds ${name(leafAt)} at distance=${props(leafAt).distance}`
     )
 
     for (const line of results) process.stdout.write(line + '\n')
