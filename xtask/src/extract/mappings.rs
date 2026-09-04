@@ -673,11 +673,57 @@ pub const LIGHT_ORACLE: &[Wanted<'static>] = &[
         class: BLOCK_STATE_BASE,
         field: "destroySpeed",
     },
+    // **Whether a block can stay where it is.** A torch on a wall that is
+    // removed, a rail on ground that is mined, a flower on dirt that is dug
+    // out: every one of them is `canSurvive`, and every one of them is Java.
+    // It takes a `LevelReader`, which is why this was out of reach until now —
+    // `LevelReader` is an *interface*, so the oracle can hand it a
+    // `java.lang.reflect.Proxy` that answers `getBlockState` out of a map of
+    // eight cells and delegates everything else to `EmptyBlockGetter`. A
+    // `Level` could not have been faked that way, which is the wall
+    // `tools/bot/placement.js` documents for `getStateForPlacement` and the
+    // reason that answer is surveyed rather than extracted.
+    Wanted::Method {
+        key: "blockstate.can_survive",
+        class: BLOCK_STATE_BASE,
+        method: "canSurvive",
+        parameters: &[LEVEL_READER, BLOCK_POS],
+    },
+    Wanted::Class {
+        key: "levelreader.class",
+        class: LEVEL_READER,
+    },
+    // The one method the proxy answers itself. Everything else a `canSurvive`
+    // reaches for is delegated to `EmptyBlockGetter`, which is what Minecraft
+    // itself passes where there is no world.
+    Wanted::Method {
+        key: "block_getter.get_block_state",
+        class: BLOCK_GETTER,
+        method: "getBlockState",
+        parameters: &[BLOCK_POS],
+    },
+    // Which blocks fall when nothing holds them up. `FallingBlock` is a class
+    // and the whole answer is `isInstance`: sand, gravel, the concrete
+    // powders, the anvils and the dragon egg are its subclasses and nothing
+    // else is. A name list would be thirty rows of Mojang's data in this
+    // repository and would go stale the first time a version adds a colour.
+    Wanted::Class {
+        key: "falling_block.class",
+        class: FALLING_BLOCK,
+    },
+    Wanted::Method {
+        key: "blockstate.get_block",
+        class: BLOCK_STATE_BASE,
+        method: "getBlock",
+        parameters: &[],
+    },
 ];
 
 const BLOCK_STATE_BASE: &str =
     "net.minecraft.world.level.block.state.BlockBehaviour$BlockStateBase";
 const BLOCK_GETTER: &str = "net.minecraft.world.level.BlockGetter";
+const LEVEL_READER: &str = "net.minecraft.world.level.LevelReader";
+const FALLING_BLOCK: &str = "net.minecraft.world.level.block.FallingBlock";
 const BLOCK_POS: &str = "net.minecraft.core.BlockPos";
 const DIRECTION: &str = "net.minecraft.core.Direction";
 const EMPTY_BLOCK_GETTER: &str = "net.minecraft.world.level.EmptyBlockGetter";
