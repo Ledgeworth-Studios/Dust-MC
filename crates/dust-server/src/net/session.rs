@@ -1040,6 +1040,13 @@ where
     // closed one.
     let mut screen = Screen::player();
     let mut next_window = FIRST_CONTAINER_WINDOW;
+    // Held for as long as a furnace's screen is open, and dropped by the
+    // close, by the next open, and by this function returning at all — which
+    // is what covers the player whose connection is cut and who therefore
+    // never sends a close packet. While it is held the furnace announces every
+    // tick, so the flame comes down and the arrow crosses; without it the bars
+    // would move once per ingot.
+    let mut watching: Option<super::furnaces::Watch> = None;
 
     // And told to the client, all forty-six slots at once. This is the one
     // place the whole container goes out: a join has nothing to compare
@@ -1946,6 +1953,7 @@ where
                                 at: Some(use_on.hit.location),
                             };
                             inventory.at_fire(Some(fire));
+                            drop(watching.replace(ctx.furnaces.watch(use_on.hit.location)));
                             open_furnace(conn, ctx, &mut inventory, screen, fire).await?;
                         }
                         let opens = opens || fire.is_some();
@@ -1959,6 +1967,12 @@ where
                                 if screen.id != PLAYER_WINDOW {
                                     inventory.closed(screen.window);
                                 }
+                                // A table replacing a furnace's screen. The
+                                // watch has to go with it, or the furnace they
+                                // walked away from announces every tick until
+                                // they log out.
+                                inventory.clear_furnace_mirror();
+                                drop(watching.take());
                                 next_window = if next_window >= LAST_CONTAINER_WINDOW {
                                     FIRST_CONTAINER_WINDOW
                                 } else {
@@ -2151,8 +2165,11 @@ where
                             let moved = inventory.closed(screen.window);
                             // The three slots stay with the block. Clearing
                             // the mirror is what makes that true in this
-                            // process as well as on paper.
+                            // process as well as on paper, and dropping the
+                            // watch stops a furnace nobody is looking at from
+                            // announcing every tick for ever.
                             inventory.clear_furnace_mirror();
+                            drop(watching.take());
                             let was = screen;
                             // Whatever it was, the player is looking at their
                             // own inventory again.

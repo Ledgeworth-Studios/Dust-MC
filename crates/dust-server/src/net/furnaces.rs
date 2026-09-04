@@ -306,6 +306,31 @@ impl Furnace {
     }
 }
 
+/// One open furnace screen. Dropping it says the screen is shut.
+#[derive(Debug)]
+pub struct Watch {
+    furnaces: std::sync::Arc<Furnaces>,
+    at: Position,
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        let mut inner = self
+            .furnaces
+            .inner
+            .lock()
+            .expect("the furnace world is never poisoned");
+        if let std::collections::hash_map::Entry::Occupied(mut entry) =
+            inner.watched.entry(self.at)
+        {
+            *entry.get_mut() -= 1;
+            if *entry.get() == 0 {
+                entry.remove();
+            }
+        }
+    }
+}
+
 /// What moved in one furnace, for a session that has it open.
 #[derive(Debug, Clone)]
 pub struct FurnaceChange {
@@ -346,6 +371,21 @@ struct Inner {
     /// The indices that must tick. Every entry's cell is `Some` and its
     /// `active` flag is set; the two are kept in step by [`Inner::refresh`].
     active: Vec<u32>,
+    /// The furnaces somebody currently has open, and how many players that is.
+    ///
+    /// **This is what makes the two bars move.** A furnace's slots change once
+    /// every two hundred ticks and its *timers* change every tick, and the
+    /// timers are what a player is looking at: the flame comes down, the arrow
+    /// crosses. Announcing every tick for every burning furnace would be
+    /// twenty thousand messages a second on a world with a thousand of them,
+    /// almost all for furnaces in an empty room. Announcing only on a slot
+    /// change makes the bars jump once per ingot, which is what this had until
+    /// somebody watched one.
+    ///
+    /// So: every tick for the furnaces with a screen open, on a change for the
+    /// rest. Two players at one furnace is one entry with a count of two,
+    /// because the tick asks "is anybody watching" and not "who".
+    watched: HashMap<Position, u32>,
 }
 
 #[derive(Debug)]
@@ -371,6 +411,7 @@ impl Furnaces {
                 at: HashMap::new(),
                 free: Vec::new(),
                 active: Vec::new(),
+                watched: HashMap::new(),
             }),
             active: AtomicUsize::new(0),
             announce: broadcast::channel(CHANGE_BACKLOG).0,
@@ -408,6 +449,33 @@ impl Furnaces {
     #[must_use]
     pub fn active(&self) -> usize {
         self.active.load(Ordering::Relaxed)
+    }
+
+    /// Say that somebody has this furnace's screen open, until the returned
+    /// guard is dropped.
+    ///
+    /// A guard rather than a `watch`/`unwatch` pair because the one caller
+    /// that matters is a session, and a session ends by being dropped — a
+    /// player whose connection is cut never sends a close packet, and a watch
+    /// leaked by every such player would be a server that eventually announces
+    /// every furnace every tick to nobody.
+    #[must_use]
+    pub fn watch(self: &std::sync::Arc<Self>, at: Position) -> Watch {
+        {
+            let mut inner = self.inner.lock().expect("the furnace world is never poisoned");
+            *inner.watched.entry(at).or_insert(0) += 1;
+        }
+        Watch {
+            furnaces: std::sync::Arc::clone(self),
+            at,
+        }
+    }
+
+    /// How many furnaces have a screen open on them.
+    #[must_use]
+    pub fn watched(&self) -> usize {
+        let inner = self.inner.lock().expect("the furnace world is never poisoned");
+        inner.watched.len()
     }
 
     /// Read one furnace, or `None` if that block has never held anything.
@@ -544,6 +612,11 @@ impl Furnaces {
                 .inner
                 .lock()
                 .expect("the furnace world is never poisoned");
+            // Taken out and put back so the loop below can hold `&mut` on the
+            // cells. A watch map is one entry per open furnace screen on the
+            // whole server, so this moves a pointer rather than copying
+            // anything.
+            let watched = std::mem::take(&mut inner.watched);
             // Walked by index and compacted in place: a furnace that stops
             // being active leaves the set during the same pass that noticed,
             // with no second walk and no allocation.
@@ -559,7 +632,9 @@ impl Furnaces {
                 if was_lit != now_lit {
                     lit.push((cell.at, now_lit));
                 }
-                if moved {
+                // Every tick for a furnace somebody has a screen open on, and
+                // only on a real change for the rest. See `Inner::watched`.
+                if moved || watched.contains_key(&cell.at) {
                     changes.push(change_of(cell));
                 }
                 let still = cell.furnace.is_active(cooking, fuel);
@@ -570,6 +645,7 @@ impl Furnaces {
                 }
             }
             inner.active.truncate(write);
+            inner.watched = watched;
             self.active.store(inner.active.len(), Ordering::Relaxed);
         }
         for change in changes {

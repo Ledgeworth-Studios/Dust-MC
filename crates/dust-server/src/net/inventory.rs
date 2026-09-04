@@ -615,7 +615,25 @@ impl Window {
         }
     }
 
-    /// The output slot a click on it takes from, grid or fire.
+    /// The slot a *recipe* fills, which a click on has to pay for out of the
+    /// grid. `None` for a window with no grid.
+    ///
+    /// **A furnace's output is not one of these**, and it looked like one for
+    /// long enough to be measured: a shift-click on it went down the crafting
+    /// path, which loops "craft again until the inputs run out" and pays out
+    /// of a grid a furnace does not have, so it took nothing and the ingots
+    /// stayed where they were. A furnace's output is an ordinary slot that
+    /// refuses everything put into it — the fire filled it, and it is already
+    /// paid for.
+    fn crafting_output(self) -> Option<usize> {
+        match self {
+            Self::Player => Some(CRAFTING_OUTPUT),
+            Self::Table => Some(TABLE_OUTPUT),
+            Self::Furnace => None,
+        }
+    }
+
+    /// The output slot, whatever filled it.
     fn output(self) -> usize {
         match self {
             Self::Player => CRAFTING_OUTPUT,
@@ -1309,7 +1327,7 @@ impl Inventory {
         let Some(index) = named else {
             return;
         };
-        if index == window.output() {
+        if Some(index) == window.crafting_output() {
             self.pickup_result(window, button, changed);
             return;
         }
@@ -1477,7 +1495,7 @@ impl Inventory {
         let Some(index) = named else {
             return;
         };
-        if index == window.output() {
+        if Some(index) == window.crafting_output() {
             self.quick_move_result(window, changed);
             return;
         }
@@ -1548,6 +1566,14 @@ impl Inventory {
             // that back into the inventory it came from without knowing which
             // slots it touched — so the question "does all of it fit" is asked
             // before anything moves.
+            // **The one place Dust does not do what Minecraft does, and it is
+            // a choice — see `docs/decisions/0041-a-craft-that-only-half-fits.md`.**
+            // Vanilla moves what fits, spends the grid and lets the remainder
+            // fall off the stack frame: eight planks in, one stick out, one
+            // stick destroyed. Dust refuses the pass instead. Nothing is
+            // created and nothing is lost, and the state that caused it — a
+            // full inventory — is on the screen the player is looking at,
+            // which the silent loss is not.
             if !self.room_for(&made) {
                 return;
             }
@@ -1725,7 +1751,7 @@ impl Inventory {
         let Some(index) = named else {
             return;
         };
-        if index == window.output() {
+        if Some(index) == window.crafting_output() {
             let Some(made) = self.slots[index].clone() else {
                 return;
             };
@@ -1816,7 +1842,7 @@ impl Inventory {
         let Some(index) = named else {
             return;
         };
-        if index == window.output() && (0..=1).contains(&button) {
+        if Some(index) == window.crafting_output() && (0..=1).contains(&button) {
             if self.slots[index].is_none() {
                 return;
             }
