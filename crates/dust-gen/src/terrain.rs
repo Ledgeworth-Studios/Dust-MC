@@ -227,6 +227,19 @@ pub struct Filler<'a> {
     flow: Option<crate::aquifer::Flow<'a>>,
 }
 
+impl<'a> Filler<'a> {
+    /// The aquifer's own scratch, for a stage that runs *after* the fill and
+    /// still has to ask what a pocket holds — which is the carvers.
+    ///
+    /// Handed out rather than duplicated: [`Filler::fill_with_aquifer`] has
+    /// already pointed this at the chunk and filled its grid, so a carver that
+    /// built its own would pay for the same jittered centres a second time and
+    /// hold a second evaluator over the same graph.
+    pub fn flow_mut(&mut self) -> Option<&mut crate::aquifer::Flow<'a>> {
+        self.flow.as_mut()
+    }
+}
+
 impl Filler<'_> {
     /// Fill one chunk's worth of materials.
     ///
@@ -530,6 +543,8 @@ fn lerp(delta: f64, start: f64, end: f64) -> f64 {
 pub struct Generator {
     terrain: Terrain,
     parameters: crate::biome::BiomeParameters,
+    /// The dimension's carvers, or `None` when no biome of it names any.
+    carvers: Option<crate::carver::Carvers>,
     /// The seed the biome blur fiddles with, which is a hash of the world seed
     /// and not the world seed. Computed once because it is a SHA-256 and a
     /// surface rule asks for a biome at every solid block of every column.
@@ -543,11 +558,35 @@ impl Generator {
         seed: i64,
         parameters: crate::biome::BiomeParameters,
     ) -> Result<Self, BuildError> {
+        let terrain = Terrain::new(data_root, dimension, seed)?;
+        // Distinct biome names, because the carver list is a fact about a biome
+        // and the parameter list names most of them many times over.
+        let mut biomes: Vec<String> = parameters
+            .regions()
+            .iter()
+            .map(|region| region.name.clone())
+            .collect();
+        biomes.sort();
+        biomes.dedup();
+        let palette = terrain
+            .router()
+            .surface
+            .as_ref()
+            .map(|rules| rules.palette().to_vec())
+            .unwrap_or_default();
+        let carvers =
+            crate::carver::Carvers::over(data_root, terrain.settings(), seed, &biomes, &palette)?;
         Ok(Self {
-            terrain: Terrain::new(data_root, dimension, seed)?,
+            terrain,
             parameters,
+            carvers,
             zoom_seed: crate::noise::rng::obfuscate_seed(seed),
         })
+    }
+
+    /// The dimension's carvers, or `None` when no biome of it names any.
+    pub fn carvers(&self) -> Option<&crate::carver::Carvers> {
+        self.carvers.as_ref()
     }
 
     /// The dimension's surface rules, or `None` if its settings carry none.
@@ -605,6 +644,7 @@ impl Generator {
             }),
             zoom_seed: self.zoom_seed,
             materials: vec![0u8; self.terrain.cells_per_chunk()],
+            cutter: self.carvers.as_ref().map(crate::carver::Carvers::cutter),
         }
     }
 }
@@ -618,6 +658,7 @@ pub struct Columns<'a> {
     painter: Option<crate::surface::Painter<'a>>,
     zoom_seed: i64,
     materials: Vec<u8>,
+    cutter: Option<crate::carver::Cutter<'a>>,
 }
 
 impl<'a> Columns<'a> {
@@ -669,6 +710,38 @@ impl<'a> Columns<'a> {
             );
         }
         &self.materials
+    }
+
+    /// The noise stage, the aquifers, the surface rules and then the carvers —
+    /// vanilla's own order, and the whole of what a chunk holds before its
+    /// features are placed.
+    ///
+    /// The carvers go over the rules and not under them because vanilla's chunk
+    /// statuses run `surface` before `carvers`: a tunnel cuts through finished
+    /// ground, which is why `carveBlock` has anything to say about grass.
+    pub fn carve(&mut self, chunk_x: i32, chunk_z: i32) -> &[u8] {
+        let Self {
+            filler,
+            biomes,
+            painter,
+            zoom_seed,
+            materials,
+            cutter,
+        } = self;
+        filler.fill_with_aquifer(chunk_x, chunk_z, materials);
+        if let Some(painter) = painter.as_mut() {
+            painter.paint(chunk_x, chunk_z, materials, biomes, *zoom_seed);
+        }
+        if let Some(cutter) = cutter.as_mut() {
+            cutter.carve(chunk_x, chunk_z, materials, filler.flow_mut());
+        }
+        materials
+    }
+
+    /// What the carvers have done since this scratch was made, or `None` when
+    /// the dimension has none.
+    pub fn carving(&self) -> Option<crate::carver::Counts> {
+        self.cutter.as_ref().map(crate::carver::Cutter::counts)
     }
 
     /// How many times the rules asked something this generator declines to

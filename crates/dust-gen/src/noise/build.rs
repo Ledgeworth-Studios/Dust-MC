@@ -828,7 +828,7 @@ fn noise_parameters(value: &Value, path: &Path) -> Result<NoiseParameters, Build
     })
 }
 
-fn read_json(path: &Path) -> Result<Value, BuildError> {
+pub(crate) fn read_json(path: &Path) -> Result<Value, BuildError> {
     let bytes = std::fs::read(path).map_err(|e| BuildError::Unreadable {
         path: path.to_path_buf(),
         detail: e.to_string(),

@@ -250,10 +250,18 @@ enum Rung {
     /// deciding what an enclosed pocket holds before the rules are painted —
     /// which is where vanilla puts them.
     ///
-    /// **The last rung a server could run in.** Everything below it reads the
-    /// region file. Carvers have still not run, so a cave that is only a cave
-    /// because something dug it is not there at all.
+    /// **The last rung a server could run in** until the one below it.
+    /// Carvers have still not run, so a cave that is only a cave because
+    /// something dug it is not there at all.
     Aquifers,
+    /// The same world with the dimension's own carvers cut through it after the
+    /// surface rules, which is where vanilla's chunk statuses put them: 289
+    /// neighbouring chunks' worth of tunnels and canyons, of which this chunk
+    /// keeps the part that lands inside it.
+    ///
+    /// **The last rung a server could run in.** Everything below it reads the
+    /// region file.
+    Carve,
     /// The flat stack again, with each column's grass at the y Minecraft's
     /// `MOTION_BLOCKING` puts it. The terrain's *shape*, and nothing else:
     /// stone is still dirt, an ocean is still filled in solid.
@@ -278,13 +286,14 @@ enum Rung {
 
 impl Rung {
     /// The ladder, in order.
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::Flat,
         Self::FlatAtSeaLevel,
         Self::Biomes,
         Self::Density,
         Self::Surface,
         Self::Aquifers,
+        Self::Carve,
         Self::Heights,
         Self::Carvers,
         Self::BelowTheSurface,
@@ -301,6 +310,7 @@ impl Rung {
             Self::Aquifers => {
                 "+ Dust's aquifers                        (whether a cave drowns you)"
             }
+            Self::Carve => "+ Dust's carvers                         (the caves themselves)",
             Self::Heights => "+ Minecraft's surface height             (the ceiling above it)",
             Self::Carvers => "+ Minecraft's carvers                    (caves)",
             Self::BelowTheSurface => {
@@ -321,6 +331,7 @@ impl Rung {
                 | Self::Density
                 | Self::Surface
                 | Self::Aquifers
+                | Self::Carve
         )
     }
 }
@@ -546,6 +557,15 @@ fn generator(version: &str, seed: i64, names: &RegistryNames) -> Result<Generato
         settings.default_block.name,
         settings.default_fluid.name
     );
+    match generator.carvers() {
+        Some(carvers) => println!(
+            "carvers: {} — {}, from {}",
+            carvers.len(),
+            carvers.names().collect::<Vec<_>>().join(", "),
+            data.join("minecraft/worldgen/configured_carver").display()
+        ),
+        None => println!("carvers: none — no biome of this dimension names one"),
+    }
     Ok(generator)
 }
 
@@ -679,7 +699,7 @@ fn measure(options: &Options) -> Result<(), String> {
             );
         }
         report(rung, &scores);
-        if rung == Rung::Surface || rung == Rung::Aquifers {
+        if matches!(rung, Rung::Surface | Rung::Aquifers | Rung::Carve) {
             // Counted, not assumed. `minecraft:temperature` answers `false`
             // without looking and the badlands bands are the one table in the
             // rules that is not in the pack, so both are worth a number: a gap
@@ -701,6 +721,27 @@ fn measure(options: &Options) -> Result<(), String> {
                         "off — this dimension's settings say it has none, so this rung is                          the one above it"
                     }
                 );
+            }
+            if rung == Rung::Carve {
+                match sampler.carving() {
+                    Some(counts) => println!(
+                        "      carvers: {} start(s) rolled out of {} neighbour chunk(s) drawn; \
+                         {} cell(s) got as far as the block test and {} changed, {} of them held \
+                         up by the aquifer's own barrier; {} carved column(s) stood on dirt \
+                         under a grass block, which is the one clause of `carveBlock` this \
+                         generator declines (decision record 0039)",
+                        counts.starts,
+                        counts.neighbours,
+                        counts.reached,
+                        counts.carved,
+                        counts.barred,
+                        counts.grass_floors,
+                    ),
+                    None => println!(
+                        "      carvers: none — no biome of this dimension names one, so this \
+                         rung is                          the one above it"
+                    ),
+                }
             }
             let (temperature, bandlands) = sampler.declined();
             println!(
@@ -786,12 +827,16 @@ fn build(
     );
 
     let top = height.min_y() + height.height() as i32;
-    if matches!(rung, Rung::Density | Rung::Surface | Rung::Aquifers) {
+    if matches!(
+        rung,
+        Rung::Density | Rung::Surface | Rung::Aquifers | Rung::Carve
+    ) {
         // The world's own floor is bedrock on every rung of this ladder,
         // including the control, because vanilla's is: the bedrock gradient is
         // true at and below the bottom without a die being rolled. What is
         // above it here is the noise stage and nothing else.
         let materials = match rung {
+            Rung::Carve => generator.carve(vanilla.pos().x, vanilla.pos().z),
             Rung::Aquifers => generator.aquifer(vanilla.pos().x, vanilla.pos().z),
             Rung::Surface => generator.surface(vanilla.pos().x, vanilla.pos().z),
             _ => generator.terrain(vanilla.pos().x, vanilla.pos().z),
@@ -825,7 +870,7 @@ fn build(
                 // level everywhere; the rest take it from Minecraft, and a column
                 // Minecraft left empty gets no ground at all rather than a guess.
                 let ground = match rung {
-                    Rung::Flat | Rung::Density | Rung::Surface | Rung::Aquifers => {
+                    Rung::Flat | Rung::Density | Rung::Surface | Rung::Aquifers | Rung::Carve => {
                         unreachable!("handled above")
                     }
                     Rung::FlatAtSeaLevel | Rung::Biomes => Some(SEA_LEVEL),
@@ -836,7 +881,11 @@ fn build(
                         blocks.palette.bedrock
                     } else {
                         match rung {
-                            Rung::Flat | Rung::Density | Rung::Surface | Rung::Aquifers => {
+                            Rung::Flat
+                            | Rung::Density
+                            | Rung::Surface
+                            | Rung::Aquifers
+                            | Rung::Carve => {
                                 unreachable!("handled above")
                             }
                             Rung::FlatAtSeaLevel | Rung::Biomes | Rung::Heights => {
@@ -881,7 +930,7 @@ fn build(
         }
     } else if matches!(
         rung,
-        Rung::Biomes | Rung::Density | Rung::Surface | Rung::Aquifers
+        Rung::Biomes | Rung::Density | Rung::Surface | Rung::Aquifers | Rung::Carve
     ) {
         // Quart coordinates: the cell index, which is the block position
         // shifted down by two. The x and z of the chunk are added first,

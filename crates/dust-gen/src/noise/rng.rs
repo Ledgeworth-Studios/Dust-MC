@@ -488,3 +488,116 @@ mod tests {
         }
     }
 }
+
+/// `LegacyRandomSource`: `java.util.Random`, bit for bit.
+///
+/// Modern worldgen does not use this and [`Xoroshiro`] is the reason the module
+/// opens the way it does. Carvers are the exception, and they are not an
+/// oversight: `ChunkGenerator.applyCarvers` builds a `WorldgenRandom` over a
+/// `LegacyRandomSource` and re-seeds it per neighbouring chunk, so a cave's
+/// shape comes out of the 48-bit linear congruential generator Java shipped in
+/// 1995. Reproduced rather than approximated for the same reason as the one
+/// above: a different stream is a different world that still looks like a world.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Legacy {
+    seed: i64,
+}
+
+const LEGACY_MULTIPLIER: i64 = 0x5DEE_CE66D;
+const LEGACY_INCREMENT: i64 = 0xB;
+const LEGACY_MASK: i64 = (1 << 48) - 1;
+
+impl Legacy {
+    pub fn from_seed(seed: i64) -> Self {
+        let mut rng = Self { seed: 0 };
+        rng.set_seed(seed);
+        rng
+    }
+
+    /// `Random.setSeed`, scramble included.
+    pub fn set_seed(&mut self, seed: i64) {
+        self.seed = (seed ^ LEGACY_MULTIPLIER) & LEGACY_MASK;
+    }
+
+    /// `WorldgenRandom.setLargeFeatureSeed`: the stream a chunk's features and
+    /// its carvers are drawn from.
+    ///
+    /// The two `nextLong` draws are taken from the *seeded* stream and then
+    /// thrown away, which is what makes a chunk's carvers depend on the world
+    /// seed twice over. Reading it as "hash the coordinates" and skipping them
+    /// would give every world the same caves in a different place.
+    pub fn set_large_feature_seed(&mut self, seed: i64, chunk_x: i32, chunk_z: i32) {
+        self.set_seed(seed);
+        let a = self.next_i64();
+        let b = self.next_i64();
+        let mixed =
+            (i64::from(chunk_x).wrapping_mul(a)) ^ (i64::from(chunk_z).wrapping_mul(b)) ^ seed;
+        self.set_seed(mixed);
+    }
+
+    fn next(&mut self, bits: u32) -> i32 {
+        self.seed = self
+            .seed
+            .wrapping_mul(LEGACY_MULTIPLIER)
+            .wrapping_add(LEGACY_INCREMENT)
+            & LEGACY_MASK;
+        ((self.seed as u64) >> (48 - bits)) as i32
+    }
+
+    /// `Random.nextInt(bound)`, rejection loop and power-of-two path both.
+    ///
+    /// The power-of-two path is not an optimisation to be dropped: it draws a
+    /// different value from the same stream than the general path would.
+    pub fn next_i32_below(&mut self, bound: i32) -> i32 {
+        assert!(bound > 0, "a bound is positive");
+        if bound & (bound - 1) == 0 {
+            return ((i64::from(bound).wrapping_mul(i64::from(self.next(31)))) >> 31) as i32;
+        }
+        loop {
+            let bits = self.next(31);
+            let value = bits % bound;
+            // Java's own overflow test, kept as one: it is what rejects the
+            // tail that would otherwise be drawn twice as often.
+            if bits.wrapping_sub(value).wrapping_add(bound - 1) >= 0 {
+                return value;
+            }
+        }
+    }
+
+    pub fn next_f32(&mut self) -> f32 {
+        self.next(24) as f32 / (1 << 24) as f32
+    }
+
+    pub fn next_i64(&mut self) -> i64 {
+        (i64::from(self.next(32)) << 32).wrapping_add(i64::from(self.next(32)))
+    }
+}
+
+/// `Mth.SIN`: the 65,536-entry sine table vanilla's carvers turn with.
+///
+/// Not `f64::sin`. A carver's tunnel walks by `Mth.sin` and `Mth.cos`, which
+/// are a table lookup on a truncated `float` index, and the table is coarse
+/// enough — one entry per 2π/65536 — that the difference from a real sine is
+/// visible in where a cave ends up after a hundred steps.
+fn sine_table() -> &'static [f32; 65536] {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<Box<[f32; 65536]>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = Box::new([0.0f32; 65536]);
+        for (i, slot) in table.iter_mut().enumerate() {
+            *slot = ((i as f64 * std::f64::consts::PI * 2.0) / 65536.0).sin() as f32;
+        }
+        table
+    })
+}
+
+/// `Mth.sin`.
+pub fn mth_sin(value: f32) -> f32 {
+    sine_table()[((value * 10430.378) as i32 & 65535) as usize]
+}
+
+/// `Mth.cos`. The same table read a quarter turn along, which is why a carver
+/// that used `cos(x) = sin(x + PI/2)` would be a different world.
+pub fn mth_cos(value: f32) -> f32 {
+    sine_table()[(((value * 10430.378 + 16384.0) as i32) & 65535) as usize]
+}
