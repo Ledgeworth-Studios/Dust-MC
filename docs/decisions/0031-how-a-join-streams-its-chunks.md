@@ -10,6 +10,12 @@ settled player's chat round trip went from a worst case of **469, 298 and 697 ms
 over three runs to 20, 71 and 20 ms**, and from a third of its pings never
 coming back inside the window to all of them.
 
+**One number in this record has since been retracted** — the settled player's
+round trip, here and everywhere below it, was a measurement of the test harness
+rather than of this server. See
+[D42](0042-what-a-joining-crowd-costs-a-bystander.md). What the join does to a
+tokio worker stands; what it does to a bystander does not.
+
 It is **not uniformly better**: on a world read from region files, where a
 column was never expensive enough to be worth moving, four simultaneous joins
 now have a fatter tail. The last section says what that is and what is known
@@ -235,6 +241,15 @@ warming thread**. Most of what this section called a regression is a floor that
 four simultaneous joins impose on any world at all, and the pool is declined a
 second time because the count of stalls did not change when the build got 2.2x
 faster; only their length did.
+
+**Retracted by [D42](0042-what-a-joining-crowd-costs-a-bystander.md),
+2026-09-03.** There is no regression and no floor. Every bot in that harness
+lived in one node process, and a joiner's 289 chunk packets are parsed by
+prismarine on the node thread that receives them — so the settled player's
+round trip was timed by an event loop four joins had just filled. Given a
+process of its own the settler's worst round trip is **7 ms** on this world, and
+7 ms on the build before D38 as well. The numbers this section reports are the
+harness's, and so are the ones above about a settled player.
 
 **A cold generated join is still about 3.3 seconds of world arriving** at the
 terrain [D32](0032-what-the-ground-is-made-of.md) now generates, and almost all

@@ -674,6 +674,42 @@ It reports what it saw either way — packets, columns streamed, columns
 forgotten, keep-alives answered — because "it survived" with no numbers beside
 it is indistinguishable from "it sat there".
 
+## What a joining crowd does to somebody already there
+
+```
+node join.js 25565 4          # four joiners, a process each
+node join.js 25565 4 same     # every bot in this process
+```
+
+A settler joins, streams its whole view, then chats twenty times a second and
+times the round trip while four others join at the same moment. Its worst round
+trip across a fixed three-second window is the number.
+
+**The third argument is not a tuning knob, and it is the reason this file is
+worth reading.** A joiner receives 289 chunk packets at the default view
+distance, and prismarine parses every one of them on the node thread that
+receives it. With every bot in one process — which is what this harness did for
+its whole life — the settler's round trip is timed by an event loop that four
+joins have just filled with work. It reads as a server that stalls a bystander
+for a quarter of a second, and it reported that for two decision records.
+
+Same server, same commit, eight interleaved runs a row:
+
+| | median worst round trip | round trips over 50 ms |
+| --- | --- | --- |
+| `same` | 1,486 ms | 8 |
+| `each` | **7 ms** | **0** |
+
+`each` is also the *more* demanding arrangement — every joiner owns a thread to
+receive on, so all four finish their 289 columns sooner than in any other mode.
+The stall is not hidden by a slower test; it was never in the server. Decision
+record 0042 has the whole ladder, and `same` is kept only so that the retracted
+numbers can still be reproduced.
+
+The general form is worth carrying to the next harness: **a bot is a program,
+and a measurement taken inside it is a measurement of it.** When a check times
+one client while other clients are busy, ask what else is on that thread.
+
 ## Why the dependency is not in the licence gate
 
 `cargo xtask licenses` audits what a Dust *build* incorporates. This is a

@@ -19,6 +19,18 @@ line from **seven of twelve to three of twelve**.
 The measurement also overturned half of the question it was asked, and that is
 the more useful half. See "The floor nobody had measured".
 
+**Half of this record has since been retracted by
+[D42](0042-what-a-joining-crowd-costs-a-bystander.md), 2026-09-03**, and it is
+the player-facing half. Every bot in the harness lived in one node process, and
+a joiner's 289 chunk packets are parsed by prismarine on the node thread that
+receives them — so the settled player's chat round trip was timed by an event
+loop four joins had just filled. Measured from a process of its own, the
+settled player's worst round trip is **7 ms on this build and 7 ms on the build
+before it**, and there is no floor. What survives is everything this record
+measured about the server itself: the lock was six times wider than it needed
+to be, and narrowing it is worth 1,594 to 3,566 columns a second. The chat
+round trips below, and the flat world's "floor", are the harness.
+
 ## What was asked and why a running server could not answer it
 
 Two candidates, opposite fixes. If four joins queue behind the **single warming

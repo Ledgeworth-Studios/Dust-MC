@@ -46,6 +46,34 @@
 //!   mutex around a cache lookup and nothing else. The second control: it says
 //!   what column building looks like when the lock is not in the way.
 //!
+//! # The second question: what four joins cost after the column exists
+//!
+//! Decision record 0038 measured the first question and then overturned half
+//! of it. A **flat** world — one template column, no file, no residency and no
+//! lock — stalls a settled player as badly as a world read from region files,
+//! so most of what a bystander waits through is not the column at all. The
+//! ladder that followed, on the running server, says what it is: four joins
+//! 600 ms apart cost a settled player nothing (worst round trip 92 ms over
+//! eight runs) and the *same* 1,156 columns sent at the same moment cost up to
+//! 1,291 ms. It is simultaneity, not volume, and dropping the view distance
+//! from 8 to 2 — 25 columns a join instead of 289 — removes it entirely.
+//!
+//! So the last two rows are about the per-column work a session task does
+//! **after** the column is in hand, which is the part four joins do four times
+//! over in the same 700 ms:
+//!
+//! - **chunk packets, encode** — `play::chunk_packet` over the flat template.
+//! - **chunk packets, encode and frame** — the same, plus what `Conn::send`
+//!   does to it: the packet body encoded a second time and, above the 256-byte
+//!   threshold every chunk packet clears, zlib at level 6. The single named
+//!   change from the row above is *the framing*, so the gap between them is
+//!   the compression.
+//!
+//! Both are run at 1, 2, 4 and 8 threads for the same reason the region rows
+//! are: a path that scales is asking for cores, and a path that does not is
+//! holding something. Which of the two it is decides whether the answer is to
+//! do less work or to stop sharing something.
+//!
 //! Each row prints **throughput and the per-column latency distribution**,
 //! because the number under investigation is a tail. Throughput can be flat
 //! while p99 quadruples, and that is precisely the shape a queue has.
@@ -65,9 +93,23 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use dust_net::frame::{Compress, Frame, FrameEncoder, Limits};
+use dust_protocol::packets::play;
+use dust_protocol::wire::Writer;
+use dust_protocol::ProtocolVersion;
 use dust_server::net::source::{AnvilWorld, GeneratedColumns, RegistryNames, Source};
 use dust_server::net::world::{FlatWorld, Palette};
 use dust_world::coords::ChunkPos;
+
+/// The version everything on the wire is encoded for.
+const VERSION: ProtocolVersion = dust_protocol::version::V1_21_1;
+
+/// The compression threshold this server announces at login, in bytes.
+///
+/// Not a constant this bench chose: `login_flow::Config` defaults to 256 and
+/// nothing in the server changes it, and every chunk packet is far above it.
+/// It is here so that the row below compresses exactly what a session does.
+const COMPRESSION_THRESHOLD: usize = 256;
 
 /// How many columns a row builds, however many threads it splits them over.
 ///
@@ -103,6 +145,12 @@ fn main() {
     );
 
     control();
+
+    // The packet path, before either world: it needs no files and no data
+    // directory, so it runs on every machine this bench is run on, and it is
+    // the part a *flat* world still pays. See the module docs.
+    packets("chunk packets, encode", flat(), &columns, false);
+    packets("chunk packets, encode and frame", flat(), &columns, true);
 
     match std::env::var_os("DUST_BENCH_REGION").map(std::path::PathBuf::from) {
         Some(directory) => match RegistryNames::new() {
@@ -211,6 +259,102 @@ fn separate(name: &str, columns: &[ChunkPos], build: &dyn Fn() -> Source) {
         let worlds: Vec<Source> = (0..threads).map(|_| build()).collect();
         let row = run(threads, columns, |thread| &worlds[thread]);
         print_row(threads, &row, &mut alone);
+    }
+    println!();
+}
+
+/// What a session task pays per column **after** the column is in hand.
+///
+/// Every one of these is work the server does once per column per session, so
+/// four players joining the same place at the same moment do it four times
+/// over — and unlike the column itself, none of it is shared, cached or
+/// reused. The flat template is deliberate: it is the world where the column
+/// costs nothing, so whatever this row prints is the floor under every world.
+///
+/// With `frame`, the row adds exactly what `Conn::send` does — the body
+/// encoded again into a frame and then zlib level 6, because a chunk packet is
+/// far over the 256-byte threshold announced at login. The two rows differ in
+/// that one named thing.
+fn packets(name: &str, flat: FlatWorld, columns: &[ChunkPos], frame: bool) {
+    if frame {
+        // What one column costs on the wire, printed because the CPU number
+        // alone cannot say whether a burst is bounded by cores or by bytes.
+        let mut encoder = FrameEncoder::new(Limits::default());
+        encoder.set_compression(Compress::At {
+            threshold: COMPRESSION_THRESHOLD,
+        });
+        let packet: play::clientbound::Packet =
+            dust_server::net::play::chunk_packet(flat.column(), ChunkPos::new(0, 0), VERSION)
+                .expect("a flat column encodes")
+                .into();
+        let mut body = Writer::default();
+        packet
+            .encode_body(&mut body, VERSION)
+            .expect("a flat column encodes");
+        let wire = Frame::new(
+            packet.protocol_id(VERSION).expect("a known packet") as i32,
+            body.into_bytes(),
+        );
+        let mut out = Vec::new();
+        encoder.encode(&wire, &mut out).expect("a frame encodes");
+        println!(
+            "\none flat column frames to {} bytes on the wire",
+            out.len()
+        );
+    }
+    heading(name);
+    let mut alone = None;
+    for threads in THREADS {
+        let at = Instant::now();
+        let mut latencies: Vec<Duration> = std::thread::scope(|scope| {
+            let flat = &flat;
+            let handles: Vec<_> = (0..threads)
+                .map(|thread| {
+                    scope.spawn(move || {
+                        // One encoder per thread, as one per connection is what
+                        // the server has. A shared one would be measuring a
+                        // lock this server does not own.
+                        let mut encoder = FrameEncoder::new(Limits::default());
+                        encoder.set_compression(Compress::At {
+                            threshold: COMPRESSION_THRESHOLD,
+                        });
+                        let mut out = Vec::with_capacity(1 << 16);
+                        let mut mine = Vec::with_capacity(columns.len() / threads + 1);
+                        for pos in columns.iter().skip(thread).step_by(threads) {
+                            let started = Instant::now();
+                            let packet: play::clientbound::Packet =
+                                dust_server::net::play::chunk_packet(flat.column(), *pos, VERSION)
+                                    .expect("a flat column encodes")
+                                    .into();
+                            if frame {
+                                let mut body = Writer::default();
+                                packet
+                                    .encode_body(&mut body, VERSION)
+                                    .expect("a flat column encodes");
+                                let wire = Frame::new(
+                                    packet.protocol_id(VERSION).expect("a known packet") as i32,
+                                    body.into_bytes(),
+                                );
+                                out.clear();
+                                encoder.encode(&wire, &mut out).expect("a frame encodes");
+                                std::hint::black_box(out.len());
+                            } else {
+                                std::hint::black_box(&packet);
+                            }
+                            mine.push(started.elapsed());
+                        }
+                        mine
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+        let wall = at.elapsed();
+        latencies.sort_unstable();
+        print_row(threads, &Row { wall, latencies }, &mut alone);
     }
     println!();
 }
