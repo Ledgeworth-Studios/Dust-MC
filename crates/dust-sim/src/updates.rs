@@ -32,6 +32,14 @@
 //! multiface lichen, a crop that also wants light, a piston head. Those never
 //! break, which is the safe direction and is stated in decision record 0040.
 //!
+//! * [`LEAF_DISTANCE`] — one column, 280 states, saying that a state carries a
+//!   leaf's `distance`. The number itself is a property of the state and is in
+//!   the protocol table both sides already share; the column is what says the
+//!   number *means* a leaf's reach, which matters because scaffolding has a
+//!   `distance` too and it means something else entirely. The block oracle
+//!   checks that Minecraft's own `getOptionalDistanceAt` and the property
+//!   agree for all 280 before writing the column.
+//!
 //! # What counts as holding a block up, and why it is not the sturdy column
 //!
 //! The obvious rule is that the supporting face has to be *sturdy*, which the
@@ -72,6 +80,67 @@ pub const SUPPORT: [&str; 6] = [
 /// The constants column that says a state falls when nothing is under it.
 pub const FALLS: &str = "falls";
 
+/// The constants column that says a state carries a leaf's `distance`.
+///
+/// 280 of 26,684 states: ten leaf blocks, seven distances, persistent or not,
+/// waterlogged or not.
+pub const LEAF_DISTANCE: &str = "LEAF_DISTANCE";
+
+/// The block tag whose members count as a leaf's distance zero.
+///
+/// The half of `LeavesBlock.getOptionalDistanceAt` the block oracle cannot
+/// answer, because a tag's contents come from a data pack and the oracle runs
+/// Minecraft's static initialisation with no server and no pack loaded. It
+/// prints `log_states=0` and that zero is the evidence. Taken from the tag
+/// table instead, which is extracted data and is where a tag belongs.
+pub const LOGS: &str = "minecraft:logs";
+
+/// How far a leaf may be from a log before it comes down.
+///
+/// `BlockStateProperties.DISTANCE` is `1..=7` and Minecraft's own
+/// `updateDistance` starts its minimum at seven, so seven is both the largest
+/// value and the one that means "no log found".
+pub const LEAF_REACH: u8 = 7;
+
+/// The seven values `distance` takes, so the relabel is an index and not a
+/// formatted string on a path that runs once per leaf of every felled tree.
+const DISTANCES: [&str; 8] = ["0", "1", "2", "3", "4", "5", "6", "7"];
+
+/// Which blocks Minecraft counts as a log, by `Block::protocol_id`.
+///
+/// Resolved once. `minecraft:logs` names no block directly — it is three
+/// other tags, one of which is four more — so this is a transitive walk, and
+/// a walk done per leaf per tick would be the whole cost of felling a tree.
+fn logs() -> &'static [bool] {
+    static LOGS_BY_BLOCK: std::sync::OnceLock<Box<[bool]>> = std::sync::OnceLock::new();
+    LOGS_BY_BLOCK.get_or_init(|| {
+        let mut set = vec![false; dust_registry::Block::all().count()].into_boxed_slice();
+        let mut stack = vec![LOGS];
+        let mut seen: Vec<&str> = Vec::new();
+        while let Some(id) = stack.pop() {
+            if seen.contains(&id) {
+                continue;
+            }
+            seen.push(id);
+            let Some(tag) =
+                dust_registry::tags::from_id(dust_registry::tags::TagRegistry::Block, id)
+            else {
+                continue;
+            };
+            for member in tag.members {
+                if let Some(referenced) = member.strip_prefix('#') {
+                    stack.push(referenced);
+                } else if let Some(block) = dust_registry::Block::from_name(member) {
+                    if let Some(slot) = set.get_mut(block.protocol_id() as usize) {
+                        *slot = true;
+                    }
+                }
+            }
+        }
+        set
+    })
+}
+
 /// What the world should do about a cell whose surroundings just changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reaction {
@@ -82,6 +151,13 @@ pub enum Reaction {
     Break,
     /// Nothing is holding it up: it becomes a falling entity.
     Fall,
+    /// A leaf that is a different distance from the nearest log than its own
+    /// state says. Put this state in its place; the write queues the cell
+    /// again, and the pass after that is what notices it has reached seven.
+    Relabel(BlockState),
+    /// A leaf with no log within seven, which comes down on a tick of its own
+    /// rather than at once — see the delay the caller draws.
+    Decay,
 }
 
 /// The rules, bound to one operator's constants table.
@@ -100,6 +176,10 @@ pub struct Rules<'a> {
     /// `None` for a table written before the column: nothing falls, rather
     /// than everything falling or a guess about which.
     falls: Option<Flag>,
+    /// `None` for a table written before the column: no leaf ever decays,
+    /// rather than every leaf decaying because a missing column reads as
+    /// distance seven. This is the direction that keeps a player's tree house.
+    leaf: Option<Flag>,
 }
 
 impl<'a> Rules<'a> {
@@ -123,6 +203,7 @@ impl<'a> Rules<'a> {
             alone,
             support,
             falls: constants.flag(FALLS),
+            leaf: constants.flag(LEAF_DISTANCE),
         })
     }
 
@@ -133,7 +214,65 @@ impl<'a> Rules<'a> {
     /// that almost every neighbour of almost every edit actually is.
     #[must_use]
     pub fn reacts(&self, state: BlockState) -> bool {
-        !self.survives_alone(state) || self.falls(state)
+        !self.survives_alone(state) || self.falls(state) || self.is_leaf(state)
+    }
+
+    /// Whether this state is a leaf — one that carries a `distance` counted up
+    /// from the nearest log.
+    #[must_use]
+    pub fn is_leaf(&self, state: BlockState) -> bool {
+        self.leaf
+            .is_some_and(|flag| self.constants.is_set(flag, state.id()))
+    }
+
+    /// How far Minecraft counts this state as being from a log.
+    ///
+    /// `LeavesBlock.getOptionalDistanceAt`, in both its halves: zero for a
+    /// log, the leaf's own `distance` for a leaf, and `None` for everything
+    /// else — which `updateDistance` treats as [`LEAF_REACH`].
+    #[must_use]
+    pub fn distance_from_log(&self, state: BlockState) -> Option<u8> {
+        if logs()
+            .get(state.block().protocol_id() as usize)
+            .copied()
+            .unwrap_or(false)
+        {
+            return Some(0);
+        }
+        if !self.is_leaf(state) {
+            return None;
+        }
+        state.property("distance").and_then(|d| d.parse().ok())
+    }
+
+    /// Whether this leaf was put here by a player rather than grown.
+    ///
+    /// A `persistent` leaf never decays however far it is from a log, which is
+    /// every leaf a player has ever placed by hand and the reason a hedge does
+    /// not evaporate.
+    #[must_use]
+    fn persistent(&self, state: BlockState) -> bool {
+        state.property("persistent") == Some("true")
+    }
+
+    /// What `distance` this cell's neighbours say it should hold.
+    ///
+    /// Minecraft's `updateDistance`: start at seven and take the smallest
+    /// neighbour's answer plus one. Six reads, and it runs only for the 280
+    /// states that are leaves.
+    #[must_use]
+    fn leaf_distance(&self, around: Around) -> u8 {
+        let mut nearest = LEAF_REACH;
+        for side in Face::ALL {
+            let Some(theirs) = self.distance_from_log(around.at(side)) else {
+                continue;
+            };
+            nearest = nearest.min(theirs.saturating_add(1));
+            if nearest == 1 {
+                break;
+            }
+        }
+        nearest
     }
 
     /// Whether this state needs nothing beside it.
@@ -197,6 +336,17 @@ impl<'a> Rules<'a> {
         if self.falls(state) && self.free(around.at(Face::Down)) {
             return Reaction::Fall;
         }
+        if self.is_leaf(state) {
+            let want = self.leaf_distance(around);
+            if state.property("distance") != DISTANCES.get(want as usize).copied() {
+                if let Some(next) = state.with("distance", DISTANCES[want as usize]) {
+                    return Reaction::Relabel(next);
+                }
+            }
+            if want == LEAF_REACH && !self.persistent(state) {
+                return Reaction::Decay;
+            }
+        }
         Reaction::Stay
     }
 }
@@ -216,9 +366,9 @@ mod tests {
             header.push('\t');
             header.push_str(column);
         }
-        header.push_str("\tfalls\n");
-        let mut set: Vec<[bool; 8]> =
-            vec![[true, false, false, false, false, false, false, false]; states];
+        header.push_str("\tfalls\tLEAF_DISTANCE\n");
+        let mut set: Vec<[bool; 9]> =
+            vec![[true, false, false, false, false, false, false, false, false]; states];
         let mut replaceable = vec![false; states];
         replaceable[Block::from_name("minecraft:air")
             .unwrap()
@@ -231,6 +381,7 @@ mod tests {
                     let at = match *column {
                         "SURVIVES_ALONE" => 0,
                         "falls" => 7,
+                        "LEAF_DISTANCE" => 8,
                         other => {
                             1 + SUPPORT
                                 .iter()
@@ -249,7 +400,7 @@ mod tests {
         let mut out = header;
         for (id, flags) in set.iter().enumerate() {
             out.push_str(&format!(
-                "{id}\t0\t0\t0\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{id}\t0\t0\t0\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 u8::from(replaceable[id]),
                 u8::from(flags[0]),
                 u8::from(flags[1]),
@@ -259,9 +410,52 @@ mod tests {
                 u8::from(flags[5]),
                 u8::from(flags[6]),
                 u8::from(flags[7]),
+                u8::from(flags[8]),
             ));
         }
+        TABLE_TEXT.with(|text| *text.borrow_mut() = out.clone());
         BlockConstants::parse(&out).expect("the table this test wrote parses")
+    }
+
+    /// The same table with the leaf column cut out of it, which is what an
+    /// operator running a table extracted before this landed hands the server.
+    ///
+    /// A column cut and not a column of zeroes, and the difference is the
+    /// whole test: the first version of the check below asked `table(&[])`
+    /// for a canopy and passed with the mutation that makes a missing column
+    /// mean *every* state is a leaf, because that helper writes the column
+    /// whatever is in it.
+    fn table_without_leaves() -> BlockConstants {
+        let _ = table(&[]);
+        let full = TABLE_TEXT.with(|text| text.borrow().clone());
+        let mut out = String::new();
+        for line in full.lines() {
+            // `LEAF_DISTANCE` is the last column the helper writes.
+            out.push_str(line.rsplit_once('\t').map_or(line, |(head, _)| head));
+            out.push('\n');
+        }
+        BlockConstants::parse(&out).expect("a table one column narrower still parses")
+    }
+
+    thread_local! {
+        /// The text the last `table` call wrote, so a case can hand the parser
+        /// a narrower version of the same thing.
+        static TABLE_TEXT: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    }
+
+    /// A table in which oak leaves are leaves and nothing else is.
+    fn canopy() -> BlockConstants {
+        table(&[("minecraft:oak_leaves", &["LEAF_DISTANCE"])])
+    }
+
+    /// A leaf at one particular distance, placed rather than grown unless
+    /// `grown`.
+    fn leaf(distance: &str, grown: bool) -> BlockState {
+        state("minecraft:oak_leaves")
+            .with("distance", distance)
+            .expect("oak leaves carry a distance")
+            .with("persistent", if grown { "false" } else { "true" })
+            .expect("oak leaves carry a persistent")
     }
 
     fn state(name: &str) -> BlockState {
@@ -382,5 +576,100 @@ mod tests {
         let rules = Rules::from_constants(&table).expect("the columns are there");
         assert!(rules.free(air()));
         assert!(!rules.free(state("minecraft:stone")));
+    }
+
+    #[test]
+    fn a_leaf_touching_a_log_is_one_away_from_it() {
+        let table = canopy();
+        let rules = Rules::from_constants(&table).expect("the columns are there");
+        let far = leaf("7", true);
+        assert!(rules.reacts(far));
+        assert_eq!(
+            rules.reaction(far, around_with(Face::North, state("minecraft:oak_log"))),
+            Reaction::Relabel(leaf("1", true))
+        );
+    }
+
+    #[test]
+    fn a_leaf_counts_up_from_the_leaf_beside_it() {
+        let table = canopy();
+        let rules = Rules::from_constants(&table).expect("the columns are there");
+        assert_eq!(
+            rules.reaction(leaf("7", true), around_with(Face::West, leaf("3", true))),
+            Reaction::Relabel(leaf("4", true))
+        );
+        // Already right, so nothing to write. This is the row that stops the
+        // cascade, and without it a canopy relabels itself for ever.
+        assert_eq!(
+            rules.reaction(leaf("4", true), around_with(Face::West, leaf("3", true))),
+            Reaction::Stay
+        );
+    }
+
+    #[test]
+    fn a_leaf_with_no_tree_left_comes_down() {
+        let table = canopy();
+        let rules = Rules::from_constants(&table).expect("the columns are there");
+        assert_eq!(
+            rules.reaction(leaf("7", true), Around::empty()),
+            Reaction::Decay
+        );
+    }
+
+    #[test]
+    fn a_leaf_a_player_put_there_stays_for_ever() {
+        let table = canopy();
+        let rules = Rules::from_constants(&table).expect("the columns are there");
+        // Same cell, same emptiness, opposite answer: `persistent` is the
+        // whole difference between a canopy and a hedge.
+        assert_eq!(
+            rules.reaction(leaf("7", false), Around::empty()),
+            Reaction::Stay
+        );
+    }
+
+    #[test]
+    fn a_block_with_a_distance_that_is_not_a_leafs_is_not_read_as_one() {
+        let table = canopy();
+        let rules = Rules::from_constants(&table).expect("the columns are there");
+        // Scaffolding carries a `distance` property too, counted from a
+        // different thing and starting at zero. Reading the property instead
+        // of asking the column would make a scaffold read as a log and hold a
+        // whole canopy up.
+        let scaffold = state("minecraft:scaffolding")
+            .with("distance", "0")
+            .expect("scaffolding carries a distance");
+        assert!(!rules.is_leaf(scaffold));
+        assert_eq!(rules.distance_from_log(scaffold), None);
+        assert_eq!(
+            rules.reaction(leaf("7", true), around_with(Face::Up, scaffold)),
+            Reaction::Decay
+        );
+    }
+
+    #[test]
+    fn a_log_is_zero_away_from_itself_and_the_column_never_says_so() {
+        let table = canopy();
+        let rules = Rules::from_constants(&table).expect("the columns are there");
+        let log = state("minecraft:oak_log");
+        // The half the block oracle cannot answer: it runs with no data pack,
+        // so the log tag it consults is empty and it writes 0 in this column
+        // for every log in the game. The tag table is where this comes from.
+        assert!(!rules.is_leaf(log));
+        assert_eq!(rules.distance_from_log(log), Some(0));
+        assert_eq!(
+            rules.distance_from_log(state("minecraft:warped_stem")),
+            Some(0)
+        );
+        assert_eq!(rules.distance_from_log(state("minecraft:stone")), None);
+    }
+
+    #[test]
+    fn a_table_with_no_leaf_column_leaves_the_canopy_where_it_is() {
+        let table = table_without_leaves();
+        let rules = Rules::from_constants(&table).expect("the columns are there");
+        let far = leaf("7", true);
+        assert!(!rules.reacts(far));
+        assert_eq!(rules.reaction(far, Around::empty()), Reaction::Stay);
     }
 }

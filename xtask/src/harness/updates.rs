@@ -128,10 +128,38 @@ pub fn run(options: &Options) -> std::process::ExitCode {
     let mut kept_wrongly = 0usize;
     let mut broke_wrongly = 0usize;
     let mut unreadable = 0usize;
+    let mut arena = 0usize;
     // Which blocks disagree, and about which faces.
     let mut worklist: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
+    // A shell that refused the block on all six sides did not measure a
+    // support rule; it measured the arena. `/setblock` places a state without
+    // asking `canSurvive`, so a dandelion can be stood on stone and then dies
+    // at the first update whichever side moved. Six of six is the signature,
+    // because no state in 1.21.1 needs all six of its neighbours, and the
+    // block that made this visible is a flower that scored five disagreements
+    // in stone and six agreements in dirt.
+    let refusing: std::collections::BTreeSet<(String, String)> = {
+        let mut broke: BTreeMap<(String, String), (usize, usize)> = BTreeMap::new();
+        for row in &rows {
+            let entry = broke
+                .entry((row.block.clone(), row.shell.clone()))
+                .or_default();
+            entry.0 += 1;
+            entry.1 += usize::from(row.broke);
+        }
+        broke
+            .into_iter()
+            .filter(|(_, (seen, broke))| *seen == Face::ALL.len() && seen == broke)
+            .map(|(key, _)| key)
+            .collect()
+    };
+
     for row in &rows {
+        if refusing.contains(&(row.block.clone(), row.shell.clone())) {
+            arena += 1;
+            continue;
+        }
         let Some(state) = parse_state(&row.stood) else {
             unreadable += 1;
             continue;
@@ -189,6 +217,12 @@ pub fn run(options: &Options) -> std::process::ExitCode {
     }
     if skipped > 0 {
         println!("  {skipped} row(s) the server reshaped rather than broke, which is D14's rule");
+    }
+    if arena > 0 {
+        println!(
+            "  {arena} row(s) in a shell that refused the block on all six sides, \
+             which is the arena and not a rule"
+        );
     }
     if rules.is_none() {
         println!(

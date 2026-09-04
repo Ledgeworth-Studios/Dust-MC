@@ -113,6 +113,31 @@ public final class BlockOracle {
         Class<?> fallingBlock = names.type("falling_block.class");
         Support support = new Support(names, emptyLevel, registry, getBlock);
 
+        // How far a leaf is from the nearest log, which is what decides
+        // whether a felled tree's canopy stays in the air.
+        //
+        // `getOptionalDistanceAt` is Minecraft's own whole relation: zero for
+        // anything in `BlockTags.LOGS`, the state's own `distance` for a leaf,
+        // and absent for everything else. **It answers only half of that here,
+        // and the half it drops is silent.** This oracle runs Minecraft's
+        // static initialisation and nothing else, and a block tag's contents
+        // arrive from the data pack when a server loads one — so
+        // `BlockTags.LOGS` is empty, every log falls through to the property
+        // test, and every log is reported as having no answer. The count
+        // printed as `log_states` is what says so: it is zero, and a rule that
+        // read this column alone would put every leaf in the world at distance
+        // seven and decay the tree it is still attached to. Dust takes the log
+        // half from its own tag table, which is data and is extracted, and
+        // this column carries the half that is Java.
+        //
+        // The number itself, where there is one, is a property of the state
+        // and is already in the protocol table both sides share, so one flag
+        // column carries the whole of what is left. The extractor checks that
+        // claim below rather than assuming it.
+        Method optionalDistanceAt = names.method(
+            "leaves_block.class", "leaves_block.optional_distance_at",
+            names.type("blockstate.concrete_class"));
+
         // Whether the state has a full square face on each of the six sides,
         // which is what a fence, a wall and a glass pane ask of the block
         // beside them before they grow an arm towards it. It is the block's
@@ -150,6 +175,9 @@ public final class BlockOracle {
         int sturdyFaces = 0;
         int falling = 0;
         int needsSupport = 0;
+        int leaves = 0;
+        int logs = 0;
+        int distanceDisagreed = 0;
         try (BufferedWriter out = Files.newBufferedWriter(Path.of(args[1]))) {
             StringBuilder header = new StringBuilder(
                 "# state_id\topacity\temission\tocclude\treplaceable"
@@ -161,7 +189,7 @@ public final class BlockOracle {
             for (String side : sideNames) {
                 header.append('\t').append(side);
             }
-            header.append("\tfalls\tSURVIVES_ALONE");
+            header.append("\tfalls\tLEAF_DISTANCE\tSURVIVES_ALONE");
             for (String side : Support.COLUMNS) {
                 header.append('\t').append(side);
             }
@@ -202,6 +230,25 @@ public final class BlockOracle {
                 if (falls) {
                     falling++;
                 }
+                java.util.OptionalInt distance =
+                    (java.util.OptionalInt) optionalDistanceAt.invoke(null, state);
+                boolean known = distance.isPresent();
+                boolean zero = known && distance.getAsInt() == 0;
+                row.append('\t').append(known && !zero ? 1 : 0);
+                if (zero) {
+                    logs++;
+                } else if (known) {
+                    leaves++;
+                    // The claim the two columns rest on: where Minecraft has a
+                    // non-zero answer, that answer is the state's own
+                    // `distance` property, which the Rust side already has out
+                    // of the protocol table. If a version ever makes those two
+                    // different this says so instead of Dust quietly
+                    // restating a rule that has stopped being true.
+                    if (distance.getAsInt() != leafDistanceProperty(state)) {
+                        distanceDisagreed++;
+                    }
+                }
                 boolean[] survives = support.of(state);
                 for (boolean answer : survives) {
                     row.append('\t').append(answer ? 1 : 0);
@@ -218,11 +265,46 @@ public final class BlockOracle {
         System.out.println("sturdy_faces=" + sturdyFaces);
         System.out.println("falling_states=" + falling);
         System.out.println("needs_support=" + needsSupport);
+        System.out.println("leaf_states=" + leaves);
+        // Expected to be zero, and it is the evidence for the note above: a
+        // bare static initialisation has loaded no data pack, so the log tag
+        // `getOptionalDistanceAt` consults is empty. Printed rather than
+        // asserted because a version that made it non-zero would be telling
+        // this oracle something true and new.
+        System.out.println("log_states=" + logs);
+        System.out.println("leaf_distance_disagreed=" + distanceDisagreed);
         System.out.println("unaskable_probes=" + support.unaskable());
         System.out.println("unsupported_states=" + support.unsupported());
         System.out.println("sound_groups=" + sounds.seen());
         System.out.println("items=" + writeItems(names, Path.of(args[2])));
         System.out.println("blocks=" + writeBlocks(names, Path.of(args[3])));
+    }
+
+    /**
+     * The `distance` a state's own properties say it is at.
+     *
+     * Read off `toString`, which is the one name on a Minecraft class that
+     * obfuscation cannot take away, and used for one purpose: to check that
+     * Minecraft's `getOptionalDistanceAt` and the state's own property agree,
+     * so that the Rust side may read the number out of the protocol table it
+     * already has instead of being handed a third column. `-1` where there is
+     * no such property, which makes a disagreement rather than hiding one.
+     */
+    private static int leafDistanceProperty(Object state) {
+        String text = state.toString();
+        int at = text.indexOf("distance=");
+        if (at < 0) {
+            return -1;
+        }
+        int end = at + "distance=".length();
+        int stop = end;
+        while (stop < text.length() && Character.isDigit(text.charAt(stop))) {
+            stop++;
+        }
+        if (stop == end) {
+            return -1;
+        }
+        return Integer.parseInt(text.substring(end, stop));
     }
 
     /**

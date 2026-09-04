@@ -717,6 +717,32 @@ pub const LIGHT_ORACLE: &[Wanted<'static>] = &[
         method: "getBlock",
         parameters: &[],
     },
+    // **How far a leaf is from the nearest log.** A felled tree leaves a
+    // canopy that has to go, and what decides it is `distance`, which counts
+    // up from a log and stops at seven. `LeavesBlock.getOptionalDistanceAt` is
+    // the whole relation in one static method: zero for anything in
+    // `BlockTags.LOGS`, the state's own `distance` for a leaf, and absent for
+    // everything else. Asking Minecraft for it rather than writing it out is
+    // the difference between reading the rule and extracting it — and the tag
+    // half in particular is a data-pack list this repository must not hold.
+    Wanted::Class {
+        key: "leaves_block.class",
+        class: LEAVES_BLOCK,
+    },
+    // `BlockState` and not `BlockBehaviour$BlockStateBase`, which is what
+    // every other entry here means by a state. They are different classes —
+    // the second is the base the first extends — and a method *declared* as
+    // taking the first cannot be found by the name of the second.
+    Wanted::Class {
+        key: "blockstate.concrete_class",
+        class: BLOCK_STATE,
+    },
+    Wanted::Method {
+        key: "leaves_block.optional_distance_at",
+        class: LEAVES_BLOCK,
+        method: "getOptionalDistanceAt",
+        parameters: &[BLOCK_STATE],
+    },
 ];
 
 const BLOCK_STATE_BASE: &str =
@@ -724,6 +750,8 @@ const BLOCK_STATE_BASE: &str =
 const BLOCK_GETTER: &str = "net.minecraft.world.level.BlockGetter";
 const LEVEL_READER: &str = "net.minecraft.world.level.LevelReader";
 const FALLING_BLOCK: &str = "net.minecraft.world.level.block.FallingBlock";
+const LEAVES_BLOCK: &str = "net.minecraft.world.level.block.LeavesBlock";
+const BLOCK_STATE: &str = "net.minecraft.world.level.block.state.BlockState";
 const BLOCK_POS: &str = "net.minecraft.core.BlockPos";
 const DIRECTION: &str = "net.minecraft.core.Direction";
 const EMPTY_BLOCK_GETTER: &str = "net.minecraft.world.level.EmptyBlockGetter";

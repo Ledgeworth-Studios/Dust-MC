@@ -33,6 +33,16 @@
 //! that answers yes to [`Rules::reacts`](dust_sim::updates::Rules::reacts)
 //! pays for the six reads that build its neighbourhood.
 //!
+//! # Leaves, which are the reason the queue has to cascade at all
+//!
+//! Everything else here is a rule about one cell and its six neighbours. A
+//! leaf is not: it holds a `distance` counted up from the nearest log, and
+//! felling a trunk changes that number for a canopy of a hundred cells, each
+//! of which learns it from the one beside it. That is why the queue exists in
+//! the shape it does — a relabelled leaf is written like any other block, and
+//! the write queues its own six neighbours, so the front spreads outward and
+//! stops on its own when a distance stops changing.
+//!
 //! # Scheduled ticks, which the save format now has to carry
 //!
 //! Sand does not fall the instant its support goes: vanilla schedules a tick
@@ -76,6 +86,34 @@ pub const MAX_PENDING: usize = 16_384;
 /// How many ticks after its support goes before a block starts to fall.
 /// Vanilla's `FallingBlock` tick delay.
 pub const FALL_DELAY: u64 = 2;
+
+/// The chance, per tick, that Minecraft looks at any one decaying leaf.
+///
+/// Vanilla decides a leaf's fate on a **random tick**: three positions are
+/// drawn out of each sixteen-cubed section every tick, so a given cell is
+/// looked at with probability three in 4,096 and a leaf that has lost its
+/// tree waits a mean of 1,365 ticks — about a minute — before it goes. That
+/// wait is the whole look of a felled tree, and it is why this is not done
+/// the instant the log goes: a canopy that vanishes with the trunk reads as
+/// the block having been part of the trunk, and one that pops out over a
+/// minute reads as a tree dying.
+///
+/// Dust has no random ticking and this does not add one. A random tick over
+/// every loaded section is an O(loaded world) step run twenty times a second
+/// whose only caller here would be a few hundred leaves; drawing each leaf's
+/// wait from the same geometric distribution the moment it becomes decayable
+/// gives a player the identical thing to look at and costs one draw per leaf.
+/// That is the second decision-rule priority deciding between two options the
+/// first cannot tell apart.
+pub const DECAY_CHANCE: (u64, u64) = (3, 4_096);
+
+/// The longest a leaf may be made to wait, in ticks. Five minutes.
+///
+/// A geometric draw has no upper bound, and a leaf scheduled an hour out is an
+/// entry held for an hour. The tail past five minutes is 1.2% of leaves, and
+/// by then the tree has been gone for four and a half minutes and nobody is
+/// watching the last of it.
+pub const DECAY_HORIZON: u64 = 6_000;
 
 /// Cells whose surroundings changed and that nobody has looked at yet.
 ///
@@ -272,7 +310,13 @@ impl Spill<'_> {
                 item: held.map(|stack| stack.item),
                 enchantments: &enchantments,
             },
-            broken_by_entity: true,
+            // Whether anybody broke it. `held` is the stack that did, and is
+            // `None` exactly when the world decided: a torch that fell off a
+            // wall, a leaf that ran out of tree, a falling block that could
+            // not land. Saying `true` there would let a loot condition that
+            // asks whether an entity did this answer yes for a break nobody
+            // made.
+            broken_by_entity: held.is_some(),
             neighbours: &around,
         };
         let mut rolled = Vec::new();
@@ -334,6 +378,10 @@ pub struct Counts {
     pub landed: u64,
     /// Falling entities that could not, and spilled as an item instead.
     pub spilled: u64,
+    /// Leaves given a new `distance` because the nearest log moved.
+    pub relabelled: u64,
+    /// Leaves that ran out of tree and came down.
+    pub decayed: u64,
 }
 
 impl std::fmt::Debug for WorldTicker {
@@ -384,6 +432,23 @@ impl WorldTicker {
         self.counts
     }
 
+    /// How long this leaf waits before it comes down.
+    ///
+    /// A geometric draw with [`DECAY_CHANCE`], which is the distribution a
+    /// random tick produces, so a canopy goes the way a canopy goes rather
+    /// than all at once. The float is here and not in a tick loop: this runs
+    /// once for each leaf that loses its tree and never per tick.
+    fn decay_delay(&mut self) -> u64 {
+        #[allow(clippy::cast_precision_loss)]
+        let uniform =
+            ((self.next_seed() >> 11) as f64 / (1u64 << 53) as f64).max(f64::MIN_POSITIVE);
+        #[allow(clippy::cast_precision_loss)]
+        let chance = DECAY_CHANCE.0 as f64 / DECAY_CHANCE.1 as f64;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let ticks = (uniform.ln() / (1.0 - chance).ln()).ceil() as u64;
+        ticks.clamp(1, DECAY_HORIZON)
+    }
+
     fn next_seed(&mut self) -> u64 {
         self.seed = self
             .seed
@@ -418,6 +483,18 @@ impl WorldTicker {
         self.spill()
             .at(at, state, &[(-1i8, below), (1i8, above)], None, seed);
         self.counts.broken += 1;
+    }
+
+    /// Write a leaf's new distance from the nearest log.
+    ///
+    /// The write queues this cell and its six neighbours like any other, which
+    /// is the whole of the cascade: a felled trunk relabels the ring of leaves
+    /// touching it, each of those relabels the ring beyond, and the front
+    /// stops when a distance stops changing. Nothing here needs to know how
+    /// big the canopy is.
+    fn relabel(&mut self, at: Position, next: dust_registry::BlockState) {
+        self.world.set_block(at, next.id());
+        self.counts.relabelled += 1;
     }
 
     /// Turn a cell into a falling entity, or leave it alone if it cannot be.
@@ -509,8 +586,21 @@ impl crate::participant::TickParticipant for WorldTicker {
                     continue;
                 };
                 let around = self.world.around(at);
-                if rules.reaction(state, around) == Reaction::Fall {
-                    self.launch(at, id);
+                // The whole question again rather than only the one that was
+                // asked when this was scheduled. A cell whose support came
+                // back in the two ticks it waited should stay, and a leaf
+                // whose tree was replanted in the minute it waited should
+                // stay: re-asking is what makes the delay a pause rather than
+                // a decision already taken.
+                match rules.reaction(state, around) {
+                    Reaction::Stay => {}
+                    Reaction::Break => self.topple(at, id),
+                    Reaction::Fall => self.launch(at, id),
+                    Reaction::Relabel(next) => self.relabel(at, next),
+                    Reaction::Decay => {
+                        self.topple(at, id);
+                        self.counts.decayed += 1;
+                    }
                 }
             }
             self.batch = batch;
@@ -537,6 +627,12 @@ impl crate::participant::TickParticipant for WorldTicker {
                 // Not now: vanilla waits two ticks, and that pause is what
                 // makes a column of sand collapse like sand.
                 Reaction::Fall => self.schedule.at(ctx.tick_index + FALL_DELAY, at),
+                Reaction::Relabel(next) => self.relabel(at, next),
+                // Not now either, and for longer: see `decay_delay`.
+                Reaction::Decay => {
+                    let delay = self.decay_delay();
+                    self.schedule.at(ctx.tick_index + delay, at);
+                }
             }
         }
         self.batch = batch;
