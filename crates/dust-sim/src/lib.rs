@@ -22,9 +22,11 @@ pub mod crafting;
 pub mod drops;
 pub mod mining;
 pub mod placement;
+pub mod updates;
 
 pub use cooking::{Cooked, Cooking, Fire};
 pub use crafting::{Recipe, Recipes};
 pub use drops::{compile, Break, Drop, Rng, Table, Tables, Tool};
 pub use mining::{tool_is_correct, Digger, Progress};
 pub use placement::{replaces_beside, replaces_clicked, state_for, state_for_item, Click, Face};
+pub use updates::{Reaction, Rules};

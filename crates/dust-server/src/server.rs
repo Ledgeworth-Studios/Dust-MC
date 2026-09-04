@@ -446,6 +446,10 @@ pub struct Server {
     /// The furnaces' ticker, stashed for the same reason: it needs the world,
     /// which the bind phase builds, and it runs in the tick phase.
     furnace_ticker: Option<Box<dyn crate::participant::TickParticipant>>,
+    /// Block updates: what cannot stay, what falls, and what lands. Built and
+    /// inserted in the same two phases and for the same reason as the item
+    /// physics beside it.
+    world_ticker: Option<Box<dyn crate::participant::TickParticipant>>,
 }
 
 /// What the teardown has to write out.
@@ -494,6 +498,7 @@ impl Server {
             saveable: None,
             item_ticker: None,
             furnace_ticker: None,
+            world_ticker: None,
         }
     }
 
@@ -581,6 +586,9 @@ impl Server {
             &config,
             &tasks::WorkCharger::from_option(self.options.virtual_work_clock.clone()),
         );
+        if let Some(ticker) = self.world_ticker.take() {
+            participants.insert(ticker);
+        }
         if let Some(ticker) = self.item_ticker.take() {
             participants.insert(ticker);
         }
@@ -1052,6 +1060,7 @@ impl Server {
         let recipes = std::sync::Arc::new(recipes);
         let cooking = std::sync::Arc::new(cooking);
         let items: std::sync::Arc<crate::net::items::ItemWorld> = std::sync::Arc::default();
+        let falling: std::sync::Arc<crate::net::falling::FallingWorld> = std::sync::Arc::default();
 
         let opacity = crate::net::world::opacity_of(palette.air, constants.as_ref());
         // Shared rather than moved: the world lights and heightmaps with this
@@ -1378,6 +1387,10 @@ impl Server {
             item_entity_type: crate::net::play::item_entity_type().ok_or_else(|| {
                 fail("the generated entity table has no minecraft:item".to_owned())
             })?,
+            falling_entity_type: crate::net::play::falling_entity_type().ok_or_else(|| {
+                fail("the generated entity table has no minecraft:falling_block".to_owned())
+            })?,
+            falling: std::sync::Arc::clone(&falling),
         });
 
         // Built here because it needs the world and the roster, both of which
@@ -1392,7 +1405,19 @@ impl Server {
             std::sync::Arc::clone(&items),
             std::sync::Arc::clone(&world),
             std::sync::Arc::clone(&roster),
+            constants.clone(),
+        )));
+        // The world reacting to itself, built here for the same reason: it
+        // needs the world, the roster, the loot tables and both entity worlds,
+        // and every one of those is phase 3's.
+        self.world_ticker = Some(Box::new(crate::net::updates::WorldTicker::new(
+            std::sync::Arc::clone(&world),
+            std::sync::Arc::clone(&items),
+            std::sync::Arc::clone(&falling),
+            std::sync::Arc::clone(&roster),
+            std::sync::Arc::clone(&drops),
             constants,
+            palette.air,
         )));
 
         let handle = listener

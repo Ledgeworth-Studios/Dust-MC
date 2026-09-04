@@ -43,6 +43,7 @@ pub mod chat;
 pub mod collide;
 pub mod configure;
 pub mod edits;
+pub mod falling;
 pub mod favicon;
 pub mod furnaces;
 pub mod generated;
@@ -57,6 +58,7 @@ pub mod save;
 pub mod session;
 pub mod source;
 pub mod status;
+pub mod updates;
 pub mod view;
 pub mod world;
 
